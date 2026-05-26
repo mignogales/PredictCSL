@@ -15,42 +15,48 @@ TSFM's forecast error. So we MEASURE it -- this script is the measurement.
 Pipeline
 --------
 1. Generate N synthetic series of length MAX_WINDOW + max(HORIZON_GRID). Each
-   series is built segment-by-segment with injected non-stationarity (regime
-   changes, level shifts, variance shifts, per-segment trend/AR/seasonality).
-   This is what makes context length matter: without change points every
-   ablation curve is monotone and there is nothing to learn.
+   series is built segment-by-segment with injected non-stationarity: regime
+   changes, level shifts, variance shifts, per-segment trend/AR/seasonality,
+   wave-type variety (sin/cos/sawtooth/square), and random spikes. Change-point
+   transitions are optionally gradual (linear crossfade). Within multi-regime
+   series the dominant seasonal period can shift at each regime boundary.
 2. For each series, forecast max(HORIZON_GRID) steps from the last W context
-   samples, for every W in WINDOW_GRID, using a chosen TSFM (Chronos-2 first).
-   Per-window inference is done once at the longest horizon; the prefix
-   property of left-to-right forecasting lets us slice the prediction at every
-   h in HORIZON_GRID and get the same answer as if we'd called the model with
-   prediction_length=h directly.
+   samples, for every W in WINDOW_GRID, using a chosen TSFM. Per-window
+   inference is done once at the longest horizon; left-to-right prefix property
+   lets us slice at every h in HORIZON_GRID for free.
 3. Save the full per-series error-vs-(context, horizon) surface (MAE and MSE
-   for every (W, h) pair). Horizon is a first-class axis because the useful
-   context length depends on how far ahead you're forecasting.
+   for every (W, h) pair). Each model run appends its own curve files to the
+   shared run directory, reusing the same series pool.
 
-The downstream predictor (experiments/predict_context_length.py) consumes
-`contexts.npy` (its input) and `curves_mae.npy` / `curves_mse.npy` (its label,
-shape (N, n_windows, n_horizons)).
+Multi-model labeling
+--------------------
+Run once per model using --model-idx N [--resume <run_dir>]. The first run
+generates the series pool; subsequent --resume runs load it from disk and skip
+re-generation. Curve files are named curves_mae_<family>.npy so all models
+coexist in one run directory.
+
+    python build_context_length_dataset.py --model-idx 0              # pool + label
+    python build_context_length_dataset.py --model-idx 1 --resume DIR # reuse pool
+    python build_context_length_dataset.py --model-idx 2 --resume DIR
 
 Parallelism
 -----------
-Series generation runs once in the parent (CPU-bound, seconds). The expensive
-labeling stage is sharded across GPUs: one worker process per CUDA device
-drains a shared queue of series-shards, loading the TSFM into VRAM exactly
-once. Each completed shard is written to disk; the parent merges shards into
-the top-level curve arrays. Runs are resumable per shard via --resume.
+Series generation runs once in the parent (CPU-bound, seconds). The labeling
+stage is sharded across GPUs: one worker per CUDA device drains a shared queue
+of series-shards, loading the TSFM into VRAM once. Each shard is written to
+disk; the parent merges shards. Runs are resumable per shard via --resume.
 
 Outputs
 -------
 logs/experiments/context_length_dataset/<run>/
-    contexts.npy      (N, MAX_WINDOW)            float32  -- predictor input
-    targets.npy       (N, MAX_HORIZON)           float32  -- forecast target
-    n_segments.npy    (N,)                       int32    -- regime count per series
-    curves_mae.npy    (N, n_windows, n_horizons) float32  -- MAE per (W, h)
-    curves_mse.npy    (N, n_windows, n_horizons) float32  -- MSE per (W, h)
-    shards/shard_NNN/                            -- per-shard curves (resume unit)
-    meta.json                                    -- grid, horizon grid, model, seeds
+    contexts.npy                   (N, MAX_WINDOW)            float32
+    targets.npy                    (N, MAX_HORIZON)           float32
+    n_segments.npy                 (N,)                       int32
+    curves_mae_<family>.npy        (N, n_windows, n_horizons) float32
+    curves_mse_<family>.npy        (N, n_windows, n_horizons) float32
+    shards/<family>/shard_NNN/     per-shard curves (resume unit)
+    meta.json                      series-pool config (written once)
+    meta_<family>.json             per-model run metadata
 """
 
 from __future__ import annotations
@@ -62,7 +68,7 @@ import os
 import time
 from datetime import datetime
 from queue import Empty
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -93,43 +99,48 @@ WINDOW_GRID = [
 ]
 
 # -- Horizon grid (forecast lengths labeled per series) -----------------------
-# Each series gets one curve per horizon. The useful context length depends on
-# horizon, so this is a first-class label axis. We forecast once at the longest
-# horizon and slice — left-to-right autoregressive output of the first h steps
-# is identical regardless of the total prediction_length requested.
 HORIZON_GRID = [8, 16, 32, 64, 96]
 MAX_HORIZON  = max(HORIZON_GRID)
 
 # -- Dataset size -------------------------------------------------------------
-N_SERIES   = 10_000          # scale up for the real run; lower with --n-series
+N_SERIES   = 100_000
 SEED       = 42
 BATCH_SIZE = 32              # TSFM inference batch size
 SHARD_SIZE = 500             # series per shard (parallelism + resume granularity)
 
 # -- Non-stationarity controls ------------------------------------------------
-# Number of regimes per series. Biased toward 1-2 so the dataset contains both
-# stationary series (curve monotone -> label = max window) and series where
-# truncation helps (curve has an interior optimum).
-N_SEGMENT_CHOICES = [1, 1, 1, 2, 2, 3]
+# Rebalanced: 50% single-regime removed in favour of richer multi-regime series.
+N_SEGMENT_CHOICES = [1, 2, 2, 3, 3, 4]   # 17% × 1, 33% × 2, 33% × 3, 17% × 4
 MIN_SEGMENT_LEN   = 512      # shortest regime; also keeps the horizon clear of cuts
 LEVEL_SHIFT_STD   = 1.5      # std of the cumulative mean jump at each regime change
 SEG_AMP_RANGE     = (0.6, 1.6)   # per-segment amplitude scale (variance regimes)
 
+# -- Seasonal-shift controls --------------------------------------------------
+SEASONAL_SHIFT_PROB = 0.5    # probability of dominant-period change at each regime boundary
+
+# -- Gradual-transition controls ----------------------------------------------
+TRANSITION_MAX = 64          # max half-width of linear blend zone at cut points (samples)
+                             # 0 = hard cut; uniformly sampled in [0, TRANSITION_MAX]
+
+# -- Spike (outlier impulse) controls -----------------------------------------
+SPIKE_PROB       = 0.30      # fraction of segments that contain impulse spikes
+SPIKE_RATE_RANGE = (0.002, 0.015)  # Poisson rate as fraction of segment length
+SPIKE_STD        = 3.0       # spike amplitude std (post-standardization scale)
+
 # -- Multi-GPU ----------------------------------------------------------------
 DEVICES = None               # None -> all visible CUDA devices (or CPU)
 
-# -- Models. Only the first uncommented entry is used. ------------------------
-#    (model_id, family, display_name)
+# -- Models  (model_id, family, display_name) ---------------------------------
 MODELS = [
     ("autogluon/chronos-2-small",       "chronos2",     "Chronos2-Small"),
-    # ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
-    # ("Salesforce/moirai-2.0-R-small",   "moirai",       "Moirai2-Small"),
-    # ("google/timesfm-2.5-200m-pytorch", "timesfm",      "TimesFM2.5-200M"),
-    # ("ibm-research/patchtst-fm-r1",     "patchtst_fm",  "PatchTST-FM-R1"),
+    ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
+    ("Salesforce/moirai-2.0-R-small",   "moirai",       "Moirai2-Small"),
+    ("google/timesfm-2.5-200m-pytorch", "timesfm",      "TimesFM2.5-200M"),
+    ("ibm-research/patchtst-fm-r1",     "patchtst_fm",  "PatchTST-FM-R1"),
 ]
 
 # -- Quantile bookkeeping (per model family) ----------------------------------
-MOIRAI2_MEDIAN_IDX            = 4
+MOIRAI2_MEDIAN_IDX              = 4
 PATCHTST_FM_MEDIAN_QUANTILE_IDX = 49
 
 OUTPUT_ROOT = "logs/experiments/context_length_dataset"
@@ -154,8 +165,16 @@ def resolve_devices(force: Optional[str]) -> List[str]:
 #  SYNTHETIC GENERATOR
 # ==============================================================================
 
-def _generate_segment(rng: np.random.RandomState, length: int) -> np.ndarray:
+def _generate_segment(
+    rng: np.random.RandomState,
+    length: int,
+    force_period: Optional[float] = None,
+) -> np.ndarray:
     """One stationary regime: periodic components + optional AR + trend + noise.
+
+    Supports sin, cos, sawtooth, and square waveforms. Optionally forces the
+    dominant (first) periodic component to `force_period` so that the caller
+    can control seasonal-period changes across regime boundaries.
 
     Not standardized here -- amplitude scaling and level shifts are applied at
     the series level so regimes differ in scale and mean.
@@ -167,21 +186,31 @@ def _generate_segment(rng: np.random.RandomState, length: int) -> np.ndarray:
     n_periodic = int(rng.randint(1, 4))
     log_lo, log_hi = math.log(PERIOD_MIN), math.log(PERIOD_MAX)
     periods = np.exp(rng.uniform(log_lo, log_hi, size=n_periodic))
+    if force_period is not None:
+        periods[0] = force_period   # dominant period is caller-controlled
     amplitudes = rng.uniform(0.5, 2.0, size=n_periodic)
     phases = rng.uniform(0.0, 2.0 * np.pi, size=n_periodic)
+
     for amp, T_p, ph in zip(amplitudes, periods, phases):
         omega = 2.0 * np.pi / float(T_p)
-        if rng.uniform() < 0.5:
+        wtype = int(rng.randint(0, 4))   # 0=sin, 1=cos, 2=sawtooth, 3=square
+        if wtype == 0:
             seg += amp * np.sin(omega * t + ph)
-        else:
+        elif wtype == 1:
             seg += amp * np.cos(omega * t + ph)
+        elif wtype == 2:
+            # Sawtooth in [-1, 1]: 2 * frac(t/T + ph/(2π)) - 1
+            seg += amp * (
+                2.0 * ((t / float(T_p) + ph / (2.0 * np.pi)) % 1.0) - 1.0
+            ).astype(np.float32)
+        else:
+            seg += amp * np.sign(np.sin(omega * t + ph)).astype(np.float32)
 
     # -- Optional AR(p) (stable; lfilter for speed) ---------------------------
     if rng.uniform() < 0.5:
         p = int(rng.randint(1, 4))
         coeffs = rng.uniform(-0.3 / p, 0.3 / p, size=p)
         innov = rng.normal(0.0, 0.3, size=length).astype(np.float32)
-        # x_t = sum_k coeffs_k x_{t-k} + innov  ->  a = [1, -c1, ..., -cp]
         a = np.concatenate([[1.0], -coeffs])
         seg += lfilter([1.0], a, innov).astype(np.float32)
 
@@ -195,6 +224,15 @@ def _generate_segment(rng: np.random.RandomState, length: int) -> np.ndarray:
     # -- Gaussian noise -------------------------------------------------------
     noise_std = float(rng.uniform(0.05, 0.30))
     seg += rng.normal(0.0, noise_std, size=length).astype(np.float32)
+
+    # -- Random spikes (Poisson-arrival impulses) -----------------------------
+    if rng.uniform() < SPIKE_PROB:
+        rate = float(rng.uniform(*SPIKE_RATE_RANGE))
+        n_spikes = int(rng.poisson(rate * length))
+        if n_spikes > 0:
+            locs = rng.randint(0, length, size=n_spikes)
+            amps = rng.normal(0.0, SPIKE_STD, size=n_spikes).astype(np.float32)
+            np.add.at(seg, locs, amps)
 
     return seg.astype(np.float32, copy=False)
 
@@ -218,10 +256,13 @@ def _generate_synthetic_series(
 ) -> Tuple[np.ndarray, int]:
     """Build one synthetic series with injected non-stationarity.
 
-    Composed of 1-3 regimes. Change points fall strictly inside the context
-    pool (the final HORIZON samples stay within the last regime, with a buffer)
-    so a small window can isolate the most recent regime while a large window
-    drags in stale history.
+    Composed of 1-4 regimes. Change points fall strictly inside the context
+    pool. Within each multi-regime series:
+      - The dominant seasonal period can shift at each regime boundary
+        (with probability SEASONAL_SHIFT_PROB).
+      - Hard cuts are replaced by a linear crossfade of half-width T (sampled
+        uniformly in [0, TRANSITION_MAX]) that preserves high-frequency
+        structure while smoothing the mean-level jump.
 
     Returns:
         series: float32 (total_length,), standardized by context-pool stats.
@@ -232,21 +273,45 @@ def _generate_synthetic_series(
     if n_seg == 1:
         series = _generate_segment(rng, total_length)
     else:
-        # Cuts inside the pool; last regime must hold HORIZON + a buffer.
         lo = MIN_SEGMENT_LEN
         hi = MAX_WINDOW - MIN_SEGMENT_LEN
         cuts = _sample_cut_points(rng, n_seg - 1, lo, hi, MIN_SEGMENT_LEN)
         bounds = [0] + cuts + [total_length]
 
+        # Initial dominant period; may shift at each boundary.
+        dominant_period = float(
+            np.exp(rng.uniform(math.log(PERIOD_MIN), math.log(PERIOD_MAX))))
+
         parts: List[np.ndarray] = []
         level = 0.0
         for i in range(n_seg):
             seg_len = bounds[i + 1] - bounds[i]
-            seg = _generate_segment(rng, seg_len)
+            seg = _generate_segment(rng, seg_len, force_period=dominant_period)
             seg = seg * float(rng.uniform(*SEG_AMP_RANGE))
             if i > 0:
                 level += float(rng.normal(0.0, LEVEL_SHIFT_STD))
-            parts.append(seg + level)
+                if rng.uniform() < SEASONAL_SHIFT_PROB:
+                    dominant_period = float(
+                        np.exp(rng.uniform(math.log(PERIOD_MIN), math.log(PERIOD_MAX))))
+            parts.append((seg + level).astype(np.float32))
+
+        # Gradual transitions: smear the level jump at each regime boundary.
+        # The crossfade adds a ramp that rises from 0 to +jump over the T
+        # samples before the cut (in the old regime) and a matching ramp that
+        # falls from -jump back to 0 over the T samples after the cut (in the
+        # new regime). Net effect: continuity at the cut point, no change
+        # outside the [cut-T, cut+T] window.
+        for i in range(len(parts) - 1):
+            T = int(rng.randint(0, TRANSITION_MAX + 1))
+            T = min(T, len(parts[i]), len(parts[i + 1]))
+            if T == 0:
+                continue
+            jump = float(parts[i + 1][0] - parts[i][-1])
+            ramp = np.linspace(0.0, jump, 2 * T, dtype=np.float32)
+            ramp[T:] -= jump                         # right half: ≈ -jump/2 → 0
+            parts[i][-T:]    = parts[i][-T:]    + ramp[:T]   # tail of old regime
+            parts[i + 1][:T] = parts[i + 1][:T] + ramp[T:]  # head of new regime
+
         series = np.concatenate(parts).astype(np.float32)
 
     # Standardize using ONLY the observed context pool (no horizon leakage).
@@ -285,8 +350,7 @@ def generate_dataset(
 #  MODEL LOADERS + MEDIAN-FORECAST WRAPPERS
 # ==============================================================================
 #  Each predict_* wrapper takes a CPU tensor x of shape (B, W, 1) and returns
-#  the point/median forecast as (B, horizon) on `device`, where `horizon` is
-#  the value passed in (we call these at MAX_HORIZON and slice).
+#  the point/median forecast as (B, horizon) on `device`.
 
 def _is_cuda(device: str) -> bool:
     return device.startswith("cuda")
@@ -429,7 +493,7 @@ def forecast_window(
     batch_size: int,
     device: str,
 ) -> torch.Tensor:
-    """Forecast the horizon for every series, using the last `window` samples.
+    """Forecast the horizon for every series using the last `window` samples.
 
     Returns the median forecast (N, horizon) on `device`.
     """
@@ -437,7 +501,6 @@ def forecast_window(
         np.ascontiguousarray(contexts[:, -window:])).unsqueeze(-1)  # (N, W, 1)
     n = x_all.shape[0]
 
-    # Per-window model objects.
     if family == "moirai":
         runner = _build_moirai(base, horizon, window, device)
     elif family == "timesfm":
@@ -474,8 +537,8 @@ def forecast_window(
 #  GPU WORKER  (one process per device, drains a shard queue)
 # ==============================================================================
 
-def _shard_dir(run_dir: str, shard_id: int) -> str:
-    return os.path.join(run_dir, "shards", f"shard_{shard_id:03d}")
+def _shard_dir(run_dir: str, family: str, shard_id: int) -> str:
+    return os.path.join(run_dir, "shards", family, f"shard_{shard_id:03d}")
 
 
 def gpu_worker(
@@ -542,7 +605,7 @@ def gpu_worker(
                     cm[:, w_idx, h_idx] = err.abs().mean(dim=1).cpu().numpy()
                     cs[:, w_idx, h_idx] = err.pow(2).mean(dim=1).cpu().numpy()
 
-            sd = _shard_dir(run_dir, shard_id)
+            sd = _shard_dir(run_dir, family, shard_id)
             os.makedirs(sd, exist_ok=True)
             np.save(os.path.join(sd, "curves_mae.npy"), cm)
             np.save(os.path.join(sd, "curves_mse.npy"), cs)
@@ -571,7 +634,9 @@ def gpu_worker(
 #  SHARD MERGE + SANITY
 # ==============================================================================
 
-def merge_shards(run_dir: str, n_series: int) -> Tuple[np.ndarray, np.ndarray, int]:
+def merge_shards(
+    run_dir: str, family: str, n_series: int
+) -> Tuple[np.ndarray, np.ndarray, int]:
     """Concatenate completed shard curves into top-level (N, n_win, n_h) arrays.
 
     Missing/incomplete shards leave NaN rows so curves stay index-aligned with
@@ -582,7 +647,7 @@ def merge_shards(run_dir: str, n_series: int) -> Tuple[np.ndarray, np.ndarray, i
     cm = np.full((n_series, n_win, n_h), np.nan, dtype=np.float32)
     cs = np.full((n_series, n_win, n_h), np.nan, dtype=np.float32)
 
-    sdir = os.path.join(run_dir, "shards")
+    sdir = os.path.join(run_dir, "shards", family)
     n_done = 0
     if os.path.isdir(sdir):
         for name in sorted(os.listdir(sdir)):
@@ -596,17 +661,15 @@ def merge_shards(run_dir: str, n_series: int) -> Tuple[np.ndarray, np.ndarray, i
             cs[s:e] = np.load(os.path.join(sdir, name, "curves_mse.npy"))
             n_done += 1
 
-    np.save(os.path.join(run_dir, "curves_mae.npy"), cm)
-    np.save(os.path.join(run_dir, "curves_mse.npy"), cs)
+    np.save(os.path.join(run_dir, f"curves_mae_{family}.npy"), cm)
+    np.save(os.path.join(run_dir, f"curves_mse_{family}.npy"), cs)
     return cm, cs, n_done
 
 
-def _print_data_sanity(curves_mae: np.ndarray, n_segments: np.ndarray) -> None:
-    """Report whether the generated data is actually context-sensitive.
-
-    curves_mae shape: (N, n_windows, n_horizons). Reports per-horizon stats so
-    we can see how the useful window changes with forecast length.
-    """
+def _print_data_sanity(
+    curves_mae: np.ndarray, n_segments: np.ndarray, family: str
+) -> None:
+    """Report whether the generated data is actually context-sensitive."""
     valid = ~np.isnan(curves_mae).any(axis=(1, 2))
     if not valid.any():
         print(Fore.RED + "  No completed curves to summarize." + Fore.RESET)
@@ -614,7 +677,7 @@ def _print_data_sanity(curves_mae: np.ndarray, n_segments: np.ndarray) -> None:
     cm_v = curves_mae[valid]                                # (V, n_win, n_h)
     n_win = cm_v.shape[1]
     win_arr = np.array(WINDOW_GRID)
-    print(Fore.GREEN + "  Data sanity (MAE curves):" + Fore.RESET)
+    print(Fore.GREEN + f"  Data sanity [{family}] (MAE curves):" + Fore.RESET)
     print(f"    valid curves: {int(valid.sum())}/{len(curves_mae)}")
     for h_idx, h in enumerate(HORIZON_GRID):
         cm_h = cm_v[:, :, h_idx]                            # (V, n_win)
@@ -636,7 +699,7 @@ def _print_data_sanity(curves_mae: np.ndarray, n_segments: np.ndarray) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Synthetic context-length ablation dataset.")
     p.add_argument("--resume", type=str, default=None,
-                   help="Resume an existing run directory.")
+                   help="Resume / extend an existing run directory.")
     p.add_argument("--device", type=str, default=None, choices=[None, "cuda", "cpu"],
                    help="Force device. Default: all CUDA devices, else CPU.")
     p.add_argument("--n-series", type=int, default=N_SERIES,
@@ -647,6 +710,12 @@ def parse_args() -> argparse.Namespace:
                    help="Series per shard (parallelism + resume granularity).")
     p.add_argument("--windows", type=int, nargs="+", default=None,
                    help="Subset of WINDOW_GRID to run (quick smoke tests).")
+    p.add_argument("--model-idx", type=int, default=0,
+                   help=(
+                       "Index into MODELS list (0-based). Run once per model "
+                       "with --resume to share the same series pool across models. "
+                       f"Available: {[f'{i}={m[2]}' for i, m in enumerate(MODELS)]}"
+                   ))
     return p.parse_args()
 
 
@@ -657,15 +726,22 @@ def main() -> None:
         pass
 
     args = parse_args()
+
+    if args.model_idx < 0 or args.model_idx >= len(MODELS):
+        raise ValueError(
+            f"--model-idx {args.model_idx} out of range; "
+            f"MODELS has {len(MODELS)} entries (0-{len(MODELS)-1})."
+        )
+    model_id, family, display = MODELS[args.model_idx]
     devices = resolve_devices(args.device)
-    model_id, family, display = MODELS[0]
 
     grid = [w for w in WINDOW_GRID if args.windows is None or w in args.windows]
     if any(w > MAX_WINDOW for w in grid):
         raise ValueError(f"WINDOW_GRID exceeds MAX_WINDOW={MAX_WINDOW}.")
     win_indices = [WINDOW_GRID.index(w) for w in grid]
 
-    print(Fore.CYAN + f"Devices: {devices}  |  Model: {display} ({model_id})" + Fore.RESET)
+    print(Fore.CYAN + f"Devices: {devices}  |  Model [{args.model_idx}]: {display} ({model_id})"
+          + Fore.RESET)
     print(Fore.CYAN + f"HORIZON_GRID={HORIZON_GRID}  MAX_WINDOW={MAX_WINDOW}  "
           + f"windows={grid}  shard_size={args.shard_size}" + Fore.RESET)
 
@@ -681,8 +757,9 @@ def main() -> None:
         print(Fore.CYAN + f"Run directory: {run_dir}" + Fore.RESET)
 
     contexts_path = os.path.join(run_dir, "contexts.npy")
-    targets_path = os.path.join(run_dir, "targets.npy")
-    nseg_path = os.path.join(run_dir, "n_segments.npy")
+    targets_path  = os.path.join(run_dir, "targets.npy")
+    nseg_path     = os.path.join(run_dir, "n_segments.npy")
+    pool_meta_path = os.path.join(run_dir, "meta.json")
 
     if os.path.isfile(contexts_path):
         n_series = int(np.load(contexts_path, mmap_mode="r").shape[0])
@@ -695,18 +772,37 @@ def main() -> None:
         np.save(targets_path, targets)
         np.save(nseg_path, n_segments)
         del contexts, targets
+        # Write pool-level meta once (not model-specific).
+        with open(pool_meta_path, "w") as f:
+            json.dump({
+                "n_series": int(n_series), "seed": SEED,
+                "max_window": MAX_WINDOW, "max_horizon": MAX_HORIZON,
+                "window_grid": WINDOW_GRID, "horizon_grid": HORIZON_GRID,
+                "period_min": PERIOD_MIN, "period_max": PERIOD_MAX,
+                "n_segment_choices": N_SEGMENT_CHOICES,
+                "min_segment_len": MIN_SEGMENT_LEN,
+                "level_shift_std": LEVEL_SHIFT_STD,
+                "seasonal_shift_prob": SEASONAL_SHIFT_PROB,
+                "transition_max": TRANSITION_MAX,
+                "spike_prob": SPIKE_PROB,
+                "spike_rate_range": list(SPIKE_RATE_RANGE),
+                "spike_std": SPIKE_STD,
+                "created": datetime.now().isoformat(timespec="seconds"),
+            }, f, indent=2)
         print(Fore.GREEN + f"  Generated synthetic pool: {n_series} series" + Fore.RESET)
 
-    # ---------- Build shard list (skip completed) ---------------------------
-    pending: List[Tuple[int, int, int]] = []
+    # ---------- Build shard list (skip completed for this model) ------------
+    pending = []
     n_completed = 0
     for shard_id, start in enumerate(range(0, n_series, args.shard_size)):
         end = min(start + args.shard_size, n_series)
-        if os.path.isfile(os.path.join(_shard_dir(run_dir, shard_id), "done.json")):
+        if os.path.isfile(
+            os.path.join(_shard_dir(run_dir, family, shard_id), "done.json")
+        ):
             n_completed += 1
         else:
             pending.append((shard_id, start, end))
-    print(Fore.CYAN + f"  Shards: {n_completed} cached, {len(pending)} pending"
+    print(Fore.CYAN + f"  [{family}] Shards: {n_completed} cached, {len(pending)} pending"
           + Fore.RESET)
 
     # ---------- Spawn workers + dispatch shards -----------------------------
@@ -719,7 +815,7 @@ def main() -> None:
         for _ in devices:
             shard_queue.put(None)
 
-        workers: List[mp.Process] = []
+        workers = []
         for i, dev in enumerate(devices):
             p = ctx.Process(
                 target=gpu_worker,
@@ -753,31 +849,27 @@ def main() -> None:
         print(Fore.MAGENTA + f"  Labeling wall-clock: "
               + f"{time.perf_counter() - t0:.1f}s" + Fore.RESET)
 
-    # ---------- Merge shards + metadata -------------------------------------
-    curves_mae, _, n_done = merge_shards(run_dir, n_series)
+    # ---------- Merge shards + per-model metadata ---------------------------
+    curves_mae, _, n_done = merge_shards(run_dir, family, n_series)
     total_shards = (n_series + args.shard_size - 1) // args.shard_size
 
-    with open(os.path.join(run_dir, "meta.json"), "w") as f:
+    with open(os.path.join(run_dir, f"meta_{family}.json"), "w") as f:
         json.dump({
             "model_id": model_id, "model_family": family, "model_display": display,
-            "window_grid": WINDOW_GRID, "horizon_grid": HORIZON_GRID,
-            "max_horizon": MAX_HORIZON, "max_window": MAX_WINDOW,
-            "n_series": int(n_series), "seed": SEED,
-            "shard_size": args.shard_size,
+            "model_idx": args.model_idx,
+            "window_indices": win_indices,
             "shards_done": n_done, "shards_total": total_shards,
             "devices": devices,
-            "period_min": PERIOD_MIN, "period_max": PERIOD_MAX,
-            "n_segment_choices": N_SEGMENT_CHOICES,
-            "min_segment_len": MIN_SEGMENT_LEN,
-            "level_shift_std": LEVEL_SHIFT_STD,
+            "shard_size": args.shard_size,
             "created": datetime.now().isoformat(timespec="seconds"),
         }, f, indent=2)
 
-    _print_data_sanity(curves_mae, n_segments)
+    _print_data_sanity(curves_mae, n_segments, family)
     if n_done < total_shards:
         print(Fore.YELLOW + f"  {total_shards - n_done} shard(s) incomplete — "
-              + f"re-run with --resume {run_dir}" + Fore.RESET)
+              + f"re-run with --resume {run_dir} --model-idx {args.model_idx}" + Fore.RESET)
     print(Fore.GREEN + f"\nDataset written to: {run_dir}" + Fore.RESET)
+    print(Fore.GREEN + f"  curves_mae_{family}.npy  curves_mse_{family}.npy" + Fore.RESET)
 
 
 if __name__ == "__main__":
