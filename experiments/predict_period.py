@@ -95,7 +95,7 @@ SEED                    = 42
 
 # -- Dual-objective loss weights (configurable per task spec) -----------------
 LAMBDA_PERIOD          = 1.0           # weight of MSE_period (log-T regression)
-LAMBDA_RECON           = 1.0           # weight of MSE_reconstruction
+LAMBDA_RECON           = 0.0           # weight of MSE_reconstruction
 # Selection metric for ranking trials. Options:
 #   "combined" -> lambda1 * val_period_mse + lambda2 * val_recon_mse
 #   "period"   -> val_period_mse
@@ -109,8 +109,8 @@ LR_SCALING_RULE        = "sqrt"
 
 # -- Multi-GPU configuration --------------------------------------------------
 DEVICES                = None          # None -> use all visible CUDA devices
-VRAM_BUDGET_GB_PER_DEVICE: Optional[List[float]] = None
-VRAM_BUDGET_DEFAULT_GB = 6.0
+VRAM_BUDGET_GB_PER_DEVICE: Optional[List[float]] = [10.0, 10.0, 6.0, 10.0]
+VRAM_BUDGET_DEFAULT_GB = 8.0
 
 # -- Hyperparameter search space ----------------------------------------------
 # Patches are non-overlapping (stride == patch_length) — yields exactly
