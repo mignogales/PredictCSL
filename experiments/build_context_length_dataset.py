@@ -25,38 +25,29 @@ Pipeline
    inference is done once at the longest horizon; left-to-right prefix property
    lets us slice at every h in HORIZON_GRID for free.
 3. Save the full per-series error-vs-(context, horizon) surface (MAE and MSE
-   for every (W, h) pair). Each model run appends its own curve files to the
-   shared run directory, reusing the same series pool.
-
-Multi-model labeling
---------------------
-Run once per model using --model-idx N [--resume <run_dir>]. The first run
-generates the series pool; subsequent --resume runs load it from disk and skip
-re-generation. Curve files are named curves_mae_<family>.npy so all models
-coexist in one run directory.
-
-    python build_context_length_dataset.py --model-idx 0              # pool + label
-    python build_context_length_dataset.py --model-idx 1 --resume DIR # reuse pool
-    python build_context_length_dataset.py --model-idx 2 --resume DIR
+   for every (W, h) pair). By default all models in MODELS are labeled in
+   sequence, sharing the same series pool. Use --model-idx to run one model.
 
 Parallelism
 -----------
 Series generation runs once in the parent (CPU-bound, seconds). The labeling
 stage is sharded across GPUs: one worker per CUDA device drains a shared queue
 of series-shards, loading the TSFM into VRAM once. Each shard is written to
-disk; the parent merges shards. Runs are resumable per shard via --resume.
+disk; the parent merges shards. Completed shards are skipped automatically on
+re-runs (safe to interrupt and restart).
 
 Outputs
 -------
-logs/experiments/context_length_dataset/<run>/
-    contexts.npy                   (N, MAX_WINDOW)            float32
-    targets.npy                    (N, MAX_HORIZON)           float32
-    n_segments.npy                 (N,)                       int32
-    curves_mae_<family>.npy        (N, n_windows, n_horizons) float32
-    curves_mse_<family>.npy        (N, n_windows, n_horizons) float32
-    shards/<family>/shard_NNN/     per-shard curves (resume unit)
-    meta.json                      series-pool config (written once)
-    meta_<family>.json             per-model run metadata
+logs/experiments/context_length_dataset/
+    contexts.npy             (N, MAX_WINDOW)            float32  -- shared pool
+    targets.npy              (N, MAX_HORIZON)           float32
+    n_segments.npy           (N,)                       int32
+    meta.json                series-pool config (written once)
+    <family>/
+        curves_mae.npy       (N, n_windows, n_horizons) float32
+        curves_mse.npy       (N, n_windows, n_horizons) float32
+        shards/shard_NNN/    per-shard curves (resume unit)
+        meta.json            per-model run metadata
 """
 
 from __future__ import annotations
@@ -537,8 +528,12 @@ def forecast_window(
 #  GPU WORKER  (one process per device, drains a shard queue)
 # ==============================================================================
 
-def _shard_dir(run_dir: str, family: str, shard_id: int) -> str:
-    return os.path.join(run_dir, "shards", family, f"shard_{shard_id:03d}")
+def _model_dir(family: str) -> str:
+    return os.path.join(OUTPUT_ROOT, family)
+
+
+def _shard_dir(model_dir: str, shard_id: int) -> str:
+    return os.path.join(model_dir, "shards", f"shard_{shard_id:03d}")
 
 
 def gpu_worker(
@@ -546,7 +541,7 @@ def gpu_worker(
     device: str,
     shard_queue: "mp.Queue",
     result_queue: "mp.Queue",
-    run_dir: str,
+    model_dir: str,
     contexts_path: str,
     targets_path: str,
     model_id: str,
@@ -605,7 +600,7 @@ def gpu_worker(
                     cm[:, w_idx, h_idx] = err.abs().mean(dim=1).cpu().numpy()
                     cs[:, w_idx, h_idx] = err.pow(2).mean(dim=1).cpu().numpy()
 
-            sd = _shard_dir(run_dir, family, shard_id)
+            sd = _shard_dir(model_dir, shard_id)
             os.makedirs(sd, exist_ok=True)
             np.save(os.path.join(sd, "curves_mae.npy"), cm)
             np.save(os.path.join(sd, "curves_mse.npy"), cs)
@@ -635,7 +630,7 @@ def gpu_worker(
 # ==============================================================================
 
 def merge_shards(
-    run_dir: str, family: str, n_series: int
+    model_dir: str, n_series: int
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """Concatenate completed shard curves into top-level (N, n_win, n_h) arrays.
 
@@ -647,7 +642,7 @@ def merge_shards(
     cm = np.full((n_series, n_win, n_h), np.nan, dtype=np.float32)
     cs = np.full((n_series, n_win, n_h), np.nan, dtype=np.float32)
 
-    sdir = os.path.join(run_dir, "shards", family)
+    sdir = os.path.join(model_dir, "shards")
     n_done = 0
     if os.path.isdir(sdir):
         for name in sorted(os.listdir(sdir)):
@@ -661,8 +656,8 @@ def merge_shards(
             cs[s:e] = np.load(os.path.join(sdir, name, "curves_mse.npy"))
             n_done += 1
 
-    np.save(os.path.join(run_dir, f"curves_mae_{family}.npy"), cm)
-    np.save(os.path.join(run_dir, f"curves_mse_{family}.npy"), cs)
+    np.save(os.path.join(model_dir, "curves_mae.npy"), cm)
+    np.save(os.path.join(model_dir, "curves_mse.npy"), cs)
     return cm, cs, n_done
 
 
@@ -698,8 +693,6 @@ def _print_data_sanity(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Synthetic context-length ablation dataset.")
-    p.add_argument("--resume", type=str, default=None,
-                   help="Resume / extend an existing run directory.")
     p.add_argument("--device", type=str, default=None, choices=[None, "cuda", "cpu"],
                    help="Force device. Default: all CUDA devices, else CPU.")
     p.add_argument("--n-series", type=int, default=N_SERIES,
@@ -710,10 +703,10 @@ def parse_args() -> argparse.Namespace:
                    help="Series per shard (parallelism + resume granularity).")
     p.add_argument("--windows", type=int, nargs="+", default=None,
                    help="Subset of WINDOW_GRID to run (quick smoke tests).")
-    p.add_argument("--model-idx", type=int, default=0,
+    p.add_argument("--model-idx", type=int, default=None,
                    help=(
-                       "Index into MODELS list (0-based). Run once per model "
-                       "with --resume to share the same series pool across models. "
+                       "Run only this model index (0-based). "
+                       "Default: run all models in sequence. "
                        f"Available: {[f'{i}={m[2]}' for i, m in enumerate(MODELS)]}"
                    ))
     return p.parse_args()
@@ -727,44 +720,27 @@ def main() -> None:
 
     args = parse_args()
 
-    if args.model_idx < 0 or args.model_idx >= len(MODELS):
+    if args.model_idx is not None and (args.model_idx < 0 or args.model_idx >= len(MODELS)):
         raise ValueError(
-            f"--model-idx {args.model_idx} out of range; "
-            f"MODELS has {len(MODELS)} entries (0-{len(MODELS)-1})."
-        )
-    model_id, family, display = MODELS[args.model_idx]
-    devices = resolve_devices(args.device)
+            f"--model-idx {args.model_idx} out of range (0-{len(MODELS)-1}).")
 
+    devices = resolve_devices(args.device)
     grid = [w for w in WINDOW_GRID if args.windows is None or w in args.windows]
     if any(w > MAX_WINDOW for w in grid):
         raise ValueError(f"WINDOW_GRID exceeds MAX_WINDOW={MAX_WINDOW}.")
     win_indices = [WINDOW_GRID.index(w) for w in grid]
 
-    print(Fore.CYAN + f"Devices: {devices}  |  Model [{args.model_idx}]: {display} ({model_id})"
-          + Fore.RESET)
-    print(Fore.CYAN + f"HORIZON_GRID={HORIZON_GRID}  MAX_WINDOW={MAX_WINDOW}  "
-          + f"windows={grid}  shard_size={args.shard_size}" + Fore.RESET)
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
-    # ---------- Run directory + series pool (generated once) ----------------
-    if args.resume:
-        run_dir = args.resume
-        if not os.path.isdir(run_dir):
-            raise FileNotFoundError(f"--resume dir not found: {run_dir}")
-        print(Fore.CYAN + f"Resuming run: {run_dir}" + Fore.RESET)
-    else:
-        run_dir = os.path.join(OUTPUT_ROOT, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-        os.makedirs(run_dir, exist_ok=True)
-        print(Fore.CYAN + f"Run directory: {run_dir}" + Fore.RESET)
-
-    contexts_path = os.path.join(run_dir, "contexts.npy")
-    targets_path  = os.path.join(run_dir, "targets.npy")
-    nseg_path     = os.path.join(run_dir, "n_segments.npy")
-    pool_meta_path = os.path.join(run_dir, "meta.json")
+    # ---------- Series pool (generated once, shared across all models) ------
+    contexts_path = os.path.join(OUTPUT_ROOT, "contexts.npy")
+    targets_path  = os.path.join(OUTPUT_ROOT, "targets.npy")
+    nseg_path     = os.path.join(OUTPUT_ROOT, "n_segments.npy")
 
     if os.path.isfile(contexts_path):
         n_series = int(np.load(contexts_path, mmap_mode="r").shape[0])
         n_segments = np.load(nseg_path)
-        print(Fore.CYAN + f"  Found existing pool: {n_series} series" + Fore.RESET)
+        print(Fore.CYAN + f"Found existing pool: {n_series} series" + Fore.RESET)
     else:
         n_series = args.n_series
         contexts, targets, n_segments = generate_dataset(n_series, SEED)
@@ -772,8 +748,7 @@ def main() -> None:
         np.save(targets_path, targets)
         np.save(nseg_path, n_segments)
         del contexts, targets
-        # Write pool-level meta once (not model-specific).
-        with open(pool_meta_path, "w") as f:
+        with open(os.path.join(OUTPUT_ROOT, "meta.json"), "w") as f:
             json.dump({
                 "n_series": int(n_series), "seed": SEED,
                 "max_window": MAX_WINDOW, "max_horizon": MAX_HORIZON,
@@ -789,87 +764,93 @@ def main() -> None:
                 "spike_std": SPIKE_STD,
                 "created": datetime.now().isoformat(timespec="seconds"),
             }, f, indent=2)
-        print(Fore.GREEN + f"  Generated synthetic pool: {n_series} series" + Fore.RESET)
+        print(Fore.GREEN + f"Generated synthetic pool: {n_series} series" + Fore.RESET)
 
-    # ---------- Build shard list (skip completed for this model) ------------
-    pending = []
-    n_completed = 0
-    for shard_id, start in enumerate(range(0, n_series, args.shard_size)):
-        end = min(start + args.shard_size, n_series)
-        if os.path.isfile(
-            os.path.join(_shard_dir(run_dir, family, shard_id), "done.json")
-        ):
-            n_completed += 1
-        else:
-            pending.append((shard_id, start, end))
-    print(Fore.CYAN + f"  [{family}] Shards: {n_completed} cached, {len(pending)} pending"
+    # ---------- Label with each model (or just the one requested) -----------
+    models_to_run = MODELS if args.model_idx is None else [MODELS[args.model_idx]]
+    print(Fore.CYAN
+          + f"Models to label: {[m[2] for m in models_to_run]}  |  devices={devices}"
           + Fore.RESET)
 
-    # ---------- Spawn workers + dispatch shards -----------------------------
-    if pending:
-        ctx = mp.get_context("spawn")
-        shard_queue = ctx.Queue()
-        result_queue = ctx.Queue()
-        for spec in pending:
-            shard_queue.put(spec)
-        for _ in devices:
-            shard_queue.put(None)
+    for model_id, family, display in models_to_run:
+        model_dir = _model_dir(family)
+        os.makedirs(model_dir, exist_ok=True)
+        print(Fore.CYAN + f"\n── {display} ({model_id}) ──" + Fore.RESET)
+        print(Fore.CYAN + f"   windows={grid}  shard_size={args.shard_size}" + Fore.RESET)
 
-        workers = []
-        for i, dev in enumerate(devices):
-            p = ctx.Process(
-                target=gpu_worker,
-                args=(i, dev, shard_queue, result_queue, run_dir,
-                      contexts_path, targets_path, model_id, family,
-                      MAX_HORIZON, args.batch_size, win_indices),
-                name=f"gpu_worker_{i}_{dev.replace(':', '')}",
-            )
-            p.start()
-            workers.append(p)
+        pending = []
+        n_completed = 0
+        for shard_id, start in enumerate(range(0, n_series, args.shard_size)):
+            end = min(start + args.shard_size, n_series)
+            if os.path.isfile(os.path.join(_shard_dir(model_dir, shard_id), "done.json")):
+                n_completed += 1
+            else:
+                pending.append((shard_id, start, end))
+        print(Fore.CYAN + f"   Shards: {n_completed} cached, {len(pending)} pending"
+              + Fore.RESET)
 
-        t0 = time.perf_counter()
-        n_received = 0
-        while n_received < len(pending):
-            try:
-                result_queue.get(timeout=3600)
-            except Empty:
-                if not any(p.is_alive() for p in workers):
-                    print(Fore.RED + f"  All workers died with "
-                          + f"{n_received}/{len(pending)} shards." + Fore.RESET)
-                    break
-                continue
-            n_received += 1
+        if pending:
+            ctx = mp.get_context("spawn")
+            shard_queue = ctx.Queue()
+            result_queue = ctx.Queue()
+            for spec in pending:
+                shard_queue.put(spec)
+            for _ in devices:
+                shard_queue.put(None)
 
-        for p in workers:
-            p.join(timeout=120)
-            if p.is_alive():
-                print(Fore.RED + f"  Worker {p.name} hung — terminating." + Fore.RESET)
-                p.terminate()
-                p.join(timeout=10)
-        print(Fore.MAGENTA + f"  Labeling wall-clock: "
-              + f"{time.perf_counter() - t0:.1f}s" + Fore.RESET)
+            workers = []
+            for i, dev in enumerate(devices):
+                p = ctx.Process(
+                    target=gpu_worker,
+                    args=(i, dev, shard_queue, result_queue, model_dir,
+                          contexts_path, targets_path, model_id, family,
+                          MAX_HORIZON, args.batch_size, win_indices),
+                    name=f"gpu_worker_{i}_{dev.replace(':', '')}",
+                )
+                p.start()
+                workers.append(p)
 
-    # ---------- Merge shards + per-model metadata ---------------------------
-    curves_mae, _, n_done = merge_shards(run_dir, family, n_series)
-    total_shards = (n_series + args.shard_size - 1) // args.shard_size
+            t0 = time.perf_counter()
+            n_received = 0
+            while n_received < len(pending):
+                try:
+                    result_queue.get(timeout=3600)
+                except Empty:
+                    if not any(p.is_alive() for p in workers):
+                        print(Fore.RED + f"   All workers died with "
+                              + f"{n_received}/{len(pending)} shards." + Fore.RESET)
+                        break
+                    continue
+                n_received += 1
 
-    with open(os.path.join(run_dir, f"meta_{family}.json"), "w") as f:
-        json.dump({
-            "model_id": model_id, "model_family": family, "model_display": display,
-            "model_idx": args.model_idx,
-            "window_indices": win_indices,
-            "shards_done": n_done, "shards_total": total_shards,
-            "devices": devices,
-            "shard_size": args.shard_size,
-            "created": datetime.now().isoformat(timespec="seconds"),
-        }, f, indent=2)
+            for p in workers:
+                p.join(timeout=120)
+                if p.is_alive():
+                    print(Fore.RED + f"   Worker {p.name} hung — terminating." + Fore.RESET)
+                    p.terminate()
+                    p.join(timeout=10)
+            print(Fore.MAGENTA + f"   Labeling wall-clock: {time.perf_counter() - t0:.1f}s"
+                  + Fore.RESET)
 
-    _print_data_sanity(curves_mae, n_segments, family)
-    if n_done < total_shards:
-        print(Fore.YELLOW + f"  {total_shards - n_done} shard(s) incomplete — "
-              + f"re-run with --resume {run_dir} --model-idx {args.model_idx}" + Fore.RESET)
-    print(Fore.GREEN + f"\nDataset written to: {run_dir}" + Fore.RESET)
-    print(Fore.GREEN + f"  curves_mae_{family}.npy  curves_mse_{family}.npy" + Fore.RESET)
+        curves_mae, _, n_done = merge_shards(model_dir, n_series)
+        total_shards = (n_series + args.shard_size - 1) // args.shard_size
+
+        with open(os.path.join(model_dir, "meta.json"), "w") as f:
+            json.dump({
+                "model_id": model_id, "model_family": family, "model_display": display,
+                "window_indices": win_indices,
+                "shards_done": n_done, "shards_total": total_shards,
+                "devices": devices, "shard_size": args.shard_size,
+                "created": datetime.now().isoformat(timespec="seconds"),
+            }, f, indent=2)
+
+        _print_data_sanity(curves_mae, n_segments, family)
+        if n_done < total_shards:
+            idx = MODELS.index((model_id, family, display))
+            print(Fore.YELLOW + f"   {total_shards - n_done} shard(s) incomplete — "
+                  + f"re-run with --model-idx {idx}" + Fore.RESET)
+
+    print(Fore.GREEN + f"\nAll done. Output root: {OUTPUT_ROOT}" + Fore.RESET)
 
 
 if __name__ == "__main__":
