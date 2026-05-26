@@ -30,10 +30,16 @@ Two simultaneous objectives:
 Data
 ----
 Loaded from a build_context_length_dataset.py run directory:
-    contexts.npy    (N, CONTEXT_LENGTH)  -- model input
-    curves_{mae,mse}.npy (N, n_windows)  -- regression target
-    meta.json                           -- window grid, horizon, label model
-Rows with NaN curves (incomplete ablation shards) are dropped.
+    contexts.npy             (N, CONTEXT_LENGTH)            -- model input
+    curves_{mae,mse}.npy     (N, n_windows, n_horizons)     -- regression target
+    meta.json                -- window grid, horizon grid, label model
+Rows with NaN anywhere in their curve are dropped.
+
+Horizon is a first-class label axis: the useful context length depends on how
+far ahead the TSFM is forecasting, so the predictor takes horizon as an extra
+input and conditions on it via a learned horizon embedding added to the [CLS]
+token. At train time one horizon is sampled uniformly per sample; at eval
+time we sweep all horizons and average regret / curve MSE across them.
 
 Multi-GPU execution
 -------------------
@@ -177,14 +183,16 @@ def load_split_tensors(
 ) -> Tuple[torch.Tensor, ...]:
     """Load the labeled dataset and build a fixed train/val split.
 
-    The target curve is z-scored per series: argmin (the decision) is invariant
-    to shift/scale, so the network only has to learn curve *shape*. The raw
-    (un-normalized) curve is kept for the regret metric.
+    Curves have shape (N, n_windows, n_horizons): one error-vs-context curve
+    per (series, horizon). The target is z-scored along the windows axis
+    *per horizon* — argmin (the decision) is invariant to shift/scale, so
+    the network only has to learn curve *shape*, separately for each horizon.
+    The raw (un-normalized) curve is kept for the regret metric.
 
     Returns:
         x_train:      (n_train, L, 1)
-        y_train_norm: (n_train, n_windows)  z-scored target
-        y_train_raw:  (n_train, n_windows)  raw error curve
+        y_train_norm: (n_train, n_windows, n_horizons)  z-scored target
+        y_train_raw:  (n_train, n_windows, n_horizons)  raw error curve
         x_val, y_val_norm, y_val_raw: validation counterparts.
     """
     contexts = np.load(os.path.join(dataset_dir, "contexts.npy"))
@@ -193,16 +201,21 @@ def load_split_tensors(
         raise ValueError(
             f"contexts ({contexts.shape[0]}) and curves ({curves.shape[0]}) "
             "row counts differ.")
+    if curves.ndim != 3:
+        raise ValueError(
+            f"Expected curves of shape (N, n_windows, n_horizons); got "
+            f"{curves.shape}. Re-run build_context_length_dataset.py with "
+            "the multi-horizon labeler.")
 
-    # Drop series whose ablation curve is incomplete (NaN from unfinished shards).
-    valid = ~np.isnan(curves).any(axis=1)
+    # Drop series whose ablation surface has any NaN (incomplete shard).
+    valid = ~np.isnan(curves).any(axis=(1, 2))
     contexts = contexts[valid].astype(np.float32, copy=False)
     curves = curves[valid].astype(np.float32, copy=False)
     if contexts.shape[0] == 0:
         raise RuntimeError("No fully-labeled series in dataset.")
 
-    # Per-series z-score of the target curve.
-    mu = curves.mean(axis=1, keepdims=True)
+    # Per-(series, horizon) z-score along the windows axis.
+    mu = curves.mean(axis=1, keepdims=True)                  # (N, 1, n_h)
     sd = curves.std(axis=1, keepdims=True)
     curves_norm = (curves - mu) / (sd + 1e-8)
 
@@ -230,15 +243,16 @@ class PatchTSTContextLength(nn.Module):
     """Patch-based Transformer with a curve-regression head and a recon head.
 
     Forward pipeline:
-        x : (B, L, 1)
+        x : (B, L, 1), horizon_idx : (B,) long
         -> non-overlapping patches: (B, N, P), N = L / P
         -> SimMIM-style masking (training only): a random ``mask_ratio`` of
            patches is zeroed in the embedding pathway; originals are the
            reconstruction target.
-        -> linear patch embedding -> prepend learnable [CLS]
+        -> linear patch embedding -> prepend learnable [CLS] + horizon-embed
         -> learnable positional embedding -> Transformer encoder -> LayerNorm
         -> two heads:
               * curve head: MLP on h[:, 0, :] -> (B, n_windows) error curve
+                            *for the requested horizon*
               * recon head: linear on h[:, 1:, :] -> (B, N, P)
     """
 
@@ -252,6 +266,7 @@ class PatchTSTContextLength(nn.Module):
         dropout: float,
         mask_ratio: float,
         n_windows: int,
+        n_horizons: int,
     ) -> None:
         super().__init__()
         if context_length % patch_length != 0:
@@ -268,6 +283,7 @@ class PatchTSTContextLength(nn.Module):
         self.d_model        = int(d_model)
         self.mask_ratio     = float(mask_ratio)
         self.n_windows      = int(n_windows)
+        self.n_horizons     = int(n_horizons)
         self.num_patches    = self.context_length // self.patch_length
 
         # --- Embedding -------------------------------------------------------
@@ -275,8 +291,12 @@ class PatchTSTContextLength(nn.Module):
         self.cls_token   = nn.Parameter(torch.zeros(1, 1, self.d_model))
         self.pos_embed   = nn.Parameter(
             torch.zeros(1, self.num_patches + 1, self.d_model))
+        # Per-horizon additive embedding routed into the CLS token. Conditioning
+        # before the encoder lets attention vary with the requested horizon.
+        self.horizon_embed = nn.Embedding(self.n_horizons, self.d_model)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.horizon_embed.weight, std=0.02)
 
         # --- Encoder ---------------------------------------------------------
         encoder_layer = nn.TransformerEncoderLayer(
@@ -324,10 +344,14 @@ class PatchTSTContextLength(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        horizon_idx: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns: curve_pred (B, n_windows), recon_pred (B, N, P),
-        original_patches (B, N, P), mask (B, N)."""
+        original_patches (B, N, P), mask (B, N).
+
+        horizon_idx: (B,) long, index into HORIZON_GRID from the dataset meta.
+        """
         B = x.size(0)
         original_patches = self._patchify(x)
 
@@ -340,7 +364,9 @@ class PatchTSTContextLength(nn.Module):
         embed_input = original_patches.masked_fill(mask.unsqueeze(-1), 0.0)
 
         h = self.patch_embed(embed_input)
-        cls = self.cls_token.expand(B, -1, -1)
+        cls = self.cls_token.expand(B, -1, -1)                       # (B, 1, D)
+        h_emb = self.horizon_embed(horizon_idx).unsqueeze(1)         # (B, 1, D)
+        cls = cls + h_emb
         h = torch.cat([cls, h], dim=1)
         h = h + self.pos_embed
         h = self.encoder(h)
@@ -441,6 +467,7 @@ def _probe_vram(
     batch_size: int,
     device: str,
     n_windows: int,
+    n_horizons: int,
 ) -> Optional[float]:
     """Measure peak VRAM (GB) of one fwd+bwd+step. None on OOM, 0.0 on CPU."""
     if not device.startswith("cuda"):
@@ -458,14 +485,16 @@ def _probe_vram(
                 dropout             = trial.dropout,
                 mask_ratio          = trial.mask_ratio,
                 n_windows           = n_windows,
+                n_horizons          = n_horizons,
             ).to(device)
             model.train()
             opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
             x = torch.randn(batch_size, CONTEXT_LENGTH, 1, device=device)
             y = torch.randn(batch_size, n_windows, device=device)
+            h_idx = torch.randint(0, n_horizons, (batch_size,), device=device)
 
-            curve_pred, recon_pred, orig, mask = model(x)
+            curve_pred, recon_pred, orig, mask = model(x, horizon_idx=h_idx)
             loss, _, _ = compute_dual_loss(
                 curve_pred, recon_pred, orig, mask, y,
                 LAMBDA_CURVE, LAMBDA_RECON)
@@ -473,7 +502,7 @@ def _probe_vram(
 
             torch.cuda.synchronize(torch.device(device))
             peak_bytes = torch.cuda.max_memory_allocated()
-            del model, opt, x, y, curve_pred, recon_pred, orig, mask, loss
+            del model, opt, x, y, h_idx, curve_pred, recon_pred, orig, mask, loss
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
         return peak_bytes / (1024 ** 3)
@@ -487,10 +516,11 @@ def auto_select_bs_lr(
     device: str,
     budget_gb: float,
     n_windows: int,
+    n_horizons: int,
 ) -> Tuple[Optional[int], Optional[float], Optional[float]]:
     """Largest bs in BS_CANDIDATES that fits the per-device budget."""
     for bs in BS_CANDIDATES:
-        peak = _probe_vram(trial, bs, device, n_windows)
+        peak = _probe_vram(trial, bs, device, n_windows, n_horizons)
         if peak is None:
             continue
         if peak <= budget_gb:
@@ -510,20 +540,25 @@ def _evaluate(
     batch_size: int,
     eval_seed: int,
 ) -> Dict[str, float]:
-    """Validation pass.
+    """Validation pass — sweeps every horizon for every sample.
 
-    Returns val_curve_mse, val_recon_mse, val_combined, val_regret, val_win_acc.
+    y_val_norm / y_val_raw have shape (n_val, n_windows, n_horizons). We
+    iterate horizons inside each batch (so the mask is shared) and average
+    curve MSE, regret and window accuracy across (sample, horizon). The
+    reconstruction loss is horizon-independent, so we only accumulate it at
+    h_idx=0 to avoid double-counting.
 
-    Regret is the headline task metric: using the predicted argmin window
-    instead of the true-best window, how much extra (relative) error do you
-    incur? regret = (err[pred_argmin] - err[true_argmin]) / err[true_argmin].
+    Regret is the headline metric: using the predicted argmin window instead
+    of the true-best window, how much extra (relative) error do you incur?
+        regret = (err[pred_argmin] - err[true_argmin]) / err[true_argmin].
     win_acc is the fraction whose predicted argmin is within one grid step of
-    the true argmin.
+    the true argmin (computed per (sample, horizon)).
     """
     model.eval()
     device = x_val.device
     n_val = x_val.shape[0]
-    n_windows = y_val_norm.shape[1]
+    n_windows  = y_val_norm.shape[1]
+    n_horizons = y_val_norm.shape[2]
 
     curve_sum = torch.zeros((), device=device)
     recon_sum = torch.zeros((), device=device)
@@ -537,10 +572,12 @@ def _evaluate(
         for start in range(0, n_val, batch_size):
             end = min(start + batch_size, n_val)
             x  = x_val[start:end]
-            yn = y_val_norm[start:end]
-            yr = y_val_raw[start:end]
+            yn_all = y_val_norm[start:end]                # (B, n_w, n_h)
+            yr_all = y_val_raw[start:end]                 # (B, n_w, n_h)
             B  = x.shape[0]
 
+            # Mask is sampled once per batch and reused for every horizon: the
+            # reconstruction target doesn't depend on horizon.
             n_mask = int(round(model.mask_ratio * model.num_patches))
             noise  = torch.rand(B, model.num_patches, generator=generator)
             ids    = torch.argsort(noise, dim=1)
@@ -549,34 +586,42 @@ def _evaluate(
                 mask.scatter_(1, ids[:, :n_mask], True)
             mask = mask.to(device, non_blocking=True)
 
-            curve_pred, recon_pred, orig, used_mask = model(x, mask=mask)
+            idx_b = torch.arange(B, device=device)
+            for h_idx_val in range(n_horizons):
+                yn = yn_all[:, :, h_idx_val]
+                yr = yr_all[:, :, h_idx_val]
+                h_idx_batch = torch.full(
+                    (B,), h_idx_val, device=device, dtype=torch.long)
 
-            curve_sum = curve_sum + F.mse_loss(curve_pred, yn, reduction="sum")
+                curve_pred, recon_pred, orig, used_mask = model(
+                    x, horizon_idx=h_idx_batch, mask=mask)
 
-            if used_mask.any():
-                sq_err = (recon_pred - orig).pow(2).mean(dim=-1)
-                recon_sum = recon_sum + (sq_err * used_mask.float()).sum()
-                n_recon += int(used_mask.float().sum().item())
+                curve_sum = curve_sum + F.mse_loss(curve_pred, yn, reduction="sum")
 
-            # Regret + window accuracy on the RAW curve.
-            idx = torch.arange(B, device=device)
-            pred_arg = curve_pred.argmin(dim=1)
-            true_arg = yr.argmin(dim=1)
-            best_err   = yr[idx, true_arg]
-            chosen_err = yr[idx, pred_arg]
-            regret_sum = regret_sum + (
-                (chosen_err - best_err) / best_err.clamp_min(1e-8)).sum()
-            acc_sum = acc_sum + (pred_arg - true_arg).abs().le(1).float().sum()
+                if h_idx_val == 0 and used_mask.any():
+                    sq_err = (recon_pred - orig).pow(2).mean(dim=-1)
+                    recon_sum = recon_sum + (sq_err * used_mask.float()).sum()
+                    n_recon += int(used_mask.float().sum().item())
 
-    curve_mse = (curve_sum / max(n_val * n_windows, 1)).item()
+                pred_arg = curve_pred.argmin(dim=1)
+                true_arg = yr.argmin(dim=1)
+                best_err   = yr[idx_b, true_arg]
+                chosen_err = yr[idx_b, pred_arg]
+                regret_sum = regret_sum + (
+                    (chosen_err - best_err) / best_err.clamp_min(1e-8)).sum()
+                acc_sum = acc_sum + (pred_arg - true_arg).abs().le(1).float().sum()
+
+    n_curve = max(n_val * n_windows * n_horizons, 1)
+    n_arg   = max(n_val * n_horizons, 1)
+    curve_mse = (curve_sum / n_curve).item()
     recon_mse = (recon_sum / max(n_recon, 1)).item()
     combined  = LAMBDA_CURVE * curve_mse + LAMBDA_RECON * recon_mse
     return {
         "val_curve_mse": curve_mse,
         "val_recon_mse": recon_mse,
         "val_combined":  combined,
-        "val_regret":    (regret_sum / max(n_val, 1)).item(),
-        "val_win_acc":   (acc_sum / max(n_val, 1)).item(),
+        "val_regret":    (regret_sum / n_arg).item(),
+        "val_win_acc":   (acc_sum / n_arg).item(),
     }
 
 
@@ -622,9 +667,11 @@ def _run_single_trial(
     y_val_raw: torch.Tensor,
     device: str,
     n_windows: int,
+    n_horizons: int,
 ) -> Dict[str, Any]:
     """Train one configuration end-to-end; return the best-val checkpoint."""
-    bs, lr, peak = auto_select_bs_lr(trial, device, vram_budget_gb, n_windows)
+    bs, lr, peak = auto_select_bs_lr(
+        trial, device, vram_budget_gb, n_windows, n_horizons)
     if bs is None:
         return _failed_result(trial_idx, device, trial, "vram_oom")
 
@@ -645,6 +692,7 @@ def _run_single_trial(
         dropout             = trial.dropout,
         mask_ratio          = trial.mask_ratio,
         n_windows           = n_windows,
+        n_horizons          = n_horizons,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=trial.weight_decay)
@@ -671,12 +719,17 @@ def _run_single_trial(
             for step in range(steps_per_epoch):
                 idx = perm[step * bs : (step + 1) * bs]
                 x = x_train.index_select(0, idx)
-                y = y_train.index_select(0, idx)
+                y = y_train.index_select(0, idx)              # (bs, n_w, n_h)
+
+                B = x.shape[0]
+                h_idx = torch.randint(
+                    0, n_horizons, (B,), device=device, dtype=torch.long)
+                y_at_h = y[torch.arange(B, device=device), :, h_idx]  # (B, n_w)
 
                 optimizer.zero_grad(set_to_none=True)
-                curve_pred, recon_pred, orig, mask = model(x)
+                curve_pred, recon_pred, orig, mask = model(x, horizon_idx=h_idx)
                 loss, l_curve, l_recon = compute_dual_loss(
-                    curve_pred, recon_pred, orig, mask, y,
+                    curve_pred, recon_pred, orig, mask, y_at_h,
                     LAMBDA_CURVE, LAMBDA_RECON)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -772,6 +825,7 @@ def gpu_worker(
     result_queue: "mp.Queue",
     dataset_dir: str,
     n_windows: int,
+    n_horizons: int,
 ) -> None:
     """One worker per GPU. Loads the labeled dataset, then drains trials."""
     set_seed(SEED + worker_id)
@@ -821,7 +875,7 @@ def gpu_worker(
             result = _run_single_trial(
                 trial_idx, trial, vram_budget_gb,
                 x_train, y_train, y_train_raw,
-                x_val, y_val, y_val_raw, device, n_windows,
+                x_val, y_val, y_val_raw, device, n_windows, n_horizons,
             )
         except Exception as exc:
             print(Fore.RED + f"  [{device}] trial {trial_idx:03d} "
@@ -1022,6 +1076,12 @@ def main() -> None:
     meta = load_dataset_meta(dataset_dir)
     window_grid = meta["window_grid"]
     n_windows = len(window_grid)
+    if "horizon_grid" not in meta:
+        raise ValueError(
+            "Dataset meta.json is missing 'horizon_grid' — re-run "
+            "build_context_length_dataset.py with the multi-horizon labeler.")
+    horizon_grid = meta["horizon_grid"]
+    n_horizons = len(horizon_grid)
     if meta.get("max_window") != CONTEXT_LENGTH:
         raise ValueError(
             f"Dataset max_window={meta.get('max_window')} != "
@@ -1037,10 +1097,11 @@ def main() -> None:
           + Fore.RESET)
     print(Fore.CYAN + f"Dataset: {dataset_dir}" + Fore.RESET)
     print(Fore.CYAN + f"  label model={meta.get('model_display')}  "
-          + f"curve_metric={CURVE_METRIC}  horizon={meta.get('horizon')}"
+          + f"curve_metric={CURVE_METRIC}  horizons={horizon_grid}"
           + Fore.RESET)
     print(Fore.CYAN + f"  n_train={n_train}  n_val={n_val}  "
-          + f"n_windows={n_windows}  windows={window_grid}" + Fore.RESET)
+          + f"n_windows={n_windows}  n_horizons={n_horizons}  "
+          + f"windows={window_grid}" + Fore.RESET)
     print(Fore.CYAN + f"N_TRIALS={N_TRIALS}  lambda_curve={LAMBDA_CURVE}  "
           + f"lambda_recon={LAMBDA_RECON}  selection={SELECTION_METRIC}"
           + Fore.RESET)
@@ -1076,7 +1137,7 @@ def main() -> None:
         p = ctx.Process(
             target=gpu_worker,
             args=(i, device, budget, trial_queue, result_queue,
-                  dataset_dir, n_windows),
+                  dataset_dir, n_windows, n_horizons),
             name=f"gpu_worker_{i}_{device.replace(':', '')}",
         )
         p.start(); workers.append(p)
@@ -1136,6 +1197,8 @@ def main() -> None:
                 "context_length":   CONTEXT_LENGTH,
                 "n_windows":        n_windows,
                 "window_grid":      window_grid,
+                "n_horizons":       n_horizons,
+                "horizon_grid":     horizon_grid,
                 "curve_metric":     CURVE_METRIC,
                 "lambda_curve":     LAMBDA_CURVE,
                 "lambda_recon":     LAMBDA_RECON,

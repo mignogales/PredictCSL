@@ -14,17 +14,24 @@ TSFM's forecast error. So we MEASURE it -- this script is the measurement.
 
 Pipeline
 --------
-1. Generate N synthetic series of length MAX_WINDOW + HORIZON. Each series is
-   built segment-by-segment with injected non-stationarity (regime changes,
-   level shifts, variance shifts, per-segment trend/AR/seasonality). This is
-   what makes context length matter: without change points every ablation
-   curve is monotone and there is nothing to learn.
-2. For each series, forecast the final HORIZON samples from the last W context
+1. Generate N synthetic series of length MAX_WINDOW + max(HORIZON_GRID). Each
+   series is built segment-by-segment with injected non-stationarity (regime
+   changes, level shifts, variance shifts, per-segment trend/AR/seasonality).
+   This is what makes context length matter: without change points every
+   ablation curve is monotone and there is nothing to learn.
+2. For each series, forecast max(HORIZON_GRID) steps from the last W context
    samples, for every W in WINDOW_GRID, using a chosen TSFM (Chronos-2 first).
-3. Save the full per-series error-vs-context curve (MAE and MSE at every W).
+   Per-window inference is done once at the longest horizon; the prefix
+   property of left-to-right forecasting lets us slice the prediction at every
+   h in HORIZON_GRID and get the same answer as if we'd called the model with
+   prediction_length=h directly.
+3. Save the full per-series error-vs-(context, horizon) surface (MAE and MSE
+   for every (W, h) pair). Horizon is a first-class axis because the useful
+   context length depends on how far ahead you're forecasting.
 
 The downstream predictor (experiments/predict_context_length.py) consumes
-`contexts.npy` (its input) and `curves_mae.npy` / `curves_mse.npy` (its label).
+`contexts.npy` (its input) and `curves_mae.npy` / `curves_mse.npy` (its label,
+shape (N, n_windows, n_horizons)).
 
 Parallelism
 -----------
@@ -37,13 +44,13 @@ the top-level curve arrays. Runs are resumable per shard via --resume.
 Outputs
 -------
 logs/experiments/context_length_dataset/<run>/
-    contexts.npy      (N, MAX_WINDOW)  float32  -- predictor input (context pool)
-    targets.npy       (N, HORIZON)     float32  -- forecast target (for debugging)
-    n_segments.npy    (N,)             int32    -- regime count per series
-    curves_mae.npy    (N, n_windows)   float32  -- MAE of median forecast per W
-    curves_mse.npy    (N, n_windows)   float32  -- MSE of median forecast per W
+    contexts.npy      (N, MAX_WINDOW)            float32  -- predictor input
+    targets.npy       (N, MAX_HORIZON)           float32  -- forecast target
+    n_segments.npy    (N,)                       int32    -- regime count per series
+    curves_mae.npy    (N, n_windows, n_horizons) float32  -- MAE per (W, h)
+    curves_mse.npy    (N, n_windows, n_horizons) float32  -- MSE per (W, h)
     shards/shard_NNN/                            -- per-shard curves (resume unit)
-    meta.json                                    -- grid, horizon, model, seeds
+    meta.json                                    -- grid, horizon grid, model, seeds
 """
 
 from __future__ import annotations
@@ -74,7 +81,6 @@ load_dotenv()
 
 # -- Series geometry ----------------------------------------------------------
 MAX_WINDOW   = 8192          # length of the context pool (largest ablation window)
-HORIZON      = 96            # forecast length labeled at every window
 PERIOD_MIN   = 16            # seasonal period bounds (samples)
 PERIOD_MAX   = 2048
 
@@ -85,6 +91,14 @@ WINDOW_GRID = [
     32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
     1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192,
 ]
+
+# -- Horizon grid (forecast lengths labeled per series) -----------------------
+# Each series gets one curve per horizon. The useful context length depends on
+# horizon, so this is a first-class label axis. We forecast once at the longest
+# horizon and slice — left-to-right autoregressive output of the first h steps
+# is identical regardless of the total prediction_length requested.
+HORIZON_GRID = [8, 16, 32, 64, 96]
+MAX_HORIZON  = max(HORIZON_GRID)
 
 # -- Dataset size -------------------------------------------------------------
 N_SERIES   = 10_000          # scale up for the real run; lower with --n-series
@@ -248,20 +262,20 @@ def generate_dataset(
     """Materialize the synthetic pool (parent process, serial).
 
     Returns:
-        contexts:   (n_series, MAX_WINDOW) float32  -- predictor input
-        targets:    (n_series, HORIZON)    float32  -- forecast target
-        n_segments: (n_series,)            int32
+        contexts:   (n_series, MAX_WINDOW)   float32  -- predictor input
+        targets:    (n_series, MAX_HORIZON)  float32  -- forecast target
+        n_segments: (n_series,)              int32
     """
-    total_length = MAX_WINDOW + HORIZON
+    total_length = MAX_WINDOW + MAX_HORIZON
     contexts = np.empty((n_series, MAX_WINDOW), dtype=np.float32)
-    targets = np.empty((n_series, HORIZON), dtype=np.float32)
+    targets = np.empty((n_series, MAX_HORIZON), dtype=np.float32)
     n_segments = np.empty((n_series,), dtype=np.int32)
 
     for i in tqdm(range(n_series), desc="  Generating series", leave=False):
         rng = np.random.RandomState(seed + i)
         series, n_seg = _generate_synthetic_series(rng, total_length)
         contexts[i] = series[:MAX_WINDOW]
-        targets[i] = series[MAX_WINDOW:MAX_WINDOW + HORIZON]
+        targets[i] = series[MAX_WINDOW:MAX_WINDOW + MAX_HORIZON]
         n_segments[i] = n_seg
 
     return contexts, targets, n_segments
@@ -271,7 +285,8 @@ def generate_dataset(
 #  MODEL LOADERS + MEDIAN-FORECAST WRAPPERS
 # ==============================================================================
 #  Each predict_* wrapper takes a CPU tensor x of shape (B, W, 1) and returns
-#  the point/median forecast as (B, HORIZON) on `device`.
+#  the point/median forecast as (B, horizon) on `device`, where `horizon` is
+#  the value passed in (we call these at MAX_HORIZON and slice).
 
 def _is_cuda(device: str) -> bool:
     return device.startswith("cuda")
@@ -473,16 +488,21 @@ def gpu_worker(
     targets_path: str,
     model_id: str,
     family: str,
-    horizon: int,
+    max_horizon: int,
     batch_size: int,
     win_indices: List[int],
 ) -> None:
-    """Load the TSFM once, then label series-shards until the queue drains."""
+    """Load the TSFM once, then label series-shards until the queue drains.
+
+    Each window is forecast once at ``max_horizon``; per-(window, horizon)
+    errors are computed by slicing the prediction at every h in HORIZON_GRID.
+    """
     if _is_cuda(device):
         torch.cuda.set_device(torch.device(device))
     torch.set_grad_enabled(False)
     torch.set_float32_matmul_precision("high")
     n_win = len(WINDOW_GRID)
+    n_h = len(HORIZON_GRID)
 
     try:
         base = setup_model(family, model_id, device)
@@ -508,17 +528,19 @@ def gpu_worker(
                 np.load(contexts_path, mmap_mode="r")[start:end])
             tgt = np.ascontiguousarray(
                 np.load(targets_path, mmap_mode="r")[start:end])
-            tgt_t = torch.from_numpy(tgt).to(device)
+            tgt_t = torch.from_numpy(tgt).to(device)        # (B, MAX_HORIZON)
 
-            cm = np.full((end - start, n_win), np.nan, dtype=np.float32)
-            cs = np.full((end - start, n_win), np.nan, dtype=np.float32)
+            cm = np.full((end - start, n_win, n_h), np.nan, dtype=np.float32)
+            cs = np.full((end - start, n_win, n_h), np.nan, dtype=np.float32)
             for w_idx in win_indices:
                 w = WINDOW_GRID[w_idx]
                 medians = forecast_window(
-                    family, base, model_id, ctx, w, horizon, batch_size, device)
-                err = medians - tgt_t
-                cm[:, w_idx] = err.abs().mean(dim=1).cpu().numpy()
-                cs[:, w_idx] = err.pow(2).mean(dim=1).cpu().numpy()
+                    family, base, model_id, ctx, w, max_horizon,
+                    batch_size, device)                     # (B, MAX_HORIZON)
+                for h_idx, h in enumerate(HORIZON_GRID):
+                    err = medians[:, :h] - tgt_t[:, :h]
+                    cm[:, w_idx, h_idx] = err.abs().mean(dim=1).cpu().numpy()
+                    cs[:, w_idx, h_idx] = err.pow(2).mean(dim=1).cpu().numpy()
 
             sd = _shard_dir(run_dir, shard_id)
             os.makedirs(sd, exist_ok=True)
@@ -526,7 +548,8 @@ def gpu_worker(
             np.save(os.path.join(sd, "curves_mse.npy"), cs)
             with open(os.path.join(sd, "done.json"), "w") as f:
                 json.dump({"shard_id": shard_id, "start": start, "end": end,
-                           "window_indices": win_indices}, f)
+                           "window_indices": win_indices,
+                           "horizon_grid": HORIZON_GRID}, f)
 
             elapsed = time.perf_counter() - t0
             result_queue.put({"shard_id": shard_id, "status": "ok",
@@ -549,14 +572,15 @@ def gpu_worker(
 # ==============================================================================
 
 def merge_shards(run_dir: str, n_series: int) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Concatenate completed shard curves into top-level (N, n_win) arrays.
+    """Concatenate completed shard curves into top-level (N, n_win, n_h) arrays.
 
     Missing/incomplete shards leave NaN rows so curves stay index-aligned with
     contexts.npy. Returns (curves_mae, curves_mse, n_shards_done).
     """
     n_win = len(WINDOW_GRID)
-    cm = np.full((n_series, n_win), np.nan, dtype=np.float32)
-    cs = np.full((n_series, n_win), np.nan, dtype=np.float32)
+    n_h = len(HORIZON_GRID)
+    cm = np.full((n_series, n_win, n_h), np.nan, dtype=np.float32)
+    cs = np.full((n_series, n_win, n_h), np.nan, dtype=np.float32)
 
     sdir = os.path.join(run_dir, "shards")
     n_done = 0
@@ -578,21 +602,28 @@ def merge_shards(run_dir: str, n_series: int) -> Tuple[np.ndarray, np.ndarray, i
 
 
 def _print_data_sanity(curves_mae: np.ndarray, n_segments: np.ndarray) -> None:
-    """Report whether the generated data is actually context-sensitive."""
-    valid = ~np.isnan(curves_mae).any(axis=1)
+    """Report whether the generated data is actually context-sensitive.
+
+    curves_mae shape: (N, n_windows, n_horizons). Reports per-horizon stats so
+    we can see how the useful window changes with forecast length.
+    """
+    valid = ~np.isnan(curves_mae).any(axis=(1, 2))
     if not valid.any():
         print(Fore.RED + "  No completed curves to summarize." + Fore.RESET)
         return
-    cm = curves_mae[valid]
-    argmin = cm.argmin(axis=1)
-    last = cm.shape[1] - 1
-    interior = float((argmin < last).mean())
-    opt_w = np.array(WINDOW_GRID)[argmin]
+    cm_v = curves_mae[valid]                                # (V, n_win, n_h)
+    n_win = cm_v.shape[1]
+    win_arr = np.array(WINDOW_GRID)
     print(Fore.GREEN + "  Data sanity (MAE curves):" + Fore.RESET)
     print(f"    valid curves: {int(valid.sum())}/{len(curves_mae)}")
-    print(f"    series with interior optimum (truncation helps): {interior:.1%}")
-    print(f"    median optimal window: {int(np.median(opt_w))}  "
-          f"mean: {opt_w.mean():.0f}")
+    for h_idx, h in enumerate(HORIZON_GRID):
+        cm_h = cm_v[:, :, h_idx]                            # (V, n_win)
+        argmin = cm_h.argmin(axis=1)
+        interior = float((argmin < n_win - 1).mean())
+        opt_w = win_arr[argmin]
+        print(f"    h={h:>3}: interior_opt={interior:5.1%}  "
+              f"median_opt_win={int(np.median(opt_w)):>5}  "
+              f"mean={opt_w.mean():.0f}")
     for s in sorted(set(n_segments[valid].tolist())):
         frac = float((n_segments[valid] == s).mean())
         print(f"    regimes={s}: {frac:.1%} of valid series")
@@ -635,7 +666,7 @@ def main() -> None:
     win_indices = [WINDOW_GRID.index(w) for w in grid]
 
     print(Fore.CYAN + f"Devices: {devices}  |  Model: {display} ({model_id})" + Fore.RESET)
-    print(Fore.CYAN + f"HORIZON={HORIZON}  MAX_WINDOW={MAX_WINDOW}  "
+    print(Fore.CYAN + f"HORIZON_GRID={HORIZON_GRID}  MAX_WINDOW={MAX_WINDOW}  "
           + f"windows={grid}  shard_size={args.shard_size}" + Fore.RESET)
 
     # ---------- Run directory + series pool (generated once) ----------------
@@ -694,7 +725,7 @@ def main() -> None:
                 target=gpu_worker,
                 args=(i, dev, shard_queue, result_queue, run_dir,
                       contexts_path, targets_path, model_id, family,
-                      HORIZON, args.batch_size, win_indices),
+                      MAX_HORIZON, args.batch_size, win_indices),
                 name=f"gpu_worker_{i}_{dev.replace(':', '')}",
             )
             p.start()
@@ -729,7 +760,8 @@ def main() -> None:
     with open(os.path.join(run_dir, "meta.json"), "w") as f:
         json.dump({
             "model_id": model_id, "model_family": family, "model_display": display,
-            "window_grid": WINDOW_GRID, "horizon": HORIZON, "max_window": MAX_WINDOW,
+            "window_grid": WINDOW_GRID, "horizon_grid": HORIZON_GRID,
+            "max_horizon": MAX_HORIZON, "max_window": MAX_WINDOW,
             "n_series": int(n_series), "seed": SEED,
             "shard_size": args.shard_size,
             "shards_done": n_done, "shards_total": total_shards,
