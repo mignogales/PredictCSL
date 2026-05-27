@@ -842,6 +842,10 @@ def main() -> None:
                 "shards_done": n_done, "shards_total": total_shards,
                 "devices": devices, "shard_size": args.shard_size,
                 "created": datetime.now().isoformat(timespec="seconds"),
+                # Pool-level keys repeated here so predict_context_length.py can
+                # use this subdir as --dataset-dir without reading the parent meta.
+                "max_window": MAX_WINDOW, "max_horizon": MAX_HORIZON,
+                "window_grid": WINDOW_GRID, "horizon_grid": HORIZON_GRID,
             }, f, indent=2)
 
         _print_data_sanity(curves_mae, n_segments, family)

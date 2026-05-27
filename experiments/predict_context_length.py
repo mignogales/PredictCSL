@@ -195,7 +195,15 @@ def load_split_tensors(
         y_train_raw:  (n_train, n_windows, n_horizons)  raw error curve
         x_val, y_val_norm, y_val_raw: validation counterparts.
     """
-    contexts = np.load(os.path.join(dataset_dir, "contexts.npy"))
+    # contexts.npy lives at the pool root (one level above the model family
+    # subdir). Fall back to dataset_dir itself for flat layouts.
+    _ctx_candidate = os.path.join(dataset_dir, "contexts.npy")
+    if not os.path.isfile(_ctx_candidate):
+        _ctx_candidate = os.path.join(os.path.dirname(dataset_dir), "contexts.npy")
+    if not os.path.isfile(_ctx_candidate):
+        raise FileNotFoundError(
+            f"contexts.npy not found in {dataset_dir} or its parent.")
+    contexts = np.load(_ctx_candidate)
     curves = np.load(os.path.join(dataset_dir, f"curves_{curve_metric}.npy"))
     if contexts.shape[0] != curves.shape[0]:
         raise ValueError(
@@ -1053,7 +1061,12 @@ def _persist_artifacts(results: List[Dict[str, Any]], run_label: str) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Context-length predictor training.")
     p.add_argument("--dataset-dir", type=str, required=True,
-                   help="A build_context_length_dataset.py run directory.")
+                   help=(
+                       "Model-family subdir produced by build_context_length_dataset.py "
+                       "(e.g. logs/experiments/context_length_dataset/chronos2). "
+                       "Must contain curves_{mae,mse}.npy and meta.json. "
+                       "contexts.npy is resolved from this dir or its parent."
+                   ))
     return p.parse_args()
 
 
