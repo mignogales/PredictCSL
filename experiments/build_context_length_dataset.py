@@ -90,7 +90,7 @@ WINDOW_GRID = [
 ]
 
 # -- Horizon grid (forecast lengths labeled per series) -----------------------
-HORIZON_GRID = [8, 16, 32, 64, 96]
+HORIZON_GRID = [16, 32, 64, 128, 512, 1024]
 MAX_HORIZON  = max(HORIZON_GRID)
 
 # -- Dataset size -------------------------------------------------------------
