@@ -50,11 +50,14 @@ dataset and the same train/val split.
 
 Cache layout
 ------------
-logs/experiments/context_length_predictor/<run>/
+logs/experiments/context_length_predictor/<family>/
     trials/trial_<NNN>.json
     sweep_summary.csv / sweep_summary.png
     selection_report.json
     best_model.pt / best_config.json
+
+The <family> subdir matches the basename of --dataset-dir, so each
+labeling-model family gets its own deterministic output directory.
 """
 
 import argparse
@@ -72,7 +75,6 @@ import tempfile
 import numpy as np
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Tuple, Any
-from datetime import datetime
 from queue import Empty
 import pandas as pd
 import matplotlib
@@ -1119,7 +1121,10 @@ def main() -> None:
           + f"lambda_recon={LAMBDA_RECON}  selection={SELECTION_METRIC}"
           + Fore.RESET)
 
-    run_label = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # Deterministic per-family layout: run_label is the dataset-dir basename
+    # (i.e. the model family that produced the labels). Re-running overwrites
+    # in place; cached trials are skipped via _load_trial_result.
+    run_label = os.path.basename(os.path.normpath(dataset_dir))
     run_dir = _run_dir(run_label)
     os.makedirs(os.path.join(run_dir, "trials"), exist_ok=True)
 

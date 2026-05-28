@@ -32,7 +32,6 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -64,10 +63,10 @@ from experiments.predict_context_length import PatchTSTContextLength
 
 MODELS = [
     ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
-    # ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
-    # ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
-    # ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
-    # ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
+    ("amazon/chronos-bolt-small",       "chronos_bolt","ChronosBolt-Small"),
+    ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
+    ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
+    ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
 ]
 
 DATASETS = [
@@ -1185,8 +1184,10 @@ def main():
     models = [m for m in MODELS if (args.models is None or m[2] in args.models)]
     datasets = [d for d in DATASETS if (args.datasets is None or d[2] in args.datasets)]
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = os.path.join(CACHE_ROOT, f"runs/{timestamp}_predictor")
+    # Deterministic per-family layout: run dir is the predictor's family
+    # (= basename of predictor_dir), so re-running overwrites the same place.
+    family_tag = os.path.basename(os.path.normpath(predictor_dir))
+    run_dir = os.path.join(CACHE_ROOT, family_tag)
     os.makedirs(run_dir, exist_ok=True)
 
     ge_cache: Dict[Tuple[str, str], GiftEvalCache] = {}

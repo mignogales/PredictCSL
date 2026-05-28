@@ -179,20 +179,22 @@ def _load_elapsed(
 # ==============================================================================
 
 def find_latest_run(cache_root: str) -> str:
-    """Most recent run dir under cache_root/runs that has compare_real_vs_predicted."""
-    runs_dir = os.path.join(cache_root, "runs")
-    if not os.path.isdir(runs_dir):
-        raise FileNotFoundError(f"No runs/ directory under {cache_root}")
+    """Most recent top-level family dir under cache_root containing
+    compare_real_vs_predicted/. Layout is deterministic per family
+    (cache_root/<family>/compare_real_vs_predicted/), so this just picks the
+    most recently written one when --run-dir is omitted."""
+    if not os.path.isdir(cache_root):
+        raise FileNotFoundError(f"Cache root not found: {cache_root}")
     candidates = []
-    for name in os.listdir(runs_dir):
-        rd = os.path.join(runs_dir, name)
+    for name in os.listdir(cache_root):
+        rd = os.path.join(cache_root, name)
         if not os.path.isdir(rd):
             continue
         if os.path.isdir(os.path.join(rd, "compare_real_vs_predicted")):
             candidates.append((os.path.getmtime(rd), rd))
     if not candidates:
         raise FileNotFoundError(
-            f"No run with compare_real_vs_predicted/ under {runs_dir}"
+            f"No <family>/compare_real_vs_predicted/ subdir under {cache_root}"
         )
     candidates.sort(reverse=True)
     return candidates[0][1]
