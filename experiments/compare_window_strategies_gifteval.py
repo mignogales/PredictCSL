@@ -454,49 +454,43 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str) -> str:
     strategies = ["full_mase", "best_mase", "pred_mase"]
     labels = ["Full Window", "Best Window\n(Oracle)", "Predictor\nWindow"]
 
-    # Arithmetic mean — inflated by local-MASE spikes (near-zero naive denominator)
-    means   = [r[s].mean() for s in strategies]
-    # Geometric mean — exp(mean(log)) — what M4/OWA use; log-scales each entry
-    # so a MASE of 500 contributes log(500)≈6.2 instead of 500 to the average
+    # Geometric mean — exp(mean(log)) — what M4/OWA use; robust to outlier spikes
     gmeans  = [_geomean(r[s].values) for s in strategies]
-    # Median — nonparametric, also robust, good sanity check alongside geomean
+    # Median — nonparametric sanity check
     medians = [r[s].median() for s in strategies]
 
-    # Identify datasets driving the arithmetic-mean spike (top 5 % by full_mase)
+    # Identify datasets driving spikes (top 5 % by full_mase)
     thresh_95 = float(np.percentile(r["full_mase"].values, 95))
     outliers = r[r["full_mase"] > thresh_95][["dataset_display", "model_short", "term", "full_mase"]]
     n_outliers = len(outliers)
 
     x = np.arange(len(labels))
-    wb = 0.26
-    c_arith  = ["#4472C4", "#ED7D31", "#70AD47"]
+    wb = 0.30
     c_geom   = ["#264FA0", "#A9511B", "#3E7327"]
     c_median = ["#7BA9D8", "#F0A86A", "#9ED67A"]
 
-    fig, ax = plt.subplots(figsize=(11, 6))
-    b1 = ax.bar(x - wb, means,   wb, label="Arithmetic Mean",  color=c_arith,  alpha=0.85, edgecolor="white")
-    b2 = ax.bar(x,      gmeans,  wb, label="Geometric Mean ★", color=c_geom,   alpha=0.85, edgecolor="white")
-    b3 = ax.bar(x + wb, medians, wb, label="Median",           color=c_median, alpha=0.85, edgecolor="white")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    b1 = ax.bar(x - wb / 2, gmeans,  wb, label="Geometric Mean ★", color=c_geom,   alpha=0.85, edgecolor="white")
+    b2 = ax.bar(x + wb / 2, medians, wb, label="Median",           color=c_median, alpha=0.85, edgecolor="white")
 
-    y_top = max(max(means), max(gmeans), max(medians))
-    for b in list(b1) + list(b2) + list(b3):
+    y_top = max(max(gmeans), max(medians))
+    for b in list(b1) + list(b2):
         v = b.get_height()
         ax.text(b.get_x() + b.get_width() / 2, v + y_top * 0.01,
-                f"{v:.3f}", ha="center", va="bottom", fontsize=7, rotation=45)
+                f"{v:.3f}", ha="center", va="bottom", fontsize=9)
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=11)
     ax.set_ylabel("MASE", fontsize=12)
     ax.set_title(f"MASE by Context Strategy  (n={len(r)} dataset-terms)",
                  fontsize=13, fontweight="bold")
-    ax.legend(fontsize=9, loc="upper right")
+    ax.legend(fontsize=10, loc="upper right")
     ax.grid(axis="y", alpha=0.3)
     ax.set_ylim(bottom=0)
 
     note_lines = [
-        "★ Geometric mean = exp(mean(log(MASE))): outlier-robust, used by M4/OWA benchmark.",
-        "  A local-MASE spike of 500 contributes log(500)≈6.2 instead of 500 to the average.",
-        f"  {n_outliers} entries above 95th-pct ({thresh_95:.1f}) inflate the arithmetic mean: "
+        "★ Geometric mean = exp(mean(log(MASE))): used by M4/OWA benchmark.",
+        f"  {n_outliers} entries above 95th-pct ({thresh_95:.1f}): "
         + ", ".join(
             f"{row['dataset_display']}/{row['model_short']}/t{row['term']} ({row['full_mase']:.1f})"
             for _, row in outliers.head(5).iterrows()
@@ -504,7 +498,7 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str) -> str:
         + (" ..." if n_outliers > 5 else ""),
     ]
     ax.text(0.01, 0.99, "\n".join(note_lines),
-            transform=ax.transAxes, fontsize=7, va="top", ha="left",
+            transform=ax.transAxes, fontsize=7.5, va="top", ha="left",
             color="#555555", style="italic",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.75))
 
@@ -835,68 +829,69 @@ def plot_complexity_vs_mase_gain(df: pd.DataFrame, out_dir: str) -> str:
 #  PLOTS — MISC
 # ==============================================================================
 
-def plot_per_dataset_bars(df: pd.DataFrame, out_dir: str, chunk_size: int = 20) -> List[str]:
+def plot_per_dataset_bars(df: pd.DataFrame, out_dir: str) -> List[str]:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"]).copy()
     if r.empty:
         return []
 
-    # Sort by dataset family (prefix before first '_') then by name
-    r["ds_family"] = r["dataset_display"].str.split("_").str[0]
-    r = r.sort_values(["ds_family", "dataset_display", "model_short", "term"]).reset_index(drop=True)
-    r["ds_label"] = r["dataset_display"] + "\n" + r["model_short"] + "\n(t=" + r["term"] + ")"
+    sub_dir = os.path.join(out_dir, "per_dataset_bars")
+    os.makedirs(sub_dir, exist_ok=True)
 
-    # Clip MASE at 99th percentile per chunk for readability
+    # Global 99th-pct clip so y-axes are comparable across datasets
     mase_vals = r[["full_mase", "best_mase", "pred_mase"]].values.ravel()
     clip_hi = float(np.percentile(mase_vals, 99))
 
     paths: List[str] = []
-    n_total = len(r)
-    n_chunks = math.ceil(n_total / chunk_size)
+    for dataset_name, grp in r.groupby("dataset_display", sort=True):
+        grp = grp.sort_values(["model_short", "term"]).reset_index(drop=True)
 
-    for i in range(n_chunks):
-        chunk = r.iloc[i * chunk_size : (i + 1) * chunk_size]
-        labels = chunk["ds_label"].tolist()
+        # x-axis label: model + term
+        grp["bar_label"] = grp["model_short"] + "\nt=" + grp["term"]
+        labels = grp["bar_label"].tolist()
         n = len(labels)
         x = np.arange(n)
         w = 0.25
 
-        # Clip values for display (annotate clipped bars)
-        full_v = chunk["full_mase"].clip(upper=clip_hi).values
-        best_v = chunk["best_mase"].clip(upper=clip_hi).values
-        pred_v = chunk["pred_mase"].clip(upper=clip_hi).values
+        full_v = grp["full_mase"].clip(upper=clip_hi).values
+        best_v = grp["best_mase"].clip(upper=clip_hi).values
+        pred_v = grp["pred_mase"].clip(upper=clip_hi).values
 
-        fig, ax = plt.subplots(figsize=(max(12, n * 0.75), 6))
-        ax.bar(x - w, full_v, w, label="Full window",   color="#4472C4", alpha=0.85)
-        ax.bar(x,     best_v, w, label="Best (oracle)", color="#ED7D31", alpha=0.85)
-        ax.bar(x + w, pred_v, w, label="Predictor",     color="#70AD47", alpha=0.85)
+        fig, ax = plt.subplots(figsize=(max(6, n * 1.1 + 2), 5))
+        ax.bar(x - w, full_v, w, label="Full window",   color="#4472C4", alpha=0.85, edgecolor="white")
+        ax.bar(x,     best_v, w, label="Best (oracle)", color="#ED7D31", alpha=0.85, edgecolor="white")
+        ax.bar(x + w, pred_v, w, label="Predictor",     color="#70AD47", alpha=0.85, edgecolor="white")
 
-        # Mark clipped bars with a hat symbol
-        for xi, (fv, bv, pv, fo, bo, po) in enumerate(
-            zip(full_v, best_v, pred_v,
-                chunk["full_mase"].values, chunk["best_mase"].values, chunk["pred_mase"].values)
-        ):
-            for xoff, v, raw in [(-w, fv, fo), (0, bv, bo), (w, pv, po)]:
+        # Annotate bars whose true value exceeds the clip
+        for xi, (fv, bv, pv, fo, bo, po) in enumerate(zip(
+            full_v, best_v, pred_v,
+            grp["full_mase"].values, grp["best_mase"].values, grp["pred_mase"].values,
+        )):
+            for xoff, raw in [(-w, fo), (0, bo), (w, po)]:
                 if raw > clip_hi:
                     ax.text(xi + xoff, clip_hi * 1.01, f"▲{raw:.0f}",
-                            ha="center", va="bottom", fontsize=5.5, color="darkred", rotation=90)
+                            ha="center", va="bottom", fontsize=6, color="darkred", rotation=90)
+                else:
+                    bar_h = raw
+                    ax.text(xi + xoff, bar_h + clip_hi * 0.01, f"{raw:.2f}",
+                            ha="center", va="bottom", fontsize=6, color="#333333")
 
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=90, fontsize=6.5)
-        ax.set_ylabel("MASE", fontsize=12)
-        family_range = f"{chunk['ds_family'].iloc[0]}..{chunk['ds_family'].iloc[-1]}"
-        ax.set_title(
-            f"MASE per Dataset: Full vs Best vs Predictor  "
-            f"[{i+1}/{n_chunks}  rows {i*chunk_size+1}–{i*chunk_size+n} | {family_range}]",
-            fontsize=11, fontweight="bold")
-        ax.set_ylim(bottom=0, top=clip_hi * 1.12)
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel("MASE", fontsize=11)
+        ax.set_title(f"{dataset_name}  —  MASE by context strategy",
+                     fontsize=12, fontweight="bold")
+        ax.set_ylim(bottom=0, top=clip_hi * 1.15)
         ax.legend(fontsize=9)
         ax.grid(axis="y", alpha=0.3)
-        ax.text(0.99, 0.99, f"MASE clipped at 99th-pct ({clip_hi:.2f}); ▲ = true value above clip",
-                transform=ax.transAxes, fontsize=7, ha="right", va="top",
+        ax.text(0.99, 0.99,
+                f"y clipped at global 99th-pct ({clip_hi:.2f});  ▲ = true value above clip",
+                transform=ax.transAxes, fontsize=6.5, ha="right", va="top",
                 color="gray", style="italic")
         plt.tight_layout()
-        fname = f"per_dataset_bars_{i+1:02d}_of_{n_chunks:02d}.png"
-        path = os.path.join(out_dir, fname)
+
+        # Sanitise filename: replace / and spaces
+        safe_name = str(dataset_name).replace("/", "_").replace(" ", "_")
+        path = os.path.join(sub_dir, f"{safe_name}.png")
         plt.savefig(path, dpi=150, bbox_inches="tight")
         plt.close()
         paths.append(path)
