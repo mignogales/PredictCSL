@@ -1109,7 +1109,7 @@ def plot_real_vs_predicted_curve(
     ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
     ax.tick_params(axis="x", rotation=45)
     ax.set_xlabel("Input Window Size")
-    ax.set_ylabel("Z-scored error along windows")
+    ax.set_ylabel(f"Z-scored {curve_metric.upper()} along windows")
     ax.set_title(
         f"{dataset_display}  (term={term}, h_real={horizon_real}, "
         f"h_pred={horizon_pred})  --  {model_short}",
@@ -1366,12 +1366,12 @@ def main():
                 & (results_df["dataset_display"] == dataset_display)
                 & (results_df["term"] == term)
             ].sort_values("window_size")
-            if mdf.empty or pred_curve_metric not in mdf.columns:
+            if mdf.empty or "mase" not in mdf.columns:
                 continue
 
             # Build real curve aligned to window_grid (NaN where window absent).
             ws_to_val = dict(zip(mdf["window_size"].values,
-                                 mdf[pred_curve_metric].values))
+                                 mdf["mase"].values))
             real_curve = np.array(
                 [ws_to_val.get(w, np.nan) for w in window_grid],
                 dtype=np.float64,
@@ -1403,7 +1403,7 @@ def main():
             plot_path = plot_real_vs_predicted_curve(
                 window_grid, real_curve, predicted_curves,
                 model_short, dataset_display, term,
-                horizon_real, horizon_pred, pred_curve_metric, compare_dir,
+                horizon_real, horizon_pred, "mase", compare_dir,
             )
 
             # Per-(model,dataset,term) numerical artifact for downstream eval.
