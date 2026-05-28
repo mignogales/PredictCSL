@@ -443,6 +443,496 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
 
 
 # ==============================================================================
+#  RELATIVE IMPROVEMENT TABLES
+# ==============================================================================
+
+# Maps the trailing frequency token in dataset_display to a canonical label.
+_FREQ_SUFFIX_MAP: Dict[str, str] = {
+    "10T": "10-min",
+    "5T":  "5-min",
+    "15T": "15-min",
+    "H":   "Hourly",
+    "D":   "Daily",
+    "W":   "Weekly",
+    "M":   "Monthly",
+    "Q":   "Quarterly",
+    # M4 full-word suffixes (e.g. "M4-Hourly")
+    "Hourly":     "Hourly",
+    "Daily":      "Daily",
+    "Weekly":     "Weekly",
+    "Monthly":    "Monthly",
+    "Quarterly":  "Quarterly",
+    "Yearly":     "Yearly",
+}
+
+
+def infer_freq_from_display(dataset_display: str) -> str:
+    """
+    Infer sampling frequency from dataset_display name.
+
+    Checks the part after the last '-' first (e.g. 'ETTm1-H' → 'H'),
+    then falls back to a keyword scan of the full name.
+    Returns 'Unknown' when nothing matches.
+    """
+    parts = dataset_display.rsplit("-", 1)
+    if len(parts) == 2:
+        suffix = parts[1]
+        if suffix in _FREQ_SUFFIX_MAP:
+            return _FREQ_SUFFIX_MAP[suffix]
+    # fallback: keyword scan (case-insensitive)
+    name_lower = dataset_display.lower()
+    for kw, label in [
+        ("10t", "10-min"), ("5t", "5-min"), ("15t", "15-min"),
+        ("hourly", "Hourly"), ("-h", "Hourly"),
+        ("daily", "Daily"),   ("-d", "Daily"),
+        ("weekly", "Weekly"), ("-w", "Weekly"),
+        ("monthly", "Monthly"), ("-m", "Monthly"),
+        ("quarterly", "Quarterly"),
+        ("yearly", "Yearly"),
+    ]:
+        if kw in name_lower:
+            return label
+    return "Unknown"
+
+
+def compute_relative_improvement_tables(
+    df: pd.DataFrame,
+    out_dir: str,
+) -> None:
+    """
+    Produces four CSV files and prints summaries:
+
+    1. rel_improvement_individual.csv  — one row per (dataset, model, term)
+    2. rel_improvement_by_dataset.csv  — mean over models/terms per dataset
+    3. rel_improvement_by_frequency.csv — mean over datasets per frequency
+    4. rel_improvement_by_horizon.csv  — mean over datasets per horizon value
+
+    Relative improvement (%) is defined as:
+      rel_impr_oracle = (full_mase - best_mase) / full_mase * 100
+      rel_impr_pred   = (full_mase - pred_mase) / full_mase * 100
+    Positive = the alternative strategy achieves lower MASE than the full window.
+    """
+    r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"]).copy()
+    if r.empty:
+        print(Fore.YELLOW + "  No valid rows for relative improvement tables." + Fore.RESET)
+        return
+
+    denom = r["full_mase"].clip(lower=1e-12)
+    r["rel_impr_oracle_pct"] = (r["full_mase"] - r["best_mase"]) / denom * 100.0
+    r["rel_impr_pred_pct"]   = (r["full_mase"] - r["pred_mase"]) / denom * 100.0
+    r["freq"] = r["dataset_display"].apply(infer_freq_from_display)
+
+    # Frequency display order
+    freq_order = ["10-min", "5-min", "15-min", "Hourly", "Daily",
+                  "Weekly", "Monthly", "Quarterly", "Yearly", "Unknown"]
+
+    # ------------------------------------------------------------------
+    # 1. Individual table
+    # ------------------------------------------------------------------
+    cols_ind = [
+        "dataset_display", "freq", "model_short", "term", "horizon",
+        "full_mase", "best_mase", "pred_mase",
+        "rel_impr_oracle_pct", "rel_impr_pred_pct",
+    ]
+    ind = r[cols_ind].sort_values(["dataset_display", "model_short", "term"])
+    ind_path = os.path.join(out_dir, "rel_improvement_individual.csv")
+    ind.to_csv(ind_path, index=False, float_format="%.4f")
+    print(Fore.GREEN + f"  Saved: {ind_path}" + Fore.RESET)
+
+    # ------------------------------------------------------------------
+    # 2. By dataset
+    # ------------------------------------------------------------------
+    ds_agg = (
+        r.groupby(["dataset_display", "freq"], sort=True)
+        .agg(
+            n_rows=("full_mase", "count"),
+            full_mase_mean=("full_mase", "mean"),
+            best_mase_mean=("best_mase", "mean"),
+            pred_mase_mean=("pred_mase", "mean"),
+            rel_impr_oracle_mean=("rel_impr_oracle_pct", "mean"),
+            rel_impr_pred_mean=("rel_impr_pred_pct", "mean"),
+            rel_impr_oracle_median=("rel_impr_oracle_pct", "median"),
+            rel_impr_pred_median=("rel_impr_pred_pct", "median"),
+        )
+        .reset_index()
+    )
+    ds_path = os.path.join(out_dir, "rel_improvement_by_dataset.csv")
+    ds_agg.to_csv(ds_path, index=False, float_format="%.4f")
+    print(Fore.GREEN + f"  Saved: {ds_path}" + Fore.RESET)
+
+    # ------------------------------------------------------------------
+    # 3. By frequency
+    # ------------------------------------------------------------------
+    freq_agg = (
+        r.groupby("freq", sort=False)
+        .agg(
+            n_rows=("full_mase", "count"),
+            full_mase_mean=("full_mase", "mean"),
+            best_mase_mean=("best_mase", "mean"),
+            pred_mase_mean=("pred_mase", "mean"),
+            rel_impr_oracle_mean=("rel_impr_oracle_pct", "mean"),
+            rel_impr_pred_mean=("rel_impr_pred_pct", "mean"),
+            rel_impr_oracle_median=("rel_impr_oracle_pct", "median"),
+            rel_impr_pred_median=("rel_impr_pred_pct", "median"),
+        )
+        .reset_index()
+    )
+    # Sort by canonical frequency order
+    freq_agg["_order"] = freq_agg["freq"].apply(
+        lambda f: freq_order.index(f) if f in freq_order else len(freq_order)
+    )
+    freq_agg = freq_agg.sort_values("_order").drop(columns="_order")
+    freq_path = os.path.join(out_dir, "rel_improvement_by_frequency.csv")
+    freq_agg.to_csv(freq_path, index=False, float_format="%.4f")
+    print(Fore.GREEN + f"  Saved: {freq_path}" + Fore.RESET)
+
+    # ------------------------------------------------------------------
+    # 4. By horizon
+    # ------------------------------------------------------------------
+    hor_agg = (
+        r.groupby(["term", "horizon"], sort=False)
+        .agg(
+            n_rows=("full_mase", "count"),
+            full_mase_mean=("full_mase", "mean"),
+            best_mase_mean=("best_mase", "mean"),
+            pred_mase_mean=("pred_mase", "mean"),
+            rel_impr_oracle_mean=("rel_impr_oracle_pct", "mean"),
+            rel_impr_pred_mean=("rel_impr_pred_pct", "mean"),
+            rel_impr_oracle_median=("rel_impr_oracle_pct", "median"),
+            rel_impr_pred_median=("rel_impr_pred_pct", "median"),
+        )
+        .reset_index()
+    )
+    term_order = {"short": 0, "medium": 1, "long": 2}
+    hor_agg["_order"] = hor_agg["term"].apply(lambda t: term_order.get(t, 99))
+    hor_agg = hor_agg.sort_values(["_order", "horizon"]).drop(columns="_order")
+    hor_path = os.path.join(out_dir, "rel_improvement_by_horizon.csv")
+    hor_agg.to_csv(hor_path, index=False, float_format="%.4f")
+    print(Fore.GREEN + f"  Saved: {hor_path}" + Fore.RESET)
+
+    # ------------------------------------------------------------------
+    # Console summary
+    # ------------------------------------------------------------------
+    def _fmt_table(frame: pd.DataFrame, title: str) -> None:
+        print(Fore.CYAN + f"\n{'='*70}" + Fore.RESET)
+        print(Fore.CYAN + f"  {title}" + Fore.RESET)
+        print(Fore.CYAN + f"{'='*70}" + Fore.RESET)
+        with pd.option_context(
+            "display.max_rows", 200,
+            "display.width", 160,
+            "display.float_format", "{:.2f}".format,
+        ):
+            print(frame.to_string(index=False))
+
+    _fmt_table(
+        ds_agg[["dataset_display", "freq", "n_rows",
+                "full_mase_mean", "best_mase_mean", "pred_mase_mean",
+                "rel_impr_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
+            "full_mase_mean": "full",
+            "best_mase_mean": "oracle",
+            "pred_mase_mean": "pred",
+            "rel_impr_oracle_mean": "Δoracle%",
+            "rel_impr_pred_mean":   "Δpred%",
+        }),
+        "Relative improvement vs full window — by dataset (mean over models/terms)",
+    )
+
+    _fmt_table(
+        freq_agg[["freq", "n_rows",
+                  "full_mase_mean", "best_mase_mean", "pred_mase_mean",
+                  "rel_impr_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
+            "full_mase_mean": "full",
+            "best_mase_mean": "oracle",
+            "pred_mase_mean": "pred",
+            "rel_impr_oracle_mean": "Δoracle%",
+            "rel_impr_pred_mean":   "Δpred%",
+        }),
+        "Relative improvement vs full window — by sampling frequency",
+    )
+
+    _fmt_table(
+        hor_agg[["term", "horizon", "n_rows",
+                 "full_mase_mean", "best_mase_mean", "pred_mase_mean",
+                 "rel_impr_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
+            "full_mase_mean": "full",
+            "best_mase_mean": "oracle",
+            "pred_mase_mean": "pred",
+            "rel_impr_oracle_mean": "Δoracle%",
+            "rel_impr_pred_mean":   "Δpred%",
+        }),
+        "Relative improvement vs full window — by horizon",
+    )
+
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
+    _plot_rel_impr_by_dataset(ds_agg, out_dir)
+    _plot_rel_impr_by_frequency(freq_agg, out_dir)
+    _plot_rel_impr_by_horizon(hor_agg, out_dir)
+    _plot_rel_impr_pred_vs_oracle(ds_agg, out_dir)
+
+
+def _plot_rel_impr_by_dataset(ds_agg: pd.DataFrame, out_dir: str) -> str:
+    """
+    Horizontal grouped bar chart: Δoracle% and Δpred% per dataset.
+    Sorted by Δoracle% descending so the most-improvable datasets appear first.
+    """
+    data = ds_agg.sort_values("rel_impr_oracle_mean", ascending=True).copy()
+    if data.empty:
+        return ""
+
+    n = len(data)
+    bar_h = 0.35
+    fig_h = max(6, n * 0.55 + 2)
+    fig, ax = plt.subplots(figsize=(12, fig_h))
+
+    y = np.arange(n)
+    oracle_vals = data["rel_impr_oracle_mean"].values
+    pred_vals   = data["rel_impr_pred_mean"].values
+    labels      = data["dataset_display"].values
+
+    bars_oracle = ax.barh(y + bar_h / 2, oracle_vals, bar_h,
+                          label="Oracle (best window)", color="#ED7D31", alpha=0.85, edgecolor="white")
+    bars_pred   = ax.barh(y - bar_h / 2, pred_vals,   bar_h,
+                          label="Predictor",            color="#70AD47", alpha=0.85, edgecolor="white")
+
+    # Value annotations
+    x_range = max(np.abs(oracle_vals).max(), np.abs(pred_vals).max(), 1e-3)
+    pad = x_range * 0.015
+    for bar, val in zip(list(bars_oracle) + list(bars_pred),
+                        list(oracle_vals) + list(pred_vals)):
+        w = bar.get_width()
+        xpos = w + pad if w >= 0 else w - pad
+        ha   = "left"   if w >= 0 else "right"
+        ax.text(xpos, bar.get_y() + bar.get_height() / 2,
+                f"{val:.1f}%", va="center", ha=ha, fontsize=6.5, color="#333333")
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.axvline(0, color="black", lw=1.0, ls="--", alpha=0.5)
+    ax.set_xlabel("Relative MASE improvement over full window  (positive = better than full)",
+                  fontsize=10)
+    ax.set_title(
+        "Relative MASE Improvement vs Full Window — per dataset\n"
+        "(mean over all models and forecast terms; sorted by oracle improvement)",
+        fontsize=12, fontweight="bold",
+    )
+    ax.legend(fontsize=9, loc="lower right")
+    ax.grid(axis="x", alpha=0.25)
+    plt.tight_layout()
+    path = os.path.join(out_dir, "rel_impr_by_dataset.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(Fore.GREEN + f"  Saved: {path}" + Fore.RESET)
+    return path
+
+
+def _plot_rel_impr_by_frequency(freq_agg: pd.DataFrame, out_dir: str) -> str:
+    """
+    Vertical grouped bar chart: Δoracle% and Δpred% per sampling frequency.
+    Also overlays median as a dot for robustness.
+    """
+    data = freq_agg.copy()
+    if data.empty:
+        return ""
+
+    n = len(data)
+    x = np.arange(n)
+    w = 0.32
+    fig, ax = plt.subplots(figsize=(max(8, n * 1.1 + 2), 6))
+
+    oracle_mean = data["rel_impr_oracle_mean"].values
+    pred_mean   = data["rel_impr_pred_mean"].values
+    oracle_med  = data["rel_impr_oracle_median"].values
+    pred_med    = data["rel_impr_pred_median"].values
+    freq_labels = data["freq"].values
+
+    b1 = ax.bar(x - w / 2, oracle_mean, w, label="Oracle — mean",
+                color="#ED7D31", alpha=0.82, edgecolor="white")
+    b2 = ax.bar(x + w / 2, pred_mean,   w, label="Predictor — mean",
+                color="#70AD47", alpha=0.82, edgecolor="white")
+
+    # Median dots
+    ax.scatter(x - w / 2, oracle_med, s=45, color="#A84000", zorder=4,
+               label="Oracle — median", marker="D")
+    ax.scatter(x + w / 2, pred_med,   s=45, color="#2A6E10", zorder=4,
+               label="Predictor — median", marker="D")
+
+    # Annotate mean bars
+    y_rng = max(np.abs(oracle_mean).max(), np.abs(pred_mean).max(), 1e-3)
+    pad   = y_rng * 0.03
+    for b, val in zip(list(b1) + list(b2), list(oracle_mean) + list(pred_mean)):
+        h = b.get_height()
+        ypos = h + pad if h >= 0 else h - pad
+        va   = "bottom" if h >= 0 else "top"
+        ax.text(b.get_x() + b.get_width() / 2, ypos,
+                f"{val:.1f}%", ha="center", va=va, fontsize=8.5, color="#222222")
+
+    ax.axhline(0, color="black", lw=1.0, ls="--", alpha=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(freq_labels, fontsize=10)
+    ax.set_ylabel("Relative MASE improvement over full window (%)", fontsize=10)
+    ax.set_title(
+        "Relative MASE Improvement vs Full Window — by sampling frequency\n"
+        "(mean ± median across all datasets / models / terms)",
+        fontsize=12, fontweight="bold",
+    )
+    ax.legend(fontsize=9, ncol=2)
+    ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    path = os.path.join(out_dir, "rel_impr_by_frequency.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(Fore.GREEN + f"  Saved: {path}" + Fore.RESET)
+    return path
+
+
+def _plot_rel_impr_by_horizon(hor_agg: pd.DataFrame, out_dir: str) -> str:
+    """
+    Two-panel figure:
+      Left:  grouped bars by term (short / medium / long), mean + median overlay.
+      Right: scatter of mean Δ% vs horizon value for oracle and predictor.
+    """
+    data = hor_agg.copy()
+    if data.empty:
+        return ""
+
+    fig, (ax_bar, ax_sc) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # ---- Left: grouped bars by term ----------------------------------------
+    term_data = (
+        data.groupby("term", sort=False)
+        .agg(
+            oracle_mean=("rel_impr_oracle_mean", "mean"),
+            pred_mean=("rel_impr_pred_mean",   "mean"),
+            oracle_med=("rel_impr_oracle_median", "mean"),
+            pred_med=("rel_impr_pred_median",   "mean"),
+        )
+        .reset_index()
+    )
+    term_order = {"short": 0, "medium": 1, "long": 2}
+    term_data["_ord"] = term_data["term"].map(term_order).fillna(99)
+    term_data = term_data.sort_values("_ord").drop(columns="_ord")
+
+    n_t = len(term_data)
+    xt  = np.arange(n_t)
+    wt  = 0.32
+    b1 = ax_bar.bar(xt - wt / 2, term_data["oracle_mean"].values, wt,
+                    label="Oracle — mean", color="#ED7D31", alpha=0.82, edgecolor="white")
+    b2 = ax_bar.bar(xt + wt / 2, term_data["pred_mean"].values,   wt,
+                    label="Predictor — mean", color="#70AD47", alpha=0.82, edgecolor="white")
+    ax_bar.scatter(xt - wt / 2, term_data["oracle_med"].values, s=50,
+                   color="#A84000", zorder=4, label="Oracle — median", marker="D")
+    ax_bar.scatter(xt + wt / 2, term_data["pred_med"].values,   s=50,
+                   color="#2A6E10", zorder=4, label="Predictor — median", marker="D")
+
+    y_rng = max(
+        np.abs(term_data["oracle_mean"].values).max(),
+        np.abs(term_data["pred_mean"].values).max(), 1e-3,
+    )
+    pad = y_rng * 0.04
+    for b, val in zip(list(b1) + list(b2),
+                      list(term_data["oracle_mean"].values) + list(term_data["pred_mean"].values)):
+        h = b.get_height()
+        yp = h + pad if h >= 0 else h - pad
+        ax_bar.text(b.get_x() + b.get_width() / 2, yp,
+                    f"{val:.1f}%", ha="center", va="bottom" if h >= 0 else "top",
+                    fontsize=9, color="#222222")
+
+    ax_bar.axhline(0, color="black", lw=1.0, ls="--", alpha=0.5)
+    ax_bar.set_xticks(xt)
+    ax_bar.set_xticklabels(term_data["term"].values, fontsize=11)
+    ax_bar.set_ylabel("Relative MASE improvement (%)", fontsize=10)
+    ax_bar.set_title("By forecast term", fontsize=11, fontweight="bold")
+    ax_bar.legend(fontsize=8, ncol=2)
+    ax_bar.grid(axis="y", alpha=0.25)
+
+    # ---- Right: scatter Δ% vs actual horizon value -------------------------
+    ax_sc.scatter(data["horizon"], data["rel_impr_oracle_mean"],
+                  s=60, color="#ED7D31", alpha=0.80, edgecolors="white", linewidths=0.5,
+                  label="Oracle")
+    ax_sc.scatter(data["horizon"], data["rel_impr_pred_mean"],
+                  s=60, color="#70AD47", alpha=0.80, edgecolors="white", linewidths=0.5,
+                  marker="^", label="Predictor")
+    ax_sc.axhline(0, color="black", lw=1.0, ls="--", alpha=0.5)
+    ax_sc.set_xlabel("Horizon (steps)", fontsize=10)
+    ax_sc.set_ylabel("Mean relative MASE improvement (%)", fontsize=10)
+    ax_sc.set_title("By horizon length", fontsize=11, fontweight="bold")
+    ax_sc.legend(fontsize=9)
+    ax_sc.grid(True, alpha=0.25)
+
+    fig.suptitle(
+        "Relative MASE Improvement vs Full Window — by forecast horizon",
+        fontsize=13, fontweight="bold",
+    )
+    plt.tight_layout()
+    path = os.path.join(out_dir, "rel_impr_by_horizon.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(Fore.GREEN + f"  Saved: {path}" + Fore.RESET)
+    return path
+
+
+def _plot_rel_impr_pred_vs_oracle(ds_agg: pd.DataFrame, out_dir: str) -> str:
+    """
+    Scatter: Δpred% (y) vs Δoracle% (x) coloured by frequency, one point per
+    dataset.  Shows how well the predictor tracks the oracle improvement signal
+    across datasets.  Points above the diagonal mean the predictor captures more
+    than the oracle (unusual); points below are the typical regret cases.
+    """
+    data = ds_agg.dropna(subset=["rel_impr_oracle_mean", "rel_impr_pred_mean"]).copy()
+    if data.empty:
+        return ""
+
+    freqs = data["freq"].unique().tolist()
+    cmap  = plt.get_cmap("tab10")
+    freq_colors = {f: cmap(i % 10) for i, f in enumerate(sorted(freqs))}
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    for freq, grp in data.groupby("freq"):
+        ax.scatter(
+            grp["rel_impr_oracle_mean"], grp["rel_impr_pred_mean"],
+            s=65, alpha=0.85, edgecolors="white", linewidths=0.5,
+            color=freq_colors[freq], label=freq, zorder=3,
+        )
+        for _, row in grp.iterrows():
+            ax.annotate(
+                row["dataset_display"],
+                (row["rel_impr_oracle_mean"], row["rel_impr_pred_mean"]),
+                fontsize=5.5, alpha=0.7,
+                xytext=(3, 2), textcoords="offset points",
+            )
+
+    all_vals = np.concatenate([
+        data["rel_impr_oracle_mean"].values,
+        data["rel_impr_pred_mean"].values,
+    ])
+    lo = float(np.nanmin(all_vals)) * 1.1 - 1
+    hi = float(np.nanmax(all_vals)) * 1.1 + 1
+    ax.plot([lo, hi], [lo, hi], "k--", lw=1.2, alpha=0.55, label="y = x  (predictor = oracle)")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.axhline(0, color="gray", lw=0.8, ls=":", alpha=0.5)
+    ax.axvline(0, color="gray", lw=0.8, ls=":", alpha=0.5)
+    ax.set_xlabel("Oracle Δ% = (MASE_full − MASE_oracle) / MASE_full × 100", fontsize=10)
+    ax.set_ylabel("Predictor Δ% = (MASE_full − MASE_pred) / MASE_full × 100", fontsize=10)
+    ax.set_title(
+        "Predictor vs Oracle MASE Improvement over Full Window\n"
+        "(per dataset, coloured by frequency; above diagonal = predictor beats oracle)",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(fontsize=8, title="Frequency", title_fontsize=8,
+              loc="upper left", framealpha=0.8)
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    path = os.path.join(out_dir, "rel_impr_pred_vs_oracle.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(Fore.GREEN + f"  Saved: {path}" + Fore.RESET)
+    return path
+
+
+# ==============================================================================
 #  PLOTS — MASE
 # ==============================================================================
 
@@ -837,13 +1327,13 @@ def plot_per_dataset_bars(df: pd.DataFrame, out_dir: str) -> List[str]:
     sub_dir = os.path.join(out_dir, "per_dataset_bars")
     os.makedirs(sub_dir, exist_ok=True)
 
-    # Global 99th-pct clip so y-axes are comparable across datasets
-    mase_vals = r[["full_mase", "best_mase", "pred_mase"]].values.ravel()
-    clip_hi = float(np.percentile(mase_vals, 99))
-
     paths: List[str] = []
     for dataset_name, grp in r.groupby("dataset_display", sort=True):
         grp = grp.sort_values(["model_short", "term"]).reset_index(drop=True)
+
+        # Clip at this dataset's own 99th percentile
+        ds_vals = grp[["full_mase", "best_mase", "pred_mase"]].values.ravel()
+        clip_hi = float(np.percentile(ds_vals, 99))
 
         # x-axis label: model + term
         grp["bar_label"] = grp["model_short"] + "\nt=" + grp["term"]
@@ -1009,6 +1499,10 @@ def main() -> None:
         cr = stats["complexity_ratio_pred_vs_full"]
         print(Fore.CYAN + "\n--- Complexity summary ---" + Fore.RESET)
         print(f"  FLOPs ratio pred/full:  mean={cr['mean']:.3f}  median={cr['median']:.3f}")
+
+    # ---- Relative improvement tables ----------------------------------------
+    print(Fore.CYAN + "\n--- Relative improvement tables ---" + Fore.RESET)
+    compute_relative_improvement_tables(df, out_dir)
 
     # ---- Plots --------------------------------------------------------------
     print(Fore.CYAN + "\n--- Generating plots ---" + Fore.RESET)
