@@ -380,6 +380,11 @@ def load_strategy_records(
 #  AGGREGATE STATS
 # ==============================================================================
 
+def _geomean(vals: np.ndarray) -> float:
+    """Geometric mean: exp(mean(log(x))). Clips to 1e-9 to guard against log(0)."""
+    return float(np.exp(np.log(np.clip(vals, 1e-9, None)).mean()))
+
+
 def compute_summary_stats(df: pd.DataFrame) -> dict:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"])
     stats: dict = {}
@@ -387,10 +392,11 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
     for strategy in ("full_mase", "best_mase", "pred_mase"):
         vals = r[strategy].values
         stats[strategy] = {
-            "mean":   float(vals.mean()),
-            "median": float(np.median(vals)),
-            "std":    float(vals.std()),
-            "n":      int(len(vals)),
+            "mean":    float(vals.mean()),
+            "geomean": _geomean(vals),
+            "median":  float(np.median(vals)),
+            "std":     float(vals.std()),
+            "n":       int(len(vals)),
         }
 
     stats["pred_clamped_count"] = int(df["pred_clamped"].sum()) if "pred_clamped" in df.columns else 0
@@ -441,32 +447,71 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
 # ==============================================================================
 
 def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str) -> str:
-    r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"])
+    r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"]).copy()
     if r.empty:
         return ""
-    labels  = ["Full Window", "Best Window\n(Oracle)", "Predictor\nWindow"]
-    means   = [r["full_mase"].mean(),   r["best_mase"].mean(),   r["pred_mase"].mean()]
-    medians = [r["full_mase"].median(), r["best_mase"].median(), r["pred_mase"].median()]
+
+    strategies = ["full_mase", "best_mase", "pred_mase"]
+    labels = ["Full Window", "Best Window\n(Oracle)", "Predictor\nWindow"]
+
+    # Arithmetic mean — inflated by local-MASE spikes (near-zero naive denominator)
+    means   = [r[s].mean() for s in strategies]
+    # Geometric mean — exp(mean(log)) — what M4/OWA use; log-scales each entry
+    # so a MASE of 500 contributes log(500)≈6.2 instead of 500 to the average
+    gmeans  = [_geomean(r[s].values) for s in strategies]
+    # Median — nonparametric, also robust, good sanity check alongside geomean
+    medians = [r[s].median() for s in strategies]
+
+    # Identify datasets driving the arithmetic-mean spike (top 5 % by full_mase)
+    thresh_95 = float(np.percentile(r["full_mase"].values, 95))
+    outliers = r[r["full_mase"] > thresh_95][["dataset_display", "model_short", "term", "full_mase"]]
+    n_outliers = len(outliers)
 
     x = np.arange(len(labels))
-    w = 0.35
-    c_m = ["#4472C4", "#ED7D31", "#70AD47"]
-    c_d = ["#264FA0", "#A9511B", "#3E7327"]
+    wb = 0.26
+    c_arith  = ["#4472C4", "#ED7D31", "#70AD47"]
+    c_geom   = ["#264FA0", "#A9511B", "#3E7327"]
+    c_median = ["#7BA9D8", "#F0A86A", "#9ED67A"]
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    b1 = ax.bar(x - w / 2, means,   w, label="Mean MASE",   color=c_m, alpha=0.85, edgecolor="white")
-    b2 = ax.bar(x + w / 2, medians, w, label="Median MASE", color=c_d, alpha=0.85, edgecolor="white")
-    for b in list(b1) + list(b2):
-        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.002,
-                f"{b.get_height():.4f}", ha="center", va="bottom", fontsize=9)
-    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=11)
+    fig, ax = plt.subplots(figsize=(11, 6))
+    b1 = ax.bar(x - wb, means,   wb, label="Arithmetic Mean",  color=c_arith,  alpha=0.85, edgecolor="white")
+    b2 = ax.bar(x,      gmeans,  wb, label="Geometric Mean ★", color=c_geom,   alpha=0.85, edgecolor="white")
+    b3 = ax.bar(x + wb, medians, wb, label="Median",           color=c_median, alpha=0.85, edgecolor="white")
+
+    y_top = max(max(means), max(gmeans), max(medians))
+    for b in list(b1) + list(b2) + list(b3):
+        v = b.get_height()
+        ax.text(b.get_x() + b.get_width() / 2, v + y_top * 0.01,
+                f"{v:.3f}", ha="center", va="bottom", fontsize=7, rotation=45)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=11)
     ax.set_ylabel("MASE", fontsize=12)
     ax.set_title(f"MASE by Context Strategy  (n={len(r)} dataset-terms)",
                  fontsize=13, fontweight="bold")
-    ax.legend(fontsize=10); ax.grid(axis="y", alpha=0.3); ax.set_ylim(bottom=0)
+    ax.legend(fontsize=9, loc="upper right")
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    note_lines = [
+        "★ Geometric mean = exp(mean(log(MASE))): outlier-robust, used by M4/OWA benchmark.",
+        "  A local-MASE spike of 500 contributes log(500)≈6.2 instead of 500 to the average.",
+        f"  {n_outliers} entries above 95th-pct ({thresh_95:.1f}) inflate the arithmetic mean: "
+        + ", ".join(
+            f"{row['dataset_display']}/{row['model_short']}/t{row['term']} ({row['full_mase']:.1f})"
+            for _, row in outliers.head(5).iterrows()
+        )
+        + (" ..." if n_outliers > 5 else ""),
+    ]
+    ax.text(0.01, 0.99, "\n".join(note_lines),
+            transform=ax.transAxes, fontsize=7, va="top", ha="left",
+            color="#555555", style="italic",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.75))
+
     plt.tight_layout()
     path = os.path.join(out_dir, "bar_aggregate_mase.png")
-    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
     return path
 
 
@@ -477,13 +522,26 @@ def plot_scatter(
     title: str, fname: str,
     out_dir: str,
     diagonal: bool = True,
+    clip_pct: Optional[float] = None,
 ) -> str:
     rows = df.dropna(subset=[x_col, y_col])
     if rows.empty:
         return ""
-    x, y = rows[x_col].values, rows[y_col].values
+    x_raw, y_raw = rows[x_col].values, rows[y_col].values
+
+    n_clipped = 0
+    if clip_pct is not None:
+        combined = np.concatenate([x_raw, y_raw])
+        lo = float(np.percentile(combined, 100 - clip_pct))
+        hi = float(np.percentile(combined, clip_pct))
+        mask = (x_raw <= hi) & (x_raw >= lo) & (y_raw <= hi) & (y_raw >= lo)
+        n_clipped = int((~mask).sum())
+        x, y = x_raw[mask], y_raw[mask]
+    else:
+        x, y = x_raw, y_raw
+
     fig, ax = plt.subplots(figsize=(8, 7))
-    ax.scatter(x, y, alpha=0.55, s=30, color="#4472C4",
+    ax.scatter(x, y, alpha=0.7, s=35, color="#4472C4",
                edgecolors="white", linewidths=0.5)
     if diagonal:
         lims = [min(x.min(), y.min()) * 0.95, max(x.max(), y.max()) * 1.05]
@@ -495,7 +553,10 @@ def plot_scatter(
         ax.legend(fontsize=10)
     if len(x) > 1:
         corr = float(np.corrcoef(x, y)[0, 1])
-        ax.text(0.05, 0.95, f"r = {corr:.3f}", transform=ax.transAxes, fontsize=11,
+        label = f"r = {corr:.3f}"
+        if n_clipped > 0:
+            label += f"\n({n_clipped} pts clipped at {clip_pct:.0f}th pct)"
+        ax.text(0.05, 0.95, label, transform=ax.transAxes, fontsize=10,
                 va="top", bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
     ax.grid(True, alpha=0.25); plt.tight_layout()
     path = os.path.join(out_dir, fname)
@@ -608,34 +669,49 @@ def plot_efficiency_frontier(df: pd.DataFrame, out_dir: str) -> str:
         print(Fore.YELLOW + "  No timing data for efficiency frontier." + Fore.RESET)
         return ""
 
-    x = r["speedup_pred_vs_full"].values       # >1 means faster
-    y = -r["delta_pred_vs_full"].values        # positive = pred has lower MASE (better)
+    x_raw = r["speedup_pred_vs_full"].values       # >1 means faster
+    y_raw = -r["delta_pred_vs_full"].values        # positive = pred has lower MASE (better)
 
+    # Clip to [1st, 99th] percentile on y to prevent MASE spikes from squashing the plot
+    y_lo = float(np.percentile(y_raw, 1))
+    y_hi = float(np.percentile(y_raw, 99))
+    x_hi = float(np.percentile(x_raw, 99))
+    mask = (y_raw >= y_lo) & (y_raw <= y_hi) & (x_raw <= x_hi)
+    n_clipped = int((~mask).sum())
+    x, y = x_raw[mask], y_raw[mask]
+
+    sym = max(abs(y.min()), abs(y.max()))
     fig, ax = plt.subplots(figsize=(9, 7))
-    sc = ax.scatter(x, y, alpha=0.6, s=35, c=y, cmap="RdYlGn",
-                    edgecolors="white", linewidths=0.4, vmin=-max(abs(y)), vmax=max(abs(y)))
-    plt.colorbar(sc, ax=ax, label="MASE improvement (pred − full, flipped)")
-    ax.axhline(0, color="gray", lw=1.0, ls="--", alpha=0.6, label="Same MASE")
-    ax.axvline(1, color="gray", lw=1.0, ls="-.", alpha=0.6, label="Same time")
+    sc = ax.scatter(x, y, alpha=0.85, s=55, c=y, cmap="RdYlGn",
+                    edgecolors="white", linewidths=0.4, vmin=-sym, vmax=sym)
+    plt.colorbar(sc, ax=ax, label="MASE improvement  MASE_full − MASE_pred")
+    ax.axhline(0, color="gray", lw=1.2, ls="--", alpha=0.7, label="Same MASE")
+    ax.axvline(1, color="gray", lw=1.2, ls="-.", alpha=0.7, label="Same time")
+
+    # Quadrant annotations
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    for qx, qy, qtxt, qa in [
+        (0.97, 0.97, "Faster & Better", "right"),
+        (0.03, 0.97, "Slower & Better", "left"),
+        (0.97, 0.03, "Faster & Worse",  "right"),
+        (0.03, 0.03, "Slower & Worse",  "left"),
+    ]:
+        ax.text(qx, qy, qtxt, transform=ax.transAxes, fontsize=8,
+                ha=qa, va="top" if qy > 0.5 else "bottom",
+                color="gray", style="italic", alpha=0.7)
+
+    if n_clipped > 0:
+        ax.text(0.5, 0.01, f"{n_clipped} extreme points clipped (outside 1–99th pct)",
+                transform=ax.transAxes, fontsize=8, ha="center", va="bottom",
+                color="gray", style="italic")
+
     ax.set_xlabel("Speedup  =  elapsed_full / elapsed_pred  (>1 means predictor is faster)",
                   fontsize=11)
     ax.set_ylabel("MASE Reduction  =  MASE_full − MASE_pred  (>0 means predictor is better)",
                   fontsize=11)
     ax.set_title("Efficiency Frontier: Accuracy vs Speed Tradeoff",
                  fontsize=13, fontweight="bold")
-
-    # Quadrant labels
-    xlim, ylim = ax.get_xlim(), ax.get_ylim()
-    xm, ym = (xlim[0] + xlim[1]) / 2, (ylim[0] + ylim[1]) / 2
-    for qx, qy, label in [
-        (xlim[1]*0.9, ylim[1]*0.9, "Faster + Better"),
-        (xlim[0]*1.1, ylim[1]*0.9, "Slower + Better"),
-        (xlim[1]*0.9, ylim[0]*1.1, "Faster + Worse"),
-        (xlim[0]*1.1, ylim[0]*1.1, "Slower + Worse"),
-    ]:
-        pass  # skip labels to keep plot clean
-
-    ax.legend(fontsize=9); ax.grid(True, alpha=0.2); plt.tight_layout()
+    ax.legend(fontsize=9); ax.grid(True, alpha=0.25); plt.tight_layout()
     path = os.path.join(out_dir, "efficiency_frontier.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     return path
@@ -698,14 +774,45 @@ def plot_complexity_vs_mase_gain(df: pd.DataFrame, out_dir: str) -> str:
     if r.empty:
         return ""
 
-    x = 1 - r["complexity_ratio_pred_vs_full"].values   # >0 means cheaper
-    y = -r["delta_pred_vs_full"].values                  # >0 means better accuracy
+    x_raw = 1 - r["complexity_ratio_pred_vs_full"].values   # >0 means cheaper
+    y_raw = -r["delta_pred_vs_full"].values                  # >0 means better accuracy
+
+    # Clip y to 1–99th percentile: high-MASE outliers stretch the axis to ±500
+    # and collapse all meaningful variation into a thin band near zero
+    y_lo = float(np.percentile(y_raw, 1))
+    y_hi = float(np.percentile(y_raw, 99))
+    mask = (y_raw >= y_lo) & (y_raw <= y_hi)
+    n_clipped = int((~mask).sum())
+    x, y = x_raw[mask], y_raw[mask]
+
+    # Symmetric y-axis so the zero line sits at center
+    y_sym = max(abs(y.min()), abs(y.max())) * 1.05
 
     fig, ax = plt.subplots(figsize=(8, 7))
-    ax.scatter(x, y, alpha=0.55, s=30, color="#4472C4",
-               edgecolors="white", linewidths=0.5)
-    ax.axhline(0, color="gray", lw=1.0, ls="--", alpha=0.6)
-    ax.axvline(0, color="gray", lw=1.0, ls="-.", alpha=0.6)
+    sc = ax.scatter(x, y, alpha=0.80, s=45, c=y, cmap="RdYlGn",
+                    edgecolors="white", linewidths=0.4,
+                    vmin=-y_sym, vmax=y_sym)
+    plt.colorbar(sc, ax=ax, label="MASE Improvement  (MASE_full − MASE_pred)")
+    ax.axhline(0, color="gray", lw=1.2, ls="--", alpha=0.7, label="No accuracy change")
+    ax.axvline(0, color="gray", lw=1.2, ls="-.", alpha=0.7, label="No complexity change")
+    ax.set_ylim(-y_sym, y_sym)
+
+    # Quadrant labels
+    for qx, qy, qtxt, ha in [
+        (0.97, 0.97, "Cheaper & Better",  "right"),
+        (0.03, 0.97, "Costlier & Better", "left"),
+        (0.97, 0.03, "Cheaper & Worse",   "right"),
+        (0.03, 0.03, "Costlier & Worse",  "left"),
+    ]:
+        ax.text(qx, qy, qtxt, transform=ax.transAxes, fontsize=8,
+                ha=ha, va="top" if qy > 0.5 else "bottom",
+                color="gray", style="italic", alpha=0.7)
+
+    if n_clipped > 0:
+        ax.text(0.5, 0.01, f"{n_clipped} extreme points clipped (outside 1–99th pct on y)",
+                transform=ax.transAxes, fontsize=8, ha="center", va="bottom",
+                color="gray", style="italic")
+
     ax.set_xlabel("FLOPs Reduction  =  1 − (FLOPs_pred / FLOPs_full)  (>0 means cheaper)",
                   fontsize=11)
     ax.set_ylabel("MASE Improvement  =  MASE_full − MASE_pred  (>0 means better)",
@@ -716,7 +823,9 @@ def plot_complexity_vs_mase_gain(df: pd.DataFrame, out_dir: str) -> str:
         corr = float(np.corrcoef(x, y)[0, 1])
         ax.text(0.05, 0.95, f"r = {corr:.3f}", transform=ax.transAxes, fontsize=11,
                 va="top", bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
-    ax.grid(True, alpha=0.25); plt.tight_layout()
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
     path = os.path.join(out_dir, "complexity_vs_mase_gain.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     return path
@@ -726,28 +835,73 @@ def plot_complexity_vs_mase_gain(df: pd.DataFrame, out_dir: str) -> str:
 #  PLOTS — MISC
 # ==============================================================================
 
-def plot_per_dataset_bars(df: pd.DataFrame, out_dir: str) -> str:
+def plot_per_dataset_bars(df: pd.DataFrame, out_dir: str, chunk_size: int = 20) -> List[str]:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"]).copy()
     if r.empty:
-        return ""
-    r["ds_label"] = r["dataset_display"] + "\n(t=" + r["term"] + ")"
-    labels = r["ds_label"].tolist()
-    n = len(labels)
-    x = np.arange(n)
-    w = 0.25
-    fig, ax = plt.subplots(figsize=(max(12, n * 0.55), 6))
-    ax.bar(x - w, r["full_mase"].values, w, label="Full window",    color="#4472C4", alpha=0.85)
-    ax.bar(x,     r["best_mase"].values, w, label="Best (oracle)",  color="#ED7D31", alpha=0.85)
-    ax.bar(x + w, r["pred_mase"].values, w, label="Predictor",      color="#70AD47", alpha=0.85)
-    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=90, fontsize=7)
-    ax.set_ylabel("MASE", fontsize=12)
-    ax.set_title("MASE per Dataset: Full vs Best vs Predictor Window",
-                 fontsize=13, fontweight="bold")
-    ax.legend(fontsize=10); ax.grid(axis="y", alpha=0.3); ax.set_ylim(bottom=0)
-    plt.tight_layout()
-    path = os.path.join(out_dir, "per_dataset_bars.png")
-    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
-    return path
+        return []
+
+    # Sort by dataset family (prefix before first '_') then by name
+    r["ds_family"] = r["dataset_display"].str.split("_").str[0]
+    r = r.sort_values(["ds_family", "dataset_display", "model_short", "term"]).reset_index(drop=True)
+    r["ds_label"] = r["dataset_display"] + "\n" + r["model_short"] + "\n(t=" + r["term"] + ")"
+
+    # Clip MASE at 99th percentile per chunk for readability
+    mase_vals = r[["full_mase", "best_mase", "pred_mase"]].values.ravel()
+    clip_hi = float(np.percentile(mase_vals, 99))
+
+    paths: List[str] = []
+    n_total = len(r)
+    n_chunks = math.ceil(n_total / chunk_size)
+
+    for i in range(n_chunks):
+        chunk = r.iloc[i * chunk_size : (i + 1) * chunk_size]
+        labels = chunk["ds_label"].tolist()
+        n = len(labels)
+        x = np.arange(n)
+        w = 0.25
+
+        # Clip values for display (annotate clipped bars)
+        full_v = chunk["full_mase"].clip(upper=clip_hi).values
+        best_v = chunk["best_mase"].clip(upper=clip_hi).values
+        pred_v = chunk["pred_mase"].clip(upper=clip_hi).values
+
+        fig, ax = plt.subplots(figsize=(max(12, n * 0.75), 6))
+        ax.bar(x - w, full_v, w, label="Full window",   color="#4472C4", alpha=0.85)
+        ax.bar(x,     best_v, w, label="Best (oracle)", color="#ED7D31", alpha=0.85)
+        ax.bar(x + w, pred_v, w, label="Predictor",     color="#70AD47", alpha=0.85)
+
+        # Mark clipped bars with a hat symbol
+        for xi, (fv, bv, pv, fo, bo, po) in enumerate(
+            zip(full_v, best_v, pred_v,
+                chunk["full_mase"].values, chunk["best_mase"].values, chunk["pred_mase"].values)
+        ):
+            for xoff, v, raw in [(-w, fv, fo), (0, bv, bo), (w, pv, po)]:
+                if raw > clip_hi:
+                    ax.text(xi + xoff, clip_hi * 1.01, f"▲{raw:.0f}",
+                            ha="center", va="bottom", fontsize=5.5, color="darkred", rotation=90)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=90, fontsize=6.5)
+        ax.set_ylabel("MASE", fontsize=12)
+        family_range = f"{chunk['ds_family'].iloc[0]}..{chunk['ds_family'].iloc[-1]}"
+        ax.set_title(
+            f"MASE per Dataset: Full vs Best vs Predictor  "
+            f"[{i+1}/{n_chunks}  rows {i*chunk_size+1}–{i*chunk_size+n} | {family_range}]",
+            fontsize=11, fontweight="bold")
+        ax.set_ylim(bottom=0, top=clip_hi * 1.12)
+        ax.legend(fontsize=9)
+        ax.grid(axis="y", alpha=0.3)
+        ax.text(0.99, 0.99, f"MASE clipped at 99th-pct ({clip_hi:.2f}); ▲ = true value above clip",
+                transform=ax.transAxes, fontsize=7, ha="right", va="top",
+                color="gray", style="italic")
+        plt.tight_layout()
+        fname = f"per_dataset_bars_{i+1:02d}_of_{n_chunks:02d}.png"
+        path = os.path.join(out_dir, fname)
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        paths.append(path)
+
+    return paths
 
 
 def plot_window_choice_scatter(df: pd.DataFrame, out_dir: str) -> str:
@@ -831,7 +985,8 @@ def main() -> None:
                       ("best_mase", "Best (oracle)"),
                       ("pred_mase", "Predictor    ")]:
         s = stats[key]
-        print(f"  {name}  mean={s['mean']:.4f}  median={s['median']:.4f}  std={s['std']:.4f}")
+        print(f"  {name}  mean={s['mean']:.4f}  geomean={s['geomean']:.4f}  "
+              f"median={s['median']:.4f}  std={s['std']:.4f}")
     print(f"  Pred beats full: {stats['pred_beats_full_count']}/{stats['total_rows']} "
           f"({100*stats['pred_beats_full_rate']:.1f}%)")
     if stats.get("pred_clamped_count", 0) > 0:
@@ -862,25 +1017,26 @@ def main() -> None:
 
     # ---- Plots --------------------------------------------------------------
     print(Fore.CYAN + "\n--- Generating plots ---" + Fore.RESET)
-    for path in [
+    single_paths = [
         plot_bar_aggregate_mase(df, out_dir),
         plot_bar_aggregate_time(df, out_dir),
         plot_scatter(df, "best_mase", "pred_mase",
                      "MASE — Best (oracle)", "MASE — Predictor",
                      "Predictor MASE vs Oracle Best MASE",
-                     "scatter_pred_vs_best.png", out_dir),
+                     "scatter_pred_vs_best.png", out_dir, clip_pct=99),
         plot_scatter(df, "full_mase", "pred_mase",
                      "MASE — Full Window", "MASE — Predictor",
                      "Predictor MASE vs Full-Window MASE",
-                     "scatter_pred_vs_full.png", out_dir),
+                     "scatter_pred_vs_full.png", out_dir, clip_pct=99),
         plot_efficiency_frontier(df, out_dir),
         plot_gain_histogram(df, out_dir),
         plot_regret_histogram(df, out_dir),
         plot_complexity_reduction(df, out_dir),
         plot_complexity_vs_mase_gain(df, out_dir),
-        plot_per_dataset_bars(df, out_dir),
         plot_window_choice_scatter(df, out_dir),
-    ]:
+    ]
+    per_dataset_paths = plot_per_dataset_bars(df, out_dir)
+    for path in single_paths + per_dataset_paths:
         if path:
             print(Fore.GREEN + f"  {path}" + Fore.RESET)
 
