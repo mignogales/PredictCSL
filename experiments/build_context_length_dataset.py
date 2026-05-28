@@ -124,10 +124,10 @@ DEVICES = None               # None -> all visible CUDA devices (or CPU)
 # -- Models  (model_id, family, display_name) ---------------------------------
 MODELS = [
     ("autogluon/chronos-2-small",       "chronos2",     "Chronos2-Small"),
-    ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
-    ("Salesforce/moirai-2.0-R-small",   "moirai",       "Moirai2-Small"),
-    ("google/timesfm-2.5-200m-pytorch", "timesfm",      "TimesFM2.5-200M"),
-    ("ibm-research/patchtst-fm-r1",     "patchtst_fm",  "PatchTST-FM-R1"),
+    # ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
+    # ("Salesforce/moirai-2.0-R-small",   "moirai",       "Moirai2-Small"),
+    # ("google/timesfm-2.5-200m-pytorch", "timesfm",      "TimesFM2.5-200M"),
+    # ("ibm-research/patchtst-fm-r1",     "patchtst_fm",  "PatchTST-FM-R1"),
 ]
 
 # -- Quantile bookkeeping (per model family) ----------------------------------

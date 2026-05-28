@@ -55,7 +55,7 @@ try:
 except ImportError:
     PatchTSTFMForPrediction = None
 
-from predict_context_length import PatchTSTContextLength
+from experiments.predict_context_length import PatchTSTContextLength
 
 
 # ==============================================================================
@@ -63,11 +63,11 @@ from predict_context_length import PatchTSTContextLength
 # ==============================================================================
 
 MODELS = [
-    # ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
-    # # ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
+    ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
+    # ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
     # ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
     # ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
-    ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
+    # ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
 ]
 
 DATASETS = [
