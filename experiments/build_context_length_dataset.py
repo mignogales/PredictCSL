@@ -128,11 +128,16 @@ MODELS = [
     ("Salesforce/moirai-2.0-R-small",   "moirai",       "Moirai2-Small"),
     ("google/timesfm-2.5-200m-pytorch", "timesfm",      "TimesFM2.5-200M"),
     ("ibm-research/patchtst-fm-r1",     "patchtst_fm",  "PatchTST-FM-R1"),
+    ("thuml/sundial-base-128m",         "sundial",      "Sundial-Base-128M"),
+    ("Maple728/TimeMoE-200M",           "timemoe",      "TimeMoE-200M"),
 ]
 
 # -- Quantile bookkeeping (per model family) ----------------------------------
 MOIRAI2_MEDIAN_IDX              = 4
 PATCHTST_FM_MEDIAN_QUANTILE_IDX = 49
+SUNDIAL_NUM_SAMPLES             = 20
+SUNDIAL_MAX_CONTEXT             = 2880
+TIMEMOE_MAX_TOTAL               = 4096   # context + horizon must not exceed this
 
 OUTPUT_ROOT = "logs/experiments/context_length_dataset"
 
@@ -455,6 +460,39 @@ def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> to
     return raw[:, :horizon].to(torch.float32)          # (B, H)
 
 
+def load_sundial(model_id: str, device: str):
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+    model.to(device).eval()
+    return model
+
+
+def predict_sundial(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
+    seqs = x[:, :, 0].to(device, non_blocking=True)
+    samples = model.generate(
+        seqs, max_new_tokens=horizon, num_samples=SUNDIAL_NUM_SAMPLES,
+    )                                                  # (B, S, H)
+    samples = samples[:, :, :horizon].to(torch.float32)
+    return torch.median(samples, dim=1).values         # (B, H)
+
+
+def load_timemoe(model_id: str, device: str):
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+    model.to(device).eval()
+    return model
+
+
+def predict_timemoe(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
+    seqs = x[:, :, 0].to(device, non_blocking=True)
+    mean = seqs.mean(dim=-1, keepdim=True)
+    std = seqs.std(dim=-1, keepdim=True)
+    normed = (seqs - mean) / (std + 1e-8)
+    out = model.generate(normed, max_new_tokens=horizon)            # (B, C+H)
+    preds = out[:, -horizon:].to(torch.float32)
+    return preds * std + mean                                       # (B, H)
+
+
 # ==============================================================================
 #  ABLATION DRIVER
 # ==============================================================================
@@ -471,6 +509,10 @@ def setup_model(family: str, model_id: str, device: str):
         return None                                    # recompiled per window
     if family == "patchtst_fm":
         return load_patchtst_fm(model_id, device)
+    if family == "sundial":
+        return load_sundial(model_id, device)
+    if family == "timemoe":
+        return load_timemoe(model_id, device)
     raise ValueError(f"Unknown model family: {family}")
 
 
@@ -512,6 +554,10 @@ def forecast_window(
             m = predict_timesfm(runner, xb, horizon, device)
         elif family == "patchtst_fm":
             m = predict_patchtst_fm(runner, xb, horizon, device)
+        elif family == "sundial":
+            m = predict_sundial(runner, xb, horizon, device)
+        elif family == "timemoe":
+            m = predict_timemoe(runner, xb, horizon, device)
         else:
             raise ValueError(f"Unknown model family: {family}")
         medians.append(m)
@@ -592,6 +638,10 @@ def gpu_worker(
             cs = np.full((end - start, n_win, n_h), np.nan, dtype=np.float32)
             for w_idx in win_indices:
                 w = WINDOW_GRID[w_idx]
+                if family == "sundial" and w > SUNDIAL_MAX_CONTEXT:
+                    continue
+                if family == "timemoe" and w + max_horizon > TIMEMOE_MAX_TOTAL:
+                    continue
                 medians = forecast_window(
                     family, base, model_id, ctx, w, max_horizon,
                     batch_size, device)                     # (B, MAX_HORIZON)

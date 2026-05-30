@@ -58,6 +58,8 @@ MODELS = [
     # # ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
     # ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
     # ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
+    # ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
+    # ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
     ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
 ]
 
@@ -173,6 +175,9 @@ MOIRAI_1_1_PATCH_SIZE = 32
 TIMESFM_QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 PATCHTST_FM_QUANTILE_LEVELS = [i / 100.0 for i in range(1, 100)]
 PATCHTST_FM_MEDIAN_QUANTILE_IDX = 49
+SUNDIAL_NUM_SAMPLES = 20
+SUNDIAL_MAX_CONTEXT = 2880
+TIMEMOE_MAX_TOTAL   = 4096   # context + horizon must not exceed this
 
 N_BEST_WORST = 10
 PLOT_METRICS = ["mae", "mse", "rmse", "mase", "smape", "crps"]
@@ -756,6 +761,54 @@ def predict_patchtst_fm(model, batches, horizon, device):
     return ForecastResult(median=all_quantiles.squeeze(1)), all_tgts
 
 
+def load_sundial(model_id, device):
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+    model.to(device).eval()
+    return model
+
+
+def predict_sundial(model, batches, horizon, device):
+    all_samples, all_tgts = [], []
+    for batch in tqdm(batches, desc="  Sundial", leave=False):
+        x, y = batch["x"], batch["y"]
+        seqs = x[:, :, 0].to(device, non_blocking=True)
+        samples = model.generate(
+            seqs, max_new_tokens=horizon, num_samples=SUNDIAL_NUM_SAMPLES,
+        )
+        samples = samples[:, :, :horizon].to(torch.float32)
+        all_samples.append(samples)
+        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
+    all_samples = torch.cat(all_samples, 0)
+    all_tgts = torch.cat(all_tgts, 0)
+    median = torch.median(all_samples, dim=1).values
+    return ForecastResult(median=median, samples=all_samples), all_tgts
+
+
+def load_timemoe(model_id, device):
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+    model.to(device).eval()
+    return model
+
+
+def predict_timemoe(model, batches, horizon, device):
+    all_preds, all_tgts = [], []
+    for batch in tqdm(batches, desc="  TimeMoE", leave=False):
+        x, y = batch["x"], batch["y"]
+        seqs = x[:, :, 0].to(device, non_blocking=True)
+        mean = seqs.mean(dim=-1, keepdim=True)
+        std = seqs.std(dim=-1, keepdim=True)
+        normed = (seqs - mean) / (std + 1e-8)
+        out = model.generate(normed, max_new_tokens=horizon)
+        preds = out[:, -horizon:].to(torch.float32) * std + mean
+        all_preds.append(preds)
+        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
+    all_preds = torch.cat(all_preds, 0)
+    all_tgts = torch.cat(all_tgts, 0)
+    return ForecastResult(median=all_preds), all_tgts
+
+
 def predict_context_parroting(batches, horizon, device):
     all_preds, all_tgts = [], []
     for batch in tqdm(batches, desc="  Parroting", leave=False):
@@ -1007,6 +1060,8 @@ def main():
         moirai_module = None
         moirai_1_1_module = None
         patchtst_fm_model = None
+        sundial_model = None
+        timemoe_model = None
 
         if model_family == "chronos_bolt":
             pipeline = load_chronos_bolt(model_id, device)
@@ -1018,6 +1073,10 @@ def main():
             moirai_1_1_module = load_moirai_1_1_module(model_id)
         elif model_family == "patchtst_fm":
             patchtst_fm_model = load_patchtst_fm(model_id, device)
+        elif model_family == "sundial":
+            sundial_model = load_sundial(model_id, device)
+        elif model_family == "timemoe":
+            timemoe_model = load_timemoe(model_id, device)
 
         for ge_name, term, dataset_display, to_univariate in datasets:
             ds_key = (ge_name, term)
@@ -1054,6 +1113,16 @@ def main():
                 # ----- Context window validation -----
                 if not cache.can_serve(window_size):
                     print(Fore.RED + f"  SKIP    {tag}  (max_context={cache.max_context} < ws)"
+                          + Fore.RESET)
+                    continue
+
+                if model_family == "sundial" and window_size > SUNDIAL_MAX_CONTEXT:
+                    print(Fore.RED + f"  SKIP    {tag}  (Sundial max context={SUNDIAL_MAX_CONTEXT} < ws)"
+                          + Fore.RESET)
+                    continue
+
+                if model_family == "timemoe" and window_size + horizon > TIMEMOE_MAX_TOTAL:
+                    print(Fore.RED + f"  SKIP    {tag}  (TimeMoE ws+h={window_size + horizon} > {TIMEMOE_MAX_TOTAL})"
                           + Fore.RESET)
                     continue
 
@@ -1094,6 +1163,10 @@ def main():
                     fr, tgts = predict_context_parroting(batches, horizon, device)
                 elif model_family == "patchtst_fm":
                     fr, tgts = predict_patchtst_fm(patchtst_fm_model, batches, horizon, device)
+                elif model_family == "sundial":
+                    fr, tgts = predict_sundial(sundial_model, batches, horizon, device)
+                elif model_family == "timemoe":
+                    fr, tgts = predict_timemoe(timemoe_model, batches, horizon, device)
                 else:
                     raise ValueError(f"Unknown model family: {model_family}")
 
@@ -1141,7 +1214,7 @@ def main():
                 gc.collect()
 
         # Free model VRAM before loading next
-        del pipeline, moirai_module, moirai_1_1_module, patchtst_fm_model
+        del pipeline, moirai_module, moirai_1_1_module, patchtst_fm_model, sundial_model, timemoe_model
         if device == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
