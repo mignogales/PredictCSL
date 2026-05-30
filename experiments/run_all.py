@@ -128,10 +128,12 @@ def stage_2_predictor(family: str, extra: Sequence[str]) -> None:
 
 def stage_3_ablation(display: str, family: str, extra: Sequence[str]) -> None:
     predictor_dir = os.path.join(PREDICTOR_ROOT, family)
+    cache_root = os.path.join(ABLATION_ROOT, family)
     _run(
         [sys.executable, "-m", "experiments.test_window_ablation_gifteval_v5",
          "--models", display,
-         "--predictor-dir", predictor_dir, *extra],
+         "--predictor-dir", predictor_dir,
+         "--cache-root", cache_root, *extra],
         stage="3/ablation",
     )
 
@@ -205,9 +207,13 @@ def _done_stage_3(family: str, *_unused) -> Tuple[bool, str]:
     marker = os.path.join(run_dir, "predictor_meta.json")
     if not os.path.isfile(marker):
         return False, "no predictor_meta.json"
-    compare_dir = os.path.join(run_dir, "compare_real_vs_predicted")
-    n_npz = (sum(1 for n in os.listdir(compare_dir) if n.endswith(".npz"))
-             if os.path.isdir(compare_dir) else 0)
+    models_root = os.path.join(run_dir, "models")
+    n_npz = 0
+    if os.path.isdir(models_root):
+        for model_short_dir in os.listdir(models_root):
+            compare_dir = os.path.join(models_root, model_short_dir, "compare_real_vs_predicted")
+            if os.path.isdir(compare_dir):
+                n_npz += sum(1 for n in os.listdir(compare_dir) if n.endswith(".npz"))
     return True, f"{n_npz} comparison .npz files"
 
 
