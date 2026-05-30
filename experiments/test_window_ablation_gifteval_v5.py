@@ -330,7 +330,7 @@ class GiftEvalCache:
 
 def _naive_cache_path(dataset_display: str, term: str) -> str:
     return os.path.join(
-        CACHE_ROOT, dataset_display, "_naive_seasonal", f"t{term}", "metrics.json"
+        CACHE_ROOT, "datasets", dataset_display, "_naive_seasonal", f"t{term}", "metrics.json"
     )
 
 
@@ -376,7 +376,7 @@ def load_or_compute_naive_baseline(
 
 def _cache_dir(dataset_display: str, model_short: str, term: str, window_size: int) -> str:
     return os.path.join(
-        CACHE_ROOT, dataset_display, model_short, f"t{term}", f"w{window_size}"
+        CACHE_ROOT, "datasets", dataset_display, model_short, f"t{term}", f"w{window_size}"
     )
 
 
@@ -967,7 +967,9 @@ def plot_ablation_summary(results_df, model_names_in_run, window_sizes,
     fig.suptitle(f"Window Size Ablation -- {dataset_display}  (term={term}, horizon={horizon_str})",
                  fontsize=15, fontweight="bold", y=1.02)
     plt.tight_layout()
-    path = os.path.join(run_dir, f"summary_{dataset_display}_t{term}_h{horizon_str}.png")
+    datasets_dir = os.path.join(run_dir, "datasets", dataset_display)
+    os.makedirs(datasets_dir, exist_ok=True)
+    path = os.path.join(datasets_dir, f"summary_{dataset_display}_t{term}_h{horizon_str}.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     return path
@@ -1239,8 +1241,7 @@ def main():
 
     # Deterministic per-family layout: run dir is the predictor's family
     # (= basename of predictor_dir), so re-running overwrites the same place.
-    family_tag = os.path.basename(os.path.normpath(predictor_dir))
-    run_dir = os.path.join(CACHE_ROOT, family_tag)
+    run_dir = CACHE_ROOT
     os.makedirs(run_dir, exist_ok=True)
 
     ge_cache: Dict[Tuple[str, str], GiftEvalCache] = {}
@@ -1423,11 +1424,10 @@ def main():
     model_names_in_run = [(m[0], m[2]) for m in models]
 
     # ---- Comparison plot per (model, dataset, term) -------------------------
-    compare_dir = os.path.join(run_dir, "compare_real_vs_predicted")
-    os.makedirs(compare_dir, exist_ok=True)
-    compare_records: List[dict] = []
-
     for model_id, model_family, model_short in models:
+        compare_dir = os.path.join(run_dir, "models", model_short, "compare_real_vs_predicted")
+        os.makedirs(compare_dir, exist_ok=True)
+        compare_records: List[dict] = []
         seen_ds_term = set()
         for ge_name, term, dataset_display, _ in datasets:
             key = (dataset_display, term)
@@ -1514,12 +1514,12 @@ def main():
                 "plot_path": plot_path,
             })
 
-    if compare_records:
-        cdf = pd.DataFrame(compare_records)
-        cdf.to_csv(os.path.join(compare_dir, "compare_summary.csv"), index=False)
-        print(Fore.GREEN + f"  Comparison summary: "
-              + f"{os.path.join(compare_dir, 'compare_summary.csv')}"
-              + Fore.RESET)
+        if compare_records:
+            cdf = pd.DataFrame(compare_records)
+            cdf.to_csv(os.path.join(compare_dir, "compare_summary.csv"), index=False)
+            print(Fore.GREEN + f"  Comparison summary: "
+                  + f"{os.path.join(compare_dir, 'compare_summary.csv')}"
+                  + Fore.RESET)
 
     # ---- Standard summary plot per (dataset, term) --------------------------
     seen = set()

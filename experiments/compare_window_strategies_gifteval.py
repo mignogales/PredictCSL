@@ -33,7 +33,7 @@ Patch sizes used (adjust via --patch-sizes JSON if needed):
   timesfm       32  (PATCH_SIZE = 32 in v5 code)
   patchtst_fm   16  (typical PatchTST default)
 
-Outputs (written to <run_dir>/strategy_comparison/)
+Outputs (written to <run_dir>/models/<model_short>/strategy_comparison/)
 ----------------------------------------------------
   comparison.csv              per-row MASE, elapsed time, complexity per strategy
   summary_stats.json          aggregate stats (mean/median, win rates, speedups)
@@ -147,7 +147,7 @@ def _cache_dir(
     window_size: int,
 ) -> str:
     return os.path.join(
-        cache_root, dataset_display, model_short, f"t{term}", f"w{window_size}"
+        cache_root, "datasets", dataset_display, model_short, f"t{term}", f"w{window_size}"
     )
 
 
@@ -179,25 +179,15 @@ def _load_elapsed(
 # ==============================================================================
 
 def find_latest_run(cache_root: str) -> str:
-    """Most recent top-level family dir under cache_root containing
-    compare_real_vs_predicted/. Layout is deterministic per family
-    (cache_root/<family>/compare_real_vs_predicted/), so this just picks the
-    most recently written one when --run-dir is omitted."""
+    """Return the run directory.  With the current layout the run dir IS the
+    cache_root (models/ and datasets/ live directly inside it)."""
     if not os.path.isdir(cache_root):
         raise FileNotFoundError(f"Cache root not found: {cache_root}")
-    candidates = []
-    for name in os.listdir(cache_root):
-        rd = os.path.join(cache_root, name)
-        if not os.path.isdir(rd):
-            continue
-        if os.path.isdir(os.path.join(rd, "compare_real_vs_predicted")):
-            candidates.append((os.path.getmtime(rd), rd))
-    if not candidates:
-        raise FileNotFoundError(
-            f"No <family>/compare_real_vs_predicted/ subdir under {cache_root}"
-        )
-    candidates.sort(reverse=True)
-    return candidates[0][1]
+    if os.path.isdir(os.path.join(cache_root, "models")):
+        return cache_root
+    raise FileNotFoundError(
+        f"No models/ subdir found under {cache_root}"
+    )
 
 
 # ==============================================================================
@@ -226,106 +216,113 @@ def load_strategy_records(
     as a relative indicator, keeping in mind that the full window may have
     fewer valid samples, which can make the speedup appear conservative.
     """
-    compare_dir = os.path.join(run_dir, "compare_real_vs_predicted")
-    summary_path = os.path.join(compare_dir, "compare_summary.csv")
-    if not os.path.isfile(summary_path):
-        raise FileNotFoundError(f"compare_summary.csv not found in {compare_dir}")
+    models_root = os.path.join(run_dir, "models")
+    if not os.path.isdir(models_root):
+        raise FileNotFoundError(f"No models/ dir found in {run_dir}")
 
-    summary = pd.read_csv(summary_path)
     records: List[dict] = []
 
-    for _, row in summary.iterrows():
-        dataset_display = str(row["dataset_display"])
-        term = str(row["term"])
-        model_short = str(row["model_short"])
-        model = str(row["model"])
-        horizon = int(row["horizon_real"])
-        n_instances = int(row["n_instances"])
-
-        npz_path = os.path.join(
-            compare_dir, _npz_filename(dataset_display, term, model_short)
-        )
-        if not os.path.isfile(npz_path):
-            print(
-                Fore.YELLOW
-                + f"  Missing .npz  {dataset_display} t={term} {model_short}"
-                + Fore.RESET
-            )
+    for model_short_dir in sorted(os.listdir(models_root)):
+        compare_dir = os.path.join(models_root, model_short_dir, "compare_real_vs_predicted")
+        summary_path = os.path.join(compare_dir, "compare_summary.csv")
+        if not os.path.isfile(summary_path):
+            print(Fore.YELLOW + f"  No compare_summary.csv for {model_short_dir}, skipping." + Fore.RESET)
             continue
 
-        try:
-            data = np.load(npz_path)
-        except Exception as exc:
-            print(Fore.YELLOW + f"  Error loading {npz_path}: {exc}" + Fore.RESET)
-            continue
+        summary = pd.read_csv(summary_path)
 
-        window_grid: np.ndarray = data["window_grid"]
-        real_curve: np.ndarray = data["real_curve"]      # raw MASE per window
-        pred_mean: np.ndarray = data["predicted_mean"]   # z-scored curve for argmin
+        for _, row in summary.iterrows():
+            dataset_display = str(row["dataset_display"])
+            term = str(row["term"])
+            model_short = str(row["model_short"])
+            model = str(row["model"])
+            horizon = int(row["horizon_real"])
+            n_instances = int(row["n_instances"])
 
-        valid = ~np.isnan(real_curve)
-        if valid.sum() < 1:
-            print(
-                Fore.YELLOW
-                + f"  Skip {dataset_display} t={term} {model_short}: no valid MASE"
-                + Fore.RESET
+            npz_path = os.path.join(
+                compare_dir, _npz_filename(dataset_display, term, model_short)
             )
-            continue
+            if not os.path.isfile(npz_path):
+                print(
+                    Fore.YELLOW
+                    + f"  Missing .npz  {dataset_display} t={term} {model_short}"
+                    + Fore.RESET
+                )
+                continue
 
-        valid_indices = np.where(valid)[0]
+            try:
+                data = np.load(npz_path)
+            except Exception as exc:
+                print(Fore.YELLOW + f"  Error loading {npz_path}: {exc}" + Fore.RESET)
+                continue
 
-        # --- Strategy indices ------------------------------------------------
-        full_idx = int(valid_indices[-1])
-        best_idx = int(valid_indices[np.argmin(real_curve[valid_indices])])
-        pred_idx = int(np.argmin(pred_mean))
+            window_grid: np.ndarray = data["window_grid"]
+            real_curve: np.ndarray = data["real_curve"]      # raw MASE per window
+            pred_mean: np.ndarray = data["predicted_mean"]   # z-scored curve for argmin
 
-        # If the predictor chose a window the dataset can't serve (not enough
-        # input context for any instance), fall back to the largest valid window.
-        pred_clamped = bool(np.isnan(real_curve[pred_idx]))
-        if pred_clamped:
-            pred_idx = full_idx
-            print(
-                Fore.YELLOW
-                + f"  Clamp {dataset_display} t={term} {model_short}: "
-                + f"pred_window={int(window_grid[int(np.argmin(pred_mean))])} "
-                + f"unavailable -> using full_window={int(window_grid[full_idx])}"
-                + Fore.RESET
+            valid = ~np.isnan(real_curve)
+            if valid.sum() < 1:
+                print(
+                    Fore.YELLOW
+                    + f"  Skip {dataset_display} t={term} {model_short}: no valid MASE"
+                    + Fore.RESET
+                )
+                continue
+
+            valid_indices = np.where(valid)[0]
+
+            # --- Strategy indices ------------------------------------------------
+            full_idx = int(valid_indices[-1])
+            best_idx = int(valid_indices[np.argmin(real_curve[valid_indices])])
+            pred_idx = int(np.argmin(pred_mean))
+
+            # If the predictor chose a window the dataset can't serve (not enough
+            # input context for any instance), fall back to the largest valid window.
+            pred_clamped = bool(np.isnan(real_curve[pred_idx]))
+            if pred_clamped:
+                pred_idx = full_idx
+                print(
+                    Fore.YELLOW
+                    + f"  Clamp {dataset_display} t={term} {model_short}: "
+                    + f"pred_window={int(window_grid[int(np.argmin(pred_mean))])} "
+                    + f"unavailable -> using full_window={int(window_grid[full_idx])}"
+                    + Fore.RESET
+                )
+
+            full_w  = int(window_grid[full_idx])
+            best_w  = int(window_grid[best_idx])
+            pred_w  = int(window_grid[pred_idx])
+
+            full_mase = float(real_curve[full_idx])
+            best_mase = float(real_curve[best_idx])
+            pred_mase = float(real_curve[pred_idx])
+
+            # --- Elapsed time (from per-window metrics.json) ---------------------
+            full_elapsed = _load_elapsed(cache_root, dataset_display, model_short, term, full_w)
+            best_elapsed = _load_elapsed(cache_root, dataset_display, model_short, term, best_w)
+            pred_elapsed = _load_elapsed(cache_root, dataset_display, model_short, term, pred_w)
+
+            # Speedup: how much faster than full window (>1 = faster)
+            speedup_pred = (
+                full_elapsed / pred_elapsed
+                if pred_elapsed > 0 and not math.isnan(pred_elapsed) and not math.isnan(full_elapsed)
+                else float("nan")
+            )
+            speedup_best = (
+                full_elapsed / best_elapsed
+                if best_elapsed > 0 and not math.isnan(best_elapsed) and not math.isnan(full_elapsed)
+                else float("nan")
             )
 
-        full_w  = int(window_grid[full_idx])
-        best_w  = int(window_grid[best_idx])
-        pred_w  = int(window_grid[pred_idx])
+            # --- Theoretical complexity ------------------------------------------
+            full_flops = theoretical_flops(model, full_w, horizon, patch_sizes)
+            best_flops = theoretical_flops(model, best_w, horizon, patch_sizes)
+            pred_flops = theoretical_flops(model, pred_w, horizon, patch_sizes)
 
-        full_mase = float(real_curve[full_idx])
-        best_mase = float(real_curve[best_idx])
-        pred_mase = float(real_curve[pred_idx])
+            complexity_ratio_pred = pred_flops / full_flops
+            complexity_ratio_best = best_flops / full_flops
 
-        # --- Elapsed time (from per-window metrics.json) ---------------------
-        full_elapsed = _load_elapsed(cache_root, dataset_display, model_short, term, full_w)
-        best_elapsed = _load_elapsed(cache_root, dataset_display, model_short, term, best_w)
-        pred_elapsed = _load_elapsed(cache_root, dataset_display, model_short, term, pred_w)
-
-        # Speedup: how much faster than full window (>1 = faster)
-        speedup_pred = (
-            full_elapsed / pred_elapsed
-            if pred_elapsed > 0 and not math.isnan(pred_elapsed) and not math.isnan(full_elapsed)
-            else float("nan")
-        )
-        speedup_best = (
-            full_elapsed / best_elapsed
-            if best_elapsed > 0 and not math.isnan(best_elapsed) and not math.isnan(full_elapsed)
-            else float("nan")
-        )
-
-        # --- Theoretical complexity ------------------------------------------
-        full_flops = theoretical_flops(model, full_w, horizon, patch_sizes)
-        best_flops = theoretical_flops(model, best_w, horizon, patch_sizes)
-        pred_flops = theoretical_flops(model, pred_w, horizon, patch_sizes)
-
-        complexity_ratio_pred = pred_flops / full_flops
-        complexity_ratio_best = best_flops / full_flops
-
-        records.append({
+            records.append({
             # identity
             "model":           model,
             "model_short":     model_short,
@@ -1411,7 +1408,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run-dir",    type=str, default=None,
                    help="Specific v5 run dir; auto-picks latest if omitted.")
     p.add_argument("--output-dir", type=str, default=None,
-                   help="Output dir; defaults to <run-dir>/strategy_comparison/.")
+                   help="Override output dir for all models (default: models/<model>/strategy_comparison/).")
     p.add_argument(
         "--patch-sizes", type=str, default=None,
         help=(
@@ -1435,89 +1432,94 @@ def main() -> None:
     run_dir = args.run_dir or find_latest_run(args.cache_root)
     print(Fore.CYAN + f"Run directory: {run_dir}" + Fore.RESET)
 
-    out_dir = args.output_dir or os.path.join(run_dir, "strategy_comparison")
-    os.makedirs(out_dir, exist_ok=True)
-
-    # ---- Load records -------------------------------------------------------
+    # ---- Load all records ---------------------------------------------------
     df = load_strategy_records(run_dir, args.cache_root, patch_sizes)
 
-    # ---- Save comparison CSV ------------------------------------------------
-    csv_path = os.path.join(out_dir, "comparison.csv")
-    df.to_csv(csv_path, index=False)
-    print(Fore.GREEN + f"  Saved: {csv_path}" + Fore.RESET)
+    def _run_outputs(df_subset: pd.DataFrame, out_dir: str) -> None:
+        os.makedirs(out_dir, exist_ok=True)
 
-    # ---- Summary stats ------------------------------------------------------
-    stats = compute_summary_stats(df)
-    stats_path = os.path.join(out_dir, "summary_stats.json")
-    with open(stats_path, "w") as f:
-        json.dump(stats, f, indent=2)
-    print(Fore.GREEN + f"  Saved: {stats_path}" + Fore.RESET)
+        csv_path = os.path.join(out_dir, "comparison.csv")
+        df_subset.to_csv(csv_path, index=False)
+        print(Fore.GREEN + f"  Saved: {csv_path}" + Fore.RESET)
 
-    print(Fore.CYAN + "\n--- MASE summary ---" + Fore.RESET)
-    for key, name in [("full_mase", "Full window  "),
-                      ("best_mase", "Best (oracle)"),
-                      ("pred_mase", "Predictor    ")]:
-        s = stats[key]
-        print(f"  {name}  mean={s['mean']:.4f}  geomean={s['geomean']:.4f}  "
-              f"median={s['median']:.4f}  std={s['std']:.4f}")
-    print(f"  Pred beats full: {stats['pred_beats_full_count']}/{stats['total_rows']} "
-          f"({100*stats['pred_beats_full_rate']:.1f}%)")
-    if stats.get("pred_clamped_count", 0) > 0:
-        print(
-            Fore.YELLOW
-            + f"  Pred clamped to full (insufficient context): "
-            + f"{stats['pred_clamped_count']}/{stats['total_rows']}"
-            + Fore.RESET
+        stats = compute_summary_stats(df_subset)
+        stats_path = os.path.join(out_dir, "summary_stats.json")
+        with open(stats_path, "w") as f:
+            json.dump(stats, f, indent=2)
+        print(Fore.GREEN + f"  Saved: {stats_path}" + Fore.RESET)
+
+        print(Fore.CYAN + "\n--- MASE summary ---" + Fore.RESET)
+        for key, name in [("full_mase", "Full window  "),
+                          ("best_mase", "Best (oracle)"),
+                          ("pred_mase", "Predictor    ")]:
+            s = stats[key]
+            print(f"  {name}  mean={s['mean']:.4f}  geomean={s['geomean']:.4f}  "
+                  f"median={s['median']:.4f}  std={s['std']:.4f}")
+        print(f"  Pred beats full: {stats['pred_beats_full_count']}/{stats['total_rows']} "
+              f"({100*stats['pred_beats_full_rate']:.1f}%)")
+        if stats.get("pred_clamped_count", 0) > 0:
+            print(
+                Fore.YELLOW
+                + f"  Pred clamped to full (insufficient context): "
+                + f"{stats['pred_clamped_count']}/{stats['total_rows']}"
+                + Fore.RESET
+            )
+        print(f"  Rel. gain pred/full:  mean={stats['rel_gain_pred_over_full']['mean']:.4f}  "
+              f"median={stats['rel_gain_pred_over_full']['median']:.4f}")
+        print(f"  Regret vs oracle:     mean={stats['regret_pred_vs_best']['mean']:.4f}  "
+              f"median={stats['regret_pred_vs_best']['median']:.4f}")
+
+        if "speedup_pred_vs_full" in stats:
+            sp = stats["speedup_pred_vs_full"]
+            print(Fore.CYAN + "\n--- Timing summary ---" + Fore.RESET)
+            print(f"  Mean elapsed: full={stats['mean_full_elapsed_s']:.2f}s  "
+                  f"best={stats.get('mean_best_elapsed_s', float('nan')):.2f}s  "
+                  f"pred={stats['mean_pred_elapsed_s']:.2f}s")
+            print(f"  Speedup pred/full:  mean={sp['mean']:.2f}x  median={sp['median']:.2f}x  "
+                  f"({100*sp['pct_faster']:.1f}% of cases faster)")
+
+        if "complexity_ratio_pred_vs_full" in stats:
+            cr = stats["complexity_ratio_pred_vs_full"]
+            print(Fore.CYAN + "\n--- Complexity summary ---" + Fore.RESET)
+            print(f"  FLOPs ratio pred/full:  mean={cr['mean']:.3f}  median={cr['median']:.3f}")
+
+        print(Fore.CYAN + "\n--- Relative improvement tables ---" + Fore.RESET)
+        compute_relative_improvement_tables(df_subset, out_dir)
+
+        print(Fore.CYAN + "\n--- Generating plots ---" + Fore.RESET)
+        single_paths = [
+            plot_bar_aggregate_mase(df_subset, out_dir),
+            plot_bar_aggregate_time(df_subset, out_dir),
+            plot_scatter(df_subset, "best_mase", "pred_mase",
+                         "MASE — Best (oracle)", "MASE — Predictor",
+                         "Predictor MASE vs Oracle Best MASE",
+                         "scatter_pred_vs_best.png", out_dir, clip_pct=99),
+            plot_scatter(df_subset, "full_mase", "pred_mase",
+                         "MASE — Full Window", "MASE — Predictor",
+                         "Predictor MASE vs Full-Window MASE",
+                         "scatter_pred_vs_full.png", out_dir, clip_pct=99),
+            plot_efficiency_frontier(df_subset, out_dir),
+            plot_gain_histogram(df_subset, out_dir),
+            plot_regret_histogram(df_subset, out_dir),
+            plot_complexity_reduction(df_subset, out_dir),
+            plot_complexity_vs_mase_gain(df_subset, out_dir),
+            plot_window_choice_scatter(df_subset, out_dir),
+        ]
+        per_dataset_paths = plot_per_dataset_bars(df_subset, out_dir)
+        for path in single_paths + per_dataset_paths:
+            if path:
+                print(Fore.GREEN + f"  {path}" + Fore.RESET)
+
+        print(Fore.GREEN + f"\nDone.  Outputs: {out_dir}" + Fore.RESET)
+
+    # ---- Per-model outputs --------------------------------------------------
+    for model_short, df_model in df.groupby("model_short"):
+        print(Fore.CYAN + f"\n{'='*78}\n  MODEL: {model_short}\n{'='*78}" + Fore.RESET)
+        model_out_dir = (
+            args.output_dir
+            or os.path.join(run_dir, "models", model_short, "strategy_comparison")
         )
-    print(f"  Rel. gain pred/full:  mean={stats['rel_gain_pred_over_full']['mean']:.4f}  "
-          f"median={stats['rel_gain_pred_over_full']['median']:.4f}")
-    print(f"  Regret vs oracle:     mean={stats['regret_pred_vs_best']['mean']:.4f}  "
-          f"median={stats['regret_pred_vs_best']['median']:.4f}")
-
-    if "speedup_pred_vs_full" in stats:
-        sp = stats["speedup_pred_vs_full"]
-        print(Fore.CYAN + "\n--- Timing summary ---" + Fore.RESET)
-        print(f"  Mean elapsed: full={stats['mean_full_elapsed_s']:.2f}s  "
-              f"best={stats.get('mean_best_elapsed_s', float('nan')):.2f}s  "
-              f"pred={stats['mean_pred_elapsed_s']:.2f}s")
-        print(f"  Speedup pred/full:  mean={sp['mean']:.2f}x  median={sp['median']:.2f}x  "
-              f"({100*sp['pct_faster']:.1f}% of cases faster)")
-
-    if "complexity_ratio_pred_vs_full" in stats:
-        cr = stats["complexity_ratio_pred_vs_full"]
-        print(Fore.CYAN + "\n--- Complexity summary ---" + Fore.RESET)
-        print(f"  FLOPs ratio pred/full:  mean={cr['mean']:.3f}  median={cr['median']:.3f}")
-
-    # ---- Relative improvement tables ----------------------------------------
-    print(Fore.CYAN + "\n--- Relative improvement tables ---" + Fore.RESET)
-    compute_relative_improvement_tables(df, out_dir)
-
-    # ---- Plots --------------------------------------------------------------
-    print(Fore.CYAN + "\n--- Generating plots ---" + Fore.RESET)
-    single_paths = [
-        plot_bar_aggregate_mase(df, out_dir),
-        plot_bar_aggregate_time(df, out_dir),
-        plot_scatter(df, "best_mase", "pred_mase",
-                     "MASE — Best (oracle)", "MASE — Predictor",
-                     "Predictor MASE vs Oracle Best MASE",
-                     "scatter_pred_vs_best.png", out_dir, clip_pct=99),
-        plot_scatter(df, "full_mase", "pred_mase",
-                     "MASE — Full Window", "MASE — Predictor",
-                     "Predictor MASE vs Full-Window MASE",
-                     "scatter_pred_vs_full.png", out_dir, clip_pct=99),
-        plot_efficiency_frontier(df, out_dir),
-        plot_gain_histogram(df, out_dir),
-        plot_regret_histogram(df, out_dir),
-        plot_complexity_reduction(df, out_dir),
-        plot_complexity_vs_mase_gain(df, out_dir),
-        plot_window_choice_scatter(df, out_dir),
-    ]
-    per_dataset_paths = plot_per_dataset_bars(df, out_dir)
-    for path in single_paths + per_dataset_paths:
-        if path:
-            print(Fore.GREEN + f"  {path}" + Fore.RESET)
-
-    print(Fore.GREEN + f"\nDone.  Outputs: {out_dir}" + Fore.RESET)
+        _run_outputs(df_model.reset_index(drop=True), model_out_dir)
 
 
 if __name__ == "__main__":
