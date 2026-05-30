@@ -12,10 +12,18 @@ deterministic per-family output paths:
 
     Stage 3 — test_window_ablation_gifteval_v5.py
                   --models <display> --predictor-dir <pred_root>/<family>
-              -> logs/experiments/window_ablation_gifteval/<family>/
+                  --cache-root <win_root>/general
+              -> logs/experiments/window_ablation_gifteval/general/
+                 (shared gifteval ablation results for ALL models — raw metrics
+                  under datasets/, real-vs-predicted curves under
+                  models/<display>/, combined results.csv)
 
-    Stage 4 — compare_window_strategies_gifteval.py --run-dir <win_root>/<family>
-              -> logs/experiments/window_ablation_gifteval/<family>/strategy_comparison/
+    Stage 4 — compare_window_strategies_gifteval.py
+                  --run-dir <win_root>/general --models <display>
+                  --output-dir <win_root>/<display>/strategy_comparison
+              -> logs/experiments/window_ablation_gifteval/<display>/strategy_comparison/
+                 (per-model comparison between window-selection methods:
+                  full window vs oracle-best vs predictor)
 
 Comment out entries in MODELS_TO_RUN to skip families. Re-running is safe:
 each stage caches its own work (per-shard for stage 1, per-trial for stage 2,
@@ -79,6 +87,10 @@ BUILD_CATALOG: List[Tuple[str, str, str]] = [
 DATASET_ROOT   = "logs/experiments/context_length_dataset"
 PREDICTOR_ROOT = "logs/experiments/context_length_predictor"
 ABLATION_ROOT  = "logs/experiments/window_ablation_gifteval"
+# Shared, cross-model gifteval ablation output (stage 3). One folder for every
+# model — v5 keys its artefacts by (dataset, model_short), so models coexist
+# here without collision and share the dataset cache + naive baselines.
+ABLATION_GENERAL = os.path.join(ABLATION_ROOT, "general")
 
 
 def _model_idx(family: str) -> int:
@@ -128,21 +140,22 @@ def stage_2_predictor(family: str, extra: Sequence[str]) -> None:
 
 def stage_3_ablation(display: str, family: str, extra: Sequence[str]) -> None:
     predictor_dir = os.path.join(PREDICTOR_ROOT, family)
-    cache_root = os.path.join(ABLATION_ROOT, family)
     _run(
         [sys.executable, "-m", "experiments.test_window_ablation_gifteval_v5",
          "--models", display,
          "--predictor-dir", predictor_dir,
-         "--cache-root", cache_root, *extra],
+         "--cache-root", ABLATION_GENERAL, *extra],
         stage="3/ablation",
     )
 
 
-def stage_4_compare(family: str, extra: Sequence[str]) -> None:
-    run_dir = os.path.join(ABLATION_ROOT, family)
+def stage_4_compare(display: str, family: str, extra: Sequence[str]) -> None:
+    out_dir = os.path.join(ABLATION_ROOT, display, "strategy_comparison")
     _run(
         [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
-         "--run-dir", run_dir, *extra],
+         "--run-dir", ABLATION_GENERAL,
+         "--models", display,
+         "--output-dir", out_dir, *extra],
         stage="4/compare",
     )
 
@@ -199,27 +212,23 @@ def _done_stage_2(family: str, *_unused) -> Tuple[bool, str]:
     )
 
 
-def _done_stage_3(family: str, *_unused) -> Tuple[bool, str]:
-    """Stage 3 is done when v5 wrote the final predictor_meta.json marker.
-    That's the last file produced by v5's main(), so its presence implies
-    the whole loop (all datasets/windows + comparison artefacts) finished."""
-    run_dir = os.path.join(ABLATION_ROOT, family)
-    marker = os.path.join(run_dir, "predictor_meta.json")
+def _done_stage_3(family: str, display: str = "") -> Tuple[bool, str]:
+    """Stage 3 (for one model) is done when v5 wrote that model's
+    compare_real_vs_predicted/compare_summary.csv into the shared general
+    folder — the terminal per-model artefact of v5's main()."""
+    compare_dir = os.path.join(
+        ABLATION_GENERAL, "models", display, "compare_real_vs_predicted")
+    marker = os.path.join(compare_dir, "compare_summary.csv")
     if not os.path.isfile(marker):
-        return False, "no predictor_meta.json"
-    models_root = os.path.join(run_dir, "models")
-    n_npz = 0
-    if os.path.isdir(models_root):
-        for model_short_dir in os.listdir(models_root):
-            compare_dir = os.path.join(models_root, model_short_dir, "compare_real_vs_predicted")
-            if os.path.isdir(compare_dir):
-                n_npz += sum(1 for n in os.listdir(compare_dir) if n.endswith(".npz"))
+        return False, "no compare_summary.csv"
+    n_npz = sum(1 for n in os.listdir(compare_dir) if n.endswith(".npz"))
     return True, f"{n_npz} comparison .npz files"
 
 
-def _done_stage_4(family: str, *_unused) -> Tuple[bool, str]:
-    """Stage 4 is done when summary_stats.json exists in strategy_comparison/."""
-    out = os.path.join(ABLATION_ROOT, family, "strategy_comparison",
+def _done_stage_4(family: str, display: str = "") -> Tuple[bool, str]:
+    """Stage 4 is done when summary_stats.json exists in the model's
+    strategy_comparison/ folder."""
+    out = os.path.join(ABLATION_ROOT, display, "strategy_comparison",
                        "summary_stats.json")
     if os.path.isfile(out):
         return True, "summary_stats.json present"
@@ -301,7 +310,7 @@ def main() -> None:
 
     def _maybe_run(sid: str, family: str, display: str) -> None:
         name = STAGES[sid][0]
-        done, summary = DONE_CHECKS[sid](family)
+        done, summary = DONE_CHECKS[sid](family, display)
         if done and sid not in forced:
             print(Fore.WHITE
                   + f"  · stage {sid}/{name} cached ({summary}) — skipping"
@@ -323,7 +332,7 @@ def main() -> None:
         elif sid == "3":
             stage_3_ablation(display, family, extras)
         else:
-            stage_4_compare(family, extras)
+            stage_4_compare(display, family, extras)
 
     t_start = time.perf_counter()
     for model_id, family, display in selected:

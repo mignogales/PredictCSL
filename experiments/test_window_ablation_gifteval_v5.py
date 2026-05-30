@@ -1418,10 +1418,31 @@ def main():
 
     results_df = pd.DataFrame(all_results)
     csv_path = os.path.join(run_dir, "results.csv")
-    results_df.to_csv(csv_path, index=False)
+
+    # run_dir is the SHARED general folder: run_all invokes v5 once per model,
+    # so merge this run's rows into any results.csv left by earlier models
+    # (dropping stale rows for the models we just recomputed) to keep a single
+    # combined "general results" table across all models.
+    merged_df = results_df
+    if os.path.isfile(csv_path):
+        try:
+            prev = pd.read_csv(csv_path)
+            cur_models = set(results_df["model_short"].unique())
+            prev = prev[~prev["model_short"].isin(cur_models)]
+            merged_df = pd.concat([prev, results_df], ignore_index=True)
+        except Exception as exc:
+            print(Fore.YELLOW + f"  Could not merge existing results.csv: {exc}"
+                  + Fore.RESET)
+    merged_df.to_csv(csv_path, index=False)
     print(Fore.GREEN + f"\n  Results CSV: {csv_path}" + Fore.RESET)
 
-    model_names_in_run = [(m[0], m[2]) for m in models]
+    # Summary plots span every model present in the combined table, not just
+    # this run's, so the shared folder shows a true cross-model comparison.
+    model_names_in_run = list(
+        merged_df[["model", "model_short"]]
+        .drop_duplicates()
+        .itertuples(index=False, name=None)
+    )
 
     # ---- Comparison plot per (model, dataset, term) -------------------------
     for model_id, model_family, model_short in models:
@@ -1528,14 +1549,24 @@ def main():
         if key in seen: continue
         seen.add(key)
         plot_ablation_summary(
-            results_df, model_names_in_run, window_sizes,
+            merged_df, model_names_in_run, window_sizes,
             dataset_display, term, run_dir,
             naive_baseline=naive_baseline_cache.get(key),
         )
 
+    # Merge naive baselines into the shared file (keyed by dataset/term, so
+    # baselines from earlier model runs are preserved).
     naive_path = os.path.join(run_dir, "naive_baselines.json")
+    naive_all: Dict[str, dict] = {}
+    if os.path.isfile(naive_path):
+        try:
+            with open(naive_path) as f:
+                naive_all = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            naive_all = {}
+    naive_all.update({f"{k[0]}/t{k[1]}": v for k, v in naive_baseline_cache.items()})
     with open(naive_path, "w") as f:
-        json.dump({f"{k[0]}/t{k[1]}": v for k, v in naive_baseline_cache.items()}, f, indent=2)
+        json.dump(naive_all, f, indent=2)
     print(Fore.GREEN + f"  Naive baselines: {naive_path}" + Fore.RESET)
 
     # ---- Persist a small marker tying this run to the predictor checkpoint --

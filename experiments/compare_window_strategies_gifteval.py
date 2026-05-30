@@ -1407,8 +1407,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cache-root", type=str, default=CACHE_ROOT)
     p.add_argument("--run-dir",    type=str, default=None,
                    help="Specific v5 run dir; auto-picks latest if omitted.")
+    p.add_argument("--models", type=str, nargs="+", default=None,
+                   help="Restrict comparison to these model_short names "
+                        "(default: every model present in the run dir).")
     p.add_argument("--output-dir", type=str, default=None,
-                   help="Override output dir for all models (default: models/<model>/strategy_comparison/).")
+                   help="Override output dir (default: models/<model>/strategy_comparison/). "
+                        "Only safe with a single --models entry, else models clobber each other.")
     p.add_argument(
         "--patch-sizes", type=str, default=None,
         help=(
@@ -1434,6 +1438,16 @@ def main() -> None:
 
     # ---- Load all records ---------------------------------------------------
     df = load_strategy_records(run_dir, args.cache_root, patch_sizes)
+
+    if args.models:
+        wanted = set(args.models)
+        available = sorted(df["model_short"].unique())
+        df = df[df["model_short"].isin(wanted)].reset_index(drop=True)
+        if df.empty:
+            raise SystemExit(
+                f"No records for models {sorted(wanted)} in {run_dir}. "
+                f"Available: {available}"
+            )
 
     def _run_outputs(df_subset: pd.DataFrame, out_dir: str) -> None:
         os.makedirs(out_dir, exist_ok=True)
