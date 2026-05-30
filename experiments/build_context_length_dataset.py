@@ -161,6 +161,79 @@ def resolve_devices(force: Optional[str]) -> List[str]:
 #  SYNTHETIC GENERATOR
 # ==============================================================================
 
+def _sample_ar_coefficients(rng: np.random.RandomState) -> Optional[np.ndarray]:
+    """
+    Sample AR(p) coefficients with diverse behavior.
+
+    Returns stable AR coefficients by sampling roots and converting, ensuring
+    variety across (p=1, 2, 3) with different dynamics:
+    - AR(1): persistent (0.4-0.95), weak (0-0.3), or oscillatory damped (-0.7-0)
+    - AR(2): oscillatory complex pairs or mixed real roots
+    - AR(3): diverse multi-root combinations
+    """
+    # 50% of the time, return None (no AR for that segment)
+    if rng.uniform() < 0.5:
+        return None
+
+    # Choose AR order: bias toward AR(1) and AR(2) for interpretability
+    p = int(rng.choice([1, 2, 3], p=[0.50, 0.35, 0.15]))
+
+    if p == 1:
+        # AR(1): φ ∈ [-1, 1] for stability; weight toward persistence
+        if rng.uniform() < 0.60:
+            # Persistent: φ ∈ [0.4, 0.95] (slow mean reversion)
+            phi = rng.uniform(0.4, 0.95)
+        elif rng.uniform() < 0.50:
+            # Weak positive: φ ∈ [0.0, 0.3]
+            phi = rng.uniform(0.0, 0.3)
+        else:
+            # Negative damped oscillation: φ ∈ [-0.7, 0.0]
+            phi = rng.uniform(-0.7, 0.0)
+        coeffs = np.array([phi])
+
+    elif p == 2:
+        # AR(2): Sample roots and convert to [c1, c2] coefficients
+        if rng.uniform() < 0.55:
+            # Oscillatory: complex conjugate pair e^(±iω)
+            # Magnitude r ∈ [0.7, 0.98], frequency ω ∈ [0.1π, 0.9π]
+            r = rng.uniform(0.7, 0.98)
+            omega = rng.uniform(0.1 * np.pi, 0.9 * np.pi)
+            # From (1 - r*e^(iω)*B)(1 - r*e^(-iω)*B) = 1 - 2r*cos(ω)*B + r^2*B^2
+            c1 = 2 * r * np.cos(omega)
+            c2 = -(r ** 2)
+            coeffs = np.array([c1, c2])
+        else:
+            # Real roots: two independent persistence levels
+            r1 = rng.uniform(0.2, 0.95)
+            r2 = rng.uniform(0.2, 0.95)
+            c1 = -(r1 + r2)
+            c2 = r1 * r2
+            coeffs = np.array([c1, c2])
+
+    else:  # p == 3
+        # AR(3): Complex dynamics; mix of real and complex roots
+        if rng.uniform() < 0.50:
+            # One real root + one complex conjugate pair
+            r_real = rng.uniform(0.3, 0.90)
+            r_complex = rng.uniform(0.6, 0.95)
+            omega = rng.uniform(0.1 * np.pi, 0.8 * np.pi)
+            c1 = -(r_real + 2 * r_complex * np.cos(omega))
+            c2 = 2 * r_real * r_complex * np.cos(omega) + r_complex ** 2
+            c3 = -(r_real * r_complex ** 2)
+            coeffs = np.array([c1, c2, c3])
+        else:
+            # Three real roots
+            r1 = rng.uniform(0.3, 0.90)
+            r2 = rng.uniform(0.3, 0.90)
+            r3 = rng.uniform(0.3, 0.90)
+            c1 = -(r1 + r2 + r3)
+            c2 = r1*r2 + r1*r3 + r2*r3
+            c3 = -(r1 * r2 * r3)
+            coeffs = np.array([c1, c2, c3])
+
+    return coeffs
+
+
 def _generate_segment(
     rng: np.random.RandomState,
     length: int,
@@ -202,11 +275,10 @@ def _generate_segment(
         else:
             seg += amp * np.sign(np.sin(omega * t + ph)).astype(np.float32)
 
-    # -- Optional AR(p) (stable; lfilter for speed) ---------------------------
-    if rng.uniform() < 0.5:
-        p = int(rng.randint(1, 4))
-        coeffs = rng.uniform(-0.3 / p, 0.3 / p, size=p)
-        innov = rng.normal(0.0, 0.3, size=length).astype(np.float32)
+    # -- Optional AR(p) with diverse roots (stable; lfilter for speed) --------
+    coeffs = _sample_ar_coefficients(rng)
+    if coeffs is not None:
+        innov = rng.normal(0.0, 0.5, size=length).astype(np.float32)
         a = np.concatenate([[1.0], -coeffs])
         seg += lfilter([1.0], a, innov).astype(np.float32)
 

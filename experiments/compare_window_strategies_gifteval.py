@@ -980,20 +980,6 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str) -> str:
     ax.grid(axis="y", alpha=0.3)
     ax.set_ylim(bottom=0)
 
-    note_lines = [
-        "★ Geometric mean = exp(mean(log(MASE))): used by M4/OWA benchmark.",
-        f"  {n_outliers} entries above 95th-pct ({thresh_95:.1f}): "
-        + ", ".join(
-            f"{row['dataset_display']}/{row['model_short']}/t{row['term']} ({row['full_mase']:.1f})"
-            for _, row in outliers.head(5).iterrows()
-        )
-        + (" ..." if n_outliers > 5 else ""),
-    ]
-    ax.text(0.01, 0.99, "\n".join(note_lines),
-            transform=ax.transAxes, fontsize=7.5, va="top", ha="left",
-            color="#555555", style="italic",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.75))
-
     plt.tight_layout()
     path = os.path.join(out_dir, "bar_aggregate_mase.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
