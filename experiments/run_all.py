@@ -67,21 +67,27 @@ from colorama import Fore
 # list in build_context_length_dataset.py — the index is what --model-idx
 # expects. Comment out a row to skip that family end-to-end.
 MODELS_TO_RUN: List[Tuple[str, str, str]] = [
-    ("autogluon/chronos-2-small",       "chronos2",     "Chronos2-Small"),
-    ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
-    ("Salesforce/moirai-2.0-R-small",   "moirai",       "Moirai2-Small"),
-    ("google/timesfm-2.5-200m-pytorch", "timesfm",      "TimesFM2.5-200M"),
-    ("ibm-research/patchtst-fm-r1",     "patchtst_fm",  "PatchTST-FM-R1"),
+    ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
+    # ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
+    ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
+    ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
+    ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
+    ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
+    ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
+    ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
 ]
 
 # Build script catalog — used to resolve --model-idx for stage 1.
 # Must mirror experiments.build_context_length_dataset.MODELS exactly.
 BUILD_CATALOG: List[Tuple[str, str, str]] = [
-    ("autogluon/chronos-2-small",       "chronos2",     "Chronos2-Small"),
-    ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
-    ("Salesforce/moirai-2.0-R-small",   "moirai",       "Moirai2-Small"),
-    ("google/timesfm-2.5-200m-pytorch", "timesfm",      "TimesFM2.5-200M"),
-    ("ibm-research/patchtst-fm-r1",     "patchtst_fm",  "PatchTST-FM-R1"),
+    ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
+    # ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
+    ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
+    ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
+    ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
+    ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
+    ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
+    ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
 ]
 
 DATASET_ROOT   = "logs/experiments/context_length_dataset"

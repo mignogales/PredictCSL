@@ -121,7 +121,7 @@ LR_SCALING_RULE = "sqrt"
 # -- Multi-GPU configuration --------------------------------------------------
 DEVICES                = None          # None -> use all visible CUDA devices
 VRAM_BUDGET_GB_PER_DEVICE: Optional[List[float]] = None
-VRAM_BUDGET_DEFAULT_GB = 6.0
+VRAM_BUDGET_DEFAULT_GB = 22.0
 
 # -- Hyperparameter search space ----------------------------------------------
 # Non-overlapping patches: CONTEXT_LENGTH / patch_length tokens (must divide).
