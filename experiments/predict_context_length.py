@@ -191,6 +191,13 @@ def load_split_tensors(
     the network only has to learn curve *shape*, separately for each horizon.
     The raw (un-normalized) curve is kept for the regret metric.
 
+    NaN entries mark (window, horizon) points that the labeler could not serve
+    for a given series — either a model-specific context cap (e.g. Sundial,
+    TimeMoE) or a short/left-padded series whose genuine signal is shorter than
+    the window. These are *kept* (not dropped) and carried through as NaN; the
+    loss and the regret/argmin metrics mask them out per entry. Only series that
+    are entirely NaN (never labeled) are dropped.
+
     Returns:
         x_train:      (n_train, L, 1)
         y_train_norm: (n_train, n_windows, n_horizons)  z-scored target
@@ -217,16 +224,30 @@ def load_split_tensors(
             f"{curves.shape}. Re-run build_context_length_dataset.py with "
             "the multi-horizon labeler.")
 
-    # Drop series whose ablation surface has any NaN (incomplete shard).
-    valid = ~np.isnan(curves).any(axis=(1, 2))
+    # Treat any non-finite curve point (NaN from unservable windows, or inf from
+    # overflowed errors in older pools) as an unlabeled point -> NaN, masked
+    # downstream. Also drop series with a non-finite context, which would
+    # otherwise inject NaN straight into the network input (unmasked).
+    curves = curves.astype(np.float32, copy=False)
+    curves[~np.isfinite(curves)] = np.nan
+    ctx_ok = np.isfinite(contexts).all(axis=1)
+    surface_ok = ~np.isnan(curves).all(axis=(1, 2))   # at least one labeled point
+    valid = ctx_ok & surface_ok
+    n_dropped = int((~valid).sum())
+    if n_dropped:
+        print(f"  load_split_tensors: dropping {n_dropped} series "
+              f"({int((~ctx_ok).sum())} non-finite context, "
+              f"{int((~surface_ok).sum())} all-NaN curve).")
     contexts = contexts[valid].astype(np.float32, copy=False)
-    curves = curves[valid].astype(np.float32, copy=False)
+    curves = curves[valid]
     if contexts.shape[0] == 0:
-        raise RuntimeError("No fully-labeled series in dataset.")
+        raise RuntimeError("No labeled series in dataset.")
 
-    # Per-(series, horizon) z-score along the windows axis.
-    mu = curves.mean(axis=1, keepdims=True)                  # (N, 1, n_h)
-    sd = curves.std(axis=1, keepdims=True)
+    # Per-(series, horizon) z-score along the windows axis, ignoring NaN points.
+    # NaN entries stay NaN in curves_norm and are masked in the loss / metrics.
+    with np.errstate(invalid="ignore"):
+        mu = np.nanmean(curves, axis=1, keepdims=True)       # (N, 1, n_h)
+        sd = np.nanstd(curves, axis=1, keepdims=True)
     curves_norm = (curves - mu) / (sd + 1e-8)
 
     n = contexts.shape[0]
@@ -398,10 +419,14 @@ def compute_dual_loss(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Combined dual-objective loss.
 
-    Curve loss is MSE over the z-scored target curve. Reconstruction loss is
+    Curve loss is MSE over the z-scored target curve, masking NaN windows
+    (points the labeler could not serve for this series). Reconstruction loss is
     MSE over MASKED patches only (visible patches are trivially identity).
     """
-    curve_mse = F.mse_loss(curve_pred, curve_target)
+    curve_valid = ~torch.isnan(curve_target)
+    target_safe = torch.nan_to_num(curve_target, nan=0.0)
+    sq = (curve_pred - target_safe).pow(2) * curve_valid.float()
+    curve_mse = sq.sum() / curve_valid.float().sum().clamp_min(1.0)
 
     if mask.any():
         sq_err = (recon_pred - original_patches).pow(2)
@@ -571,6 +596,7 @@ def _evaluate(
     n_horizons = y_val_norm.shape[2]
 
     curve_sum = torch.zeros((), device=device)
+    curve_count = torch.zeros((), device=device)
     recon_sum = torch.zeros((), device=device)
     regret_sum = torch.zeros((), device=device)
     acc_sum   = torch.zeros((), device=device)
@@ -606,24 +632,34 @@ def _evaluate(
                 curve_pred, recon_pred, orig, used_mask = model(
                     x, horizon_idx=h_idx_batch, mask=mask)
 
-                curve_sum = curve_sum + F.mse_loss(curve_pred, yn, reduction="sum")
+                # Mask NaN windows (unservable points) in the curve MSE.
+                cvalid = ~torch.isnan(yn)
+                yn_safe = torch.nan_to_num(yn, nan=0.0)
+                curve_sum = curve_sum + (
+                    (curve_pred - yn_safe).pow(2) * cvalid.float()).sum()
+                curve_count = curve_count + cvalid.float().sum()
 
                 if h_idx_val == 0 and used_mask.any():
                     sq_err = (recon_pred - orig).pow(2).mean(dim=-1)
                     recon_sum = recon_sum + (sq_err * used_mask.float()).sum()
                     n_recon += int(used_mask.float().sum().item())
 
-                pred_arg = curve_pred.argmin(dim=1)
-                true_arg = yr.argmin(dim=1)
-                best_err   = yr[idx_b, true_arg]
-                chosen_err = yr[idx_b, pred_arg]
+                # Restrict argmin to servable windows: invalid points get +inf so
+                # neither the oracle nor the predictor can select them.
+                rvalid = ~torch.isnan(yr)
+                yr_inf = torch.where(rvalid, yr, torch.full_like(yr, float("inf")))
+                pred_inf = torch.where(
+                    rvalid, curve_pred, torch.full_like(curve_pred, float("inf")))
+                pred_arg = pred_inf.argmin(dim=1)
+                true_arg = yr_inf.argmin(dim=1)
+                best_err   = yr_inf[idx_b, true_arg]
+                chosen_err = yr_inf[idx_b, pred_arg]
                 regret_sum = regret_sum + (
                     (chosen_err - best_err) / best_err.clamp_min(1e-8)).sum()
                 acc_sum = acc_sum + (pred_arg - true_arg).abs().le(1).float().sum()
 
-    n_curve = max(n_val * n_windows * n_horizons, 1)
     n_arg   = max(n_val * n_horizons, 1)
-    curve_mse = (curve_sum / n_curve).item()
+    curve_mse = (curve_sum / curve_count.clamp_min(1.0)).item()
     recon_mse = (recon_sum / max(n_recon, 1)).item()
     combined  = LAMBDA_CURVE * curve_mse + LAMBDA_RECON * recon_mse
     return {

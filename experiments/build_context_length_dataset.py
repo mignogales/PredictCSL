@@ -94,10 +94,23 @@ HORIZON_GRID = [16, 32, 64, 128, 512, 1024]
 MAX_HORIZON  = max(HORIZON_GRID)
 
 # -- Dataset size -------------------------------------------------------------
-N_SERIES   = 100_000
+N_SERIES   = 50_000
 SEED       = 42
 BATCH_SIZE = 32              # TSFM inference batch size
 SHARD_SIZE = 500             # series per shard (parallelism + resume granularity)
+
+# -- Short / padded series ----------------------------------------------------
+# A fraction of series mimic real-world short inputs: the genuine signal occupies
+# only the last `real_len` samples of the context pool and the leading
+# MAX_WINDOW - real_len samples are left-padded with zeros. This puts padded
+# inputs into the predictor's training distribution so it is robust at inference
+# to series shorter than MAX_WINDOW (which are left-padded identically).
+#   - real_len ~ Uniform[MIN_REAL_LEN, MAX_WINDOW)  (i.e. padding amount uniform)
+#   - ablation windows W > real_len are left as NaN (the window cannot be served
+#     without feeding padding), exactly mirroring the real GiftEval ablation,
+#     which skips instances whose context_length < window_size.
+PAD_FRAC     = 0.10          # fraction of series that are short / left-padded
+MIN_REAL_LEN = 500           # shortest genuine-signal length for a padded series
 
 # -- Non-stationarity controls ------------------------------------------------
 # Rebalanced: 50% single-regime removed in favour of richer multi-regime series.
@@ -203,32 +216,40 @@ def _sample_ar_coefficients(rng: np.random.RandomState) -> Optional[np.ndarray]:
             c2 = -(r ** 2)
             coeffs = np.array([c1, c2])
         else:
-            # Real roots: two independent persistence levels
+            # Real roots: two independent persistence levels.
+            # For poles p1,p2 the stable AR coeffs are c1=p1+p2, c2=-p1*p2
+            # (filter denom a=[1,-c1,-c2] -> char poly z^2 - c1 z - c2 with
+            # roots p1,p2). The previous signs put a pole outside the unit
+            # circle (|pole|>1), causing exponential blow-up over the series.
             r1 = rng.uniform(0.2, 0.95)
             r2 = rng.uniform(0.2, 0.95)
-            c1 = -(r1 + r2)
-            c2 = r1 * r2
+            c1 = r1 + r2
+            c2 = -(r1 * r2)
             coeffs = np.array([c1, c2])
 
     else:  # p == 3
         # AR(3): Complex dynamics; mix of real and complex roots
         if rng.uniform() < 0.50:
-            # One real root + one complex conjugate pair
+            # One real root + one complex conjugate pair r_complex*e^(±iω).
+            # Stable coeffs from elementary symmetric fns of the poles:
+            #   c1 = e1, c2 = -e2, c3 = e3.
             r_real = rng.uniform(0.3, 0.90)
             r_complex = rng.uniform(0.6, 0.95)
             omega = rng.uniform(0.1 * np.pi, 0.8 * np.pi)
-            c1 = -(r_real + 2 * r_complex * np.cos(omega))
-            c2 = 2 * r_real * r_complex * np.cos(omega) + r_complex ** 2
-            c3 = -(r_real * r_complex ** 2)
+            two_re = 2 * r_complex * np.cos(omega)
+            r2c = r_complex ** 2
+            c1 = r_real + two_re
+            c2 = -(r_real * two_re + r2c)
+            c3 = r_real * r2c
             coeffs = np.array([c1, c2, c3])
         else:
-            # Three real roots
+            # Three real roots: c1=Σp, c2=-Σpairwise, c3=Πp (stable poles).
             r1 = rng.uniform(0.3, 0.90)
             r2 = rng.uniform(0.3, 0.90)
             r3 = rng.uniform(0.3, 0.90)
-            c1 = -(r1 + r2 + r3)
-            c2 = r1*r2 + r1*r3 + r2*r3
-            c3 = -(r1 * r2 * r3)
+            c1 = r1 + r2 + r3
+            c2 = -(r1*r2 + r1*r3 + r2*r3)
+            c3 = r1 * r2 * r3
             coeffs = np.array([c1, c2, c3])
 
     return coeffs
@@ -320,7 +341,7 @@ def _sample_cut_points(
 
 
 def _generate_synthetic_series(
-    rng: np.random.RandomState, total_length: int
+    rng: np.random.RandomState, total_length: int, pad_len: int = 0
 ) -> Tuple[np.ndarray, int]:
     """Build one synthetic series with injected non-stationarity.
 
@@ -332,8 +353,15 @@ def _generate_synthetic_series(
         uniformly in [0, TRANSITION_MAX]) that preserves high-frequency
         structure while smoothing the mean-level jump.
 
+    If ``pad_len > 0`` the series is treated as a short input: the genuine
+    signal occupies only the last ``MAX_WINDOW - pad_len`` context samples
+    (plus the horizon) and the leading ``pad_len`` samples are zeroed out as
+    left-padding before standardization (so they map to a constant, matching
+    the inference path).
+
     Returns:
-        series: float32 (total_length,), standardized by context-pool stats.
+        series: float32 (total_length,), standardized by the full-context
+            stats; left-padded when pad_len > 0.
         n_segments: number of regimes.
     """
     n_seg = int(rng.choice(N_SEGMENT_CHOICES))
@@ -382,8 +410,18 @@ def _generate_synthetic_series(
 
         series = np.concatenate(parts).astype(np.float32)
 
-    # Standardize using ONLY the observed context pool (no horizon leakage).
-    ctx = series[:MAX_WINDOW]
+    # Zero the left-padding (if any) in raw space, then standardize using the
+    # full observed context (no horizon leakage). This matches the inference
+    # path exactly — test_window_ablation_gifteval_v5._prepare_predictor_inputs
+    # zero-pads then computes mu/sigma over the whole context_length vector, so
+    # the padded region maps to the constant -mu/sigma rather than exactly 0.
+    if pad_len > 0:
+        series[:pad_len] = 0.0
+    # Guard against rare AR/lfilter blow-ups: sanitize non-finite values and
+    # compute the standardization stats in float64 so squaring large-but-finite
+    # values does not overflow float32 (which would yield an all-NaN series).
+    series = np.nan_to_num(series, nan=0.0, posinf=0.0, neginf=0.0)
+    ctx = series[:MAX_WINDOW].astype(np.float64)
     mu, sigma = float(ctx.mean()), float(ctx.std())
     series = (series - mu) / (sigma + 1e-8)
     return series.astype(np.float32, copy=False), n_seg
@@ -391,27 +429,41 @@ def _generate_synthetic_series(
 
 def generate_dataset(
     n_series: int, seed: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Materialize the synthetic pool (parent process, serial).
 
+    A PAD_FRAC fraction of series are short / left-padded: their genuine signal
+    occupies only the last `real_len` context samples (real_len uniform in
+    [MIN_REAL_LEN, MAX_WINDOW)) and the leading samples are zeroed.
+
     Returns:
-        contexts:   (n_series, MAX_WINDOW)   float32  -- predictor input
-        targets:    (n_series, MAX_HORIZON)  float32  -- forecast target
-        n_segments: (n_series,)              int32
+        contexts:     (n_series, MAX_WINDOW)   float32  -- predictor input
+        targets:      (n_series, MAX_HORIZON)  float32  -- forecast target
+        n_segments:   (n_series,)              int32
+        real_lengths: (n_series,)              int32    -- genuine-signal length
+                          in the context (MAX_WINDOW for non-padded series)
     """
     total_length = MAX_WINDOW + MAX_HORIZON
     contexts = np.empty((n_series, MAX_WINDOW), dtype=np.float32)
     targets = np.empty((n_series, MAX_HORIZON), dtype=np.float32)
     n_segments = np.empty((n_series,), dtype=np.int32)
+    real_lengths = np.empty((n_series,), dtype=np.int32)
 
     for i in tqdm(range(n_series), desc="  Generating series", leave=False):
         rng = np.random.RandomState(seed + i)
-        series, n_seg = _generate_synthetic_series(rng, total_length)
+        # Decide short/padded status first so the RNG stream is deterministic.
+        if rng.uniform() < PAD_FRAC:
+            real_len = int(rng.randint(MIN_REAL_LEN, MAX_WINDOW))
+        else:
+            real_len = MAX_WINDOW
+        pad_len = MAX_WINDOW - real_len
+        series, n_seg = _generate_synthetic_series(rng, total_length, pad_len=pad_len)
         contexts[i] = series[:MAX_WINDOW]
         targets[i] = series[MAX_WINDOW:MAX_WINDOW + MAX_HORIZON]
         n_segments[i] = n_seg
+        real_lengths[i] = real_len
 
-    return contexts, targets, n_segments
+    return contexts, targets, n_segments, real_lengths
 
 
 # ==============================================================================
@@ -662,6 +714,7 @@ def gpu_worker(
     model_dir: str,
     contexts_path: str,
     targets_path: str,
+    real_lengths_path: str,
     model_id: str,
     family: str,
     max_horizon: int,
@@ -704,6 +757,8 @@ def gpu_worker(
                 np.load(contexts_path, mmap_mode="r")[start:end])
             tgt = np.ascontiguousarray(
                 np.load(targets_path, mmap_mode="r")[start:end])
+            real_len = np.ascontiguousarray(
+                np.load(real_lengths_path, mmap_mode="r")[start:end])  # (B,)
             tgt_t = torch.from_numpy(tgt).to(device)        # (B, MAX_HORIZON)
 
             cm = np.full((end - start, n_win, n_h), np.nan, dtype=np.float32)
@@ -721,6 +776,14 @@ def gpu_worker(
                     err = medians[:, :h] - tgt_t[:, :h]
                     cm[:, w_idx, h_idx] = err.abs().mean(dim=1).cpu().numpy()
                     cs[:, w_idx, h_idx] = err.pow(2).mean(dim=1).cpu().numpy()
+                # Short/padded series: a window wider than the genuine signal
+                # would feed left-padding to the model. That (window, *) point
+                # cannot be served, so mark it NaN (mirrors the real GiftEval
+                # ablation, which skips instances with context_length < window).
+                too_short = real_len < w
+                if too_short.any():
+                    cm[too_short, w_idx, :] = np.nan
+                    cs[too_short, w_idx, :] = np.nan
 
             sd = _shard_dir(model_dir, shard_id)
             os.makedirs(sd, exist_ok=True)
@@ -858,6 +921,7 @@ def main() -> None:
     contexts_path = os.path.join(OUTPUT_ROOT, "contexts.npy")
     targets_path  = os.path.join(OUTPUT_ROOT, "targets.npy")
     nseg_path     = os.path.join(OUTPUT_ROOT, "n_segments.npy")
+    rlen_path     = os.path.join(OUTPUT_ROOT, "real_lengths.npy")
 
     if os.path.isfile(contexts_path):
         n_series = int(np.load(contexts_path, mmap_mode="r").shape[0])
@@ -865,10 +929,12 @@ def main() -> None:
         print(Fore.CYAN + f"Found existing pool: {n_series} series" + Fore.RESET)
     else:
         n_series = args.n_series
-        contexts, targets, n_segments = generate_dataset(n_series, SEED)
+        contexts, targets, n_segments, real_lengths = generate_dataset(n_series, SEED)
         np.save(contexts_path, contexts)
         np.save(targets_path, targets)
         np.save(nseg_path, n_segments)
+        np.save(rlen_path, real_lengths)
+        n_padded = int((real_lengths < MAX_WINDOW).sum())
         del contexts, targets
         with open(os.path.join(OUTPUT_ROOT, "meta.json"), "w") as f:
             json.dump({
@@ -884,9 +950,17 @@ def main() -> None:
                 "spike_prob": SPIKE_PROB,
                 "spike_rate_range": list(SPIKE_RATE_RANGE),
                 "spike_std": SPIKE_STD,
+                "pad_frac": PAD_FRAC, "min_real_len": MIN_REAL_LEN,
+                "n_padded": n_padded,
                 "created": datetime.now().isoformat(timespec="seconds"),
             }, f, indent=2)
-        print(Fore.GREEN + f"Generated synthetic pool: {n_series} series" + Fore.RESET)
+        print(Fore.GREEN + f"Generated synthetic pool: {n_series} series "
+              + f"({n_padded} short/padded)" + Fore.RESET)
+
+    # Defensive: an older pool may predate real_lengths.npy. Treat all series as
+    # full-length (no padding) so labeling stays backward-compatible.
+    if not os.path.isfile(rlen_path):
+        np.save(rlen_path, np.full((n_series,), MAX_WINDOW, dtype=np.int32))
 
     # ---------- Label with each model (or just the one requested) -----------
     models_to_run = MODELS if args.model_idx is None else [MODELS[args.model_idx]]
@@ -925,7 +999,8 @@ def main() -> None:
                 p = ctx.Process(
                     target=gpu_worker,
                     args=(i, dev, shard_queue, result_queue, model_dir,
-                          contexts_path, targets_path, model_id, family,
+                          contexts_path, targets_path, rlen_path,
+                          model_id, family,
                           MAX_HORIZON, args.batch_size, win_indices),
                     name=f"gpu_worker_{i}_{dev.replace(':', '')}",
                 )
