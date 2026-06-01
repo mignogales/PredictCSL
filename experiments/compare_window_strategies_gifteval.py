@@ -1343,7 +1343,7 @@ def plot_per_dataset_bars(df: pd.DataFrame, out_dir: str) -> List[str]:
         )):
             for xoff, raw in [(-w, fo), (0, bo), (w, po)]:
                 if raw > clip_hi:
-                    ax.text(xi + xoff, clip_hi * 1.01, f"▲{raw:.0f}",
+                    ax.text(xi + xoff, clip_hi * 1.01, f"▲{raw:.2f}",
                             ha="center", va="bottom", fontsize=6, color="darkred", rotation=90)
                 else:
                     bar_h = raw
