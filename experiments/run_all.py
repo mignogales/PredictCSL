@@ -68,7 +68,6 @@ from colorama import Fore
 # expects. Comment out a row to skip that family end-to-end.
 MODELS_TO_RUN: List[Tuple[str, str, str]] = [
     ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
-    # ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
     ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
     ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
     ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
@@ -81,7 +80,6 @@ MODELS_TO_RUN: List[Tuple[str, str, str]] = [
 # Must mirror experiments.build_context_length_dataset.MODELS exactly.
 BUILD_CATALOG: List[Tuple[str, str, str]] = [
     ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
-    # ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
     ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
     ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
     ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
