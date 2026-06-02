@@ -93,12 +93,16 @@ ABLATION_ROOT  = "logs/experiments/window_ablation_gifteval"
 ABLATION_GENERAL = os.path.join(ABLATION_ROOT, "general")
 
 
-def _model_idx(family: str) -> int:
-    for i, (_, fam, _) in enumerate(BUILD_CATALOG):
-        if fam == family:
+def _model_idx(display: str) -> int:
+    # Match on the unique display name, not the family — families are shared
+    # across variants (e.g. Chronos2-Small and Chronos2-Synth both have family
+    # "chronos2"), so a family lookup would be ambiguous and return the wrong
+    # build index for the second variant.
+    for i, (_, _, disp) in enumerate(BUILD_CATALOG):
+        if disp == display:
             return i
     raise ValueError(
-        f"Family {family!r} not in BUILD_CATALOG — keep MODELS_TO_RUN aligned "
+        f"Display {display!r} not in BUILD_CATALOG — keep MODELS_TO_RUN aligned "
         "with experiments/build_context_length_dataset.py MODELS."
     )
 
@@ -120,8 +124,8 @@ def _run(cmd: Sequence[str], stage: str) -> None:
     print(Fore.GREEN + f"  ✓ stage {stage} done in {dt:.1f}s" + Fore.RESET)
 
 
-def stage_1_build(family: str, extra: Sequence[str]) -> None:
-    idx = _model_idx(family)
+def stage_1_build(display: str, family: str, extra: Sequence[str]) -> None:
+    idx = _model_idx(display)
     _run(
         [sys.executable, "-m", "experiments.build_context_length_dataset",
          "--model-idx", str(idx), *extra],
@@ -129,8 +133,8 @@ def stage_1_build(family: str, extra: Sequence[str]) -> None:
     )
 
 
-def stage_2_predictor(family: str, extra: Sequence[str]) -> None:
-    dataset_dir = os.path.join(DATASET_ROOT, family)
+def stage_2_predictor(display: str, family: str, extra: Sequence[str]) -> None:
+    dataset_dir = os.path.join(DATASET_ROOT, display)
     _run(
         [sys.executable, "-m", "experiments.predict_context_length",
          "--dataset-dir", dataset_dir, *extra],
@@ -139,7 +143,7 @@ def stage_2_predictor(family: str, extra: Sequence[str]) -> None:
 
 
 def stage_3_ablation(display: str, family: str, extra: Sequence[str]) -> None:
-    predictor_dir = os.path.join(PREDICTOR_ROOT, family)
+    predictor_dir = os.path.join(PREDICTOR_ROOT, display)
     _run(
         [sys.executable, "-m", "experiments.test_window_ablation_gifteval_v5",
          "--models", display,
@@ -175,10 +179,10 @@ STAGES = {
 #  `summary` is shown to the user so they know what was cached. These checks
 #  are intentionally cheap: a few stat() calls and one JSON read per stage.
 
-def _done_stage_1(family: str, *_unused) -> Tuple[bool, str]:
-    """Stage 1 is done when every labeling shard for this family is on disk.
+def _done_stage_1(family: str, display: str = "") -> Tuple[bool, str]:
+    """Stage 1 is done when every labeling shard for this model is on disk.
     meta.json carries shards_done / shards_total — written each invocation."""
-    meta_path = os.path.join(DATASET_ROOT, family, "meta.json")
+    meta_path = os.path.join(DATASET_ROOT, display, "meta.json")
     if not os.path.isfile(meta_path):
         return False, "no meta.json"
     try:
@@ -193,11 +197,11 @@ def _done_stage_1(family: str, *_unused) -> Tuple[bool, str]:
     return False, f"{done}/{total} shards"
 
 
-def _done_stage_2(family: str, *_unused) -> Tuple[bool, str]:
+def _done_stage_2(family: str, display: str = "") -> Tuple[bool, str]:
     """Stage 2 is done when the predictor's final artefacts are persisted.
     Trials are sweep-internal cache; what downstream stages need is
     best_model.pt + best_config.json."""
-    fdir = os.path.join(PREDICTOR_ROOT, family)
+    fdir = os.path.join(PREDICTOR_ROOT, display)
     have_model = os.path.isfile(os.path.join(fdir, "best_model.pt"))
     have_cfg   = os.path.isfile(os.path.join(fdir, "best_config.json"))
     trial_dir  = os.path.join(fdir, "trials")
@@ -326,9 +330,9 @@ def main() -> None:
                   + Fore.RESET)
         extras = extras_by_stage[sid]
         if sid == "1":
-            stage_1_build(family, extras)
+            stage_1_build(display, family, extras)
         elif sid == "2":
-            stage_2_predictor(family, extras)
+            stage_2_predictor(display, family, extras)
         elif sid == "3":
             stage_3_ablation(display, family, extras)
         else:
