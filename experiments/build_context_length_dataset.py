@@ -698,8 +698,12 @@ def forecast_window(
 #  GPU WORKER  (one process per device, drains a shard queue)
 # ==============================================================================
 
-def _model_dir(family: str) -> str:
-    return os.path.join(OUTPUT_ROOT, family)
+def _model_dir(display: str) -> str:
+    # Key the output folder on the unique display name (e.g. "Chronos2-Small"),
+    # not the family — families are shared across model variants (e.g.
+    # chronos-2-small and chronos-2-synth both map to family "chronos2") and
+    # would collide on disk.
+    return os.path.join(OUTPUT_ROOT, display)
 
 
 def _shard_dir(model_dir: str, shard_id: int) -> str:
@@ -969,7 +973,7 @@ def main() -> None:
           + Fore.RESET)
 
     for model_id, family, display in models_to_run:
-        model_dir = _model_dir(family)
+        model_dir = _model_dir(display)
         os.makedirs(model_dir, exist_ok=True)
         print(Fore.CYAN + f"\n── {display} ({model_id}) ──" + Fore.RESET)
         print(Fore.CYAN + f"   windows={grid}  shard_size={args.shard_size}" + Fore.RESET)
