@@ -1248,6 +1248,12 @@ def main() -> None:
                   + f"({n_received}/{n_expected})." + Fore.RESET)
             continue
         fresh_results.append(r); n_received += 1
+        # Flush this trial's JSON immediately so an interrupted sweep can resume
+        # from it. The durable weights (trial_NNN_best.pt) are written by the
+        # worker, but _load_trial_result keys resume on the JSON — without this
+        # incremental save the JSONs only land at the end (_persist_artifacts),
+        # so a crash mid-sweep loses all cached trials and restarts from zero.
+        _save_trial_result(run_label, r["trial_idx"], r)
         _write_sweep_progress(run_dir, len(cached_results) + n_received, N_TRIALS)
 
     print(Fore.MAGENTA + f"  Sweep wall-clock: "
