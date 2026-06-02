@@ -143,6 +143,10 @@ MODELS = [
     ("ibm-research/patchtst-fm-r1",     "patchtst_fm",  "PatchTST-FM-R1"),
     ("thuml/sundial-base-128m",         "sundial",      "Sundial-Base-128M"),
     ("Maple728/TimeMoE-200M",           "timemoe",      "TimeMoE-200M"),
+    # Distinct checkpoint, same chronos2 architecture/loader (load_chronos2) —
+    # only the weights differ. Appended (not inserted) so existing --model-idx
+    # positions stay stable for direct CLI use.
+    ("autogluon/chronos-2-synth",       "chronos2",     "Chronos2-Synth"),
 ]
 
 # -- Quantile bookkeeping (per model family) ----------------------------------
