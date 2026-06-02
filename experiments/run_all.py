@@ -86,6 +86,10 @@ MODELS_TO_RUN: List[Tuple[str, str, str]] = [
 DATASET_ROOT   = "logs/experiments/context_length_dataset"
 PREDICTOR_ROOT = "logs/experiments/context_length_predictor"
 ABLATION_ROOT  = "logs/experiments/window_ablation_gifteval"
+# Per-stage subprocess output is captured here in quiet mode (the default), so
+# the terminal shows only the top-level tqdm bar. One log per (model, stage);
+# overwritten on each run. Tail is surfaced if a stage fails.
+RUN_LOG_ROOT   = "logs/experiments/run_all_logs"
 # Shared, cross-model gifteval ablation output (stage 3). One folder for every
 # model — v5 keys its artefacts by (dataset, model_short), so models coexist
 # here without collision and share the dataset cache + naive baselines.
@@ -113,13 +117,22 @@ def _model_idx(model_id: str, display: str) -> int:
 
 
 # Overall progress bar (set in main). Orchestrator-level messages are routed
-# through _emit so they print *above* the bar instead of clobbering it; the
-# subprocess output of each stage still streams raw and will scroll the bar,
-# which tqdm redraws on the next update.
+# through _emit so they print *above* the bar instead of clobbering it.
+#
+# Quiet mode (the default) captures each subprocess's stdout/stderr to a log
+# file under RUN_LOG_ROOT and suppresses informational orchestrator chatter, so
+# the terminal shows only the top-level tqdm bar (model · stage). Pass
+# --verbose to restore the old behaviour: subprocess output streams raw to the
+# terminal and every banner / command echo is printed.
 _BAR: "tqdm | None" = None
+_QUIET: bool = True
 
 
-def _emit(msg: str) -> None:
+def _emit(msg: str, level: str = "info") -> None:
+    # In quiet mode only warnings/errors reach the terminal; "info" chatter is
+    # swallowed so the bar stands alone.
+    if _QUIET and level == "info":
+        return
     if _BAR is not None:
         _BAR.write(msg)
     else:
@@ -131,56 +144,91 @@ def _banner(text: str) -> None:
     _emit(Fore.CYAN + f"\n{bar}\n  {text}\n{bar}" + Fore.RESET)
 
 
-def _run(cmd: Sequence[str], stage: str) -> None:
-    """Subprocess wrapper: stream output, raise on non-zero."""
-    _emit(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
+def _tail(path: str, n: int = 40) -> str:
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-n:])
+    except OSError:
+        return "(log unavailable)"
+
+
+def _run(cmd: Sequence[str], stage: str, display: str) -> float:
+    """Subprocess wrapper: run a stage, raise on non-zero. Returns wall time.
+
+    Quiet mode: redirect the child's stdout+stderr to a per-(model, stage) log
+    file and stay silent unless it fails, in which case the log tail is shown.
+    Verbose mode: echo the command and stream the child's output to the terminal.
+    """
     t0 = time.perf_counter()
+    if _QUIET:
+        os.makedirs(RUN_LOG_ROOT, exist_ok=True)
+        safe = f"{display}_{stage.replace('/', '-')}".replace(" ", "_")
+        log_path = os.path.join(RUN_LOG_ROOT, f"{safe}.log")
+        with open(log_path, "w") as lf:
+            res = subprocess.run(cmd, check=False, stdout=lf,
+                                 stderr=subprocess.STDOUT)
+        dt = time.perf_counter() - t0
+        if res.returncode != 0:
+            _emit(
+                Fore.RED
+                + f"  ✗ stage {stage} ({display}) failed (exit {res.returncode}) "
+                  f"after {dt:.1f}s — last lines of {log_path}:\n"
+                + _tail(log_path) + Fore.RESET,
+                level="error",
+            )
+            raise RuntimeError(
+                f"Stage {stage} failed (exit {res.returncode}) after {dt:.1f}s. "
+                f"See {log_path}.")
+        return dt
+
+    _emit(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
     res = subprocess.run(cmd, check=False)
     dt = time.perf_counter() - t0
     if res.returncode != 0:
         raise RuntimeError(
             f"Stage {stage} failed (exit {res.returncode}) after {dt:.1f}s.")
     _emit(Fore.GREEN + f"  ✓ stage {stage} done in {dt:.1f}s" + Fore.RESET)
+    return dt
 
 
 def stage_1_build(model_id: str, display: str, family: str,
-                  extra: Sequence[str]) -> None:
+                  extra: Sequence[str]) -> float:
     idx = _model_idx(model_id, display)
-    _run(
+    return _run(
         [sys.executable, "-m", "experiments.build_context_length_dataset",
          "--model-idx", str(idx), *extra],
-        stage="1/build",
+        stage="1/build", display=display,
     )
 
 
-def stage_2_predictor(display: str, family: str, extra: Sequence[str]) -> None:
+def stage_2_predictor(display: str, family: str, extra: Sequence[str]) -> float:
     dataset_dir = os.path.join(DATASET_ROOT, display)
-    _run(
+    return _run(
         [sys.executable, "-m", "experiments.predict_context_length",
          "--dataset-dir", dataset_dir, *extra],
-        stage="2/predictor",
+        stage="2/predictor", display=display,
     )
 
 
-def stage_3_ablation(display: str, family: str, extra: Sequence[str]) -> None:
+def stage_3_ablation(display: str, family: str, extra: Sequence[str]) -> float:
     predictor_dir = os.path.join(PREDICTOR_ROOT, display)
-    _run(
+    return _run(
         [sys.executable, "-m", "experiments.test_window_ablation_gifteval_v5",
          "--models", display,
          "--predictor-dir", predictor_dir,
          "--cache-root", ABLATION_GENERAL, *extra],
-        stage="3/ablation",
+        stage="3/ablation", display=display,
     )
 
 
-def stage_4_compare(display: str, family: str, extra: Sequence[str]) -> None:
+def stage_4_compare(display: str, family: str, extra: Sequence[str]) -> float:
     out_dir = os.path.join(ABLATION_ROOT, display, "strategy_comparison")
-    _run(
+    return _run(
         [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
          "--run-dir", ABLATION_GENERAL,
          "--models", display,
          "--output-dir", out_dir, *extra],
-        stage="4/compare",
+        stage="4/compare", display=display,
     )
 
 
@@ -288,6 +336,12 @@ def parse_args() -> argparse.Namespace:
               "Pass stage numbers (e.g. --force 2 3) or use --force with no "
               "argument to force every active stage."),
     )
+    p.add_argument(
+        "-v", "--verbose", action="store_true",
+        help=("Stream each stage's subprocess output to the terminal (old "
+              "behaviour). Default is quiet: only the top-level tqdm bar shows, "
+              f"and per-stage output is captured under {RUN_LOG_ROOT}/."),
+    )
     # Pass-through extras per stage.
     for sid, (name, _) in STAGES.items():
         p.add_argument(
@@ -299,6 +353,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    global _QUIET
+    _QUIET = not args.verbose
 
     if args.only_stages and args.skip_stages:
         raise SystemExit("Use either --skip-stages or --only-stages, not both.")
@@ -336,6 +393,8 @@ def main() -> None:
         name = STAGES[sid][0]
         done, summary = DONE_CHECKS[sid](family, display)
         if done and sid not in forced:
+            if _BAR is not None:
+                _BAR.set_postfix_str(f"cached ({summary})")
             _emit(Fore.WHITE
                   + f"  · stage {sid}/{name} cached ({summary}) — skipping"
                   + Fore.RESET)
@@ -348,15 +407,19 @@ def main() -> None:
             _emit(Fore.CYAN
                   + f"  → stage {sid}/{name} — {summary}"
                   + Fore.RESET)
+        if _BAR is not None:
+            _BAR.set_postfix_str("running")
         extras = extras_by_stage[sid]
         if sid == "1":
-            stage_1_build(model_id, display, family, extras)
+            dt = stage_1_build(model_id, display, family, extras)
         elif sid == "2":
-            stage_2_predictor(display, family, extras)
+            dt = stage_2_predictor(display, family, extras)
         elif sid == "3":
-            stage_3_ablation(display, family, extras)
+            dt = stage_3_ablation(display, family, extras)
         else:
-            stage_4_compare(display, family, extras)
+            dt = stage_4_compare(display, family, extras)
+        if _BAR is not None:
+            _BAR.set_postfix_str(f"done in {dt:.1f}s")
 
     # One overall bar across every (model × active stage) unit of work. Its
     # description names the model + stage currently in flight so a long run is
