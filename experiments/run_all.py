@@ -61,24 +61,19 @@ import time
 from typing import Callable, List, Sequence, Tuple
 
 from colorama import Fore
+from tqdm.auto import tqdm
+
+# Authoritative model catalog. --model-idx for stage 1 indexes into THIS list,
+# so we resolve indices from it directly rather than from a hand-copied mirror.
+from experiments.build_context_length_dataset import MODELS as BUILD_MODELS
 
 
-# Master catalog: (model_id, family, display). Order MUST match the MODELS
-# list in build_context_length_dataset.py — the index is what --model-idx
-# expects. Comment out a row to skip that family end-to-end.
+# Master catalog: (model_id, family, display). Order is free — stage 1 resolves
+# --model-idx by matching model_id against build_context_length_dataset.MODELS
+# (see _model_idx), so reordering or renaming here can't mislabel a model.
+# Every model_id must exist in that build catalog. Comment out a row to skip a
+# family end-to-end.
 MODELS_TO_RUN: List[Tuple[str, str, str]] = [
-    ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
-    ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
-    ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
-    ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
-    ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
-    ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
-    ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
-]
-
-# Build script catalog — used to resolve --model-idx for stage 1.
-# Must mirror experiments.build_context_length_dataset.MODELS exactly.
-BUILD_CATALOG: List[Tuple[str, str, str]] = [
     ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
     ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
     ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
@@ -97,39 +92,60 @@ ABLATION_ROOT  = "logs/experiments/window_ablation_gifteval"
 ABLATION_GENERAL = os.path.join(ABLATION_ROOT, "general")
 
 
-def _model_idx(display: str) -> int:
-    # Match on the unique display name, not the family — families are shared
-    # across variants (e.g. Chronos2-Small and Chronos2-Synth both have family
-    # "chronos2"), so a family lookup would be ambiguous and return the wrong
-    # build index for the second variant.
-    for i, (_, _, disp) in enumerate(BUILD_CATALOG):
-        if disp == display:
+def _model_idx(model_id: str, display: str) -> int:
+    # Resolve --model-idx against the build script's OWN MODELS list (imported
+    # as BUILD_MODELS), keyed by the unique checkpoint id. This is the only safe
+    # key: --model-idx is positional into build's MODELS, so matching by id
+    # guarantees the index always points at the same checkpoint the build script
+    # will load — no hand-maintained mirror to drift out of sync. (Matching by
+    # display would break for variants whose display differs from build's, e.g.
+    # a synthetic-data variant reusing the same checkpoint.)
+    for i, (mid, _, _) in enumerate(BUILD_MODELS):
+        if mid == model_id:
             return i
+    available = "\n".join(
+        f"    [{i}] {mid}  ({disp})" for i, (mid, _, disp) in enumerate(BUILD_MODELS))
     raise ValueError(
-        f"Display {display!r} not in BUILD_CATALOG — keep MODELS_TO_RUN aligned "
-        "with experiments/build_context_length_dataset.py MODELS."
+        f"Model id {model_id!r} (display {display!r}) is not in "
+        f"experiments/build_context_length_dataset.py MODELS, so stage 1 cannot "
+        f"build it. Add it there first. Available checkpoints:\n{available}"
     )
+
+
+# Overall progress bar (set in main). Orchestrator-level messages are routed
+# through _emit so they print *above* the bar instead of clobbering it; the
+# subprocess output of each stage still streams raw and will scroll the bar,
+# which tqdm redraws on the next update.
+_BAR: "tqdm | None" = None
+
+
+def _emit(msg: str) -> None:
+    if _BAR is not None:
+        _BAR.write(msg)
+    else:
+        print(msg)
 
 
 def _banner(text: str) -> None:
     bar = "═" * 78
-    print(Fore.CYAN + f"\n{bar}\n  {text}\n{bar}" + Fore.RESET)
+    _emit(Fore.CYAN + f"\n{bar}\n  {text}\n{bar}" + Fore.RESET)
 
 
 def _run(cmd: Sequence[str], stage: str) -> None:
     """Subprocess wrapper: stream output, raise on non-zero."""
-    print(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
+    _emit(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
     t0 = time.perf_counter()
     res = subprocess.run(cmd, check=False)
     dt = time.perf_counter() - t0
     if res.returncode != 0:
         raise RuntimeError(
             f"Stage {stage} failed (exit {res.returncode}) after {dt:.1f}s.")
-    print(Fore.GREEN + f"  ✓ stage {stage} done in {dt:.1f}s" + Fore.RESET)
+    _emit(Fore.GREEN + f"  ✓ stage {stage} done in {dt:.1f}s" + Fore.RESET)
 
 
-def stage_1_build(display: str, family: str, extra: Sequence[str]) -> None:
-    idx = _model_idx(display)
+def stage_1_build(model_id: str, display: str, family: str,
+                  extra: Sequence[str]) -> None:
+    idx = _model_idx(model_id, display)
     _run(
         [sys.executable, "-m", "experiments.build_context_length_dataset",
          "--model-idx", str(idx), *extra],
@@ -316,25 +332,25 @@ def main() -> None:
     if forced:
         print(Fore.YELLOW + f"Forced re-runs: {sorted(forced)}" + Fore.RESET)
 
-    def _maybe_run(sid: str, family: str, display: str) -> None:
+    def _maybe_run(sid: str, model_id: str, family: str, display: str) -> None:
         name = STAGES[sid][0]
         done, summary = DONE_CHECKS[sid](family, display)
         if done and sid not in forced:
-            print(Fore.WHITE
+            _emit(Fore.WHITE
                   + f"  · stage {sid}/{name} cached ({summary}) — skipping"
                   + Fore.RESET)
             return
         if done and sid in forced:
-            print(Fore.YELLOW
+            _emit(Fore.YELLOW
                   + f"  ! stage {sid}/{name} cached ({summary}) but --force given — re-running"
                   + Fore.RESET)
         else:
-            print(Fore.CYAN
+            _emit(Fore.CYAN
                   + f"  → stage {sid}/{name} — {summary}"
                   + Fore.RESET)
         extras = extras_by_stage[sid]
         if sid == "1":
-            stage_1_build(display, family, extras)
+            stage_1_build(model_id, display, family, extras)
         elif sid == "2":
             stage_2_predictor(display, family, extras)
         elif sid == "3":
@@ -342,12 +358,27 @@ def main() -> None:
         else:
             stage_4_compare(display, family, extras)
 
+    # One overall bar across every (model × active stage) unit of work. Its
+    # description names the model + stage currently in flight so a long run is
+    # legible at a glance: "Chronos2-Small · 3/ablation".
+    ordered_stages = [s for s in ("1", "2", "3", "4") if s in active]
+    total_units = len(selected) * len(ordered_stages)
+
+    global _BAR
     t_start = time.perf_counter()
-    for model_id, family, display in selected:
-        _banner(f"{display}  ({family})  —  {model_id}")
-        for sid in ("1", "2", "3", "4"):
-            if sid in active:
-                _maybe_run(sid, family, display)
+    with tqdm(total=total_units, desc="pipeline", unit="stage",
+              dynamic_ncols=True) as bar:
+        _BAR = bar
+        try:
+            for model_id, family, display in selected:
+                _banner(f"{display}  ({family})  —  {model_id}")
+                for sid in ordered_stages:
+                    name = STAGES[sid][0]
+                    bar.set_description(f"{display} · {sid}/{name}")
+                    _maybe_run(sid, model_id, family, display)
+                    bar.update(1)
+        finally:
+            _BAR = None
 
     total = time.perf_counter() - t_start
     print(Fore.GREEN + f"\nAll done in {total/60:.1f} min." + Fore.RESET)
