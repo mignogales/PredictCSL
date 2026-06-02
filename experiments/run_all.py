@@ -182,17 +182,33 @@ def _save_duration(label: str, dt: float) -> None:
     os.replace(tmp, _durations_path())
 
 
-def _run(cmd: Sequence[str], stage: str, display: str) -> float:
+def _read_progress(path: str):
+    """Read {done, total} from a sweep_progress.json; returns (None, None) on any error."""
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return int(d["done"]), int(d["total"])
+    except (OSError, KeyError, ValueError, json.JSONDecodeError):
+        return None, None
+
+
+def _run(cmd: Sequence[str], stage: str, display: str,
+         progress_file: str = None) -> float:
     """Run one (model, stage) unit, raise on non-zero. Returns wall time.
 
-    Quiet mode (default): give *this* unit its own tqdm line — a live timer that
-    ticks while the child runs and persists (leave=True) showing ``✓ {secs}s``
-    when it finishes, so a full run leaves one bar per (stage, model). The
-    child's stdout+stderr are captured to a per-unit log file; on failure the
-    log tail is shown.
+    Quiet mode (default): each unit gets its own tqdm line that stays on screen
+    after finishing.  Two flavours:
 
-    Verbose mode: echo the command and stream the child's output to the terminal
-    (no per-unit bar — live output would clobber it).
+      progress_file set  — trial-count bar (n / total trials [elapsed<ETA]).
+                           The child writes sweep_progress.json after every trial;
+                           we poll it and call bar.update() so tqdm accumulates a
+                           real rate.  ETA appears after the first trial completes.
+
+      progress_file None — wall-clock bar using the cached duration from the
+                           previous run (seconds as the unit).  First ever run of
+                           a unit shows elapsed-only.
+
+    Verbose mode: raw subprocess output streams to the terminal (no bar).
     """
     label = f"{display} · {stage}"
     t0 = time.perf_counter()
@@ -211,36 +227,63 @@ def _run(cmd: Sequence[str], stage: str, display: str) -> float:
     safe = f"{display}_{stage.replace('/', '-')}".replace(" ", "_")
     log_path = os.path.join(RUN_LOG_ROOT, f"{safe}.log")
 
-    # If we've timed this exact unit before, drive a determinate bar whose total
-    # is the expected wall-clock — tqdm then renders a real ETA. Otherwise fall
-    # back to an indeterminate elapsed-only timer (no honest ETA possible yet).
-    expected = _load_durations().get(label)
+    # ---- choose bar style -----------------------------------------------
+    if progress_file is not None:
+        # Trial-count bar.  Total is read from the progress file once it
+        # appears; until then the bar is indeterminate.
+        done0, total0 = _read_progress(progress_file)
+        bar = tqdm(
+            total=total0, initial=done0 or 0,
+            desc=label, leave=True, unit="trial", dynamic_ncols=True,
+            bar_format=("{desc}  {n}/{total} trials"
+                        " |{bar}|  [{elapsed}<{remaining}]{postfix}"),
+        )
+    else:
+        # Wall-clock bar backed by the duration cache.
+        expected = _load_durations().get(label)
+        if expected and expected > 0:
+            bar = tqdm(
+                total=round(expected), desc=label, leave=True, unit="s",
+                dynamic_ncols=True,
+                bar_format=("{desc} {percentage:3.0f}%|{bar}|"
+                            " {n:.0f}/{total:.0f}s [{elapsed}<{remaining}]{postfix}"),
+            )
+        else:
+            bar = tqdm(
+                total=None, desc=label, leave=True, dynamic_ncols=True,
+                bar_format="{desc}  {elapsed} (first run — no ETA){postfix}",
+            )
 
     global _BAR
-    if expected and expected > 0:
-        bar = tqdm(total=round(expected), desc=label, leave=True, unit="s",
-                   dynamic_ncols=True,
-                   bar_format="{desc} {percentage:3.0f}%|{bar}| "
-                              "{n:.0f}/{total:.0f}s [{elapsed}<~{remaining}]{postfix}")
-    else:
-        bar = tqdm(total=None, desc=label, leave=True, dynamic_ncols=True,
-                   bar_format="{desc} … {elapsed} (first run — no ETA){postfix}")
-
     _BAR = bar
     try:
         bar.set_postfix_str("running")
         with open(log_path, "w") as lf:
             proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
-            # Poll so the clock ticks; for the ETA bar, advance n to the elapsed
-            # seconds (capped at total) so {remaining} counts down honestly.
+
             while proc.poll() is None:
-                if expected and expected > 0:
+                if progress_file is not None:
+                    done, total = _read_progress(progress_file)
+                    if done is not None:
+                        # Give bar a total on first successful read.
+                        if bar.total is None and total:
+                            bar.total = total
+                            bar.refresh()
+                        # Advance by the delta — this is what feeds tqdm's rate
+                        # estimator and produces an honest ETA.
+                        delta = done - bar.n
+                        if delta > 0:
+                            bar.update(delta)
+                elif hasattr(bar, "total") and bar.total:
+                    # Wall-clock bar: nudge n toward total so the fill moves.
                     bar.n = min(time.perf_counter() - t0, bar.total)
                 bar.refresh()
                 time.sleep(0.5)
+
         dt = time.perf_counter() - t0
         ok = proc.returncode == 0
-        if expected and expected > 0:
+        # Snap to 100 % on success so the bar looks clean when it freezes.
+        if ok and bar.total:
             bar.n = bar.total
         bar.set_postfix_str(f"✓ {dt:.1f}s" if ok else f"✗ exit {proc.returncode}")
         bar.refresh()
@@ -258,7 +301,7 @@ def _run(cmd: Sequence[str], stage: str, display: str) -> float:
         raise RuntimeError(
             f"Stage {stage} failed (exit {proc.returncode}) after {dt:.1f}s. "
             f"See {log_path}.")
-    _save_duration(label, dt)  # record only successful runs
+    _save_duration(label, dt)   # record wall-clock for non-progress-file stages
     return dt
 
 
@@ -274,10 +317,15 @@ def stage_1_build(model_id: str, display: str, family: str,
 
 def stage_2_predictor(display: str, family: str, extra: Sequence[str]) -> float:
     dataset_dir = os.path.join(DATASET_ROOT, display)
+    # The predictor writes sweep_progress.json to its run_dir after each trial.
+    # Passing the path here lets _run drive a "N/60 trials [ETA]" bar instead of
+    # the generic elapsed-only timer.
+    progress_file = os.path.join(PREDICTOR_ROOT, display, "sweep_progress.json")
     return _run(
         [sys.executable, "-m", "experiments.predict_context_length",
          "--dataset-dir", dataset_dir, *extra],
         stage="2/predictor", display=display,
+        progress_file=progress_file,
     )
 
 

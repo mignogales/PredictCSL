@@ -1011,6 +1011,18 @@ def _trial_best_path(run_label: str, trial_idx: int) -> str:
     return os.path.join(_run_dir(run_label), "trials",
                         f"trial_{trial_idx:03d}_best.pt")
 
+def _write_sweep_progress(run_dir: str, done: int, total: int) -> None:
+    """Atomically write {done, total} for run_all.py to poll and drive its bar."""
+    path = os.path.join(run_dir, "sweep_progress.json")
+    tmp  = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"done": done, "total": total}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass   # non-critical — the bar just won't update
+
+
 def _load_trial_result(run_label: str, trial_idx: int) -> Optional[Dict]:
     p = _trial_json_path(run_label, trial_idx)
     if not os.path.isfile(p):
@@ -1199,6 +1211,10 @@ def main() -> None:
         else:
             pending.append((idx, trial))
 
+    # Write initial progress so run_all.py's bar gets a total right away
+    # (before any GPU work starts). Updated after each result below.
+    _write_sweep_progress(run_dir, len(cached_results), N_TRIALS)
+
     # ---------- Spawn workers ----------------------------------------------
     ctx = mp.get_context("spawn")
     trial_queue  = ctx.Queue()
@@ -1232,6 +1248,7 @@ def main() -> None:
                   + f"({n_received}/{n_expected})." + Fore.RESET)
             continue
         fresh_results.append(r); n_received += 1
+        _write_sweep_progress(run_dir, len(cached_results) + n_received, N_TRIALS)
 
     print(Fore.MAGENTA + f"  Sweep wall-clock: "
           + f"{time.perf_counter() - t_start:.1f}s  "
