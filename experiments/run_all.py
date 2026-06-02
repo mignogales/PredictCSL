@@ -153,41 +153,61 @@ def _tail(path: str, n: int = 40) -> str:
 
 
 def _run(cmd: Sequence[str], stage: str, display: str) -> float:
-    """Subprocess wrapper: run a stage, raise on non-zero. Returns wall time.
+    """Run one (model, stage) unit, raise on non-zero. Returns wall time.
 
-    Quiet mode: redirect the child's stdout+stderr to a per-(model, stage) log
-    file and stay silent unless it fails, in which case the log tail is shown.
-    Verbose mode: echo the command and stream the child's output to the terminal.
+    Quiet mode (default): give *this* unit its own tqdm line — a live timer that
+    ticks while the child runs and persists (leave=True) showing ``✓ {secs}s``
+    when it finishes, so a full run leaves one bar per (stage, model). The
+    child's stdout+stderr are captured to a per-unit log file; on failure the
+    log tail is shown.
+
+    Verbose mode: echo the command and stream the child's output to the terminal
+    (no per-unit bar — live output would clobber it).
     """
+    label = f"{display} · {stage}"
     t0 = time.perf_counter()
-    if _QUIET:
-        os.makedirs(RUN_LOG_ROOT, exist_ok=True)
-        safe = f"{display}_{stage.replace('/', '-')}".replace(" ", "_")
-        log_path = os.path.join(RUN_LOG_ROOT, f"{safe}.log")
-        with open(log_path, "w") as lf:
-            res = subprocess.run(cmd, check=False, stdout=lf,
-                                 stderr=subprocess.STDOUT)
+
+    if not _QUIET:
+        _emit(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
+        res = subprocess.run(cmd, check=False)
         dt = time.perf_counter() - t0
         if res.returncode != 0:
-            _emit(
-                Fore.RED
-                + f"  ✗ stage {stage} ({display}) failed (exit {res.returncode}) "
-                  f"after {dt:.1f}s — last lines of {log_path}:\n"
-                + _tail(log_path) + Fore.RESET,
-                level="error",
-            )
             raise RuntimeError(
-                f"Stage {stage} failed (exit {res.returncode}) after {dt:.1f}s. "
-                f"See {log_path}.")
+                f"Stage {stage} failed (exit {res.returncode}) after {dt:.1f}s.")
+        _emit(Fore.GREEN + f"  ✓ {label} done in {dt:.1f}s" + Fore.RESET)
         return dt
 
-    _emit(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
-    res = subprocess.run(cmd, check=False)
-    dt = time.perf_counter() - t0
-    if res.returncode != 0:
+    os.makedirs(RUN_LOG_ROOT, exist_ok=True)
+    safe = f"{display}_{stage.replace('/', '-')}".replace(" ", "_")
+    log_path = os.path.join(RUN_LOG_ROOT, f"{safe}.log")
+
+    global _BAR
+    with open(log_path, "w") as lf, tqdm(
+            total=None, desc=label, leave=True, dynamic_ncols=True,
+            bar_format="{desc} … {elapsed}{postfix}") as bar:
+        _BAR = bar
+        bar.set_postfix_str("running")
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+        # Poll so the elapsed clock keeps ticking; refresh() forces a redraw.
+        while proc.poll() is None:
+            bar.refresh()
+            time.sleep(0.5)
+        dt = time.perf_counter() - t0
+        ok = proc.returncode == 0
+        bar.set_postfix_str(f"✓ {dt:.1f}s" if ok else f"✗ exit {proc.returncode}")
+        bar.refresh()
+        _BAR = None
+
+    if proc.returncode != 0:
+        _emit(
+            Fore.RED
+            + f"  ✗ {label} failed (exit {proc.returncode}) after {dt:.1f}s — "
+              f"last lines of {log_path}:\n" + _tail(log_path) + Fore.RESET,
+            level="error",
+        )
         raise RuntimeError(
-            f"Stage {stage} failed (exit {res.returncode}) after {dt:.1f}s.")
-    _emit(Fore.GREEN + f"  ✓ stage {stage} done in {dt:.1f}s" + Fore.RESET)
+            f"Stage {stage} failed (exit {proc.returncode}) after {dt:.1f}s. "
+            f"See {log_path}.")
     return dt
 
 
@@ -391,57 +411,38 @@ def main() -> None:
 
     def _maybe_run(sid: str, model_id: str, family: str, display: str) -> None:
         name = STAGES[sid][0]
+        label = f"{display} · {sid}/{name}"
         done, summary = DONE_CHECKS[sid](family, display)
         if done and sid not in forced:
-            if _BAR is not None:
-                _BAR.set_postfix_str(f"cached ({summary})")
-            _emit(Fore.WHITE
-                  + f"  · stage {sid}/{name} cached ({summary}) — skipping"
-                  + Fore.RESET)
+            # Cached units finish instantly — one line, not a live bar.
+            tqdm.write(Fore.WHITE
+                       + f"{label} … · cached ({summary}) — skipping"
+                       + Fore.RESET)
             return
         if done and sid in forced:
             _emit(Fore.YELLOW
-                  + f"  ! stage {sid}/{name} cached ({summary}) but --force given — re-running"
+                  + f"  ! {label} cached ({summary}) but --force given — re-running"
                   + Fore.RESET)
-        else:
-            _emit(Fore.CYAN
-                  + f"  → stage {sid}/{name} — {summary}"
-                  + Fore.RESET)
-        if _BAR is not None:
-            _BAR.set_postfix_str("running")
         extras = extras_by_stage[sid]
         if sid == "1":
-            dt = stage_1_build(model_id, display, family, extras)
+            stage_1_build(model_id, display, family, extras)
         elif sid == "2":
-            dt = stage_2_predictor(display, family, extras)
+            stage_2_predictor(display, family, extras)
         elif sid == "3":
-            dt = stage_3_ablation(display, family, extras)
+            stage_3_ablation(display, family, extras)
         else:
-            dt = stage_4_compare(display, family, extras)
-        if _BAR is not None:
-            _BAR.set_postfix_str(f"done in {dt:.1f}s")
+            stage_4_compare(display, family, extras)
 
-    # One overall bar across every (model × active stage) unit of work. Its
-    # description names the model + stage currently in flight so a long run is
-    # legible at a glance: "Chronos2-Small · 3/ablation".
+    # Each (model × active stage) unit gets its own tqdm bar (created in _run),
+    # so a full run leaves one persistent line per stage+model combination.
     ordered_stages = [s for s in ("1", "2", "3", "4") if s in active]
-    total_units = len(selected) * len(ordered_stages)
 
-    global _BAR
     t_start = time.perf_counter()
-    with tqdm(total=total_units, desc="pipeline", unit="stage",
-              dynamic_ncols=True) as bar:
-        _BAR = bar
-        try:
-            for model_id, family, display in selected:
-                _banner(f"{display}  ({family})  —  {model_id}")
-                for sid in ordered_stages:
-                    name = STAGES[sid][0]
-                    bar.set_description(f"{display} · {sid}/{name}")
-                    _maybe_run(sid, model_id, family, display)
-                    bar.update(1)
-        finally:
-            _BAR = None
+    for model_id, family, display in selected:
+        if not _QUIET:
+            _banner(f"{display}  ({family})  —  {model_id}")
+        for sid in ordered_stages:
+            _maybe_run(sid, model_id, family, display)
 
     total = time.perf_counter() - t_start
     print(Fore.GREEN + f"\nAll done in {total/60:.1f} min." + Fore.RESET)
