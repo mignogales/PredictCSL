@@ -152,6 +152,36 @@ def _tail(path: str, n: int = 40) -> str:
         return "(log unavailable)"
 
 
+# --- Per-unit duration cache (powers the ETA) --------------------------------
+# A single subprocess exposes no internal progress, so a remaining-time estimate
+# is impossible on a unit's first run. Instead we persist each (model, stage)
+# wall-clock and reuse it as the bar's `total` next time, turning the timer into
+# a real progress bar with an ETA. Stored as {label: seconds} in RUN_LOG_ROOT.
+
+def _durations_path() -> str:
+    return os.path.join(RUN_LOG_ROOT, "durations.json")
+
+
+def _load_durations() -> dict:
+    try:
+        with open(_durations_path()) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_duration(label: str, dt: float) -> None:
+    os.makedirs(RUN_LOG_ROOT, exist_ok=True)
+    data = _load_durations()
+    prev = data.get(label)
+    # EMA: track the current machine without being whipsawed by one slow run.
+    data[label] = round(0.5 * prev + 0.5 * dt, 2) if prev else round(dt, 2)
+    tmp = _durations_path() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, _durations_path())
+
+
 def _run(cmd: Sequence[str], stage: str, display: str) -> float:
     """Run one (model, stage) unit, raise on non-zero. Returns wall time.
 
@@ -181,21 +211,41 @@ def _run(cmd: Sequence[str], stage: str, display: str) -> float:
     safe = f"{display}_{stage.replace('/', '-')}".replace(" ", "_")
     log_path = os.path.join(RUN_LOG_ROOT, f"{safe}.log")
 
+    # If we've timed this exact unit before, drive a determinate bar whose total
+    # is the expected wall-clock — tqdm then renders a real ETA. Otherwise fall
+    # back to an indeterminate elapsed-only timer (no honest ETA possible yet).
+    expected = _load_durations().get(label)
+
     global _BAR
-    with open(log_path, "w") as lf, tqdm(
-            total=None, desc=label, leave=True, dynamic_ncols=True,
-            bar_format="{desc} … {elapsed}{postfix}") as bar:
-        _BAR = bar
+    if expected and expected > 0:
+        bar = tqdm(total=round(expected), desc=label, leave=True, unit="s",
+                   dynamic_ncols=True,
+                   bar_format="{desc} {percentage:3.0f}%|{bar}| "
+                              "{n:.0f}/{total:.0f}s [{elapsed}<~{remaining}]{postfix}")
+    else:
+        bar = tqdm(total=None, desc=label, leave=True, dynamic_ncols=True,
+                   bar_format="{desc} … {elapsed} (first run — no ETA){postfix}")
+
+    _BAR = bar
+    try:
         bar.set_postfix_str("running")
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
-        # Poll so the elapsed clock keeps ticking; refresh() forces a redraw.
-        while proc.poll() is None:
-            bar.refresh()
-            time.sleep(0.5)
+        with open(log_path, "w") as lf:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+            # Poll so the clock ticks; for the ETA bar, advance n to the elapsed
+            # seconds (capped at total) so {remaining} counts down honestly.
+            while proc.poll() is None:
+                if expected and expected > 0:
+                    bar.n = min(time.perf_counter() - t0, bar.total)
+                bar.refresh()
+                time.sleep(0.5)
         dt = time.perf_counter() - t0
         ok = proc.returncode == 0
+        if expected and expected > 0:
+            bar.n = bar.total
         bar.set_postfix_str(f"✓ {dt:.1f}s" if ok else f"✗ exit {proc.returncode}")
         bar.refresh()
+    finally:
+        bar.close()
         _BAR = None
 
     if proc.returncode != 0:
@@ -208,6 +258,7 @@ def _run(cmd: Sequence[str], stage: str, display: str) -> float:
         raise RuntimeError(
             f"Stage {stage} failed (exit {proc.returncode}) after {dt:.1f}s. "
             f"See {log_path}.")
+    _save_duration(label, dt)  # record only successful runs
     return dt
 
 

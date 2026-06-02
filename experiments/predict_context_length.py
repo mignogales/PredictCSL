@@ -71,7 +71,6 @@ import math
 import time
 import random
 import shutil
-import tempfile
 import numpy as np
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Tuple, Any
@@ -714,6 +713,7 @@ def _run_single_trial(
     device: str,
     n_windows: int,
     n_horizons: int,
+    run_label: str,
 ) -> Dict[str, Any]:
     """Train one configuration end-to-end; return the best-val checkpoint."""
     bs, lr, peak = auto_select_bs_lr(
@@ -830,10 +830,13 @@ def _run_single_trial(
 
     best_state_path: Optional[str] = None
     if best_state is not None:
-        fd, best_state_path = tempfile.mkstemp(
-            prefix=f"ctxlen_trial{trial_idx:03d}_", suffix=".pt")
-        os.close(fd)
-        torch.save(best_state, best_state_path)
+        # Durable, deterministic location under the run dir (atomic write) so a
+        # later resume can still select this trial's checkpoint.
+        best_state_path = _trial_best_path(run_label, trial_idx)
+        os.makedirs(os.path.dirname(best_state_path), exist_ok=True)
+        tmp_path = best_state_path + ".tmp"
+        torch.save(best_state, tmp_path)
+        os.replace(tmp_path, best_state_path)
         del best_state
 
     elapsed = time.perf_counter() - t0
@@ -872,6 +875,7 @@ def gpu_worker(
     dataset_dir: str,
     n_windows: int,
     n_horizons: int,
+    run_label: str,
 ) -> None:
     """One worker per GPU. Loads the labeled dataset, then drains trials."""
     set_seed(SEED + worker_id)
@@ -922,6 +926,7 @@ def gpu_worker(
                 trial_idx, trial, vram_budget_gb,
                 x_train, y_train, y_train_raw,
                 x_val, y_val, y_val_raw, device, n_windows, n_horizons,
+                run_label,
             )
         except Exception as exc:
             print(Fore.RED + f"  [{device}] trial {trial_idx:03d} "
@@ -996,6 +1001,15 @@ def _run_dir(run_label: str) -> str:
 def _trial_json_path(run_label: str, trial_idx: int) -> str:
     return os.path.join(_run_dir(run_label), "trials",
                         f"trial_{trial_idx:03d}.json")
+
+def _trial_best_path(run_label: str, trial_idx: int) -> str:
+    """Durable per-trial best-weights checkpoint (survives a pause/resume).
+
+    Replaces the old ephemeral tempfile: keeping the weights in the run dir is
+    what lets a resumed run re-select the global best from *cached* trials, not
+    just the ones rebuilt in the current process."""
+    return os.path.join(_run_dir(run_label), "trials",
+                        f"trial_{trial_idx:03d}_best.pt")
 
 def _load_trial_result(run_label: str, trial_idx: int) -> Optional[Dict]:
     p = _trial_json_path(run_label, trial_idx)
@@ -1177,7 +1191,10 @@ def main() -> None:
                 and "val_curve_mse" in cached
                 and not (isinstance(cached["val_curve_mse"], float)
                          and math.isnan(cached["val_curve_mse"]))):
-            cached["best_state_path"] = None
+            # Re-attach the durable weights so this cached trial can still win
+            # final selection on a resumed run (None if weights were pruned).
+            bp = _trial_best_path(run_label, idx)
+            cached["best_state_path"] = bp if os.path.isfile(bp) else None
             cached_results.append(cached)
         else:
             pending.append((idx, trial))
@@ -1191,7 +1208,7 @@ def main() -> None:
         p = ctx.Process(
             target=gpu_worker,
             args=(i, device, budget, trial_queue, result_queue,
-                  dataset_dir, n_windows, n_horizons),
+                  dataset_dir, n_windows, n_horizons, run_label),
             name=f"gpu_worker_{i}_{device.replace(':', '')}",
         )
         p.start(); workers.append(p)
@@ -1232,7 +1249,10 @@ def main() -> None:
     _persist_artifacts(all_results, run_label)
 
     # ---------- Final selection --------------------------------------------
-    chosen, report = _select_final(fresh_results)
+    # Select over ALL trials (cached + fresh): on a resumed run the winner may
+    # be a trial that finished in an earlier session, whose weights now live
+    # durably under trials/trial_NNN_best.pt.
+    chosen, report = _select_final(all_results)
     if chosen:
         shutil.copyfile(chosen["best_state_path"],
                         os.path.join(run_dir, "best_model.pt"))
@@ -1269,11 +1289,10 @@ def main() -> None:
         print(Fore.YELLOW + "  No valid fresh trials — no checkpoint persisted."
               + Fore.RESET)
 
-    for r in fresh_results:
-        p = r.get("best_state_path")
-        if p and os.path.exists(p):
-            try: os.remove(p)
-            except OSError: pass
+    # NOTE: per-trial best-weights (trials/trial_NNN_best.pt) are intentionally
+    # kept, not deleted — they are the resume cache that lets a later run
+    # re-select the global best without retraining. best_model.pt is a separate
+    # copy of the winner. Delete the trials/ dir manually to reclaim disk.
 
     print(Fore.GREEN + "\nContext-length predictor training done." + Fore.RESET)
 
