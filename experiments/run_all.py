@@ -61,6 +61,7 @@ import time
 from typing import Callable, List, Sequence, Tuple
 
 from colorama import Fore
+from tqdm.auto import tqdm
 
 
 # Master catalog: (model_id, family, display). Order MUST match the MODELS
@@ -107,21 +108,35 @@ def _model_idx(display: str) -> int:
     )
 
 
+# Overall progress bar (set in main). Orchestrator-level messages are routed
+# through _emit so they print *above* the bar instead of clobbering it; the
+# subprocess output of each stage still streams raw and will scroll the bar,
+# which tqdm redraws on the next update.
+_BAR: "tqdm | None" = None
+
+
+def _emit(msg: str) -> None:
+    if _BAR is not None:
+        _BAR.write(msg)
+    else:
+        print(msg)
+
+
 def _banner(text: str) -> None:
     bar = "═" * 78
-    print(Fore.CYAN + f"\n{bar}\n  {text}\n{bar}" + Fore.RESET)
+    _emit(Fore.CYAN + f"\n{bar}\n  {text}\n{bar}" + Fore.RESET)
 
 
 def _run(cmd: Sequence[str], stage: str) -> None:
     """Subprocess wrapper: stream output, raise on non-zero."""
-    print(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
+    _emit(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
     t0 = time.perf_counter()
     res = subprocess.run(cmd, check=False)
     dt = time.perf_counter() - t0
     if res.returncode != 0:
         raise RuntimeError(
             f"Stage {stage} failed (exit {res.returncode}) after {dt:.1f}s.")
-    print(Fore.GREEN + f"  ✓ stage {stage} done in {dt:.1f}s" + Fore.RESET)
+    _emit(Fore.GREEN + f"  ✓ stage {stage} done in {dt:.1f}s" + Fore.RESET)
 
 
 def stage_1_build(display: str, family: str, extra: Sequence[str]) -> None:
@@ -316,16 +331,16 @@ def main() -> None:
         name = STAGES[sid][0]
         done, summary = DONE_CHECKS[sid](family, display)
         if done and sid not in forced:
-            print(Fore.WHITE
+            _emit(Fore.WHITE
                   + f"  · stage {sid}/{name} cached ({summary}) — skipping"
                   + Fore.RESET)
             return
         if done and sid in forced:
-            print(Fore.YELLOW
+            _emit(Fore.YELLOW
                   + f"  ! stage {sid}/{name} cached ({summary}) but --force given — re-running"
                   + Fore.RESET)
         else:
-            print(Fore.CYAN
+            _emit(Fore.CYAN
                   + f"  → stage {sid}/{name} — {summary}"
                   + Fore.RESET)
         extras = extras_by_stage[sid]
@@ -338,12 +353,27 @@ def main() -> None:
         else:
             stage_4_compare(display, family, extras)
 
+    # One overall bar across every (model × active stage) unit of work. Its
+    # description names the model + stage currently in flight so a long run is
+    # legible at a glance: "Chronos2-Small · 3/ablation".
+    ordered_stages = [s for s in ("1", "2", "3", "4") if s in active]
+    total_units = len(selected) * len(ordered_stages)
+
+    global _BAR
     t_start = time.perf_counter()
-    for model_id, family, display in selected:
-        _banner(f"{display}  ({family})  —  {model_id}")
-        for sid in ("1", "2", "3", "4"):
-            if sid in active:
-                _maybe_run(sid, family, display)
+    with tqdm(total=total_units, desc="pipeline", unit="stage",
+              dynamic_ncols=True) as bar:
+        _BAR = bar
+        try:
+            for model_id, family, display in selected:
+                _banner(f"{display}  ({family})  —  {model_id}")
+                for sid in ordered_stages:
+                    name = STAGES[sid][0]
+                    bar.set_description(f"{display} · {sid}/{name}")
+                    _maybe_run(sid, family, display)
+                    bar.update(1)
+        finally:
+            _BAR = None
 
     total = time.perf_counter() - t_start
     print(Fore.GREEN + f"\nAll done in {total/60:.1f} min." + Fore.RESET)
