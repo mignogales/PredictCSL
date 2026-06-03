@@ -379,9 +379,10 @@ def _done_stage_1(family: str, display: str = "") -> Tuple[bool, str]:
         return False, "meta.json unreadable"
     done = int(meta.get("shards_done", 0))
     total = int(meta.get("shards_total", 0))
+    pct = 100.0 * done / total if total > 0 else 0.0
     if total > 0 and done >= total:
-        return True, f"{done}/{total} shards"
-    return False, f"{done}/{total} shards"
+        return True, f"{done}/{total} shards ({pct:.1f}%)"
+    return False, f"{done}/{total} shards ({pct:.1f}%)"
 
 
 def _done_stage_2(family: str, display: str = "") -> Tuple[bool, str]:

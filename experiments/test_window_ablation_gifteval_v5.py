@@ -1245,6 +1245,23 @@ def main():
     run_dir = CACHE_ROOT
     os.makedirs(run_dir, exist_ok=True)
 
+    # ---- Resume estimate: how many (model, dataset, window) cells are already
+    # on disk. Cheap file-stat scan, no dataset loading. The denominator is the
+    # full grid, so cells that will be skipped (can't serve / model context
+    # limits) are still counted — treat the percentage as a lower bound.
+    n_planned = len(models) * len(datasets) * len(window_sizes)
+    n_cached = sum(
+        1
+        for _, _, model_short in models
+        for _, term, dataset_display, _ in datasets
+        for window_size in window_sizes
+        if _result_cached(dataset_display, model_short, term, window_size)
+    )
+    pct_cached = 100.0 * n_cached / n_planned if n_planned else 100.0
+    print(Fore.CYAN
+          + f"Resume: {n_cached}/{n_planned} cells cached ({pct_cached:.1f}% complete)"
+          + Fore.RESET)
+
     ge_cache: Dict[Tuple[str, str], GiftEvalCache] = {}
     naive_baseline_cache: Dict[Tuple[str, str], Dict[str, float]] = {}
     all_results: List[dict] = []

@@ -998,8 +998,10 @@ def main() -> None:
                 n_completed += 1
             else:
                 pending.append((shard_id, start, end))
-        print(Fore.CYAN + f"   Shards: {n_completed} cached, {len(pending)} pending"
-              + Fore.RESET)
+        n_total_shards = n_completed + len(pending)
+        pct_done = 100.0 * n_completed / n_total_shards if n_total_shards else 100.0
+        print(Fore.CYAN + f"   Shards: {n_completed} cached, {len(pending)} pending "
+              + f"({pct_done:.1f}% complete)" + Fore.RESET)
 
         if pending:
             ctx = mp.get_context("spawn")
