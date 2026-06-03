@@ -63,6 +63,7 @@ from experiments.predict_context_length import PatchTSTContextLength
 
 MODELS = [
     ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
+    ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
     ("amazon/chronos-bolt-small",       "chronos_bolt","ChronosBolt-Small"),
     ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
     ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),

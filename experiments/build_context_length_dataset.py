@@ -734,7 +734,15 @@ def gpu_worker(
     Each window is forecast once at ``max_horizon``; per-(window, horizon)
     errors are computed by slicing the prediction at every h in HORIZON_GRID.
     """
+    dev_label = device
     if _is_cuda(device):
+        # Pin this worker to its physical GPU *before* CUDA initializes. Some
+        # backends (e.g. TimesFM) hardcode cuda:0 and ignore the requested
+        # device, which makes every worker pile onto GPU 0 while the others sit
+        # idle. Masking to one visible GPU forces correct placement regardless;
+        # inside this process that GPU is then always addressed as cuda:0.
+        os.environ["CUDA_VISIBLE_DEVICES"] = device.split(":")[-1] if ":" in device else "0"
+        device = "cuda:0"
         torch.cuda.set_device(torch.device(device))
     torch.set_grad_enabled(False)
     torch.set_float32_matmul_precision("high")
@@ -743,9 +751,9 @@ def gpu_worker(
 
     try:
         base = setup_model(family, model_id, device)
-        print(Fore.CYAN + f"  [{device}] worker {worker_id} ready." + Fore.RESET)
+        print(Fore.CYAN + f"  [{dev_label}] worker {worker_id} ready." + Fore.RESET)
     except Exception as exc:
-        print(Fore.RED + f"  [{device}] worker {worker_id} model load failed: "
+        print(Fore.RED + f"  [{dev_label}] worker {worker_id} model load failed: "
               + f"{type(exc).__name__}: {exc}" + Fore.RESET)
         while True:
             spec = shard_queue.get()
@@ -805,17 +813,17 @@ def gpu_worker(
             elapsed = time.perf_counter() - t0
             result_queue.put({"shard_id": shard_id, "status": "ok",
                               "elapsed": elapsed})
-            print(Fore.YELLOW + f"  [{device}] shard {shard_id:03d} "
+            print(Fore.YELLOW + f"  [{dev_label}] shard {shard_id:03d} "
                   + f"[{start}:{end}] done ({elapsed:.1f}s)" + Fore.RESET)
         except Exception as exc:
-            print(Fore.RED + f"  [{device}] shard {shard_id:03d} FAILED: "
+            print(Fore.RED + f"  [{dev_label}] shard {shard_id:03d} FAILED: "
                   + f"{type(exc).__name__}: {exc}" + Fore.RESET)
             result_queue.put({"shard_id": shard_id,
                               "status": f"error:{type(exc).__name__}"})
         if _is_cuda(device):
             torch.cuda.empty_cache()
 
-    print(Fore.CYAN + f"  [{device}] worker {worker_id} exited." + Fore.RESET)
+    print(Fore.CYAN + f"  [{dev_label}] worker {worker_id} exited." + Fore.RESET)
 
 
 # ==============================================================================
