@@ -163,6 +163,33 @@ OUTPUT_ROOT = "logs/experiments/context_length_dataset"
 #  DEVICE RESOLUTION
 # ==============================================================================
 
+# Snapshot the GPU ordering the user requested via CUDA_VISIBLE_DEVICES *before*
+# any worker re-masks it. torch enumerates only the listed GPUs and re-indexes
+# them from 0, so the logical label cuda:i maps positionally onto this list
+# (e.g. cuda:1 under CUDA_VISIBLE_DEVICES=0,2 is physical GPU "2").
+_ORIG_VISIBLE_DEVICES: Optional[List[str]] = (
+    [d.strip() for d in os.environ["CUDA_VISIBLE_DEVICES"].split(",") if d.strip()]
+    if os.environ.get("CUDA_VISIBLE_DEVICES")
+    else None
+)
+
+
+def _physical_gpu_id(device: str) -> str:
+    """Map a torch logical device label (``cuda:i``) to its physical GPU id.
+
+    A worker that re-masks ``CUDA_VISIBLE_DEVICES`` to pin itself must use the
+    original physical id, not the logical index -- otherwise ``cuda:1`` under
+    ``CUDA_VISIBLE_DEVICES=0,2`` wrongly selects physical GPU 1 instead of 2.
+    """
+    logical = device.split(":")[-1] if ":" in device else "0"
+    if _ORIG_VISIBLE_DEVICES is None:
+        return logical
+    try:
+        return _ORIG_VISIBLE_DEVICES[int(logical)]
+    except (ValueError, IndexError):
+        return logical
+
+
 def resolve_devices(force: Optional[str]) -> List[str]:
     if force == "cpu":
         return ["cpu"]
@@ -741,7 +768,7 @@ def gpu_worker(
         # device, which makes every worker pile onto GPU 0 while the others sit
         # idle. Masking to one visible GPU forces correct placement regardless;
         # inside this process that GPU is then always addressed as cuda:0.
-        os.environ["CUDA_VISIBLE_DEVICES"] = device.split(":")[-1] if ":" in device else "0"
+        os.environ["CUDA_VISIBLE_DEVICES"] = _physical_gpu_id(device)
         device = "cuda:0"
         torch.cuda.set_device(torch.device(device))
     torch.set_grad_enabled(False)
