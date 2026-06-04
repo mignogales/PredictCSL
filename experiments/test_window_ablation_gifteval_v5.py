@@ -30,6 +30,8 @@ import argparse
 import gc
 import json
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -1201,7 +1203,55 @@ def parse_args() -> argparse.Namespace:
                    help="Override: use this specific predictor run directory.")
     p.add_argument("--predictor-batch-size", type=int, default=64,
                    help="Batch size used when running the predictor on test-instance contexts.")
+    p.add_argument("--num-gpus", type=int, default=0,
+                   help="GPUs to shard the ablation across. 0 = auto (all visible, "
+                        "respecting CUDA_VISIBLE_DEVICES); >0 caps to min(n, device_count). "
+                        "1 (or CPU) keeps the original single-process behavior.")
+    # Internal: set by the coordinator when it spawns one worker per GPU.
+    p.add_argument("--shard-id", type=int, default=None,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--num-shards", type=int, default=1,
+                   help=argparse.SUPPRESS)
     return p.parse_args()
+
+
+def _run_coordinator(args, device: str, n_gpus: int, n_visible: int) -> None:
+    """Spawn one worker subprocess per GPU (each pinned + given a dataset shard),
+    wait for all, then run a single aggregation pass over the now-filled cache.
+
+    Workers are fresh `python -m` processes (no CUDA-in-fork hazard) writing to
+    the shared per-cell cache; the coordinator produces the CSV/plots/marker."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    phys = visible.split(",") if visible else [str(j) for j in range(n_visible)]
+
+    print(Fore.CYAN
+          + f"Coordinator: sharding ablation across {n_gpus} GPU(s) "
+          + f"(physical {phys[:n_gpus]}), by dataset." + Fore.RESET)
+
+    procs = []
+    for i in range(n_gpus):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = phys[i]
+        cmd = [sys.executable, "-m",
+               "experiments.test_window_ablation_gifteval_v5",
+               *sys.argv[1:],
+               "--shard-id", str(i), "--num-shards", str(n_gpus)]
+        procs.append(subprocess.Popen(cmd, env=env))
+
+    rcs = [p.wait() for p in procs]
+    failed = [i for i, rc in enumerate(rcs) if rc != 0]
+    if failed:
+        raise SystemExit(
+            Fore.RED
+            + f"stage-3 worker(s) on GPU index {failed} failed "
+            + "(see output above); aggregation skipped, cache may be incomplete."
+            + Fore.RESET)
+
+    # Every ablation cell is cached now → this pass hits the CACHED branch
+    # (no GPU ablation, no foundation-model load) and only runs the aggregation
+    # tail + the small predictor inference on a single GPU.
+    print(Fore.CYAN + "Coordinator: all shards done — aggregating." + Fore.RESET)
+    run_ablation(args, device, shard_id=None, num_shards=1)
 
 
 def main():
@@ -1215,6 +1265,23 @@ def main():
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
     torch.set_grad_enabled(False)
+
+    is_worker = args.shard_id is not None
+    n_visible = torch.cuda.device_count() if device == "cuda" else 0
+    n_gpus = n_visible if args.num_gpus == 0 else min(args.num_gpus, n_visible)
+
+    if device == "cuda" and n_gpus > 1 and not is_worker:
+        _run_coordinator(args, device, n_gpus, n_visible)
+    else:
+        run_ablation(args, device,
+                     shard_id=args.shard_id,
+                     num_shards=(args.num_shards if is_worker else 1))
+
+
+def run_ablation(args, device: str, shard_id: Optional[int] = None,
+                 num_shards: int = 1) -> None:
+    global CACHE_ROOT
+    CACHE_ROOT = args.cache_root
 
     # ---- Load predictor + derive window grid + horizon grid ------------------
     predictor_dir = args.predictor_dir or find_latest_predictor_run(
@@ -1271,29 +1338,37 @@ def main():
         print(Fore.CYAN + f"  MODEL: {model_id}  ({model_family})" + Fore.RESET)
         print(Fore.CYAN + "=" * 78 + Fore.RESET)
 
-        pipeline = None
-        moirai_module = None
-        moirai_1_1_module = None
-        patchtst_fm_model = None
-        sundial_model = None
-        timemoe_model = None
+        # Foundation models are loaded lazily + memoized: the first cell that
+        # actually needs prediction triggers the load. This keeps a sharded
+        # worker from loading models it owns no work for, and lets the
+        # coordinator's all-cached aggregation pass skip GPU model loads
+        # entirely. (timesfm loads per-cell; context_parroting needs nothing.)
+        _handle = [None]
 
-        if model_family == "chronos_bolt":
-            pipeline = load_chronos_bolt(model_id, device)
-        elif model_family == "chronos2":
-            pipeline = load_chronos2(model_id, device)
-        elif model_family == "moirai":
-            moirai_module = load_moirai_module(model_id)
-        elif model_family == "moirai_1_1":
-            moirai_1_1_module = load_moirai_1_1_module(model_id)
-        elif model_family == "patchtst_fm":
-            patchtst_fm_model = load_patchtst_fm(model_id, device)
-        elif model_family == "sundial":
-            sundial_model = load_sundial(model_id, device)
-        elif model_family == "timemoe":
-            timemoe_model = load_timemoe(model_id, device)
+        def ensure_handle():
+            if _handle[0] is None:
+                if model_family == "chronos_bolt":
+                    _handle[0] = load_chronos_bolt(model_id, device)
+                elif model_family == "chronos2":
+                    _handle[0] = load_chronos2(model_id, device)
+                elif model_family == "moirai":
+                    _handle[0] = load_moirai_module(model_id)
+                elif model_family == "moirai_1_1":
+                    _handle[0] = load_moirai_1_1_module(model_id)
+                elif model_family == "patchtst_fm":
+                    _handle[0] = load_patchtst_fm(model_id, device)
+                elif model_family == "sundial":
+                    _handle[0] = load_sundial(model_id, device)
+                elif model_family == "timemoe":
+                    _handle[0] = load_timemoe(model_id, device)
+            return _handle[0]
 
-        for ge_name, term, dataset_display, to_univariate in datasets:
+        for d_idx, (ge_name, term, dataset_display, to_univariate) in enumerate(datasets):
+            # Dataset-level sharding: each worker owns a round-robin slice of
+            # datasets (all their windows), so each dataset is loaded by exactly
+            # one process. Index is stable across workers (same filtered list).
+            if num_shards > 1 and d_idx % num_shards != shard_id:
+                continue
             ds_key = (ge_name, term)
             if ds_key not in ge_cache:
                 print(Fore.CYAN + f"\n  Loading GiftEval: {ge_name}  term={term}" + Fore.RESET)
@@ -1353,16 +1428,16 @@ def main():
                 print(f"    Samples: {n_valid}  Batches: {len(batches)}  W={window_size}  H={horizon}")
 
                 if model_family == "chronos_bolt":
-                    fr, tgts = predict_chronos_bolt(pipeline, batches, horizon, device)
+                    fr, tgts = predict_chronos_bolt(ensure_handle(), batches, horizon, device)
                 elif model_family == "chronos2":
-                    fr, tgts = predict_chronos2(pipeline, batches, horizon, device)
+                    fr, tgts = predict_chronos2(ensure_handle(), batches, horizon, device)
                 elif model_family == "moirai":
-                    moirai_model = build_moirai_forecast(moirai_module, horizon, window_size, device)
+                    moirai_model = build_moirai_forecast(ensure_handle(), horizon, window_size, device)
                     fr, tgts = predict_moirai(moirai_model, batches, horizon, device)
                     del moirai_model
                     if device == "cuda": torch.cuda.empty_cache()
                 elif model_family == "moirai_1_1":
-                    moirai_1_1_model = build_moirai_1_1_forecast(moirai_1_1_module, horizon, window_size, device)
+                    moirai_1_1_model = build_moirai_1_1_forecast(ensure_handle(), horizon, window_size, device)
                     fr, tgts = predict_moirai_1_1(moirai_1_1_model, batches, horizon, device)
                     del moirai_1_1_model
                     if device == "cuda": torch.cuda.empty_cache()
@@ -1374,11 +1449,11 @@ def main():
                 elif model_family == "context_parroting":
                     fr, tgts = predict_context_parroting(batches, horizon, device)
                 elif model_family == "patchtst_fm":
-                    fr, tgts = predict_patchtst_fm(patchtst_fm_model, batches, horizon, device)
+                    fr, tgts = predict_patchtst_fm(ensure_handle(), batches, horizon, device)
                 elif model_family == "sundial":
-                    fr, tgts = predict_sundial(sundial_model, batches, horizon, device)
+                    fr, tgts = predict_sundial(ensure_handle(), batches, horizon, device)
                 elif model_family == "timemoe":
-                    fr, tgts = predict_timemoe(timemoe_model, batches, horizon, device)
+                    fr, tgts = predict_timemoe(ensure_handle(), batches, horizon, device)
                 else:
                     raise ValueError(f"Unknown model family: {model_family}")
 
@@ -1422,10 +1497,17 @@ def main():
                     torch.cuda.empty_cache()
                 gc.collect()
 
-        del pipeline, moirai_module, moirai_1_1_module, patchtst_fm_model, sundial_model, timemoe_model
+        _handle[0] = None
         if device == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
+
+    # A sharded worker only fills the per-cell cache; the coordinator runs the
+    # aggregation tail once over the combined cache (see _run_coordinator).
+    if shard_id is not None:
+        print(Fore.GREEN
+              + f"Worker shard {shard_id}/{num_shards} done." + Fore.RESET)
+        return
 
     # ==========================================================================
     #  AGGREGATE + SAVE + COMPARISON PLOTS
