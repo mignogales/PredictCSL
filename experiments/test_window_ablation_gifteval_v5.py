@@ -325,6 +325,60 @@ class GiftEvalCache:
 
         return batches, all_x, all_y, valid_indices
 
+    def build_batches_padded(
+        self,
+        window_size: int,
+        batch_size: int,
+        device: str,
+        pin_memory: bool,
+        window_grid: List[int],
+    ) -> List[Tuple[int, List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, np.ndarray]]:
+        """Pad-mode batching: NO instance is skipped.
+
+        Every instance contributes ``min(window_size, context_length)`` of its
+        genuine context (the most recent samples). Instances are grouped by that
+        effective width — bucketed *down* to ``window_grid`` so models recompiling
+        per context length build at most one runner per distinct grid width. The
+        per-window error curve is then averaged over the *same* full instance set
+        at every window (it flattens once an instance runs out of context), rather
+        than over only the instances long enough to serve that window.
+
+        Returns a list of ``(L, batches, all_x, all_y, indices)`` groups, where
+        ``indices`` are positions into the full instance list (0..n_total-1).
+        """
+        ctx_lens = self.context_lengths
+        eff = np.minimum(int(window_size), ctx_lens)
+        grid = np.asarray(sorted(set(window_grid)))
+        # Largest grid width <= eff; per-instance min() guards the rare eff < grid[0].
+        eff_buck = np.minimum(
+            eff, grid[np.clip(np.searchsorted(grid, eff, side="right") - 1, 0, None)]
+        )
+
+        groups: List[Tuple[int, List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, np.ndarray]] = []
+        for L in np.unique(eff_buck):
+            L = int(L)
+            idx = np.flatnonzero(eff_buck == L)
+            g = idx.size
+            x_np = np.empty((g, L), dtype=np.float32)
+            for j, i in enumerate(idx):
+                x_np[j] = self.contexts[i][-L:]
+            y_np = self.labels_np[idx]
+
+            all_x = torch.from_numpy(x_np).unsqueeze(-1)
+            all_y = torch.from_numpy(y_np).unsqueeze(-1)
+            if pin_memory and device == "cuda":
+                ax, ay = all_x.pin_memory(), all_y.pin_memory()
+            else:
+                ax, ay = all_x, all_y
+
+            batches = []
+            for start in range(0, g, batch_size):
+                stop = min(start + batch_size, g)
+                batches.append({"x": ax[start:stop], "y": ay[start:stop]})
+            groups.append((L, batches, all_x, all_y, idx))
+
+        return groups
+
 
 # ==============================================================================
 #  NAIVE BASELINE
@@ -705,15 +759,17 @@ def predict_patchtst_fm(model, batches, horizon, device):
         x = x_cpu.to(device, non_blocking=True)
         y = y_cpu.to(device, non_blocking=True)
         B = x.shape[0]
-        # PatchTST-FM-R1 has a FIXED context_length (8192). Inputs shorter than
-        # that produce all-NaN forecasts (the model logs "Context Len: 8192" and
-        # its internal padding NaNs out). Left-pad with zeros up to the native
-        # context — matching the zero-left-pad convention used for short series
-        # in build_context_length_dataset.py — so every window yields valid output.
+        # PatchTST-FM-R1 has a FIXED context_length (8192) and no observed-mask
+        # input; a shorter tensor makes its internal padding NaN out. Left-pad to
+        # the native context with NaN, which the model treats as its missing-value
+        # indicator and masks (empirically the least-distorting pad: matches
+        # mean-padding, beats zeros). Genuine samples drive the forecast; output
+        # stays finite. Any incoming NaN pad region (pad-mode short inputs) is
+        # likewise masked.
         ctx_len = model.config.context_length
         past_values = x.squeeze(-1)                          # (B, W)
         if past_values.shape[1] < ctx_len:
-            pad = past_values.new_zeros(B, ctx_len - past_values.shape[1])
+            pad = past_values.new_full((B, ctx_len - past_values.shape[1]), float("nan"))
             past_values = torch.cat([pad, past_values], dim=1)
         elif past_values.shape[1] > ctx_len:
             past_values = past_values[:, -ctx_len:]
@@ -1198,6 +1254,82 @@ def plot_real_vs_predicted_curve(
 #  RUN
 # ==============================================================================
 
+def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
+                   device, batch_size):
+    """Run one model family on a uniform-width set of batches.
+
+    `width` is the context length these batches share; moirai/timesfm recompile
+    against it. `handle` is the loaded base model (None for timesfm — recompiled
+    here — and context_parroting). Returns (ForecastResult, tgts).
+    """
+    if model_family == "chronos_bolt":
+        return predict_chronos_bolt(handle, batches, horizon, device)
+    if model_family == "chronos2":
+        return predict_chronos2(handle, batches, horizon, device)
+    if model_family == "moirai":
+        m = build_moirai_forecast(handle, horizon, width, device)
+        fr, tgts = predict_moirai(m, batches, horizon, device)
+        del m
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        return fr, tgts
+    if model_family == "moirai_1_1":
+        m = build_moirai_1_1_forecast(handle, horizon, width, device)
+        fr, tgts = predict_moirai_1_1(m, batches, horizon, device)
+        del m
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        return fr, tgts
+    if model_family == "timesfm":
+        tfm = load_timesfm(model_id, width, horizon, batch_size)
+        fr, tgts = predict_timesfm(tfm, batches, horizon, device)
+        del tfm
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        return fr, tgts
+    if model_family == "context_parroting":
+        return predict_context_parroting(batches, horizon, device)
+    if model_family == "patchtst_fm":
+        return predict_patchtst_fm(handle, batches, horizon, device)
+    if model_family == "sundial":
+        return predict_sundial(handle, batches, horizon, device)
+    if model_family == "timemoe":
+        return predict_timemoe(handle, batches, horizon, device)
+    raise ValueError(f"Unknown model family: {model_family}")
+
+
+def _merge_grouped(results, n_total, horizon, device):
+    """Reassemble per-width-group forecasts into a single instance-ordered result.
+
+    `results` is a list of (indices, ForecastResult, tgts). All groups come from
+    the same model, so they share sample count / quantile levels.
+    """
+    first = results[0][1]
+    median = torch.empty((n_total, horizon), device=device, dtype=first.median.dtype)
+    tgts = torch.empty((n_total, horizon), device=device, dtype=results[0][2].dtype)
+
+    samples = quantiles = None
+    qlevels = first.quantile_levels
+    if first.samples is not None:
+        S = first.samples.shape[1]
+        samples = torch.empty((n_total, S, horizon), device=device, dtype=first.samples.dtype)
+    if first.quantiles is not None:
+        Q = first.quantiles.shape[1]
+        quantiles = torch.empty((n_total, Q, horizon), device=device, dtype=first.quantiles.dtype)
+
+    for idx, fr, t in results:
+        ii = torch.as_tensor(idx, device=device, dtype=torch.long)
+        median[ii] = fr.median
+        tgts[ii] = t
+        if samples is not None:
+            samples[ii] = fr.samples
+        if quantiles is not None:
+            quantiles[ii] = fr.quantiles
+
+    return ForecastResult(median=median, samples=samples,
+                          quantiles=quantiles, quantile_levels=qlevels), tgts
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Window-size ablation on GiftEval with predictor overlay.")
@@ -1207,6 +1339,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default=None, choices=[None, "cuda", "cpu"])
     p.add_argument("--no-plots", action="store_true",
                    help="Skip per-(model,window) plots (summary + comparison still produced).")
+    p.add_argument("--no-cell-cache", action="store_true",
+                   help="Do not persist per-cell metrics.json / per-sample .npz. Results "
+                        "are still aggregated in memory into results.csv and the comparison "
+                        "plots, so downstream stages work — but nothing is cached for resume. "
+                        "Used by run_all.py --test smoke runs.")
     p.add_argument("--cache-root", type=str, default=CACHE_ROOT)
     p.add_argument("--predictor-cache-root", type=str, default=CACHE_ROOT_PREDICTOR,
                    help="Root holding context-length-predictor runs. Latest run is auto-picked.")
@@ -1214,6 +1351,14 @@ def parse_args() -> argparse.Namespace:
                    help="Override: use this specific predictor run directory.")
     p.add_argument("--predictor-batch-size", type=int, default=64,
                    help="Batch size used when running the predictor on test-instance contexts.")
+    p.add_argument("--short-context-mode", choices=["skip", "pad"], default="skip",
+                   help="How to handle instances whose context is shorter than the "
+                        "ablation window. 'skip' (default): exclude them at that window "
+                        "(original behaviour; the curve at window w averages only "
+                        "instances with >=w history). 'pad': never skip — feed each "
+                        "instance its min(w, context) genuine samples (PatchTST-FM is "
+                        "NaN-padded to its native context), so every window averages the "
+                        "same full instance set and the curve flattens past available context.")
     p.add_argument("--num-gpus", type=int, default=0,
                    help="GPUs to shard the ablation across. 0 = auto (all visible, "
                         "respecting CUDA_VISIBLE_DEVICES); >0 caps to min(n, device_count). "
@@ -1311,8 +1456,9 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
           + Fore.RESET)
 
     window_sizes = sorted(set(window_grid))
+    short_mode = args.short_context_mode
     print(Fore.CYAN + f"Device: {device}  |  ablation windows: {window_sizes}"
-          + Fore.RESET)
+          + f"  |  short-context mode: {short_mode}" + Fore.RESET)
 
     models = [m for m in MODELS if (args.models is None or m[2] in args.models)]
     datasets = [d for d in DATASETS if (args.datasets is None or d[2] in args.datasets)]
@@ -1410,7 +1556,10 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     })
                     continue
 
-                if not cache.can_serve(window_size):
+                # In skip mode a window wider than every instance's context has no
+                # servable instances -> skip. In pad mode we still evaluate it: each
+                # instance contributes its available context (the curve flattens).
+                if short_mode == "skip" and not cache.can_serve(window_size):
                     print(Fore.RED + f"  SKIP    {tag}  (max_context={cache.max_context} < ws)"
                           + Fore.RESET)
                     continue
@@ -1429,44 +1578,40 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 t_start = time.perf_counter()
 
                 try:
-                    batches, all_x_cpu, all_y_cpu, _ = cache.build_batches(
-                        window_size, args.batch_size, device, pin_memory=True
-                    )
+                    if short_mode == "pad":
+                        groups = cache.build_batches_padded(
+                            window_size, args.batch_size, device,
+                            pin_memory=True, window_grid=window_sizes)
+                    else:
+                        batches, all_x_cpu, all_y_cpu, _ = cache.build_batches(
+                            window_size, args.batch_size, device, pin_memory=True)
                 except RuntimeError as exc:
                     print(Fore.RED + f"    SKIP: {exc}" + Fore.RESET); continue
 
-                n_valid = all_x_cpu.shape[0]
-                print(f"    Samples: {n_valid}  Batches: {len(batches)}  W={window_size}  H={horizon}")
-
-                if model_family == "chronos_bolt":
-                    fr, tgts = predict_chronos_bolt(ensure_handle(), batches, horizon, device)
-                elif model_family == "chronos2":
-                    fr, tgts = predict_chronos2(ensure_handle(), batches, horizon, device)
-                elif model_family == "moirai":
-                    moirai_model = build_moirai_forecast(ensure_handle(), horizon, window_size, device)
-                    fr, tgts = predict_moirai(moirai_model, batches, horizon, device)
-                    del moirai_model
-                    if device == "cuda": torch.cuda.empty_cache()
-                elif model_family == "moirai_1_1":
-                    moirai_1_1_model = build_moirai_1_1_forecast(ensure_handle(), horizon, window_size, device)
-                    fr, tgts = predict_moirai_1_1(moirai_1_1_model, batches, horizon, device)
-                    del moirai_1_1_model
-                    if device == "cuda": torch.cuda.empty_cache()
-                elif model_family == "timesfm":
-                    tfm = load_timesfm(model_id, window_size, horizon, args.batch_size)
-                    fr, tgts = predict_timesfm(tfm, batches, horizon, device)
-                    del tfm
-                    if device == "cuda": torch.cuda.empty_cache()
-                elif model_family == "context_parroting":
-                    fr, tgts = predict_context_parroting(batches, horizon, device)
-                elif model_family == "patchtst_fm":
-                    fr, tgts = predict_patchtst_fm(ensure_handle(), batches, horizon, device)
-                elif model_family == "sundial":
-                    fr, tgts = predict_sundial(ensure_handle(), batches, horizon, device)
-                elif model_family == "timemoe":
-                    fr, tgts = predict_timemoe(ensure_handle(), batches, horizon, device)
+                if short_mode == "pad":
+                    # Run each width-group (its own moirai/timesfm runner), then
+                    # stitch back into one instance-ordered result over ALL n_total.
+                    results = []
+                    for L, batches_L, _ax, _ay, idx_L in groups:
+                        fr_L, tgts_L = _forecast_cell(
+                            model_family, ensure_handle(), model_id, batches_L,
+                            L, horizon, device, args.batch_size)
+                        results.append((idx_L, fr_L, tgts_L))
+                    n_valid = cache.n_total
+                    fr, tgts = _merge_grouped(results, n_valid, horizon, device)
+                    # Uniform-width (NaN-left-padded) inputs, for plotting only.
+                    all_x_np = np.full((n_valid, window_size, 1), np.nan, dtype=np.float32)
+                    for L, _b, ax_L, _ay, idx_L in groups:
+                        all_x_np[idx_L, -int(L):, :] = ax_L.numpy()
+                    all_x_cpu = torch.from_numpy(all_x_np)
+                    print(f"    Samples: {n_valid} ({len(groups)} width-groups, pad)  "
+                          f"W={window_size}  H={horizon}")
                 else:
-                    raise ValueError(f"Unknown model family: {model_family}")
+                    n_valid = all_x_cpu.shape[0]
+                    print(f"    Samples: {n_valid}  Batches: {len(batches)}  W={window_size}  H={horizon}")
+                    fr, tgts = _forecast_cell(
+                        model_family, ensure_handle(), model_id, batches,
+                        window_size, horizon, device, args.batch_size)
 
                 elapsed = time.perf_counter() - t_start
 
@@ -1480,7 +1625,8 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 print(Fore.MAGENTA + f"    TIME  {elapsed:.1f}s" + Fore.RESET)
 
                 per_sample = compute_per_sample_metrics(fr, tgts, cache.naive_seasonal_mae_train)
-                _save_per_sample_metrics(dataset_display, model_short, term, window_size, per_sample)
+                if not args.no_cell_cache:
+                    _save_per_sample_metrics(dataset_display, model_short, term, window_size, per_sample)
 
                 if not args.no_plots:
                     pred_3d = fr.median.detach().cpu().unsqueeze(-1)
@@ -1495,7 +1641,8 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     plot_error_distributions(per_sample, model_short, window_size, horizon,
                                              cell_dir, naive_baseline=naive_bl)
 
-                _save_result(dataset_display, model_short, term, window_size, metrics)
+                if not args.no_cell_cache:
+                    _save_result(dataset_display, model_short, term, window_size, metrics)
 
                 all_results.append({
                     "model": model_id, "model_short": model_short, "model_family": model_family,
@@ -1503,7 +1650,7 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     "horizon": horizon, "window_size": window_size, **metrics,
                 })
 
-                del fr, tgts, batches, all_x_cpu, all_y_cpu, per_sample
+                del fr, tgts, all_x_cpu, per_sample
                 if device == "cuda":
                     torch.cuda.empty_cache()
                 gc.collect()

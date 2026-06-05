@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -94,6 +95,18 @@ RUN_LOG_ROOT   = "logs/experiments/run_all_logs"
 # model — v5 keys its artefacts by (dataset, model_short), so models coexist
 # here without collision and share the dataset cache + naive baselines.
 ABLATION_GENERAL = os.path.join(ABLATION_ROOT, "general")
+
+# Per-model strategy-comparison subfolder (stage 4). Made mode-specific in main()
+# so that --short-context-mode pad never collides with / reuses skip-mode caches.
+STRATEGY_SUBDIR = "strategy_comparison"
+
+# --test (smoke) mode: the whole pipeline runs end-to-end for every model and
+# dataset but is shrunk dramatically (smallest+largest window only, a handful of
+# synthetic series, a 2-trial / 3-epoch predictor sweep) and redirected into this
+# throwaway tree, which is deleted once the run finishes. Lets you confirm every
+# stage wires up and every model/dataset loads, without touching real results.
+TEST_ROOT      = "logs/experiments/_smoke_test"
+TEST_N_SERIES  = 200   # synthetic series built in stage 1 under --test
 
 
 def _model_idx(model_id: str, display: str) -> int:
@@ -341,7 +354,7 @@ def stage_3_ablation(display: str, family: str, extra: Sequence[str]) -> float:
 
 
 def stage_4_compare(display: str, family: str, extra: Sequence[str]) -> float:
-    out_dir = os.path.join(ABLATION_ROOT, display, "strategy_comparison")
+    out_dir = os.path.join(ABLATION_ROOT, display, STRATEGY_SUBDIR)
     return _run(
         [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
          "--run-dir", ABLATION_GENERAL,
@@ -420,7 +433,7 @@ def _done_stage_3(family: str, display: str = "") -> Tuple[bool, str]:
 def _done_stage_4(family: str, display: str = "") -> Tuple[bool, str]:
     """Stage 4 is done when summary_stats.json exists in the model's
     strategy_comparison/ folder."""
-    out = os.path.join(ABLATION_ROOT, display, "strategy_comparison",
+    out = os.path.join(ABLATION_ROOT, display, STRATEGY_SUBDIR,
                        "summary_stats.json")
     if os.path.isfile(out):
         return True, "summary_stats.json present"
@@ -457,6 +470,26 @@ def parse_args() -> argparse.Namespace:
               "argument to force every active stage."),
     )
     p.add_argument(
+        "--short-context-mode", choices=["skip", "pad"], default="skip",
+        help=("Stage-3 handling of instances shorter than the ablation window. "
+              "'skip' (default): exclude them at that window (original behaviour). "
+              "'pad': never skip — feed each instance its available context "
+              "(PatchTST-FM NaN-padded to native context). Threaded to stage 3."),
+    )
+    p.add_argument(
+        "--test", action="store_true",
+        help=("Smoke test: run the full pipeline for every selected model and "
+              "dataset, but dramatically reduced (smallest+largest window only, "
+              f"{TEST_N_SERIES} synthetic series, a 2-trial/3-epoch predictor "
+              "sweep, no plots, no per-cell cache). All output is redirected into "
+              f"{TEST_ROOT}/ and deleted afterwards (see --keep-test-output), so "
+              "real datasets/results are never touched."),
+    )
+    p.add_argument(
+        "--keep-test-output", action="store_true",
+        help=f"With --test, do not delete {TEST_ROOT}/ at the end (for debugging).",
+    )
+    p.add_argument(
         "-v", "--verbose", action="store_true",
         help=("Stream each stage's subprocess output to the terminal (old "
               "behaviour). Default is quiet: only the top-level tqdm bar shows, "
@@ -477,6 +510,43 @@ def main() -> None:
     global _QUIET
     _QUIET = not args.verbose
 
+    # ---- Smoke-test mode --------------------------------------------------
+    # Redirect every stage's output into a throwaway tree and switch the stage
+    # scripts into their reduced "test" configuration. Stage scripts pick up the
+    # reductions/roots from these env vars at *import* time, which is the only
+    # spawn-safe channel: build/predictor fan out to per-GPU `mp spawn` workers
+    # that re-import the module, so a main()-level override would not reach them
+    # but an inherited env var does. Stages 3/4 take their roots via CLI (set on
+    # the globals below). Everything lands under TEST_ROOT and is deleted in the
+    # finally-block unless --keep-test-output is given.
+    global DATASET_ROOT, PREDICTOR_ROOT, ABLATION_ROOT, RUN_LOG_ROOT
+    if args.test:
+        DATASET_ROOT   = os.path.join(TEST_ROOT, "context_length_dataset")
+        PREDICTOR_ROOT = os.path.join(TEST_ROOT, "context_length_predictor")
+        ABLATION_ROOT  = os.path.join(TEST_ROOT, "window_ablation_gifteval")
+        RUN_LOG_ROOT   = os.path.join(TEST_ROOT, "run_all_logs")
+        os.environ["PREDICTCSL_TEST"]            = "1"
+        os.environ["PREDICTCSL_DATASET_ROOT"]    = DATASET_ROOT
+        os.environ["PREDICTCSL_PREDICTOR_ROOT"]  = PREDICTOR_ROOT
+        print(Fore.YELLOW
+              + f"SMOKE TEST: reduced full pipeline -> {TEST_ROOT}/ "
+              + ("(kept)" if args.keep_test_output else "(deleted afterwards)")
+              + Fore.RESET)
+
+    # Route pad-mode artefacts to a separate run dir + strategy subfolder so the
+    # two short-context strategies never share (and silently reuse) caches. Stage
+    # 1/2 are unaffected — the predictor is trained on stage-1 labels regardless.
+    # Recompute from the (possibly test-overridden) ABLATION_ROOT — the module
+    # default was derived from the real root at import.
+    global ABLATION_GENERAL, STRATEGY_SUBDIR
+    if args.short_context_mode == "pad":
+        ABLATION_GENERAL = os.path.join(ABLATION_ROOT, "general_pad")
+        STRATEGY_SUBDIR = "strategy_comparison_pad"
+        print(Fore.CYAN + f"Short-context mode: pad  ->  run dir {ABLATION_GENERAL}"
+              + Fore.RESET)
+    else:
+        ABLATION_GENERAL = os.path.join(ABLATION_ROOT, "general")
+
     if args.only_stages and args.skip_stages:
         raise SystemExit("Use either --skip-stages or --only-stages, not both.")
     active = (set(args.only_stages) if args.only_stages
@@ -490,11 +560,18 @@ def main() -> None:
             f"--models={args.models}")
 
     extras_by_stage = {
-        "1": args.build_args,
-        "2": args.predictor_args,
-        "3": args.ablation_args,
-        "4": args.compare_args,
+        "1": list(args.build_args),
+        "2": list(args.predictor_args),
+        "3": list(args.ablation_args) + ["--short-context-mode", args.short_context_mode],
+        "4": list(args.compare_args),
     }
+    if args.test:
+        # Stage 1: few synthetic series (windows are collapsed via PREDICTCSL_TEST).
+        # Stage 2: trial/epoch counts collapse via PREDICTCSL_TEST (no CLI needed).
+        # Stage 3: smallest+largest window come from the predictor grid; skip plots
+        #          and the per-cell cache so the smoke run leaves nothing to clean.
+        extras_by_stage["1"] += ["--n-series", str(TEST_N_SERIES)]
+        extras_by_stage["3"] += ["--no-plots", "--no-cell-cache"]
 
     # --force semantics: None = no override, [] = force all active, [...] = force listed
     if args.force is None:
@@ -538,14 +615,24 @@ def main() -> None:
     ordered_stages = [s for s in ("1", "2", "3", "4") if s in active]
 
     t_start = time.perf_counter()
-    for model_id, family, display in selected:
-        if not _QUIET:
-            _banner(f"{display}  ({family})  —  {model_id}")
-        for sid in ordered_stages:
-            _maybe_run(sid, model_id, family, display)
+    try:
+        for model_id, family, display in selected:
+            if not _QUIET:
+                _banner(f"{display}  ({family})  —  {model_id}")
+            for sid in ordered_stages:
+                _maybe_run(sid, model_id, family, display)
 
-    total = time.perf_counter() - t_start
-    print(Fore.GREEN + f"\nAll done in {total/60:.1f} min." + Fore.RESET)
+        total = time.perf_counter() - t_start
+        print(Fore.GREEN + f"\nAll done in {total/60:.1f} min." + Fore.RESET)
+    finally:
+        # Remove the throwaway smoke-test tree whether the run succeeded or a
+        # stage raised — the point of --test is to leave nothing behind.
+        if args.test and not args.keep_test_output:
+            shutil.rmtree(TEST_ROOT, ignore_errors=True)
+            print(Fore.YELLOW + f"SMOKE TEST: removed {TEST_ROOT}/" + Fore.RESET)
+        elif args.test:
+            print(Fore.YELLOW + f"SMOKE TEST: output kept at {TEST_ROOT}/"
+                  + Fore.RESET)
 
 
 if __name__ == "__main__":

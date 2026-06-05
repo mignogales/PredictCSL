@@ -102,6 +102,16 @@ EARLY_STOPPING_PATIENCE = 4            # validation events, not epochs
 GRAD_CLIP               = 1.0
 SEED                    = 42
 
+# Smoke-test mode (PREDICTCSL_TEST=1, set by experiments/run_all.py --test):
+# shrink the random search and per-trial training so this stage finishes in a
+# couple of minutes. Resolved from the env at import so it also takes effect
+# inside the spawned per-GPU trial workers (they re-import this module).
+if os.environ.get("PREDICTCSL_TEST") == "1":
+    N_TRIALS                = 2
+    MAX_EPOCHS              = 3
+    VAL_EVERY_N_EPOCHS      = 1
+    EARLY_STOPPING_PATIENCE = 2
+
 # -- Dual-objective loss weights ----------------------------------------------
 LAMBDA_CURVE = 1.0             # weight of MSE_curve (z-scored curve regression)
 LAMBDA_RECON = 0.5             # weight of MSE_reconstruction (aux; 0 disables)
@@ -135,7 +145,12 @@ HP_SPACE = {
     "weight_decay":        [1e-4, 1e-3],
 }
 
-CACHE_ROOT = "logs/experiments/context_length_predictor"
+# Run root. Overridable via env so run_all.py --test can redirect predictor
+# output into its throwaway tree. Resolved at import so the spawned trial
+# workers (which persist per-trial checkpoints under this root) agree with the
+# parent process.
+CACHE_ROOT = os.environ.get(
+    "PREDICTCSL_PREDICTOR_ROOT", "logs/experiments/context_length_predictor")
 
 
 # ==============================================================================

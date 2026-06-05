@@ -89,6 +89,14 @@ WINDOW_GRID = [
     1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192,
 ]
 
+# Smoke-test mode (PREDICTCSL_TEST=1, set by experiments/run_all.py --test):
+# collapse the ablation grid to just its smallest and largest window so the
+# whole pipeline can be exercised end-to-end in minutes. Resolved from the env
+# at import time on purpose — `mp spawn` workers re-import this module, so a
+# main()-level override would not reach them, but an inherited env var does.
+if os.environ.get("PREDICTCSL_TEST") == "1":
+    WINDOW_GRID = [WINDOW_GRID[0], WINDOW_GRID[-1]]
+
 # -- Horizon grid (forecast lengths labeled per series) -----------------------
 HORIZON_GRID = [16, 32, 64, 128, 512, 1024]
 MAX_HORIZON  = max(HORIZON_GRID)
@@ -106,9 +114,14 @@ SHARD_SIZE = 500             # series per shard (parallelism + resume granularit
 # inputs into the predictor's training distribution so it is robust at inference
 # to series shorter than MAX_WINDOW (which are left-padded identically).
 #   - real_len ~ Uniform[MIN_REAL_LEN, MAX_WINDOW)  (i.e. padding amount uniform)
-#   - ablation windows W > real_len are left as NaN (the window cannot be served
-#     without feeding padding), exactly mirroring the real GiftEval ablation,
-#     which skips instances whose context_length < window_size.
+#   - ablation windows W > real_len are served model-aware, NOT with raw padding:
+#       * variable-length models (chronos, timesfm, moirai, sundial, timemoe) are
+#         fed ONLY the min(W, real_len) genuine samples (the leading zero-padding
+#         is stripped, never shown to the model),
+#       * fixed-context models (patchtst_fm) are fed the genuine samples NaN-padded
+#         to their native length (NaN is the model's missing-value indicator).
+#     The label curve therefore flattens beyond real_len (extra context carries no
+#     signal, so it cannot reduce error) and stays NaN-free.
 PAD_FRAC     = 0.10          # fraction of series that are short / left-padded
 MIN_REAL_LEN = 500           # shortest genuine-signal length for a padded series
 
@@ -156,7 +169,12 @@ SUNDIAL_NUM_SAMPLES             = 20
 SUNDIAL_MAX_CONTEXT             = 2880
 TIMEMOE_MAX_TOTAL               = 4096   # context + horizon must not exceed this
 
-OUTPUT_ROOT = "logs/experiments/context_length_dataset"
+# Output root. Overridable via env so run_all.py --test can redirect the whole
+# smoke run into a throwaway tree (which it deletes afterwards) without ever
+# touching the real datasets. Used only in the parent process (workers receive
+# explicit paths), but env-resolution keeps it consistent regardless.
+OUTPUT_ROOT = os.environ.get(
+    "PREDICTCSL_DATASET_ROOT", "logs/experiments/context_length_dataset")
 
 
 # ==============================================================================
@@ -604,12 +622,15 @@ def load_patchtst_fm(model_id: str, device: str):
 
 def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
     past_values = x.to(device, non_blocking=True).squeeze(-1)
-    # PatchTST-FM-R1 has a FIXED context_length (8192); shorter inputs NaN out.
-    # Left-pad with zeros up to the native context (same convention as the
-    # short/padded synthetic series above) so every window yields valid output.
+    # PatchTST-FM-R1 has a FIXED context_length (8192) and no observed-mask input;
+    # a shorter tensor makes its internal padding NaN out. Left-pad to the native
+    # context with NaN, which the model treats as its missing-value indicator and
+    # masks out (empirically the least-distorting pad: matches mean-padding, beats
+    # zeros). So genuine samples drive the forecast and output stays finite.
     ctx_len = model.config.context_length
     if past_values.shape[1] < ctx_len:
-        pad = past_values.new_zeros(past_values.shape[0], ctx_len - past_values.shape[1])
+        pad = past_values.new_full(
+            (past_values.shape[0], ctx_len - past_values.shape[1]), float("nan"))
         past_values = torch.cat([pad, past_values], dim=1)
     elif past_values.shape[1] > ctx_len:
         past_values = past_values[:, -ctx_len:]
@@ -680,28 +701,25 @@ def setup_model(family: str, model_id: str, device: str):
     raise ValueError(f"Unknown model family: {family}")
 
 
-def forecast_window(
+def _forecast_uniform(
     family: str,
     base,
     model_id: str,
-    contexts: np.ndarray,
-    window: int,
+    x_all: torch.Tensor,            # (n, width, 1) on CPU
+    width: int,
     horizon: int,
     batch_size: int,
     device: str,
 ) -> torch.Tensor:
-    """Forecast the horizon for every series using the last `window` samples.
+    """Forecast a uniform-width batch; return median (n, horizon) on `device`.
 
-    Returns the median forecast (N, horizon) on `device`.
-    """
-    x_all = torch.from_numpy(
-        np.ascontiguousarray(contexts[:, -window:])).unsqueeze(-1)  # (N, W, 1)
+    moirai/timesfm recompile against `width`, so this is called once per distinct
+    context width (see forecast_window's grouping)."""
     n = x_all.shape[0]
-
     if family == "moirai":
-        runner = _build_moirai(base, horizon, window, device)
+        runner = _build_moirai(base, horizon, width, device)
     elif family == "timesfm":
-        runner = load_timesfm(model_id, window, horizon, batch_size)
+        runner = load_timesfm(model_id, width, horizon, batch_size)
     else:
         runner = base
 
@@ -731,7 +749,51 @@ def forecast_window(
         if _is_cuda(device):
             torch.cuda.empty_cache()
 
-    return torch.cat(medians, dim=0)                   # (N, H)
+    return torch.cat(medians, dim=0)                   # (n, H)
+
+
+def forecast_window(
+    family: str,
+    base,
+    model_id: str,
+    contexts: np.ndarray,
+    window: int,
+    real_lengths: np.ndarray,
+    horizon: int,
+    batch_size: int,
+    device: str,
+) -> torch.Tensor:
+    """Forecast the horizon for every series using only its *genuine* context.
+
+    Each series is fed its last ``min(window, real_len)`` genuine samples — the
+    pool left-pads short series, so the genuine signal is the suffix and slicing
+    ``[-L:]`` never touches the artificial padding. Variable-length models receive
+    exactly those samples; PatchTST-FM is NaN-padded to its fixed context inside
+    ``predict_patchtst_fm``. Effective lengths are bucketed *down* to WINDOW_GRID
+    so models that recompile per context width (timesfm, moirai) build at most one
+    runner per distinct grid width. The curve flattens past real_len and the
+    labels are NaN-free.
+
+    Returns the median forecast (N, horizon) on `device`.
+    """
+    n = contexts.shape[0]
+    eff = np.minimum(int(window), np.asarray(real_lengths))      # genuine width / series
+    grid = np.asarray(sorted(set(WINDOW_GRID)))
+    # Largest grid width <= eff; per-series min() guards the rare eff < grid[0].
+    eff_buck = np.minimum(
+        eff, grid[np.clip(np.searchsorted(grid, eff, side="right") - 1, 0, None)]
+    )
+
+    out = torch.empty((n, horizon), device=device, dtype=torch.float32)
+    for L in np.unique(eff_buck):
+        idx = np.flatnonzero(eff_buck == L)
+        x_grp = torch.from_numpy(
+            np.ascontiguousarray(contexts[idx, -int(L):])).unsqueeze(-1)  # (g, L, 1)
+        med = _forecast_uniform(
+            family, base, model_id, x_grp, int(L), horizon, batch_size, device)
+        out[torch.as_tensor(idx, device=device, dtype=torch.long)] = med
+
+    return out                                          # (N, H)
 
 
 # ==============================================================================
@@ -822,20 +884,15 @@ def gpu_worker(
                 if family == "timemoe" and w + max_horizon > TIMEMOE_MAX_TOTAL:
                     continue
                 medians = forecast_window(
-                    family, base, model_id, ctx, w, max_horizon,
+                    family, base, model_id, ctx, w, real_len, max_horizon,
                     batch_size, device)                     # (B, MAX_HORIZON)
                 for h_idx, h in enumerate(HORIZON_GRID):
                     err = medians[:, :h] - tgt_t[:, :h]
                     cm[:, w_idx, h_idx] = err.abs().mean(dim=1).cpu().numpy()
                     cs[:, w_idx, h_idx] = err.pow(2).mean(dim=1).cpu().numpy()
-                # Short/padded series: a window wider than the genuine signal
-                # would feed left-padding to the model. That (window, *) point
-                # cannot be served, so mark it NaN (mirrors the real GiftEval
-                # ablation, which skips instances with context_length < window).
-                too_short = real_len < w
-                if too_short.any():
-                    cm[too_short, w_idx, :] = np.nan
-                    cs[too_short, w_idx, :] = np.nan
+                # No NaN-masking for short series: forecast_window already feeds
+                # each series only its min(w, real_len) genuine samples, so the
+                # error is real and finite. The curve flattens past real_len.
 
             sd = _shard_dir(model_dir, shard_id)
             os.makedirs(sd, exist_ok=True)
