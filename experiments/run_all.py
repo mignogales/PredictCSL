@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -105,8 +106,9 @@ STRATEGY_SUBDIR = "strategy_comparison"
 # synthetic series, a 2-trial / 3-epoch predictor sweep) and redirected into this
 # throwaway tree, which is deleted once the run finishes. Lets you confirm every
 # stage wires up and every model/dataset loads, without touching real results.
-TEST_ROOT      = "logs/experiments/_smoke_test"
-TEST_N_SERIES  = 200   # synthetic series built in stage 1 under --test
+TEST_ROOT       = "logs/experiments/_smoke_test"
+TEST_N_SERIES   = 200   # synthetic series built in stage 1 under --test
+TEST_N_DATASETS = 3     # randomly sampled (dataset, term) entries in stage 3 under --test
 
 
 def _model_idx(model_id: str, display: str) -> int:
@@ -568,10 +570,20 @@ def main() -> None:
     if args.test:
         # Stage 1: few synthetic series (windows are collapsed via PREDICTCSL_TEST).
         # Stage 2: trial/epoch counts collapse via PREDICTCSL_TEST (no CLI needed).
-        # Stage 3: smallest+largest window come from the predictor grid; skip plots
-        #          and the per-cell cache so the smoke run leaves nothing to clean.
+        # Stage 3: smallest+largest window come from the predictor grid; sample a
+        #          few datasets (fresh seed each run so coverage rotates, but the
+        #          same seed reaches every sharded worker via the coordinator's
+        #          forwarded argv); skip plots and the per-cell cache.
+        test_ds_seed = random.randrange(1_000_000)
         extras_by_stage["1"] += ["--n-series", str(TEST_N_SERIES)]
-        extras_by_stage["3"] += ["--no-plots", "--no-cell-cache"]
+        extras_by_stage["3"] += [
+            "--no-plots", "--no-cell-cache",
+            "--test-datasets", str(TEST_N_DATASETS),
+            "--test-datasets-seed", str(test_ds_seed),
+        ]
+        print(Fore.YELLOW
+              + f"SMOKE TEST: sampling {TEST_N_DATASETS} datasets (seed={test_ds_seed})"
+              + Fore.RESET)
 
     # --force semantics: None = no override, [] = force all active, [...] = force listed
     if args.force is None:

@@ -30,6 +30,7 @@ import argparse
 import gc
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -1344,6 +1345,13 @@ def parse_args() -> argparse.Namespace:
                         "are still aggregated in memory into results.csv and the comparison "
                         "plots, so downstream stages work — but nothing is cached for resume. "
                         "Used by run_all.py --test smoke runs.")
+    p.add_argument("--test-datasets", type=int, default=None,
+                   help="Smoke test: randomly sample this many (dataset, term) entries to "
+                        "run, instead of the full grid. Applied after --datasets. The sample "
+                        "is seeded (--test-datasets-seed) so every sharded worker agrees on "
+                        "the same subset. Used by run_all.py --test.")
+    p.add_argument("--test-datasets-seed", type=int, default=0,
+                   help="Seed for --test-datasets sampling (kept identical across workers).")
     p.add_argument("--cache-root", type=str, default=CACHE_ROOT)
     p.add_argument("--predictor-cache-root", type=str, default=CACHE_ROOT_PREDICTOR,
                    help="Root holding context-length-predictor runs. Latest run is auto-picked.")
@@ -1462,6 +1470,18 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
 
     models = [m for m in MODELS if (args.models is None or m[2] in args.models)]
     datasets = [d for d in DATASETS if (args.datasets is None or d[2] in args.datasets)]
+
+    # Smoke test: keep only a random subset of (dataset, term) entries. Seeded so
+    # every sharded worker samples the identical subset (d_idx must stay stable
+    # across processes). Sorted back to original order for a sane shard split.
+    if args.test_datasets is not None and args.test_datasets < len(datasets):
+        rng = random.Random(args.test_datasets_seed)
+        datasets = sorted(rng.sample(datasets, args.test_datasets),
+                          key=lambda d: DATASETS.index(d))
+        print(Fore.YELLOW
+              + f"SMOKE TEST: sampled {len(datasets)} datasets "
+              + f"(seed={args.test_datasets_seed}): {[d[2] + '/' + d[1] for d in datasets]}"
+              + Fore.RESET)
 
     # Deterministic per-family layout: run dir is the predictor's family
     # (= basename of predictor_dir), so re-running overwrites the same place.
