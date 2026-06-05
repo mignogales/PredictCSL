@@ -705,7 +705,18 @@ def predict_patchtst_fm(model, batches, horizon, device):
         x = x_cpu.to(device, non_blocking=True)
         y = y_cpu.to(device, non_blocking=True)
         B = x.shape[0]
-        past_values = x.squeeze(-1)
+        # PatchTST-FM-R1 has a FIXED context_length (8192). Inputs shorter than
+        # that produce all-NaN forecasts (the model logs "Context Len: 8192" and
+        # its internal padding NaNs out). Left-pad with zeros up to the native
+        # context — matching the zero-left-pad convention used for short series
+        # in build_context_length_dataset.py — so every window yields valid output.
+        ctx_len = model.config.context_length
+        past_values = x.squeeze(-1)                          # (B, W)
+        if past_values.shape[1] < ctx_len:
+            pad = past_values.new_zeros(B, ctx_len - past_values.shape[1])
+            past_values = torch.cat([pad, past_values], dim=1)
+        elif past_values.shape[1] > ctx_len:
+            past_values = past_values[:, -ctx_len:]
         output = model(inputs=past_values, prediction_length=horizon)
         raw = output[0]
         if raw.dim() == 4:

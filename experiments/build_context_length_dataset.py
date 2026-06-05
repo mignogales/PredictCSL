@@ -604,6 +604,15 @@ def load_patchtst_fm(model_id: str, device: str):
 
 def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
     past_values = x.to(device, non_blocking=True).squeeze(-1)
+    # PatchTST-FM-R1 has a FIXED context_length (8192); shorter inputs NaN out.
+    # Left-pad with zeros up to the native context (same convention as the
+    # short/padded synthetic series above) so every window yields valid output.
+    ctx_len = model.config.context_length
+    if past_values.shape[1] < ctx_len:
+        pad = past_values.new_zeros(past_values.shape[0], ctx_len - past_values.shape[1])
+        past_values = torch.cat([pad, past_values], dim=1)
+    elif past_values.shape[1] > ctx_len:
+        past_values = past_values[:, -ctx_len:]
     raw = model(inputs=past_values, prediction_length=horizon)[0]
     if raw.dim() == 4:                                 # (B, Q, H, 1)
         qf = raw[:, :, :horizon, 0]
