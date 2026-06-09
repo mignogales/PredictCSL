@@ -57,6 +57,7 @@ import json
 import math
 import os
 import time
+import traceback
 from datetime import datetime
 from queue import Empty
 from typing import List, Optional, Tuple
@@ -894,6 +895,7 @@ def gpu_worker(
     torch.set_float32_matmul_precision("high")
     n_win = len(WINDOW_GRID)
     n_h = len(HORIZON_GRID)
+    tb_shown = False        # print a full traceback only for the first shard failure
 
     try:
         base = setup_model(family, model_id, device)
@@ -959,6 +961,13 @@ def gpu_worker(
         except Exception as exc:
             print(Fore.RED + f"  [{dev_label}] shard {shard_id:03d} FAILED: "
                   + f"{type(exc).__name__}: {exc}" + Fore.RESET)
+            if not tb_shown:
+                # First failure on this worker: dump the full traceback so the
+                # offending modeling line (not just the message) is in the log.
+                print(Fore.RED + f"  [{dev_label}] shard {shard_id:03d} "
+                      + "traceback (shown once per worker):" + Fore.RESET)
+                traceback.print_exc()
+                tb_shown = True
             result_queue.put({"shard_id": shard_id,
                               "status": f"error:{type(exc).__name__}"})
         if _is_cuda(device):
