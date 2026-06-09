@@ -655,6 +655,8 @@ def _patch_dynamic_cache_seen_tokens() -> None:
       * ``get_max_length`` — method deprecated in 4.41, removed ~4.48 (now
                              ``get_max_cache_shape()``); always ``None`` for the
                              unbounded ``DynamicCache``.
+      * ``get_usable_length`` — companion of ``get_max_length``, removed in the
+                             same cleanup; restored with its original logic.
 
     Without these, ``model.generate`` raises ``AttributeError`` mid-decode. We
     re-expose them as thin shims so the cap-free forecast path works unchanged.
@@ -677,6 +679,16 @@ def _patch_dynamic_cache_seen_tokens() -> None:
             shape_fn = getattr(self, "get_max_cache_shape", None)
             return shape_fn() if shape_fn is not None else None
         DynamicCache.get_max_length = _get_max_length
+
+    if not hasattr(DynamicCache, "get_usable_length"):
+        def _get_usable_length(self, new_seq_length, layer_idx=0):
+            max_length = self.get_max_length()
+            previous_seq_length = self.get_seq_length(layer_idx)
+            if (max_length is not None
+                    and previous_seq_length + new_seq_length > max_length):
+                return max_length - new_seq_length
+            return previous_seq_length
+        DynamicCache.get_usable_length = _get_usable_length
 
 
 def load_sundial(model_id: str, device: str):
