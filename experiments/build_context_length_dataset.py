@@ -646,24 +646,37 @@ def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> to
 
 
 def _patch_dynamic_cache_seen_tokens() -> None:
-    """Restore ``DynamicCache.seen_tokens`` for old trust_remote_code models.
+    """Restore legacy ``DynamicCache`` APIs for old trust_remote_code models.
 
-    Sundial's remote modeling code reads ``past_key_values.seen_tokens``, an
-    attribute that transformers deprecated and removed in >=4.41 (replaced by
-    ``get_seq_length()``). Without this, ``model.generate`` raises
-    ``AttributeError: 'DynamicCache' object has no attribute 'seen_tokens'``.
-    Re-expose it as a read-only alias so the cap-free path works unchanged.
+    Sundial's (and TimeMoE's) remote modeling code predates several transformers
+    Cache-API changes and calls members that newer versions deprecated/removed:
+
+      * ``seen_tokens``    — attribute removed in >=4.41 (now ``get_seq_length()``)
+      * ``get_max_length`` — method deprecated in 4.41, removed ~4.48 (now
+                             ``get_max_cache_shape()``); always ``None`` for the
+                             unbounded ``DynamicCache``.
+
+    Without these, ``model.generate`` raises ``AttributeError`` mid-decode. We
+    re-expose them as thin shims so the cap-free forecast path works unchanged.
+    Each is added only if missing, so this is a no-op on versions that still
+    provide them and never shadows native behavior.
     """
     try:
         from transformers.cache_utils import DynamicCache
     except Exception:
         return
-    if hasattr(DynamicCache, "seen_tokens"):
-        return
-    def _seen_tokens(self):
-        val = getattr(self, "_seen_tokens", None)
-        return val if val is not None else self.get_seq_length()
-    DynamicCache.seen_tokens = property(_seen_tokens)
+
+    if not hasattr(DynamicCache, "seen_tokens"):
+        def _seen_tokens(self):
+            val = getattr(self, "_seen_tokens", None)
+            return val if val is not None else self.get_seq_length()
+        DynamicCache.seen_tokens = property(_seen_tokens)
+
+    if not hasattr(DynamicCache, "get_max_length"):
+        def _get_max_length(self):
+            shape_fn = getattr(self, "get_max_cache_shape", None)
+            return shape_fn() if shape_fn is not None else None
+        DynamicCache.get_max_length = _get_max_length
 
 
 def load_sundial(model_id: str, device: str):
