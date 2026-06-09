@@ -645,8 +645,30 @@ def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> to
     return raw[:, :horizon].to(torch.float32)          # (B, H)
 
 
+def _patch_dynamic_cache_seen_tokens() -> None:
+    """Restore ``DynamicCache.seen_tokens`` for old trust_remote_code models.
+
+    Sundial's remote modeling code reads ``past_key_values.seen_tokens``, an
+    attribute that transformers deprecated and removed in >=4.41 (replaced by
+    ``get_seq_length()``). Without this, ``model.generate`` raises
+    ``AttributeError: 'DynamicCache' object has no attribute 'seen_tokens'``.
+    Re-expose it as a read-only alias so the cap-free path works unchanged.
+    """
+    try:
+        from transformers.cache_utils import DynamicCache
+    except Exception:
+        return
+    if hasattr(DynamicCache, "seen_tokens"):
+        return
+    def _seen_tokens(self):
+        val = getattr(self, "_seen_tokens", None)
+        return val if val is not None else self.get_seq_length()
+    DynamicCache.seen_tokens = property(_seen_tokens)
+
+
 def load_sundial(model_id: str, device: str):
     from transformers import AutoModelForCausalLM
+    _patch_dynamic_cache_seen_tokens()
     model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
     model.to(device).eval()
     return model
@@ -663,6 +685,7 @@ def predict_sundial(model, x: torch.Tensor, horizon: int, device: str) -> torch.
 
 def load_timemoe(model_id: str, device: str):
     from transformers import AutoModelForCausalLM
+    _patch_dynamic_cache_seen_tokens()
     model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
     model.to(device).eval()
     return model
@@ -1157,8 +1180,18 @@ def main() -> None:
             }, f, indent=2)
 
         _print_data_sanity(curves_mae, n_segments, family)
+        idx = MODELS.index((model_id, family, display))
+        if n_done == 0:
+            # Nothing was labeled at all — almost always a model-load failure in
+            # the workers (see the "model load failed" line above). The curves
+            # file is entirely NaN, so the predictor would otherwise die later
+            # with a misleading "No labeled series in dataset". Fail here, on the
+            # build stage, so the error points at the right log.
+            raise RuntimeError(
+                f"{display}: 0/{total_shards} shards labeled — curves are all "
+                f"NaN. Check the worker model-load error above; re-run with "
+                f"--model-idx {idx} once fixed.")
         if n_done < total_shards:
-            idx = MODELS.index((model_id, family, display))
             print(Fore.YELLOW + f"   {total_shards - n_done} shard(s) incomplete — "
                   + f"re-run with --model-idx {idx}" + Fore.RESET)
 

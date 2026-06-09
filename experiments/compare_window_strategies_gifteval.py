@@ -198,6 +198,28 @@ def _npz_filename(dataset_display: str, term: str, model_short: str) -> str:
     return f"compare_{dataset_display}_t{term}_{model_short}.npz"
 
 
+def _load_period_record(
+    compare_dir: str, dataset_display: str, term: str, model_short: str
+) -> Optional[dict]:
+    """Load the period_window_eval.py sidecar for this (dataset, term, model), if any.
+
+    Returns the parsed JSON (period_mase / window stats / elapsed) or None when the
+    period-window strategy was not evaluated -- in which case the period_* columns
+    stay NaN and the comparison degrades gracefully to the original 3 strategies.
+    """
+    path = os.path.join(
+        compare_dir, f"period_{dataset_display}_t{term}_{model_short}.json"
+    )
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as exc:
+        print(Fore.YELLOW + f"  Could not read period sidecar {path}: {exc}" + Fore.RESET)
+        return None
+
+
 def load_strategy_records(
     run_dir: str,
     cache_root: str,
@@ -322,6 +344,30 @@ def load_strategy_records(
             complexity_ratio_pred = pred_flops / full_flops
             complexity_ratio_best = best_flops / full_flops
 
+            # --- Period-window strategy (per-series 2x-period; off-grid) ----------
+            # Loaded from the period_window_eval.py sidecar; NaN-filled when absent
+            # so the comparison still runs with just full/best/pred.
+            prec = _load_period_record(compare_dir, dataset_display, term, model_short)
+            if prec is not None:
+                period_w       = float(prec.get("window_mean", float("nan")))
+                period_mase    = float(prec.get("period_mase", float("nan")))
+                period_elapsed = float(prec.get("period_elapsed_s", float("nan")))
+                period_w_med   = float(prec.get("window_median", float("nan")))
+                period_n_inst  = int(prec.get("n_instances", n_instances))
+                period_flops   = theoretical_flops(
+                    model, max(1, int(round(period_w))), horizon, patch_sizes)
+                speedup_period = (
+                    full_elapsed / period_elapsed
+                    if period_elapsed > 0 and not math.isnan(period_elapsed)
+                    and not math.isnan(full_elapsed)
+                    else float("nan")
+                )
+            else:
+                period_w = period_mase = period_elapsed = period_w_med = float("nan")
+                period_n_inst = 0
+                period_flops = float("nan")
+                speedup_period = float("nan")
+
             records.append({
             # identity
             "model":           model,
@@ -360,6 +406,23 @@ def load_strategy_records(
             "pred_flops":      pred_flops,
             "complexity_ratio_pred_vs_full": complexity_ratio_pred,
             "complexity_ratio_best_vs_full": complexity_ratio_best,
+            # period-window strategy (per-series max(2*period, horizon); off-grid)
+            "period_window":   period_w,        # mean per-series window (representative)
+            "period_window_median": period_w_med,
+            "period_n_instances":   period_n_inst,
+            "period_mase":     period_mase,
+            "delta_period_vs_full": period_mase - full_mase,
+            "delta_period_vs_best": period_mase - best_mase,
+            "delta_period_vs_pred": period_mase - pred_mase,
+            "rel_gain_period_over_full": (
+                (full_mase - period_mase) / (abs(full_mase) + 1e-12)
+            ),
+            "period_elapsed_s": period_elapsed,
+            "speedup_period_vs_full": speedup_period,
+            "period_flops":    period_flops,
+            "complexity_ratio_period_vs_full": (
+                period_flops / full_flops if full_flops > 0 else float("nan")
+            ),
         })
 
     if not records:
@@ -437,6 +500,41 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
             "mean":   float(cr.mean()),
             "median": float(np.median(cr)),
         }
+
+    # ---- Period-window strategy (only when sidecars were present) ------------
+    if "period_mase" in df.columns:
+        rp = df.dropna(subset=["full_mase", "best_mase", "period_mase"])
+        if not rp.empty:
+            vals = rp["period_mase"].values
+            stats["period_mase"] = {
+                "mean":    float(vals.mean()),
+                "geomean": _geomean(vals),
+                "median":  float(np.median(vals)),
+                "std":     float(vals.std()),
+                "n":       int(len(vals)),
+            }
+            stats["period_beats_full_count"] = int((rp["period_mase"] < rp["full_mase"]).sum())
+            stats["period_beats_full_rate"]  = (
+                int((rp["period_mase"] < rp["full_mase"]).sum()) / max(len(rp), 1))
+            stats["period_beats_pred_count"] = int((rp["period_mase"] < rp["pred_mase"]).sum())
+            gain_p = rp["rel_gain_period_over_full"].values
+            stats["rel_gain_period_over_full"] = {
+                "mean":         float(gain_p.mean()),
+                "median":       float(np.median(gain_p)),
+                "pct_positive": float((gain_p > 0).mean()),
+            }
+            regret_p = rp["delta_period_vs_best"].values
+            stats["regret_period_vs_best"] = {
+                "mean":   float(regret_p.mean()),
+                "median": float(np.median(regret_p)),
+            }
+            crp = df["complexity_ratio_period_vs_full"].dropna().values
+            if crp.size:
+                stats["complexity_ratio_period_vs_full"] = {
+                    "mean":   float(crp.mean()),
+                    "median": float(np.median(crp)),
+                }
+            stats["mean_period_window"] = float(rp["period_window"].dropna().mean())
 
     return stats
 
@@ -942,6 +1040,12 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str) -> str:
 
     strategies = ["full_mase", "best_mase", "pred_mase"]
     labels = ["Full Window", "Best Window\n(Oracle)", "Predictor\nWindow"]
+    # Append the period-window strategy when sidecars supplied it (restricted to
+    # the rows that actually have a period_mase, so bars stay comparable).
+    if "period_mase" in r.columns and r["period_mase"].notna().any():
+        r = r.dropna(subset=["period_mase"]).copy()
+        strategies.append("period_mase")
+        labels.append("Period\n(2×Period)")
 
     # Geometric mean — exp(mean(log)) — what M4/OWA use; robust to outlier spikes
     gmeans  = [_geomean(r[s].values) for s in strategies]
@@ -955,8 +1059,8 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str) -> str:
 
     x = np.arange(len(labels))
     wb = 0.30
-    c_geom   = ["#264FA0", "#A9511B", "#3E7327"]
-    c_median = ["#7BA9D8", "#F0A86A", "#9ED67A"]
+    c_geom   = ["#264FA0", "#A9511B", "#3E7327", "#6A1B9A"][:len(labels)]
+    c_median = ["#7BA9D8", "#F0A86A", "#9ED67A", "#C39BD3"][:len(labels)]
 
     fig, ax = plt.subplots(figsize=(10, 6))
     b1 = ax.bar(x - wb / 2, gmeans,  wb, label="Geometric Mean ★", color=c_geom,   alpha=0.85, edgecolor="white")
@@ -1463,12 +1567,20 @@ def main() -> None:
         print(Fore.GREEN + f"  Saved: {stats_path}" + Fore.RESET)
 
         print(Fore.CYAN + "\n--- MASE summary ---" + Fore.RESET)
-        for key, name in [("full_mase", "Full window  "),
-                          ("best_mase", "Best (oracle)"),
-                          ("pred_mase", "Predictor    ")]:
+        mase_keys = [("full_mase", "Full window  "),
+                     ("best_mase", "Best (oracle)"),
+                     ("pred_mase", "Predictor    ")]
+        if "period_mase" in stats:
+            mase_keys.append(("period_mase", "Period (2xP) "))
+        for key, name in mase_keys:
             s = stats[key]
             print(f"  {name}  mean={s['mean']:.4f}  geomean={s['geomean']:.4f}  "
                   f"median={s['median']:.4f}  std={s['std']:.4f}")
+        if "period_mase" in stats:
+            print(f"  Period beats full: {stats['period_beats_full_count']}/{stats['total_rows']} "
+                  f"({100*stats['period_beats_full_rate']:.1f}%)  |  "
+                  f"regret vs oracle: mean={stats['regret_period_vs_best']['mean']:.4f}  "
+                  f"mean window={stats.get('mean_period_window', float('nan')):.0f}")
         print(f"  Pred beats full: {stats['pred_beats_full_count']}/{stats['total_rows']} "
               f"({100*stats['pred_beats_full_rate']:.1f}%)")
         if stats.get("pred_clamped_count", 0) > 0:
