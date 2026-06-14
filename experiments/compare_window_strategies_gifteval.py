@@ -37,9 +37,14 @@ Outputs (written to <run_dir>/models/<model_short>/strategy_comparison/)
 ----------------------------------------------------
   comparison.csv              per-row MASE, elapsed time, complexity per strategy
   summary_stats.json          aggregate stats (mean/median, win rates, speedups)
-  flops_savings.csv           total FLOPs saved vs full + mean MASE drop, per strategy
-                              (run-level roll-up across models at <run_dir>/
-                               flops_savings_all_models.csv, incl. a TOTAL row)
+  flops_savings.csv           total FLOPs saved vs full + geomean MASE drop, per strategy
+
+Run-level (at <run_dir>/, one figure for the whole run; via --rollup-only)
+----------------------------------------------------
+  flops_savings_all_models.csv   per-(model,strategy) savings + a grand TOTAL row
+                                 (arith & geo means of ratio / %saved / abs saved)
+  model_strategy_overview.png    single scatter: every (model × strategy) point,
+                                 FLOPs saved (x) vs geomean MASE change (y)
   bar_aggregate_mase.png      mean & median MASE per strategy
   bar_aggregate_time.png      mean elapsed time per strategy
   scatter_pred_vs_best.png    MASE(pred) vs MASE(best)
@@ -458,6 +463,18 @@ def _geomean(vals: np.ndarray) -> float:
     return float(np.exp(np.log(np.clip(vals, 1e-9, None)).mean()))
 
 
+def _wgeomean(vals: np.ndarray, weights: np.ndarray) -> float:
+    """Weighted geometric mean: exp(sum(w*log(x)) / sum(w)). Clips to 1e-9.
+
+    Combining per-group weighted geomeans with their group weights reproduces the
+    global weighted geomean exactly (logs are additive), so the run-level rollup
+    can aggregate the per-model MASE geomeans without the raw rows.
+    """
+    vals = np.clip(np.asarray(vals, dtype=float), 1e-9, None)
+    w = np.asarray(weights, dtype=float)
+    return float(np.exp((w * np.log(vals)).sum() / w.sum()))
+
+
 def compute_summary_stats(df: pd.DataFrame) -> dict:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"])
     stats: dict = {}
@@ -560,9 +577,10 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
 
     Each row in ``df`` aggregates ``n_instances`` forecasts and stores the
     *per-forecast* FLOPs proxy (``full_flops`` etc.), so we weight by
-    ``n_instances`` to get a benchmark-wide total.  MASE is likewise instance-
-    weighted so ``mase_drop_vs_full`` is the mean accuracy change over the same
-    population.
+    ``n_instances`` to get a benchmark-wide total.  MASE is aggregated with an
+    instance-weighted *geometric* mean (the GiftEval convention for scale-free
+    error scores), so ``mase_drop_vs_full`` is the change in geometric-mean MASE
+    over the same population.
 
     Caveat: ``theoretical_flops`` is an *unnormalized* proxy, comparable only as
     a ratio within a single (model, horizon).  Absolute totals are therefore most
@@ -586,8 +604,8 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
         full_f  = float((sub["full_flops"].values * w).sum())
         strat_f = float((sub[flops_col].values   * w).sum())
         saved   = full_f - strat_f
-        mean_full_mase  = float((sub["full_mase"].values * w).sum() / wsum)
-        mean_strat_mase = float((sub[mase_col].values    * w).sum() / wsum)
+        gm_full_mase  = _wgeomean(sub["full_mase"].values, w)
+        gm_strat_mase = _wgeomean(sub[mase_col].values,    w)
         rows.append({
             "strategy":             name,
             "n_rows":               int(len(sub)),
@@ -597,12 +615,100 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
             "flops_saved":          saved,
             "flops_ratio":          strat_f / full_f if full_f > 0 else float("nan"),
             "pct_flops_saved":      saved / full_f if full_f > 0 else float("nan"),
-            "mean_full_mase":       mean_full_mase,
-            "mean_strategy_mase":   mean_strat_mase,
-            "mase_drop_vs_full":    mean_full_mase - mean_strat_mase,  # >0 = better
-            "mean_delta_vs_full":   mean_strat_mase - mean_full_mase,  # (strat - full)
+            "geomean_full_mase":     gm_full_mase,
+            "geomean_strategy_mase": gm_strat_mase,
+            "mase_drop_vs_full":     gm_full_mase - gm_strat_mase,  # >0 = better
+            "mean_delta_vs_full":    gm_strat_mase - gm_full_mase,  # (strat - full)
         })
     return pd.DataFrame(rows)
+
+
+def write_run_rollup(df: pd.DataFrame, out_dir: str) -> None:
+    """Cross-model roll-up: per-(model, strategy) FLOPs savings + MASE change, a
+    grand TOTAL row per strategy, the single overview figure, and the console
+    summary.  Writes ``flops_savings_all_models.csv`` and
+    ``model_strategy_overview.png`` into ``out_dir``.
+
+    Absolute FLOPs are an unnormalized proxy (comparable as a ratio within a
+    model), so per-model rows carry the portable ``pct_flops_saved`` while the
+    TOTAL row also sums the raw proxy FLOPs and reports both means.
+    """
+    rollup_rows = []
+    for model_short, df_model in df.groupby("model_short"):
+        fs = compute_flops_savings(df_model.reset_index(drop=True))
+        if not fs.empty:
+            fs.insert(0, "model_short", model_short)
+            rollup_rows.append(fs)
+    if not rollup_rows:
+        print(Fore.YELLOW + "  No FLOPs/MASE records for the run-level roll-up." + Fore.RESET)
+        return
+
+    rollup = pd.concat(rollup_rows, ignore_index=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Single run-level overview figure: each (model, strategy) point.
+    overview_path = plot_model_strategy_overview(rollup, out_dir)
+    if overview_path:
+        print(Fore.GREEN + f"\nSaved run-level overview: {overview_path}" + Fore.RESET)
+
+    # Grand total per strategy across all models.
+    totals = []
+    for name, grp in rollup.groupby("strategy"):
+        tot_full = grp["total_full_flops"].sum()
+        tot_strat = grp["total_strategy_flops"].sum()
+        inst = grp["total_instances"].sum()
+        w_inst = grp["total_instances"].values.astype(float)
+        # Per-model FLOPs ratios / fractional savings / absolute savings, aggregated
+        # two ways.  Absolute FLOPs are unnormalized and incomparable across
+        # families, so the geometric mean of the per-model ratio is the portable
+        # aggregate; the arithmetic mean is provided alongside.
+        ratios   = grp["flops_ratio"].dropna().values
+        pct_sav  = grp["pct_flops_saved"].dropna().values
+        abs_sav  = grp["flops_saved"].dropna().values
+        # MASE: combine per-model instance-weighted geomeans with their instance
+        # weights -> exact global instance-weighted geometric-mean MASE.
+        gm_full  = _wgeomean(grp["geomean_full_mase"].values,     w_inst)
+        gm_strat = _wgeomean(grp["geomean_strategy_mase"].values, w_inst)
+        totals.append({
+            "model_short":          "TOTAL",
+            "strategy":             name,
+            "n_rows":               int(grp["n_rows"].sum()),
+            "total_instances":      int(inst),
+            "total_full_flops":     tot_full,
+            "total_strategy_flops": tot_strat,
+            "flops_saved":          tot_full - tot_strat,
+            "flops_ratio":          tot_strat / tot_full if tot_full > 0 else float("nan"),
+            "pct_flops_saved":      (tot_full - tot_strat) / tot_full if tot_full > 0 else float("nan"),
+            # cross-model aggregation of the per-model FLOPs ratio
+            "flops_ratio_amean":        float(ratios.mean()) if ratios.size else float("nan"),
+            "flops_ratio_gmean":        _geomean(ratios) if ratios.size else float("nan"),
+            # cross-model aggregation of the per-model fractional savings
+            "pct_flops_saved_amean":    float(pct_sav.mean()) if pct_sav.size else float("nan"),
+            "pct_flops_saved_gmean":    _geomean(pct_sav) if pct_sav.size else float("nan"),
+            # cross-model aggregation of the per-model absolute FLOPs saved
+            "flops_saved_amean":        float(abs_sav.mean()) if abs_sav.size else float("nan"),
+            "flops_saved_gmean":        _geomean(abs_sav) if abs_sav.size else float("nan"),
+            # MASE aggregated geometrically (GiftEval convention)
+            "geomean_full_mase":     gm_full,
+            "geomean_strategy_mase": gm_strat,
+            "mase_drop_vs_full":     gm_full - gm_strat,
+            "mean_delta_vs_full":    gm_strat - gm_full,
+        })
+    rollup = pd.concat([rollup, pd.DataFrame(totals)], ignore_index=True)
+    rollup_path = os.path.join(out_dir, "flops_savings_all_models.csv")
+    rollup.to_csv(rollup_path, index=False, float_format="%.6g")
+    print(Fore.GREEN + f"\nSaved run-level FLOPs savings: {rollup_path}" + Fore.RESET)
+    print(Fore.CYAN + "\n--- Grand total FLOPs saved vs full window ---" + Fore.RESET)
+    for t in totals:
+        print(f"  {t['strategy']:<7}  pooled saved {100*t['pct_flops_saved']:5.1f}%  "
+              f"({t['flops_saved']:.3g} FLOPs)")
+        print(f"           per-model %saved  amean={100*t['pct_flops_saved_amean']:5.1f}%  "
+              f"gmean={100*t['pct_flops_saved_gmean']:5.1f}%   |   "
+              f"FLOPs ratio amean={t['flops_ratio_amean']:.3f}  gmean={t['flops_ratio_gmean']:.3f}")
+        print(f"           abs FLOPs saved  amean={t['flops_saved_amean']:.3g}  "
+              f"gmean={t['flops_saved_gmean']:.3g}")
+        print(f"           geomean MASE {t['geomean_full_mase']:.4f} -> "
+              f"{t['geomean_strategy_mase']:.4f}  (drop {t['mase_drop_vs_full']:+.4f})")
 
 
 # ==============================================================================
@@ -1479,6 +1585,120 @@ def plot_complexity_vs_mase_gain(df: pd.DataFrame, out_dir: str) -> str:
 
 
 # ==============================================================================
+#  PLOT — RUN-LEVEL MODEL x STRATEGY OVERVIEW
+# ==============================================================================
+
+# Strategy display names + palette, shared with the other complexity plots.
+_STRATEGY_STYLE = {
+    "pred":   ("Predictor",     "#70AD47"),
+    "best":   ("Oracle best",   "#ED7D31"),
+    "period": ("Period (2×P)",  "#6A1B9A"),
+}
+_MODEL_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "p"]
+
+
+def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str) -> str:
+    """Single run-level figure: every (model, strategy) as one point, trading off
+    FLOPs saved (x) against the geometric-mean MASE change (y).
+
+    x = pct_flops_saved (>0 = cheaper than full); y = mase_drop_vs_full
+    (>0 = lower MASE than full, i.e. better).  Colour encodes strategy, marker
+    shape encodes model, and a faint line links each model's strategies so a
+    family's spread is readable at a glance.  The top-right quadrant — cheaper
+    *and* better — is the win region and is shaded.
+    """
+    from matplotlib.lines import Line2D
+
+    r = rollup.dropna(subset=["pct_flops_saved", "mase_drop_vs_full"]).copy()
+    if r.empty:
+        return ""
+
+    models = sorted(r["model_short"].unique())
+    marker_of = {m: _MODEL_MARKERS[i % len(_MODEL_MARKERS)] for i, m in enumerate(models)}
+    # Strategy plot order (and any unexpected strategy falls back to grey).
+    strat_order = [s for s in _STRATEGY_STYLE if s in set(r["strategy"])]
+
+    fig, ax = plt.subplots(figsize=(11, 8))
+
+    x_all = r["pct_flops_saved"].values * 100.0
+    y_all = r["mase_drop_vs_full"].values
+    x_pad = max(2.0, 0.05 * (np.ptp(x_all) or 1.0))
+    y_pad = max(1e-3, 0.10 * (np.ptp(y_all) or 1.0))
+    x_lo, x_hi = x_all.min() - x_pad, x_all.max() + x_pad
+    y_lo, y_hi = y_all.min() - y_pad, y_all.max() + y_pad
+    ax.set_xlim(x_lo, x_hi); ax.set_ylim(y_lo, y_hi)
+
+    # Win quadrant (cheaper & better) + zero crosshair. Clamp the shaded spans to
+    # the visible positive region so they collapse (not invert) if every point is
+    # costlier or worse than full.
+    ax.axhspan(0, max(0.0, y_hi), color="#70AD47", alpha=0.04)
+    ax.axvspan(0, max(0.0, x_hi), color="#70AD47", alpha=0.04)
+    ax.axhline(0, color="gray", lw=1.2, ls="--", alpha=0.7)
+    ax.axvline(0, color="gray", lw=1.2, ls="-.", alpha=0.7)
+
+    # Faint connector tracing each model across its strategies (sorted by x).
+    for m in models:
+        sub = r[r["model_short"] == m].copy()
+        sub["__o"] = sub["strategy"].map(lambda s: strat_order.index(s)
+                                         if s in strat_order else len(strat_order))
+        sub = sub.sort_values("__o")
+        if len(sub) > 1:
+            ax.plot(sub["pct_flops_saved"] * 100.0, sub["mase_drop_vs_full"],
+                    color="gray", lw=0.8, alpha=0.30, zorder=1)
+
+    # Markers: colour = strategy, shape = model.
+    for strat in strat_order:
+        _, color = _STRATEGY_STYLE[strat]
+        sub = r[r["strategy"] == strat]
+        for _, row in sub.iterrows():
+            ax.scatter(row["pct_flops_saved"] * 100.0, row["mase_drop_vs_full"],
+                       marker=marker_of[row["model_short"]], s=170, c=color,
+                       edgecolors="white", linewidths=0.8, alpha=0.92, zorder=3)
+
+    # Quadrant captions.
+    for qx, qy, txt, ha in [
+        (0.985, 0.985, "Cheaper & Better",  "right"),
+        (0.015, 0.985, "Costlier & Better", "left"),
+        (0.985, 0.015, "Cheaper & Worse",   "right"),
+        (0.015, 0.015, "Costlier & Worse",  "left"),
+    ]:
+        ax.text(qx, qy, txt, transform=ax.transAxes, fontsize=8.5,
+                ha=ha, va="top" if qy > 0.5 else "bottom",
+                color="gray", style="italic", alpha=0.75)
+
+    ax.set_xlabel("FLOPs saved vs full window  =  100·(1 − FLOPs_strategy / FLOPs_full)   (%)",
+                  fontsize=11)
+    ax.set_ylabel("Geomean MASE change vs full  =  MASE_full − MASE_strategy   (>0 = better)",
+                  fontsize=11)
+    ax.set_title("Model × Strategy Overview — Compute Saved vs Accuracy Change",
+                 fontsize=13, fontweight="bold")
+    ax.grid(True, alpha=0.25)
+
+    # Two legends: strategy (colour) kept inside, model (shape) outside right.
+    strat_handles = [
+        Line2D([0], [0], marker="o", linestyle="none", markersize=10,
+               markerfacecolor=_STRATEGY_STYLE[s][1], markeredgecolor="white",
+               label=_STRATEGY_STYLE[s][0])
+        for s in strat_order
+    ]
+    model_handles = [
+        Line2D([0], [0], marker=marker_of[m], linestyle="none", markersize=9,
+               markerfacecolor="0.35", markeredgecolor="white", label=m)
+        for m in models
+    ]
+    leg1 = ax.legend(handles=strat_handles, title="Strategy", fontsize=9,
+                     title_fontsize=10, loc="upper left", framealpha=0.9)
+    ax.add_artist(leg1)
+    ax.legend(handles=model_handles, title="Model", fontsize=8.5, title_fontsize=10,
+              loc="center left", bbox_to_anchor=(1.01, 0.5), framealpha=0.9)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, "model_strategy_overview.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    return path
+
+
+# ==============================================================================
 #  PLOTS — MISC
 # ==============================================================================
 
@@ -1609,6 +1829,12 @@ def parse_args() -> argparse.Namespace:
             'Example: \'{"moirai": 16, "chronos2": 2}\''
         ),
     )
+    p.add_argument(
+        "--rollup-only", action="store_true",
+        help="Skip the per-model outputs and emit only the cross-model overview "
+             "figure + flops_savings_all_models.csv (covering every model in the "
+             "run dir). Used for the final aggregation pass after per-model runs.",
+    )
     return p.parse_args()
 
 
@@ -1703,7 +1929,7 @@ def main() -> None:
             for _, fr in flops_sav.iterrows():
                 print(f"  {fr['strategy']:<7}  saved {100*fr['pct_flops_saved']:5.1f}%  "
                       f"({fr['flops_saved']:.3g} of {fr['total_full_flops']:.3g} FLOPs)  |  "
-                      f"MASE {fr['mean_full_mase']:.4f} -> {fr['mean_strategy_mase']:.4f}  "
+                      f"geomean MASE {fr['geomean_full_mase']:.4f} -> {fr['geomean_strategy_mase']:.4f}  "
                       f"(drop {fr['mase_drop_vs_full']:+.4f})")
 
         print(Fore.CYAN + "\n--- Relative improvement tables ---" + Fore.RESET)
@@ -1735,6 +1961,12 @@ def main() -> None:
 
         print(Fore.GREEN + f"\nDone.  Outputs: {out_dir}" + Fore.RESET)
 
+    # ---- Rollup-only mode: skip per-model outputs, emit the cross-model -------
+    # overview + grand-total CSV from every model in the run dir, then return.
+    if getattr(args, "rollup_only", False):
+        write_run_rollup(df, args.output_dir or run_dir)
+        return
+
     # ---- Per-model outputs --------------------------------------------------
     for model_short, df_model in df.groupby("model_short"):
         print(Fore.CYAN + f"\n{'='*78}\n  MODEL: {model_short}\n{'='*78}" + Fore.RESET)
@@ -1744,66 +1976,13 @@ def main() -> None:
         )
         _run_outputs(df_model.reset_index(drop=True), model_out_dir)
 
-    # ---- Run-level FLOPs savings roll-up (per model + grand total) -----------
-    # One CSV at the run root combining every model, so the total benchmark
-    # FLOPs saved is in a single place. Absolute FLOPs are an unnormalized proxy
-    # (comparable as a ratio within a model), so the per-model rows carry the
-    # portable pct_flops_saved; the TOTAL row sums absolute proxy FLOPs.
-    rollup_rows = []
-    for model_short, df_model in df.groupby("model_short"):
-        fs = compute_flops_savings(df_model.reset_index(drop=True))
-        if not fs.empty:
-            fs.insert(0, "model_short", model_short)
-            rollup_rows.append(fs)
-    if rollup_rows:
-        rollup = pd.concat(rollup_rows, ignore_index=True)
-        # Grand total per strategy across all models (instance-weighted MASE).
-        totals = []
-        for name, grp in rollup.groupby("strategy"):
-            tot_full = grp["total_full_flops"].sum()
-            tot_strat = grp["total_strategy_flops"].sum()
-            inst = grp["total_instances"].sum()
-            # Per-model FLOPs ratios / fractional savings, aggregated two ways.
-            # Absolute FLOPs are unnormalized and incomparable across families, so
-            # the geometric mean of the per-model ratio is the portable aggregate;
-            # the arithmetic mean is provided alongside as requested.
-            ratios = grp["flops_ratio"].dropna().values
-            pct_sav = grp["pct_flops_saved"].dropna().values
-            totals.append({
-                "model_short":          "TOTAL",
-                "strategy":             name,
-                "n_rows":               int(grp["n_rows"].sum()),
-                "total_instances":      int(inst),
-                "total_full_flops":     tot_full,
-                "total_strategy_flops": tot_strat,
-                "flops_saved":          tot_full - tot_strat,
-                "flops_ratio":          tot_strat / tot_full if tot_full > 0 else float("nan"),
-                "pct_flops_saved":      (tot_full - tot_strat) / tot_full if tot_full > 0 else float("nan"),
-                # cross-model aggregation of the per-model FLOPs ratio
-                "flops_ratio_amean":        float(ratios.mean()) if ratios.size else float("nan"),
-                "flops_ratio_gmean":        _geomean(ratios) if ratios.size else float("nan"),
-                # cross-model aggregation of the per-model fractional savings
-                "pct_flops_saved_amean":    float(pct_sav.mean()) if pct_sav.size else float("nan"),
-                "pct_flops_saved_gmean":    _geomean(pct_sav) if pct_sav.size else float("nan"),
-                "mean_full_mase":       float((grp["mean_full_mase"] * grp["total_instances"]).sum() / inst),
-                "mean_strategy_mase":   float((grp["mean_strategy_mase"] * grp["total_instances"]).sum() / inst),
-                "mase_drop_vs_full":    float(((grp["mean_full_mase"] - grp["mean_strategy_mase"]) * grp["total_instances"]).sum() / inst),
-                "mean_delta_vs_full":   float(((grp["mean_strategy_mase"] - grp["mean_full_mase"]) * grp["total_instances"]).sum() / inst),
-            })
-        rollup = pd.concat([rollup, pd.DataFrame(totals)], ignore_index=True)
-        rollup_dir = args.output_dir or run_dir
-        os.makedirs(rollup_dir, exist_ok=True)
-        rollup_path = os.path.join(rollup_dir, "flops_savings_all_models.csv")
-        rollup.to_csv(rollup_path, index=False, float_format="%.6g")
-        print(Fore.GREEN + f"\nSaved run-level FLOPs savings: {rollup_path}" + Fore.RESET)
-        print(Fore.CYAN + "\n--- Grand total FLOPs saved vs full window ---" + Fore.RESET)
-        for t in totals:
-            print(f"  {t['strategy']:<7}  pooled saved {100*t['pct_flops_saved']:5.1f}%  "
-                  f"({t['flops_saved']:.3g} FLOPs)")
-            print(f"           per-model %saved  amean={100*t['pct_flops_saved_amean']:5.1f}%  "
-                  f"gmean={100*t['pct_flops_saved_gmean']:5.1f}%   |   "
-                  f"FLOPs ratio amean={t['flops_ratio_amean']:.3f}  gmean={t['flops_ratio_gmean']:.3f}")
-            print(f"           mean MASE drop {t['mase_drop_vs_full']:+.4f}")
+    # ---- Run-level roll-up across models -------------------------------------
+    # Only meaningful with >1 model in scope. run_all drives stage 4 one model at
+    # a time (--models X), so the cross-model figure comes from a dedicated final
+    # --rollup-only pass; here we emit it only for multi-model (e.g. standalone)
+    # invocations so single-model runs don't drop a stray one-point overview.
+    if df["model_short"].nunique() > 1:
+        write_run_rollup(df, args.output_dir or run_dir)
 
 
 if __name__ == "__main__":
