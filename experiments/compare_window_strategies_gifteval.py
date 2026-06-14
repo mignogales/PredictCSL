@@ -14,24 +14,23 @@ compare_real_vs_predicted/*.npz files.
 
 Complexity model (per model family)
 ------------------------------------
-All current TSFMs use patch-based transformers, so the dominant complexity term
-is quadratic in the number of context patches.  We model:
+We estimate per-forecast transformer MACs, keeping BOTH cost terms rather than
+just the quadratic attention term.  Per layer over a length-L sequence (hidden
+d, feed-forward f, E active experts):
 
-  FLOPs(C, H) ∝  n_ctx(C)² + n_ctx(C)·n_hor(H)
+  projections  4·L·d²        feed-forward  2·L·d·f·E        (both linear in L)
+  attention    2·L²·d                                       (quadratic in L)
 
-where n_ctx = ⌈C/P⌉, n_hor = ⌈H/P⌉, and P is the effective patch size.
+  enc_dec (chronos2, chronos_bolt): encoder over n_ctx + decoder over n_hor
+                                    with cross-attention to the context.
+  unified (moirai, timesfm, patchtst_fm, sundial, timemoe): one stack over
+                                    n_ctx + n_hor tokens.
 
-For Moirai family the context + horizon tokens are processed jointly:
-
-  FLOPs(C, H) ∝  (n_ctx(C) + n_hor(H))²
-
-Patch sizes used (adjust via --patch-sizes JSON if needed):
-  moirai        32  (Moirai2, frequency-adaptive but ~32 in practice)
-  moirai_1_1    32  (explicit MOIRAI_1_1_PATCH_SIZE = 32 in v5 code)
-  chronos2       1  (VQ token per timestep)
-  chronos_bolt  32  (patch-based fast variant)
-  timesfm       32  (PATCH_SIZE = 32 in v5 code)
-  patchtst_fm   16  (typical PatchTST default)
+where n_ctx = ⌈C/P⌉, n_hor = ⌈H/P⌉, P = effective patch size.  The linear terms
+dominate when n_ctx < d (the usual regime here), so dropping them — as the old
+n_ctx²-only proxy did — overstated context-shrink savings.  d_model / layer
+count / d_ff / experts are taken from each model's HF config.json (see
+MODEL_ARCH); patch sizes are overridable via --patch-sizes JSON.
 
 Outputs (written to <run_dir>/models/<model_short>/strategy_comparison/)
 ----------------------------------------------------
@@ -79,29 +78,75 @@ CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
 # ==============================================================================
 #  COMPLEXITY MODEL
 # ==============================================================================
+#
+# We estimate per-forecast transformer MACs (multiply-accumulates) so that the
+# context-length savings reflect the *true* cost mix, not just the quadratic
+# attention term.  A transformer layer over a sequence of L tokens (hidden size
+# d, feed-forward size f) costs, per layer:
+#
+#     projections (Q,K,V,O):   4 * L * d^2          <- LINEAR in L
+#     self-attention:          2 * L^2 * d          <- QUADRATIC in L
+#     feed-forward (MLP):      2 * L * d * f * E     <- LINEAR in L (E = active experts)
+#
+# The linear (projection + FFN) terms DOMINATE whenever n_ctx < d, which is the
+# regime most of these patch-based TSFMs actually run in (a few hundred patches
+# vs d = 512..1280).  The previous proxy kept only the L^2 term and therefore
+# overstated the savings from shrinking context.  Carrying d, the layer count,
+# and f fixes both the within-model scaling AND makes cross-model numbers an
+# approximate absolute MAC count (still a proxy: it ignores embeddings, norms,
+# quantile heads, and exact attention-kernel constants).
+#
+# Architecture specs below are taken verbatim from each model's HF config.json.
 
-# Effective patch sizes per model family.
-# Changing these does NOT affect MASE or time columns; only the theoretical
-# complexity columns.  Override at runtime with --patch-sizes.
-DEFAULT_PATCH_SIZES: Dict[str, int] = {
-    "moirai":           16,   # Moirai-2 patch size
-    "moirai_1_1":       32,
-    "chronos2":         16,
-    "chronos_bolt":     32,
-    "timesfm":          32,
-    "patchtst_fm":      16,
-    "timemoe":           1,   # point-wise decoder-only (TimeMoE)
-    "context_parroting": 1,
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ModelArch:
+    """Architecture spec used by the FLOPs proxy (from HF config.json)."""
+    d_model: int
+    d_ff: int
+    patch_size: int
+    seq_type: str            # "enc_dec" | "unified"
+    n_enc_layers: int = 0    # encoder blocks (enc_dec) / total blocks (unified)
+    n_dec_layers: int = 0    # decoder blocks (enc_dec only)
+    experts_per_tok: int = 1 # active experts for MoE FFN (1 = dense)
+
+
+# Per-family architecture.  Patch sizes here are the defaults; --patch-sizes can
+# still override the patch field at runtime (see resolve_arch).
+MODEL_ARCH: Dict[str, ModelArch] = {
+    # T5-style encoder-decoder (encoder over context, decoder over horizon + cross-attn)
+    "chronos2":     ModelArch(d_model=512,  d_ff=2048, patch_size=16, seq_type="enc_dec",
+                              n_enc_layers=6,  n_dec_layers=6),
+    "chronos_bolt": ModelArch(d_model=512,  d_ff=2048, patch_size=32, seq_type="enc_dec",
+                              n_enc_layers=6,  n_dec_layers=6),
+    # Encoder over the [context; masked-horizon] sequence
+    "moirai":       ModelArch(d_model=384,  d_ff=1024, patch_size=16, seq_type="unified",
+                              n_enc_layers=6),
+    "moirai_1_1":   ModelArch(d_model=384,  d_ff=1024, patch_size=32, seq_type="unified",
+                              n_enc_layers=6),
+    # Stacked decoder over context patches (intermediate_size == d_model for TimesFM-2.5)
+    "timesfm":      ModelArch(d_model=1280, d_ff=1280, patch_size=32, seq_type="unified",
+                              n_enc_layers=20),
+    # Encoder over a fixed 8192-ctx patch grid; d_ff not in config -> 4x expansion (estimate)
+    "patchtst_fm":  ModelArch(d_model=1024, d_ff=4096, patch_size=16, seq_type="unified",
+                              n_enc_layers=20),
+    # Decoder-only patch LM
+    "sundial":      ModelArch(d_model=768,  d_ff=3072, patch_size=16, seq_type="unified",
+                              n_enc_layers=12),
+    # Decoder-only MoE (top-2 of 8 experts active per token)
+    "timemoe":      ModelArch(d_model=768,  d_ff=3072, patch_size=1,  seq_type="unified",
+                              n_enc_layers=12, experts_per_tok=2),
 }
 
-# Families that process context + horizon in a unified sequence
-# (full self-attention over the concatenated sequence).  Moirai is encoder-style
-# bidirectional over [ctx; hor]; TimeMoE is a causal decoder-only LM over the same
-# concatenation.  Both pay attention cost ~ (n_ctx + n_hor)^2, so they share the
-# unified-sequence FLOPs form here.
-# NOTE: Sundial is also AutoModelForCausalLM (decoder-only) but patch-based with an
-# unconfirmed patch length, so it is intentionally left as "unknown" for now.
-UNIFIED_SEQUENCE_FAMILIES = {"moirai", "moirai_1_1", "timemoe"}
+
+# Patch sizes exposed for the --patch-sizes CLI override / printout.  Derived
+# from MODEL_ARCH; overriding a family here changes only its FLOPs columns.
+DEFAULT_PATCH_SIZES: Dict[str, int] = {
+    fam: arch.patch_size for fam, arch in MODEL_ARCH.items()
+}
+DEFAULT_PATCH_SIZES["context_parroting"] = 1
 
 
 def infer_model_family(model_id: str) -> str:
@@ -120,11 +165,29 @@ def infer_model_family(model_id: str) -> str:
         return "patchtst_fm"
     if "timemoe" in m or "time-moe" in m:
         return "timemoe"
+    if "sundial" in m:
+        return "sundial"
     return "unknown"
 
 
 def _n_patches(length: int, patch_size: int) -> int:
     return max(1, math.ceil(length / patch_size))
+
+
+def _layer_macs(L: int, d: int, f: int, mem: int = 0, experts: int = 1) -> float:
+    """Per-layer transformer MACs over a length-L sequence.
+
+    ``mem`` > 0 adds cross-attention against a memory of that length (decoder
+    cross-attn in encoder-decoder models).
+    """
+    proj      = 4.0 * L * d * d           # Q,K,V,O projections          (linear in L)
+    self_attn = 2.0 * L * L * d           # QK^T + softmax·V             (quadratic)
+    ffn       = 2.0 * L * d * f * experts # two MLP linears, MoE-scaled  (linear in L)
+    cross = 0.0
+    if mem > 0:
+        # decoder Q/O projections + K,V over memory + the two attn matmuls
+        cross = 2.0 * (L + mem) * d * d + 2.0 * L * mem * d
+    return proj + self_attn + ffn + cross
 
 
 def theoretical_flops(
@@ -133,22 +196,44 @@ def theoretical_flops(
     horizon: int,
     patch_sizes: Dict[str, int],
 ) -> float:
-    """
-    Unnormalized FLOPs proxy.  Useful only as a ratio between two context sizes
-    for the same (model, horizon).
+    """Approximate per-forecast transformer MACs.
 
-    Formula:
-      unified-sequence (Moirai, TimeMoE):  (n_ctx + n_hor)^2
-      encoder-decoder (rest):              n_ctx^2  +  n_ctx * n_hor
+    Carries d_model, layer count, feed-forward size, and (for MoE) active
+    experts, so both the linear (projection + FFN) and quadratic (attention)
+    cost terms are represented.  Comparable as a within-model ratio across
+    context sizes, and — being a real MAC estimate — roughly comparable across
+    models too (still a proxy: ignores embeddings/norms/heads and kernel
+    constants).
+
+      enc_dec  (chronos2, chronos_bolt): encoder over n_ctx + decoder over
+                                         n_hor with cross-attn to the context.
+      unified  (moirai, timesfm, patchtst_fm, sundial, timemoe): single stack
+                                         over n_ctx + n_hor tokens.
+
+    Families without a spec fall back to the legacy attention-only proxy.
     """
     family = infer_model_family(model_id)
-    P = patch_sizes.get(family, 1)
+    arch = MODEL_ARCH.get(family)
+    if arch is None:
+        # Legacy attention-only fallback for unknown families.
+        P = patch_sizes.get(family, 1)
+        n_ctx = _n_patches(context, P)
+        n_hor = _n_patches(horizon, P)
+        return float(n_ctx ** 2 + n_ctx * n_hor)
+
+    P = patch_sizes.get(family, arch.patch_size)
     n_ctx = _n_patches(context, P)
     n_hor = _n_patches(horizon, P)
-    if family in UNIFIED_SEQUENCE_FAMILIES:
-        return float((n_ctx + n_hor) ** 2)
-    else:
-        return float(n_ctx ** 2 + n_ctx * n_hor)
+    d, f = arch.d_model, arch.d_ff
+
+    if arch.seq_type == "enc_dec":
+        enc = arch.n_enc_layers * _layer_macs(n_ctx, d, f)
+        dec = arch.n_dec_layers * _layer_macs(n_hor, d, f, mem=n_ctx)
+        return float(enc + dec)
+    else:  # unified
+        L = n_ctx + n_hor
+        return float(arch.n_enc_layers *
+                     _layer_macs(L, d, f, experts=arch.experts_per_tok))
 
 
 # ==============================================================================
