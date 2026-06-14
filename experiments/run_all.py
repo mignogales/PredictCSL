@@ -366,6 +366,18 @@ def stage_4_compare(display: str, family: str, extra: Sequence[str]) -> float:
     )
 
 
+def stage_4_rollup(extra: Sequence[str]) -> float:
+    """Cross-model final pass: one overview figure + flops_savings_all_models.csv
+    spanning every model present in the shared run dir. No --models filter."""
+    return _run(
+        [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
+         "--run-dir", ABLATION_GENERAL,
+         "--output-dir", ABLATION_GENERAL,
+         "--rollup-only", *extra],
+        stage="4/rollup", display="ALL",
+    )
+
+
 STAGES = {
     "1": ("build",     stage_1_build),
     "2": ("predictor", stage_2_predictor),
@@ -633,6 +645,15 @@ def main() -> None:
                 _banner(f"{display}  ({family})  —  {model_id}")
             for sid in ordered_stages:
                 _maybe_run(sid, model_id, family, display)
+
+        # Cross-model final pass: the single overview figure + grand-total CSV
+        # spanning every model in the shared run dir. Always runs when stage 4 is
+        # active (it's cheap post-processing and the per-model passes never emit
+        # the cross-model artefacts).
+        if "4" in active:
+            if not _QUIET:
+                _banner("ALL MODELS  —  cross-model overview")
+            stage_4_rollup(extras_by_stage["4"])
 
         total = time.perf_counter() - t_start
         print(Fore.GREEN + f"\nAll done in {total/60:.1f} min." + Fore.RESET)
