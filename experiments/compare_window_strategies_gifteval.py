@@ -1303,16 +1303,24 @@ def plot_complexity_reduction(df: pd.DataFrame, out_dir: str) -> str:
     if r.empty:
         return ""
 
-    pred_ratios = r["complexity_ratio_pred_vs_full"].values
-    best_ratios = r["complexity_ratio_best_vs_full"].values
-    n_bins = min(60, max(20, len(pred_ratios) // 5))
+    n_bins = min(60, max(20, len(r) // 5))
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=False)
+    # Panels in display order. The period panel is appended only when the
+    # sidecars supplied period FLOPs ratios (else the figure stays at 2 panels).
+    panels = [
+        (r["complexity_ratio_pred_vs_full"].values, "Predictor / Full", "#70AD47"),
+        (r["complexity_ratio_best_vs_full"].values, "Oracle Best / Full", "#ED7D31"),
+    ]
+    if "complexity_ratio_period_vs_full" in df.columns:
+        period_ratios = df["complexity_ratio_period_vs_full"].dropna().values
+        if period_ratios.size:
+            panels.append((period_ratios, "Period (2×P) / Full", "#6A1B9A"))
 
-    for ax, vals, label, color in [
-        (axes[0], pred_ratios, "Predictor / Full", "#70AD47"),
-        (axes[1], best_ratios, "Oracle Best / Full", "#ED7D31"),
-    ]:
+    fig, axes = plt.subplots(1, len(panels), figsize=(7 * len(panels), 5), sharey=False)
+    if len(panels) == 1:
+        axes = [axes]
+
+    for ax, (vals, label, color) in zip(axes, panels):
         clip = np.percentile(vals, 99)
         ax.hist(vals[vals <= clip], bins=n_bins, color=color,
                 alpha=0.75, edgecolor="white", linewidth=0.5)
@@ -1416,42 +1424,53 @@ def plot_per_dataset_bars(df: pd.DataFrame, out_dir: str) -> List[str]:
     sub_dir = os.path.join(out_dir, "per_dataset_bars")
     os.makedirs(sub_dir, exist_ok=True)
 
+    # Strategies to draw, in plot order. Period is appended only when the
+    # sidecars supplied at least one period_mase, so the figure degrades to the
+    # original three strategies when stage 5 was never run.
+    strat_cols = ["full_mase", "best_mase", "pred_mase"]
+    strat_lbls = ["Full window", "Best (oracle)", "Predictor"]
+    strat_cols_clrs = ["#4472C4", "#ED7D31", "#70AD47"]
+    has_period = "period_mase" in r.columns and r["period_mase"].notna().any()
+    if has_period:
+        strat_cols.append("period_mase")
+        strat_lbls.append("Period (2×P)")
+        strat_cols_clrs.append("#6A1B9A")
+
     paths: List[str] = []
     for dataset_name, grp in r.groupby("dataset_display", sort=True):
         grp = grp.sort_values(["model_short", "term"]).reset_index(drop=True)
 
-        # Clip at this dataset's own 99th percentile
-        ds_vals = grp[["full_mase", "best_mase", "pred_mase"]].values.ravel()
-        clip_hi = float(np.percentile(ds_vals, 99))
+        # Clip at this dataset's own 99th percentile (over the strategies shown,
+        # ignoring NaNs so missing period cells don't poison the percentile).
+        ds_vals = grp[strat_cols].values.ravel()
+        clip_hi = float(np.nanpercentile(ds_vals, 99))
 
         # x-axis label: model + term
         grp["bar_label"] = grp["model_short"] + "\nt=" + grp["term"]
         labels = grp["bar_label"].tolist()
         n = len(labels)
         x = np.arange(n)
-        w = 0.25
+        k = len(strat_cols)
+        w = 0.8 / k                       # total cluster width ~0.8
+        # Symmetric offsets centred on each x tick: e.g. k=4 -> [-1.5w..1.5w].
+        offsets = [(i - (k - 1) / 2.0) * w for i in range(k)]
 
-        full_v = grp["full_mase"].clip(upper=clip_hi).values
-        best_v = grp["best_mase"].clip(upper=clip_hi).values
-        pred_v = grp["pred_mase"].clip(upper=clip_hi).values
+        fig, ax = plt.subplots(figsize=(max(6, n * 1.2 + 2), 5))
+        for col, lbl, clr, off in zip(strat_cols, strat_lbls, strat_cols_clrs, offsets):
+            ax.bar(x + off, grp[col].clip(upper=clip_hi).values, w,
+                   label=lbl, color=clr, alpha=0.85, edgecolor="white")
 
-        fig, ax = plt.subplots(figsize=(max(6, n * 1.1 + 2), 5))
-        ax.bar(x - w, full_v, w, label="Full window",   color="#4472C4", alpha=0.85, edgecolor="white")
-        ax.bar(x,     best_v, w, label="Best (oracle)", color="#ED7D31", alpha=0.85, edgecolor="white")
-        ax.bar(x + w, pred_v, w, label="Predictor",     color="#70AD47", alpha=0.85, edgecolor="white")
-
-        # Annotate bars whose true value exceeds the clip
-        for xi, (fv, bv, pv, fo, bo, po) in enumerate(zip(
-            full_v, best_v, pred_v,
-            grp["full_mase"].values, grp["best_mase"].values, grp["pred_mase"].values,
-        )):
-            for xoff, raw in [(-w, fo), (0, bo), (w, po)]:
+        # Annotate bars: ▲ + true value when clipped, else the value.
+        for xi in range(n):
+            for col, off in zip(strat_cols, offsets):
+                raw = grp[col].values[xi]
+                if np.isnan(raw):
+                    continue
                 if raw > clip_hi:
-                    ax.text(xi + xoff, clip_hi * 1.01, f"▲{raw:.2f}",
+                    ax.text(xi + off, clip_hi * 1.01, f"▲{raw:.2f}",
                             ha="center", va="bottom", fontsize=6, color="darkred", rotation=90)
                 else:
-                    bar_h = raw
-                    ax.text(xi + xoff, bar_h + clip_hi * 0.01, f"{raw:.2f}",
+                    ax.text(xi + off, raw + clip_hi * 0.01, f"{raw:.2f}",
                             ha="center", va="bottom", fontsize=6, color="#333333")
 
         ax.set_xticks(x)
