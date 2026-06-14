@@ -37,6 +37,9 @@ Outputs (written to <run_dir>/models/<model_short>/strategy_comparison/)
 ----------------------------------------------------
   comparison.csv              per-row MASE, elapsed time, complexity per strategy
   summary_stats.json          aggregate stats (mean/median, win rates, speedups)
+  flops_savings.csv           total FLOPs saved vs full + mean MASE drop, per strategy
+                              (run-level roll-up across models at <run_dir>/
+                               flops_savings_all_models.csv, incl. a TOTAL row)
   bar_aggregate_mase.png      mean & median MASE per strategy
   bar_aggregate_time.png      mean elapsed time per strategy
   scatter_pred_vs_best.png    MASE(pred) vs MASE(best)
@@ -76,18 +79,24 @@ CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
 # Changing these does NOT affect MASE or time columns; only the theoretical
 # complexity columns.  Override at runtime with --patch-sizes.
 DEFAULT_PATCH_SIZES: Dict[str, int] = {
-    "moirai":           32,
+    "moirai":           16,   # Moirai-2 patch size
     "moirai_1_1":       32,
-    "chronos2":          1,
+    "chronos2":         16,
     "chronos_bolt":     32,
     "timesfm":          32,
     "patchtst_fm":      16,
+    "timemoe":           1,   # point-wise decoder-only (TimeMoE)
     "context_parroting": 1,
 }
 
 # Families that process context + horizon in a unified sequence
-# (full self-attention over the concatenated sequence).
-UNIFIED_SEQUENCE_FAMILIES = {"moirai", "moirai_1_1"}
+# (full self-attention over the concatenated sequence).  Moirai is encoder-style
+# bidirectional over [ctx; hor]; TimeMoE is a causal decoder-only LM over the same
+# concatenation.  Both pay attention cost ~ (n_ctx + n_hor)^2, so they share the
+# unified-sequence FLOPs form here.
+# NOTE: Sundial is also AutoModelForCausalLM (decoder-only) but patch-based with an
+# unconfirmed patch length, so it is intentionally left as "unknown" for now.
+UNIFIED_SEQUENCE_FAMILIES = {"moirai", "moirai_1_1", "timemoe"}
 
 
 def infer_model_family(model_id: str) -> str:
@@ -104,6 +113,8 @@ def infer_model_family(model_id: str) -> str:
         return "timesfm"
     if "patchtst" in m:
         return "patchtst_fm"
+    if "timemoe" in m or "time-moe" in m:
+        return "timemoe"
     return "unknown"
 
 
@@ -122,8 +133,8 @@ def theoretical_flops(
     for the same (model, horizon).
 
     Formula:
-      unified-sequence (Moirai):  (n_ctx + n_hor)^2
-      encoder-decoder (rest):     n_ctx^2  +  n_ctx * n_hor
+      unified-sequence (Moirai, TimeMoE):  (n_ctx + n_hor)^2
+      encoder-decoder (rest):              n_ctx^2  +  n_ctx * n_hor
     """
     family = infer_model_family(model_id)
     P = patch_sizes.get(family, 1)
@@ -537,6 +548,61 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
             stats["mean_period_window"] = float(rp["period_window"].dropna().mean())
 
     return stats
+
+
+# ==============================================================================
+#  TOTAL FLOPs SAVINGS
+# ==============================================================================
+
+def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
+    """Total theoretical FLOPs saved per strategy vs the full window, alongside
+    the accompanying mean-MASE change.
+
+    Each row in ``df`` aggregates ``n_instances`` forecasts and stores the
+    *per-forecast* FLOPs proxy (``full_flops`` etc.), so we weight by
+    ``n_instances`` to get a benchmark-wide total.  MASE is likewise instance-
+    weighted so ``mase_drop_vs_full`` is the mean accuracy change over the same
+    population.
+
+    Caveat: ``theoretical_flops`` is an *unnormalized* proxy, comparable only as
+    a ratio within a single (model, horizon).  Absolute totals are therefore most
+    meaningful per model; the ``pct_flops_saved`` ratio is the portable number.
+    A positive ``mase_drop_vs_full`` means the strategy is *better* (lower MASE)
+    than the full window; ``mean_delta_vs_full`` keeps the (strategy − full) sign
+    convention used elsewhere in this file.
+    """
+    strat_specs = [("pred", "pred_flops", "pred_mase"),
+                   ("best", "best_flops", "best_mase")]
+    if "period_flops" in df.columns:
+        strat_specs.append(("period", "period_flops", "period_mase"))
+
+    rows = []
+    for name, flops_col, mase_col in strat_specs:
+        sub = df.dropna(subset=["full_flops", flops_col, "full_mase", mase_col])
+        if sub.empty:
+            continue
+        w = sub["n_instances"].values.astype(float)
+        wsum = w.sum()
+        full_f  = float((sub["full_flops"].values * w).sum())
+        strat_f = float((sub[flops_col].values   * w).sum())
+        saved   = full_f - strat_f
+        mean_full_mase  = float((sub["full_mase"].values * w).sum() / wsum)
+        mean_strat_mase = float((sub[mase_col].values    * w).sum() / wsum)
+        rows.append({
+            "strategy":             name,
+            "n_rows":               int(len(sub)),
+            "total_instances":      int(wsum),
+            "total_full_flops":     full_f,
+            "total_strategy_flops": strat_f,
+            "flops_saved":          saved,
+            "flops_ratio":          strat_f / full_f if full_f > 0 else float("nan"),
+            "pct_flops_saved":      saved / full_f if full_f > 0 else float("nan"),
+            "mean_full_mase":       mean_full_mase,
+            "mean_strategy_mase":   mean_strat_mase,
+            "mase_drop_vs_full":    mean_full_mase - mean_strat_mase,  # >0 = better
+            "mean_delta_vs_full":   mean_strat_mase - mean_full_mase,  # (strat - full)
+        })
+    return pd.DataFrame(rows)
 
 
 # ==============================================================================
@@ -1628,6 +1694,18 @@ def main() -> None:
             print(Fore.CYAN + "\n--- Complexity summary ---" + Fore.RESET)
             print(f"  FLOPs ratio pred/full:  mean={cr['mean']:.3f}  median={cr['median']:.3f}")
 
+        flops_sav = compute_flops_savings(df_subset)
+        if not flops_sav.empty:
+            fs_path = os.path.join(out_dir, "flops_savings.csv")
+            flops_sav.to_csv(fs_path, index=False, float_format="%.6g")
+            print(Fore.GREEN + f"  Saved: {fs_path}" + Fore.RESET)
+            print(Fore.CYAN + "\n--- Total FLOPs saved vs full window ---" + Fore.RESET)
+            for _, fr in flops_sav.iterrows():
+                print(f"  {fr['strategy']:<7}  saved {100*fr['pct_flops_saved']:5.1f}%  "
+                      f"({fr['flops_saved']:.3g} of {fr['total_full_flops']:.3g} FLOPs)  |  "
+                      f"MASE {fr['mean_full_mase']:.4f} -> {fr['mean_strategy_mase']:.4f}  "
+                      f"(drop {fr['mase_drop_vs_full']:+.4f})")
+
         print(Fore.CYAN + "\n--- Relative improvement tables ---" + Fore.RESET)
         compute_relative_improvement_tables(df_subset, out_dir)
 
@@ -1665,6 +1743,67 @@ def main() -> None:
             or os.path.join(run_dir, "models", model_short, "strategy_comparison")
         )
         _run_outputs(df_model.reset_index(drop=True), model_out_dir)
+
+    # ---- Run-level FLOPs savings roll-up (per model + grand total) -----------
+    # One CSV at the run root combining every model, so the total benchmark
+    # FLOPs saved is in a single place. Absolute FLOPs are an unnormalized proxy
+    # (comparable as a ratio within a model), so the per-model rows carry the
+    # portable pct_flops_saved; the TOTAL row sums absolute proxy FLOPs.
+    rollup_rows = []
+    for model_short, df_model in df.groupby("model_short"):
+        fs = compute_flops_savings(df_model.reset_index(drop=True))
+        if not fs.empty:
+            fs.insert(0, "model_short", model_short)
+            rollup_rows.append(fs)
+    if rollup_rows:
+        rollup = pd.concat(rollup_rows, ignore_index=True)
+        # Grand total per strategy across all models (instance-weighted MASE).
+        totals = []
+        for name, grp in rollup.groupby("strategy"):
+            tot_full = grp["total_full_flops"].sum()
+            tot_strat = grp["total_strategy_flops"].sum()
+            inst = grp["total_instances"].sum()
+            # Per-model FLOPs ratios / fractional savings, aggregated two ways.
+            # Absolute FLOPs are unnormalized and incomparable across families, so
+            # the geometric mean of the per-model ratio is the portable aggregate;
+            # the arithmetic mean is provided alongside as requested.
+            ratios = grp["flops_ratio"].dropna().values
+            pct_sav = grp["pct_flops_saved"].dropna().values
+            totals.append({
+                "model_short":          "TOTAL",
+                "strategy":             name,
+                "n_rows":               int(grp["n_rows"].sum()),
+                "total_instances":      int(inst),
+                "total_full_flops":     tot_full,
+                "total_strategy_flops": tot_strat,
+                "flops_saved":          tot_full - tot_strat,
+                "flops_ratio":          tot_strat / tot_full if tot_full > 0 else float("nan"),
+                "pct_flops_saved":      (tot_full - tot_strat) / tot_full if tot_full > 0 else float("nan"),
+                # cross-model aggregation of the per-model FLOPs ratio
+                "flops_ratio_amean":        float(ratios.mean()) if ratios.size else float("nan"),
+                "flops_ratio_gmean":        _geomean(ratios) if ratios.size else float("nan"),
+                # cross-model aggregation of the per-model fractional savings
+                "pct_flops_saved_amean":    float(pct_sav.mean()) if pct_sav.size else float("nan"),
+                "pct_flops_saved_gmean":    _geomean(pct_sav) if pct_sav.size else float("nan"),
+                "mean_full_mase":       float((grp["mean_full_mase"] * grp["total_instances"]).sum() / inst),
+                "mean_strategy_mase":   float((grp["mean_strategy_mase"] * grp["total_instances"]).sum() / inst),
+                "mase_drop_vs_full":    float(((grp["mean_full_mase"] - grp["mean_strategy_mase"]) * grp["total_instances"]).sum() / inst),
+                "mean_delta_vs_full":   float(((grp["mean_strategy_mase"] - grp["mean_full_mase"]) * grp["total_instances"]).sum() / inst),
+            })
+        rollup = pd.concat([rollup, pd.DataFrame(totals)], ignore_index=True)
+        rollup_dir = args.output_dir or run_dir
+        os.makedirs(rollup_dir, exist_ok=True)
+        rollup_path = os.path.join(rollup_dir, "flops_savings_all_models.csv")
+        rollup.to_csv(rollup_path, index=False, float_format="%.6g")
+        print(Fore.GREEN + f"\nSaved run-level FLOPs savings: {rollup_path}" + Fore.RESET)
+        print(Fore.CYAN + "\n--- Grand total FLOPs saved vs full window ---" + Fore.RESET)
+        for t in totals:
+            print(f"  {t['strategy']:<7}  pooled saved {100*t['pct_flops_saved']:5.1f}%  "
+                  f"({t['flops_saved']:.3g} FLOPs)")
+            print(f"           per-model %saved  amean={100*t['pct_flops_saved_amean']:5.1f}%  "
+                  f"gmean={100*t['pct_flops_saved_gmean']:5.1f}%   |   "
+                  f"FLOPs ratio amean={t['flops_ratio_amean']:.3f}  gmean={t['flops_ratio_gmean']:.3f}")
+            print(f"           mean MASE drop {t['mase_drop_vs_full']:+.4f}")
 
 
 if __name__ == "__main__":
