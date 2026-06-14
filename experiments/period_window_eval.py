@@ -235,6 +235,37 @@ def _sidecar_paths(run_dir: str, dataset_display: str, term: str, model_short: s
     return os.path.join(cdir, base + ".json"), os.path.join(cdir, base + "_win.npz")
 
 
+def _full_window_cap(
+    run_dir: str, dataset_display: str, term: str, model_short: str
+) -> Optional[int]:
+    """Largest VALID ablation-grid window for this (model, dataset, term).
+
+    This is the same quantity ``compare_window_strategies_gifteval.py`` treats as
+    the ``full`` strategy (largest grid window with a non-NaN real MASE), read
+    from v5's ``compare_<dataset>_t<term>_<model>.npz``.  The period strategy is
+    capped at this so the model is never given more context than the full window
+    — keeping the methods comparable and the period/full FLOPs ratio <= 1.
+
+    Returns None when the v5 npz is absent/unreadable (no cap can be derived).
+    """
+    npz_path = os.path.join(
+        _compare_dir(run_dir, model_short),
+        f"compare_{dataset_display}_t{term}_{model_short}.npz",
+    )
+    if not os.path.isfile(npz_path):
+        return None
+    try:
+        data = np.load(npz_path)
+        window_grid = np.asarray(data["window_grid"])
+        real_curve = np.asarray(data["real_curve"])
+    except Exception:
+        return None
+    valid = np.flatnonzero(~np.isnan(real_curve))
+    if valid.size == 0:
+        return None
+    return int(window_grid[valid[-1]])
+
+
 def evaluate_one(
     cache: GiftEvalCache,
     model_id: str,
@@ -243,12 +274,17 @@ def evaluate_one(
     ensure_handle,
     args,
     device: str,
+    full_window: Optional[int] = None,
 ) -> Tuple[dict, np.ndarray, np.ndarray]:
     """Run the period-window strategy for one (model, dataset, term).
 
     Returns (metrics_dict, per_instance_windows, per_instance_periods). Instances
     the family cannot serve at any length (e.g. TimeMoE when horizon alone
     exhausts its budget) are dropped from the aggregate.
+
+    ``full_window`` (when given) is the largest valid ablation-grid window; the
+    per-series period window is never allowed to exceed it, because the model is
+    never fed more context than the full-window strategy uses.
     """
     horizon = cache.horizon
     n_total = cache.n_total
@@ -275,6 +311,11 @@ def evaluate_one(
     # Clamp to each instance's genuine context and the family's serving cap.
     eff_L = np.minimum(raw_L, cache.context_lengths.astype(np.int64))
     eff_L = np.minimum(eff_L, cap)
+    # Never exceed the full-window grid ceiling: the model cannot ingest more
+    # than the full strategy does, so capping here keeps period comparable and
+    # bounds its FLOPs ratio vs full at <= 1.
+    if full_window is not None and full_window > 0:
+        eff_L = np.minimum(eff_L, np.int64(full_window))
 
     valid = eff_L >= 1
     valid_idx = np.flatnonzero(valid)
@@ -340,6 +381,7 @@ def evaluate_one(
         "horizon": horizon,
         "n_total": int(n_total),
         "n_instances": int(valid_idx.size),
+        "full_window_cap": (int(full_window) if full_window else None),
         "period_mae": float(metrics.get("mae", float("nan"))),
         "period_mase": float(metrics.get("mase", float("nan"))),
         "period_elapsed_s": float(elapsed),
@@ -419,12 +461,22 @@ def run(args, device: str) -> None:
                 ge_cache[ds_key] = GiftEvalCache(ge_dataset, dataset_display)
             cache = ge_cache[ds_key]
 
+            # Full-window ceiling (largest valid grid window) from v5's npz, so
+            # period never feeds the model more context than the full strategy.
+            full_w = _full_window_cap(args.run_dir, dataset_display, term, model_short)
+            if full_w is None:
+                print(Fore.YELLOW
+                      + f"    WARN: no v5 npz for {dataset_display} t={term}; "
+                        "period window left uncapped by full window."
+                      + Fore.RESET)
+
             tag = f"{model_short} | {dataset_display} | t={term} | h={cache.horizon}"
-            print(Fore.YELLOW + f"\n  > {tag}  (n={cache.n_total})" + Fore.RESET)
+            print(Fore.YELLOW + f"\n  > {tag}  (n={cache.n_total}"
+                  + (f", full_cap={full_w}" if full_w else "") + ")" + Fore.RESET)
             try:
                 summary, windows, periods = evaluate_one(
                     cache, model_id, model_family, model_short,
-                    ensure_handle, args, device)
+                    ensure_handle, args, device, full_window=full_w)
             except RuntimeError as exc:
                 print(Fore.RED + f"    SKIP: {exc}" + Fore.RESET)
                 continue
