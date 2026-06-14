@@ -80,8 +80,8 @@ MODELS_TO_RUN: List[Tuple[str, str, str]] = [
     ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
     ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
     ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
-    ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
-    ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
+    # ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
+    # ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
     ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
 ]
 
