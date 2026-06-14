@@ -575,19 +575,21 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
     """Total theoretical FLOPs saved per strategy vs the full window, alongside
     the accompanying mean-MASE change.
 
-    Each row in ``df`` aggregates ``n_instances`` forecasts and stores the
-    *per-forecast* FLOPs proxy (``full_flops`` etc.), so we weight by
-    ``n_instances`` to get a benchmark-wide total.  MASE is aggregated with an
-    instance-weighted *geometric* mean (the GiftEval convention for scale-free
-    error scores), so ``mase_drop_vs_full`` is the change in geometric-mean MASE
-    over the same population.
+    FLOPs and MASE use *different* aggregations on purpose:
+    - FLOPs: each row stores the *per-forecast* proxy and aggregates ``n_instances``
+      forecasts, so totals are instance-weighted sums — the physically correct
+      "total compute" over the whole benchmark.
+    - MASE: an *unweighted* geometric mean over the (dataset, term) rows — the
+      M4/GiftEval convention, and identical to what ``plot_bar_aggregate_mase``
+      reports (so ``geomean_full_mase`` matches the bar chart). Instance-weighting
+      MASE would let a few high-window-count datasets dominate and pull the number
+      far below the per-task average.
 
-    Caveat: ``theoretical_flops`` is an *unnormalized* proxy, comparable only as
-    a ratio within a single (model, horizon).  Absolute totals are therefore most
-    meaningful per model; the ``pct_flops_saved`` ratio is the portable number.
-    A positive ``mase_drop_vs_full`` means the strategy is *better* (lower MASE)
-    than the full window; ``mean_delta_vs_full`` keeps the (strategy − full) sign
-    convention used elsewhere in this file.
+    ``mase_drop_vs_full`` (>0 = better) and its relative form ``rel_mase_drop_pct``
+    = 100·(MASE_full − MASE_strategy)/MASE_full are both off these geomeans.
+    ``mean_delta_vs_full`` keeps the (strategy − full) sign convention used
+    elsewhere.  ``theoretical_flops`` is unnormalized (comparable only as a ratio
+    within a model+horizon), so ``pct_flops_saved`` is the portable FLOPs number.
     """
     strat_specs = [("pred", "pred_flops", "pred_mase"),
                    ("best", "best_flops", "best_mase")]
@@ -604,8 +606,9 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
         full_f  = float((sub["full_flops"].values * w).sum())
         strat_f = float((sub[flops_col].values   * w).sum())
         saved   = full_f - strat_f
-        gm_full_mase  = _wgeomean(sub["full_mase"].values, w)
-        gm_strat_mase = _wgeomean(sub[mase_col].values,    w)
+        # Unweighted geomean over (dataset, term) rows — matches the bar chart.
+        gm_full_mase  = _geomean(sub["full_mase"].values)
+        gm_strat_mase = _geomean(sub[mase_col].values)
         rows.append({
             "strategy":             name,
             "n_rows":               int(len(sub)),
@@ -618,6 +621,8 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
             "geomean_full_mase":     gm_full_mase,
             "geomean_strategy_mase": gm_strat_mase,
             "mase_drop_vs_full":     gm_full_mase - gm_strat_mase,  # >0 = better
+            "rel_mase_drop_pct":     (100.0 * (gm_full_mase - gm_strat_mase) / gm_full_mase
+                                      if gm_full_mase > 0 else float("nan")),
             "mean_delta_vs_full":    gm_strat_mase - gm_full_mase,  # (strat - full)
         })
     return pd.DataFrame(rows)
@@ -665,10 +670,12 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str) -> None:
         ratios   = grp["flops_ratio"].dropna().values
         pct_sav  = grp["pct_flops_saved"].dropna().values
         abs_sav  = grp["flops_saved"].dropna().values
-        # MASE: combine per-model instance-weighted geomeans with their instance
-        # weights -> exact global instance-weighted geometric-mean MASE.
-        gm_full  = _wgeomean(grp["geomean_full_mase"].values,     w_inst)
-        gm_strat = _wgeomean(grp["geomean_strategy_mase"].values, w_inst)
+        # MASE: combine per-model *unweighted* geomeans with their row counts ->
+        # exact global unweighted geometric-mean MASE over all (dataset, term) rows
+        # (matches the bar chart's convention, just spanning every model).
+        w_rows   = grp["n_rows"].values.astype(float)
+        gm_full  = _wgeomean(grp["geomean_full_mase"].values,     w_rows)
+        gm_strat = _wgeomean(grp["geomean_strategy_mase"].values, w_rows)
         totals.append({
             "model_short":          "TOTAL",
             "strategy":             name,
@@ -688,10 +695,12 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str) -> None:
             # cross-model aggregation of the per-model absolute FLOPs saved
             "flops_saved_amean":        float(abs_sav.mean()) if abs_sav.size else float("nan"),
             "flops_saved_gmean":        _geomean(abs_sav) if abs_sav.size else float("nan"),
-            # MASE aggregated geometrically (GiftEval convention)
+            # MASE aggregated geometrically (unweighted, M4/GiftEval convention)
             "geomean_full_mase":     gm_full,
             "geomean_strategy_mase": gm_strat,
             "mase_drop_vs_full":     gm_full - gm_strat,
+            "rel_mase_drop_pct":     (100.0 * (gm_full - gm_strat) / gm_full
+                                      if gm_full > 0 else float("nan")),
             "mean_delta_vs_full":    gm_strat - gm_full,
         })
     rollup = pd.concat([rollup, pd.DataFrame(totals)], ignore_index=True)
@@ -708,7 +717,8 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str) -> None:
         print(f"           abs FLOPs saved  amean={t['flops_saved_amean']:.3g}  "
               f"gmean={t['flops_saved_gmean']:.3g}")
         print(f"           geomean MASE {t['geomean_full_mase']:.4f} -> "
-              f"{t['geomean_strategy_mase']:.4f}  (drop {t['mase_drop_vs_full']:+.4f})")
+              f"{t['geomean_strategy_mase']:.4f}  (drop {t['mase_drop_vs_full']:+.4f}, "
+              f"{t['rel_mase_drop_pct']:+.2f}%)")
 
 
 # ==============================================================================
@@ -1599,17 +1609,17 @@ _MODEL_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "p"]
 
 def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str) -> str:
     """Single run-level figure: every (model, strategy) as one point, trading off
-    FLOPs saved (x) against the geometric-mean MASE change (y).
+    FLOPs saved (x) against the *relative* geomean MASE change (y).
 
-    x = pct_flops_saved (>0 = cheaper than full); y = mase_drop_vs_full
-    (>0 = lower MASE than full, i.e. better).  Colour encodes strategy, marker
-    shape encodes model, and a faint line links each model's strategies so a
-    family's spread is readable at a glance.  The top-right quadrant — cheaper
-    *and* better — is the win region and is shaded.
+    x = pct_flops_saved (>0 = cheaper than full); y = rel_mase_drop_pct =
+    100·(MASE_full − MASE_strategy)/MASE_full (>0 = lower MASE than full, i.e.
+    better).  Colour encodes strategy, marker shape encodes model, and a faint
+    line links each model's strategies so a family's spread is readable at a
+    glance.  The top-right quadrant — cheaper *and* better — is the win region.
     """
     from matplotlib.lines import Line2D
 
-    r = rollup.dropna(subset=["pct_flops_saved", "mase_drop_vs_full"]).copy()
+    r = rollup.dropna(subset=["pct_flops_saved", "rel_mase_drop_pct"]).copy()
     if r.empty:
         return ""
 
@@ -1621,7 +1631,7 @@ def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str) -> str:
     fig, ax = plt.subplots(figsize=(11, 8))
 
     x_all = r["pct_flops_saved"].values * 100.0
-    y_all = r["mase_drop_vs_full"].values
+    y_all = r["rel_mase_drop_pct"].values
     x_pad = max(2.0, 0.05 * (np.ptp(x_all) or 1.0))
     y_pad = max(1e-3, 0.10 * (np.ptp(y_all) or 1.0))
     x_lo, x_hi = x_all.min() - x_pad, x_all.max() + x_pad
@@ -1643,7 +1653,7 @@ def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str) -> str:
                                          if s in strat_order else len(strat_order))
         sub = sub.sort_values("__o")
         if len(sub) > 1:
-            ax.plot(sub["pct_flops_saved"] * 100.0, sub["mase_drop_vs_full"],
+            ax.plot(sub["pct_flops_saved"] * 100.0, sub["rel_mase_drop_pct"],
                     color="gray", lw=0.8, alpha=0.30, zorder=1)
 
     # Markers: colour = strategy, shape = model.
@@ -1651,7 +1661,7 @@ def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str) -> str:
         _, color = _STRATEGY_STYLE[strat]
         sub = r[r["strategy"] == strat]
         for _, row in sub.iterrows():
-            ax.scatter(row["pct_flops_saved"] * 100.0, row["mase_drop_vs_full"],
+            ax.scatter(row["pct_flops_saved"] * 100.0, row["rel_mase_drop_pct"],
                        marker=marker_of[row["model_short"]], s=170, c=color,
                        edgecolors="white", linewidths=0.8, alpha=0.92, zorder=3)
 
@@ -1668,7 +1678,7 @@ def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str) -> str:
 
     ax.set_xlabel("FLOPs saved vs full window  =  100·(1 − FLOPs_strategy / FLOPs_full)   (%)",
                   fontsize=11)
-    ax.set_ylabel("Geomean MASE change vs full  =  MASE_full − MASE_strategy   (>0 = better)",
+    ax.set_ylabel("Relative MASE change vs full  =  100·(MASE_full − MASE_strategy)/MASE_full   (%, >0 = better)",
                   fontsize=11)
     ax.set_title("Model × Strategy Overview — Compute Saved vs Accuracy Change",
                  fontsize=13, fontweight="bold")
@@ -1930,7 +1940,7 @@ def main() -> None:
                 print(f"  {fr['strategy']:<7}  saved {100*fr['pct_flops_saved']:5.1f}%  "
                       f"({fr['flops_saved']:.3g} of {fr['total_full_flops']:.3g} FLOPs)  |  "
                       f"geomean MASE {fr['geomean_full_mase']:.4f} -> {fr['geomean_strategy_mase']:.4f}  "
-                      f"(drop {fr['mase_drop_vs_full']:+.4f})")
+                      f"({fr['rel_mase_drop_pct']:+.2f}%)")
 
         print(Fore.CYAN + "\n--- Relative improvement tables ---" + Fore.RESET)
         compute_relative_improvement_tables(df_subset, out_dir)
