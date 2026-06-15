@@ -164,13 +164,19 @@ MODELS = [
     # Same chronos_bolt loader as ChronosBolt-Small, just the larger checkpoint.
     # Appended (not inserted) to preserve existing --model-idx positions.
     ("amazon/chronos-bolt-base",        "chronos_bolt", "ChronosBolt-Base"),
-    # Datadog Toto — probabilistic decoder TSFM (sample-based, NOT token-by-token
-    # like TimeMoE). Needs the `toto` package importable in the active env.
-    ("Datadog/Toto-Open-Base-1.0",      "toto",         "Toto-Open-Base"),
+    # Datadog Toto 2.0 — probabilistic decoder TSFM. 2.0 uses a new module
+    # (`toto2.Toto2Model`) with a quantile output head (not the 1.0 sample-based
+    # `TotoForecaster`). 313m is the size tier closest to the other Small/200M
+    # models here. Needs the `toto2` package importable in the active env.
+    ("Datadog/Toto-2.0-313m",           "toto",         "Toto-2.0-313m"),
     # IBM Granite FlowState — SSM-encoder + functional-basis-decoder TSFM (<10M
     # params, quantile output). Loaded via tsfm_public (same package as
     # PatchTST-FM); load_flowstate pins revision r1.1 (the GIFT-Eval checkpoint).
     ("ibm-granite/granite-timeseries-flowstate-r1", "flowstate", "FlowState-R1"),
+    # NX-AI TiRex — xLSTM-based zero-shot TSFM (~35M params, quantile output).
+    # Recurrent/linear-cost like FlowState, so it's variable-length (genuine-only
+    # suffix, no NaN-pad). Loaded via the `tirex` package (pip install tirex-ts).
+    ("NX-AI/TiRex",                     "tirex",        "TiRex"),
 ]
 
 # -- Quantile bookkeeping (per model family) ----------------------------------
@@ -179,11 +185,12 @@ PATCHTST_FM_MEDIAN_QUANTILE_IDX = 49
 SUNDIAL_NUM_SAMPLES             = 20
 SUNDIAL_MAX_CONTEXT             = 2880
 TIMEMOE_MAX_TOTAL               = 4096   # context + horizon must not exceed this
-TOTO_NUM_SAMPLES                = 64     # sample paths per series; median reduces them
-# Conservative context cap: Toto-Open-Base handles long history but full-grid
-# windows (6144/8192) blow up the attention memory. Windows above this are
-# skipped (curve flattens past it), mirroring SUNDIAL_MAX_CONTEXT. Raise if your
-# GPU has the headroom.
+TOTO_NUM_QUANTILES              = 9      # Toto 2.0 quantile head: [0.1..0.9]
+TOTO_MEDIAN_QUANTILE_IDX        = 4      # middle of the 9 quantiles (0.5)
+# Conservative context cap: Toto 2.0 handles long history but full-grid windows
+# (6144/8192) blow up the attention memory. Windows above this are skipped
+# (curve flattens past it), mirroring SUNDIAL_MAX_CONTEXT. Raise if your GPU has
+# the headroom.
 TOTO_MAX_CONTEXT                = 4096
 FLOWSTATE_REVISION              = "r1.1"  # GIFT-Eval checkpoint (top of leaderboard)
 FLOWSTATE_NUM_QUANTILES         = 9
@@ -197,6 +204,13 @@ FLOWSTATE_SCALE_FACTOR          = 1.0
 # unverified — cap here to keep labels trustworthy. Curve flattens past it, like
 # SUNDIAL/TOTO. Raise (or remove the skip in gpu_worker) to probe longer context.
 FLOWSTATE_MAX_CONTEXT           = 4096
+TIREX_NUM_QUANTILES             = 9      # TiRex quantile head: [0.1..0.9]
+TIREX_MEDIAN_QUANTILE_IDX       = 4      # middle of the 9 quantiles (0.5)
+# TiRex is xLSTM (recurrent, LINEAR cost) so long windows won't blow up memory,
+# but fidelity past its trained context is unverified — cap here to keep labels
+# trustworthy (curve flattens past it), like SUNDIAL/FLOWSTATE. 2048 is TiRex's
+# pretraining context length (per the paper, arXiv:2505.23719).
+TIREX_MAX_CONTEXT               = 2048
 
 # Output root. Overridable via env so run_all.py --test can redirect the whole
 # smoke run into a throwaway tree (which it deletes afterwards) without ever
@@ -756,41 +770,36 @@ def predict_timemoe(model, x: torch.Tensor, horizon: int, device: str) -> torch.
 
 
 def load_toto(model_id: str, device: str):
-    from toto.model.toto import Toto
-    model = Toto.from_pretrained(model_id)
+    from toto2 import Toto2Model
+    model = Toto2Model.from_pretrained(model_id)
     model.to(device).eval()
     return model
 
 
 def predict_toto(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
-    """Sample-based forecast; return the per-step median (B, horizon).
+    """Quantile forecast (Toto 2.0); return the per-step median (B, horizon).
 
-    Each of the B univariate series is fed as its own variate with a distinct
-    ``id_mask`` row so Toto's space-wise attention never bleeds across unrelated
-    series — i.e. B independent univariate forecasts in one batch. Timestamps are
-    left as zeros (synthetic series have no real calendar); Toto tolerates this.
+    Each of the B univariate series is fed as one batch element with a single
+    variate, so there is no cross-series attention bleed to guard against. The
+    2.0 `forecast()` returns quantiles of shape (9, batch, n_variates, horizon);
+    we take the 0.5 row (index 4) and squeeze the singleton variate.
+
+    NOTE: the `toto2` API shapes below (target/target_mask/series_ids and the
+    `forecast()` kwargs) were reconstructed from Datadog's docs, not the package
+    source — verify against the installed `toto2` on the server before a full run.
     """
-    from toto.inference.forecaster import TotoForecaster
-    from toto.data.util.dataset import MaskedTimeseries
-
     seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
     b, length = seqs.shape
-    ids = torch.arange(b, device=device).unsqueeze(1).expand(b, length)
-    inputs = MaskedTimeseries(
-        series=seqs,
-        padding_mask=torch.full_like(seqs, True, dtype=torch.bool),
-        id_mask=ids,
-        timestamp_seconds=torch.zeros_like(seqs),
-        time_interval_seconds=torch.ones(b, device=device, dtype=torch.long),
-    )
-    forecaster = TotoForecaster(model.model)
-    forecast = forecaster.forecast(
-        inputs,
-        prediction_length=horizon,
-        num_samples=TOTO_NUM_SAMPLES,
-        samples_per_batch=TOTO_NUM_SAMPLES,
-    )
-    return forecast.median[:, :horizon].to(torch.float32)  # (B, horizon)
+    target = seqs.unsqueeze(1)                             # (B, 1, L)
+    target_mask = torch.ones_like(target, dtype=torch.bool)
+    series_ids = torch.arange(b, device=device, dtype=torch.long).unsqueeze(1)  # (B, 1)
+    quantiles = model.forecast(
+        {"target": target, "target_mask": target_mask, "series_ids": series_ids},
+        horizon=horizon,
+        has_missing_values=False,
+    )                                                      # (9, B, 1, horizon)
+    median = quantiles[TOTO_MEDIAN_QUANTILE_IDX, :, 0, :horizon]
+    return median.to(torch.float32)                        # (B, horizon)
 
 
 def load_flowstate(model_id: str, device: str):
@@ -819,6 +828,34 @@ def predict_flowstate(model, x: torch.Tensor, horizon: int, device: str) -> torc
     return qf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0].to(torch.float32)
 
 
+def load_tirex(model_id: str, device: str):
+    from tirex import load_model
+    model = load_model(model_id)
+    # tirex.load_model handles device placement internally; .to is a no-op guard.
+    try:
+        model.to(device)
+    except Exception:
+        pass
+    return model
+
+
+def predict_tirex(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
+    """Quantile forecast (TiRex); return the per-step median (B, horizon).
+
+    TiRex takes a (batch, context) tensor and returns (quantiles, mean), where
+    quantiles is (B, horizon, 9) over levels [0.1..0.9]; we take the 0.5 row
+    (index 4) as the point forecast to stay consistent with the other wrappers.
+
+    NOTE: the quantile axis order/levels below follow TiRex's docs, not its
+    package source — verify against the installed `tirex` (quantiles shape and
+    median index) before a full run.
+    """
+    seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
+    quantiles, _mean = model.forecast(context=seqs, prediction_length=horizon)
+    median = quantiles[:, :horizon, TIREX_MEDIAN_QUANTILE_IDX]
+    return median.to(torch.float32)                        # (B, horizon)
+
+
 # ==============================================================================
 #  ABLATION DRIVER
 # ==============================================================================
@@ -843,6 +880,8 @@ def setup_model(family: str, model_id: str, device: str):
         return load_toto(model_id, device)
     if family == "flowstate":
         return load_flowstate(model_id, device)
+    if family == "tirex":
+        return load_tirex(model_id, device)
     raise ValueError(f"Unknown model family: {family}")
 
 
@@ -889,6 +928,8 @@ def _forecast_uniform(
             m = predict_toto(runner, xb, horizon, device)
         elif family == "flowstate":
             m = predict_flowstate(runner, xb, horizon, device)
+        elif family == "tirex":
+            m = predict_tirex(runner, xb, horizon, device)
         else:
             raise ValueError(f"Unknown model family: {family}")
         medians.append(m)
@@ -1036,6 +1077,8 @@ def gpu_worker(
                 if family == "toto" and w > TOTO_MAX_CONTEXT:
                     continue
                 if family == "flowstate" and w > FLOWSTATE_MAX_CONTEXT:
+                    continue
+                if family == "tirex" and w > TIREX_MAX_CONTEXT:
                     continue
                 medians = forecast_window(
                     family, base, model_id, ctx, w, real_len, max_horizon,
