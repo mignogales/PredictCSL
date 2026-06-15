@@ -167,6 +167,10 @@ MODELS = [
     # Datadog Toto — probabilistic decoder TSFM (sample-based, NOT token-by-token
     # like TimeMoE). Needs the `toto` package importable in the active env.
     ("Datadog/Toto-Open-Base-1.0",      "toto",         "Toto-Open-Base"),
+    # IBM Granite FlowState — SSM-encoder + functional-basis-decoder TSFM (<10M
+    # params, quantile output). Loaded via tsfm_public (same package as
+    # PatchTST-FM); load_flowstate pins revision r1.1 (the GIFT-Eval checkpoint).
+    ("ibm-granite/granite-timeseries-flowstate-r1", "flowstate", "FlowState-R1"),
 ]
 
 # -- Quantile bookkeeping (per model family) ----------------------------------
@@ -181,6 +185,18 @@ TOTO_NUM_SAMPLES                = 64     # sample paths per series; median reduc
 # skipped (curve flattens past it), mirroring SUNDIAL_MAX_CONTEXT. Raise if your
 # GPU has the headroom.
 TOTO_MAX_CONTEXT                = 4096
+FLOWSTATE_REVISION              = "r1.1"  # GIFT-Eval checkpoint (top of leaderboard)
+FLOWSTATE_NUM_QUANTILES         = 9
+FLOWSTATE_MEDIAN_QUANTILE_IDX   = 4       # middle of the 9 output quantiles
+# scale_factor relates the data's seasonality to FlowState's pretraining base
+# (24 steps): scale = 24 / seasonality_steps. Synthetic series carry no fixed
+# sampling rate, so 1.0 (treat input cadence as the base) is the neutral choice.
+FLOWSTATE_SCALE_FACTOR          = 1.0
+# Pretraining context is 4096 (r1.1). FlowState is a *linear-cost* SSM so longer
+# windows won't blow up memory, but fidelity past the trained context is
+# unverified — cap here to keep labels trustworthy. Curve flattens past it, like
+# SUNDIAL/TOTO. Raise (or remove the skip in gpu_worker) to probe longer context.
+FLOWSTATE_MAX_CONTEXT           = 4096
 
 # Output root. Overridable via env so run_all.py --test can redirect the whole
 # smoke run into a throwaway tree (which it deletes afterwards) without ever
@@ -777,6 +793,32 @@ def predict_toto(model, x: torch.Tensor, horizon: int, device: str) -> torch.Ten
     return forecast.median[:, :horizon].to(torch.float32)  # (B, horizon)
 
 
+def load_flowstate(model_id: str, device: str):
+    from tsfm_public import FlowStateForPrediction
+    model = FlowStateForPrediction.from_pretrained(
+        model_id, revision=FLOWSTATE_REVISION).to(device)
+    model.eval()
+    return model
+
+
+def predict_flowstate(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
+    """Quantile forecast; return the median row (B, horizon).
+
+    ``x`` is (B, W, 1) == (batch, context, channels), which is exactly FlowState's
+    ``batch_first=True`` layout, so it's passed through unreshaped. The model emits
+    (B, Q, H, 1); we take the middle of its Q=9 quantiles as the point forecast.
+    """
+    series = x.to(device, non_blocking=True)               # (B, W, 1)
+    out = model(
+        series,
+        scale_factor=FLOWSTATE_SCALE_FACTOR,
+        prediction_length=horizon,
+        batch_first=True,
+    )
+    qf = out.prediction_outputs                            # (B, Q, H, 1)
+    return qf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0].to(torch.float32)
+
+
 # ==============================================================================
 #  ABLATION DRIVER
 # ==============================================================================
@@ -799,6 +841,8 @@ def setup_model(family: str, model_id: str, device: str):
         return load_timemoe(model_id, device)
     if family == "toto":
         return load_toto(model_id, device)
+    if family == "flowstate":
+        return load_flowstate(model_id, device)
     raise ValueError(f"Unknown model family: {family}")
 
 
@@ -843,6 +887,8 @@ def _forecast_uniform(
             m = predict_timemoe(runner, xb, horizon, device)
         elif family == "toto":
             m = predict_toto(runner, xb, horizon, device)
+        elif family == "flowstate":
+            m = predict_flowstate(runner, xb, horizon, device)
         else:
             raise ValueError(f"Unknown model family: {family}")
         medians.append(m)
@@ -988,6 +1034,8 @@ def gpu_worker(
                 if family == "timemoe" and w + max_horizon > TIMEMOE_MAX_TOTAL:
                     continue
                 if family == "toto" and w > TOTO_MAX_CONTEXT:
+                    continue
+                if family == "flowstate" and w > FLOWSTATE_MAX_CONTEXT:
                     continue
                 medians = forecast_window(
                     family, base, model_id, ctx, w, real_len, max_horizon,

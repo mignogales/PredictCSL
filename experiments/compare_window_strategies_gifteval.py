@@ -145,6 +145,14 @@ MODEL_ARCH: Dict[str, ModelArch] = {
     # against Toto-Open-Base-1.0 config.json before trusting its FLOPs column.
     "toto":         ModelArch(d_model=768,  d_ff=3072, patch_size=64, seq_type="unified",
                               n_enc_layers=12, max_window=4096),
+    # IBM Granite FlowState (r1.1). SSM encoder + functional-basis decoder, so its
+    # *true* cost is LINEAR in context — the attention-based proxy below therefore
+    # OVERSTATES it at long windows (keeps a spurious L^2 term). d_model/patch from
+    # config.json (512 / 6); d_ff is unset there, estimated at 4*d_model. max_window
+    # mirrors the FLOWSTATE_MAX_CONTEXT label cap. Treat its FLOPs column as a loose
+    # upper bound, not a faithful SSM count.
+    "flowstate":    ModelArch(d_model=512,  d_ff=2048, patch_size=6,  seq_type="unified",
+                              n_enc_layers=6,  max_window=4096),
 }
 
 
@@ -176,6 +184,8 @@ def infer_model_family(model_id: str) -> str:
         return "sundial"
     if "toto" in m:
         return "toto"
+    if "flowstate" in m:
+        return "flowstate"
     return "unknown"
 
 
