@@ -111,6 +111,8 @@ class ModelArch:
     n_enc_layers: int = 0    # encoder blocks (enc_dec) / total blocks (unified)
     n_dec_layers: int = 0    # decoder blocks (enc_dec only)
     experts_per_tok: int = 1 # active experts for MoE FFN (1 = dense)
+    max_window: int = 8192   # largest context the model accepts (caps full_window);
+                             # default = MAX_WINDOW grid top, overridden per family
 
 
 # Per-family architecture.  Patch sizes here are the defaults; --patch-sizes can
@@ -132,12 +134,17 @@ MODEL_ARCH: Dict[str, ModelArch] = {
     # Encoder over a fixed 8192-ctx patch grid; d_ff not in config -> 4x expansion (estimate)
     "patchtst_fm":  ModelArch(d_model=1024, d_ff=4096, patch_size=16, seq_type="unified",
                               n_enc_layers=20),
-    # Decoder-only patch LM
+    # Decoder-only patch LM (context capped at 2880; see SUNDIAL_MAX_CONTEXT)
     "sundial":      ModelArch(d_model=768,  d_ff=3072, patch_size=16, seq_type="unified",
-                              n_enc_layers=12),
-    # Decoder-only MoE (top-2 of 8 experts active per token)
+                              n_enc_layers=12, max_window=2880),
+    # Decoder-only MoE (top-2 of 8 experts active per token; ctx+horizon <= 4096)
     "timemoe":      ModelArch(d_model=768,  d_ff=3072, patch_size=1,  seq_type="unified",
-                              n_enc_layers=12, experts_per_tok=2),
+                              n_enc_layers=12, experts_per_tok=2, max_window=4096),
+    # Decoder-only probabilistic TSFM (sample-based). max_window mirrors the
+    # TOTO_MAX_CONTEXT label cap. d_model/d_ff/patch/layers are ESTIMATES — verify
+    # against Toto-Open-Base-1.0 config.json before trusting its FLOPs column.
+    "toto":         ModelArch(d_model=768,  d_ff=3072, patch_size=64, seq_type="unified",
+                              n_enc_layers=12, max_window=4096),
 }
 
 
@@ -167,6 +174,8 @@ def infer_model_family(model_id: str) -> str:
         return "timemoe"
     if "sundial" in m:
         return "sundial"
+    if "toto" in m:
+        return "toto"
     return "unknown"
 
 
