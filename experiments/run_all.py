@@ -81,8 +81,12 @@ MODELS_TO_RUN: List[Tuple[str, str, str]] = [
     ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
     ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
     ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
-    ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
+    # Dropped: autoregressive token-by-token decode is intractably slow at
+    # MAX_HORIZON=1024 across the full window grid (a single shard never finished).
+    # ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
     ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
+    ("amazon/chronos-bolt-base",        "chronos_bolt","ChronosBolt-Base"),
+    ("Datadog/Toto-Open-Base-1.0",      "toto",        "Toto-Open-Base"),
 ]
 
 DATASET_ROOT   = "logs/experiments/context_length_dataset"
