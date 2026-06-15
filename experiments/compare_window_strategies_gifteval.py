@@ -37,6 +37,8 @@ Outputs (written to <run_dir>/models/<model_short>/strategy_comparison/)
   comparison.csv              per-row MASE, elapsed time, complexity per strategy
   summary_stats.json          aggregate stats (mean/median, win rates, speedups)
   flops_savings.csv           total FLOPs saved vs full + geomean MASE drop, per strategy
+  time_savings.csv            total measured forward-pass time saved vs full + geomean
+                              MASE drop, per strategy (Stage 6, twin of flops_savings)
 
 Run-level (at <run_dir>/, one figure for the whole run; via --rollup-only)
 ----------------------------------------------------
@@ -44,6 +46,11 @@ Run-level (at <run_dir>/, one figure for the whole run; via --rollup-only)
                                  (arith & geo means of ratio / %saved / abs saved)
   model_strategy_overview.png    single scatter: every (model × strategy) point,
                                  FLOPs saved (x) vs geomean MASE change (y)
+  time_savings_all_models.csv    Stage 6 twin: per-(model,strategy) measured
+                                 forward-pass time saved + grand TOTAL row
+  model_strategy_overview_time.png  single scatter: every (model × strategy) point,
+                                 wall-clock forward-pass time saved (x) vs geomean
+                                 MASE change (y)
   bar_aggregate_mase.png      mean & median MASE per strategy
   bar_aggregate_time.png      mean elapsed time per strategy
   scatter_pred_vs_best.png    MASE(pred) vs MASE(best)
@@ -140,11 +147,12 @@ MODEL_ARCH: Dict[str, ModelArch] = {
     # Decoder-only MoE (top-2 of 8 experts active per token; ctx+horizon <= 4096)
     "timemoe":      ModelArch(d_model=768,  d_ff=3072, patch_size=1,  seq_type="unified",
                               n_enc_layers=12, experts_per_tok=2, max_window=4096),
-    # Decoder-only probabilistic TSFM (sample-based). max_window mirrors the
-    # TOTO_MAX_CONTEXT label cap. d_model/d_ff/patch/layers are ESTIMATES — verify
-    # against Toto-Open-Base-1.0 config.json before trusting its FLOPs column.
-    "toto":         ModelArch(d_model=768,  d_ff=3072, patch_size=64, seq_type="unified",
-                              n_enc_layers=12, max_window=4096),
+    # Decoder-only probabilistic TSFM (Toto 2.0, quantile head). max_window
+    # mirrors the TOTO_MAX_CONTEXT label cap. d_model/d_ff/patch/layers from
+    # Toto-2.0-313m config.json (1024 / 2736 / 32 / 24) — re-confirm against the
+    # installed checkpoint before trusting its FLOPs column.
+    "toto":         ModelArch(d_model=1024, d_ff=2736, patch_size=32, seq_type="unified",
+                              n_enc_layers=24, max_window=4096),
     # IBM Granite FlowState (r1.1). SSM encoder + functional-basis decoder, so its
     # *true* cost is LINEAR in context — the attention-based proxy below therefore
     # OVERSTATES it at long windows (keeps a spurious L^2 term). d_model/patch from
@@ -153,6 +161,15 @@ MODEL_ARCH: Dict[str, ModelArch] = {
     # upper bound, not a faithful SSM count.
     "flowstate":    ModelArch(d_model=512,  d_ff=2048, patch_size=6,  seq_type="unified",
                               n_enc_layers=6,  max_window=4096),
+    # NX-AI TiRex (~35M). xLSTM (recurrent) blocks, so its *true* cost is LINEAR
+    # in context — the attention proxy below OVERSTATES it at long windows (keeps
+    # a spurious L^2 term), same caveat as FlowState. No external config.json
+    # (arch is inside model.ckpt), so d_model/d_ff/patch/layers are ESTIMATES.
+    # max_window = TiRex's 2048 pretraining context (arXiv:2505.23719), mirroring
+    # the TIREX_MAX_CONTEXT label cap. Treat its FLOPs column as a loose upper
+    # bound, and re-confirm the arch against the checkpoint.
+    "tirex":        ModelArch(d_model=512,  d_ff=2048, patch_size=32, seq_type="unified",
+                              n_enc_layers=12, max_window=2048),
 }
 
 
@@ -186,6 +203,8 @@ def infer_model_family(model_id: str) -> str:
         return "toto"
     if "flowstate" in m:
         return "flowstate"
+    if "tirex" in m:
+        return "tirex"
     return "unknown"
 
 
@@ -820,6 +839,140 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str) -> None:
               f"FLOPs ratio amean={t['flops_ratio_amean']:.3f}  gmean={t['flops_ratio_gmean']:.3f}")
         print(f"           abs FLOPs saved  amean={t['flops_saved_amean']:.3g}  "
               f"gmean={t['flops_saved_gmean']:.3g}")
+        print(f"           geomean MASE {t['geomean_full_mase']:.4f} -> "
+              f"{t['geomean_strategy_mase']:.4f}  (drop {t['mase_drop_vs_full']:+.4f}, "
+              f"{t['rel_mase_drop_pct']:+.2f}%)")
+
+
+# ==============================================================================
+#  STAGE 6 — MEASURED WALL-CLOCK FORWARD-PASS TIME SAVED
+# ==============================================================================
+#  Twin of the FLOPs roll-up above, but using the *measured* wall-clock seconds
+#  of the forward pass (``*_elapsed_s``, read from each window's metrics.json)
+#  instead of the theoretical MAC proxy.  Same accuracy axis (geomean MASE), so
+#  the resulting figure (``model_strategy_overview_time.png``) is a drop-in
+#  companion to the FLOPs/MAC one — only the cost axis changes from "FLOPs saved"
+#  to "wall-clock time saved".
+
+def compute_time_savings(df: pd.DataFrame) -> pd.DataFrame:
+    """Total measured wall-clock forward-pass time saved per strategy vs the full
+    window, alongside the accompanying geomean-MASE change.
+
+    Unlike the FLOPs proxy (per-forecast, instance-weighted), ``*_elapsed_s`` is
+    already the *total* wall-clock for the whole (dataset, term) inference pass at
+    that window, so the benchmark total is a plain sum of the per-row seconds — no
+    instance weighting.  MASE is the same *unweighted* geometric mean over the
+    (dataset, term) rows as ``compute_flops_savings`` uses, so ``rel_mase_drop_pct``
+    is identical to the FLOPs figure's y-axis (only the cost axis differs).
+    """
+    strat_specs = [("pred", "pred_elapsed_s", "pred_mase"),
+                   ("best", "best_elapsed_s", "best_mase")]
+    if "period_elapsed_s" in df.columns:
+        strat_specs.append(("period", "period_elapsed_s", "period_mase"))
+
+    rows = []
+    for name, time_col, mase_col in strat_specs:
+        sub = df.dropna(subset=["full_elapsed_s", time_col, "full_mase", mase_col])
+        if sub.empty:
+            continue
+        full_t  = float(sub["full_elapsed_s"].values.sum())
+        strat_t = float(sub[time_col].values.sum())
+        saved   = full_t - strat_t
+        gm_full_mase  = _geomean(sub["full_mase"].values)
+        gm_strat_mase = _geomean(sub[mase_col].values)
+        rows.append({
+            "strategy":              name,
+            "n_rows":                int(len(sub)),
+            "total_instances":       int(sub["n_instances"].sum()),
+            "total_full_time_s":     full_t,
+            "total_strategy_time_s": strat_t,
+            "time_saved_s":          saved,
+            "time_ratio":            strat_t / full_t if full_t > 0 else float("nan"),
+            "pct_time_saved":        saved / full_t if full_t > 0 else float("nan"),
+            "geomean_full_mase":     gm_full_mase,
+            "geomean_strategy_mase": gm_strat_mase,
+            "mase_drop_vs_full":     gm_full_mase - gm_strat_mase,  # >0 = better
+            "rel_mase_drop_pct":     (100.0 * (gm_full_mase - gm_strat_mase) / gm_full_mase
+                                      if gm_full_mase > 0 else float("nan")),
+            "mean_delta_vs_full":    gm_strat_mase - gm_full_mase,  # (strat - full)
+        })
+    return pd.DataFrame(rows)
+
+
+def write_run_time_rollup(df: pd.DataFrame, out_dir: str) -> None:
+    """Cross-model roll-up of measured forward-pass time saved: per-(model,
+    strategy) rows, a grand TOTAL per strategy, the overview figure, and the
+    console summary.  Writes ``time_savings_all_models.csv`` and
+    ``model_strategy_overview_time.png`` into ``out_dir``.  Twin of
+    ``write_run_rollup`` for wall-clock time rather than theoretical FLOPs.
+    """
+    rollup_rows = []
+    for model_short, df_model in df.groupby("model_short"):
+        ts = compute_time_savings(df_model.reset_index(drop=True))
+        if not ts.empty:
+            ts.insert(0, "model_short", model_short)
+            rollup_rows.append(ts)
+    if not rollup_rows:
+        print(Fore.YELLOW + "  No timing/MASE records for the run-level time roll-up." + Fore.RESET)
+        return
+
+    rollup = pd.concat(rollup_rows, ignore_index=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    overview_path = plot_model_strategy_overview_time(rollup, out_dir)
+    if overview_path:
+        print(Fore.GREEN + f"\nSaved run-level time overview: {overview_path}" + Fore.RESET)
+
+    totals = []
+    for name, grp in rollup.groupby("strategy"):
+        tot_full  = grp["total_full_time_s"].sum()
+        tot_strat = grp["total_strategy_time_s"].sum()
+        inst = grp["total_instances"].sum()
+        # Per-model time ratios / fractional savings / absolute savings, aggregated
+        # both ways; wall-clock seconds are comparable across families, so the
+        # pooled sum *and* the per-model means are all meaningful.
+        ratios  = grp["time_ratio"].dropna().values
+        pct_sav = grp["pct_time_saved"].dropna().values
+        abs_sav = grp["time_saved_s"].dropna().values
+        w_rows   = grp["n_rows"].values.astype(float)
+        gm_full  = _wgeomean(grp["geomean_full_mase"].values,     w_rows)
+        gm_strat = _wgeomean(grp["geomean_strategy_mase"].values, w_rows)
+        totals.append({
+            "model_short":           "TOTAL",
+            "strategy":              name,
+            "n_rows":                int(grp["n_rows"].sum()),
+            "total_instances":       int(inst),
+            "total_full_time_s":     tot_full,
+            "total_strategy_time_s": tot_strat,
+            "time_saved_s":          tot_full - tot_strat,
+            "time_ratio":            tot_strat / tot_full if tot_full > 0 else float("nan"),
+            "pct_time_saved":        (tot_full - tot_strat) / tot_full if tot_full > 0 else float("nan"),
+            "time_ratio_amean":      float(ratios.mean()) if ratios.size else float("nan"),
+            "time_ratio_gmean":      _geomean(ratios) if ratios.size else float("nan"),
+            "pct_time_saved_amean":  float(pct_sav.mean()) if pct_sav.size else float("nan"),
+            "pct_time_saved_gmean":  _geomean(pct_sav) if pct_sav.size else float("nan"),
+            "time_saved_amean":      float(abs_sav.mean()) if abs_sav.size else float("nan"),
+            "time_saved_gmean":      _geomean(abs_sav) if abs_sav.size else float("nan"),
+            "geomean_full_mase":     gm_full,
+            "geomean_strategy_mase": gm_strat,
+            "mase_drop_vs_full":     gm_full - gm_strat,
+            "rel_mase_drop_pct":     (100.0 * (gm_full - gm_strat) / gm_full
+                                      if gm_full > 0 else float("nan")),
+            "mean_delta_vs_full":    gm_strat - gm_full,
+        })
+    rollup = pd.concat([rollup, pd.DataFrame(totals)], ignore_index=True)
+    rollup_path = os.path.join(out_dir, "time_savings_all_models.csv")
+    rollup.to_csv(rollup_path, index=False, float_format="%.6g")
+    print(Fore.GREEN + f"\nSaved run-level time savings: {rollup_path}" + Fore.RESET)
+    print(Fore.CYAN + "\n--- Grand total forward-pass time saved vs full window ---" + Fore.RESET)
+    for t in totals:
+        print(f"  {t['strategy']:<7}  pooled saved {100*t['pct_time_saved']:5.1f}%  "
+              f"({t['time_saved_s']:.3g}s of {t['total_full_time_s']:.3g}s)")
+        print(f"           per-model %saved  amean={100*t['pct_time_saved_amean']:5.1f}%  "
+              f"gmean={100*t['pct_time_saved_gmean']:5.1f}%   |   "
+              f"time ratio amean={t['time_ratio_amean']:.3f}  gmean={t['time_ratio_gmean']:.3f}")
+        print(f"           abs time saved   amean={t['time_saved_amean']:.3g}s  "
+              f"gmean={t['time_saved_gmean']:.3g}s")
         print(f"           geomean MASE {t['geomean_full_mase']:.4f} -> "
               f"{t['geomean_strategy_mase']:.4f}  (drop {t['mase_drop_vs_full']:+.4f}, "
               f"{t['rel_mase_drop_pct']:+.2f}%)")
@@ -1812,6 +1965,104 @@ def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str) -> str:
     return path
 
 
+def plot_model_strategy_overview_time(rollup: pd.DataFrame, out_dir: str) -> str:
+    """Stage-6 twin of ``plot_model_strategy_overview``: every (model, strategy)
+    as one point, trading measured wall-clock forward-pass time saved (x) against
+    the relative geomean MASE change (y).
+
+    x = pct_time_saved (>0 = faster than full); y = rel_mase_drop_pct =
+    100·(MASE_full − MASE_strategy)/MASE_full (>0 = better).  Colour = strategy,
+    marker = model.  The top-right quadrant — faster *and* better — is the win
+    region.  Identical layout to the FLOPs figure so the two can sit side by side;
+    only the cost axis differs (measured seconds vs theoretical MACs).
+    """
+    from matplotlib.lines import Line2D
+
+    r = rollup.dropna(subset=["pct_time_saved", "rel_mase_drop_pct"]).copy()
+    if r.empty:
+        return ""
+
+    models = sorted(r["model_short"].unique())
+    marker_of = {m: _MODEL_MARKERS[i % len(_MODEL_MARKERS)] for i, m in enumerate(models)}
+    strat_order = [s for s in _STRATEGY_STYLE if s in set(r["strategy"])]
+
+    fig, ax = plt.subplots(figsize=(11, 8))
+
+    x_all = r["pct_time_saved"].values * 100.0
+    y_all = r["rel_mase_drop_pct"].values
+    x_pad = max(2.0, 0.05 * (np.ptp(x_all) or 1.0))
+    y_pad = max(1e-3, 0.10 * (np.ptp(y_all) or 1.0))
+    x_lo, x_hi = x_all.min() - x_pad, x_all.max() + x_pad
+    y_lo, y_hi = y_all.min() - y_pad, y_all.max() + y_pad
+    ax.set_xlim(x_lo, x_hi); ax.set_ylim(y_lo, y_hi)
+
+    # Win quadrant (faster & better) + zero crosshair.
+    ax.axhspan(0, max(0.0, y_hi), color="#70AD47", alpha=0.04)
+    ax.axvspan(0, max(0.0, x_hi), color="#70AD47", alpha=0.04)
+    ax.axhline(0, color="gray", lw=1.2, ls="--", alpha=0.7)
+    ax.axvline(0, color="gray", lw=1.2, ls="-.", alpha=0.7)
+
+    # Faint connector tracing each model across its strategies (sorted by x).
+    for m in models:
+        sub = r[r["model_short"] == m].copy()
+        sub["__o"] = sub["strategy"].map(lambda s: strat_order.index(s)
+                                         if s in strat_order else len(strat_order))
+        sub = sub.sort_values("__o")
+        if len(sub) > 1:
+            ax.plot(sub["pct_time_saved"] * 100.0, sub["rel_mase_drop_pct"],
+                    color="gray", lw=0.8, alpha=0.30, zorder=1)
+
+    # Markers: colour = strategy, shape = model.
+    for strat in strat_order:
+        _, color = _STRATEGY_STYLE[strat]
+        sub = r[r["strategy"] == strat]
+        for _, row in sub.iterrows():
+            ax.scatter(row["pct_time_saved"] * 100.0, row["rel_mase_drop_pct"],
+                       marker=marker_of[row["model_short"]], s=170, c=color,
+                       edgecolors="white", linewidths=0.8, alpha=0.92, zorder=3)
+
+    # Quadrant captions.
+    for qx, qy, txt, ha in [
+        (0.985, 0.985, "Faster & Better",  "right"),
+        (0.015, 0.985, "Slower & Better",  "left"),
+        (0.985, 0.015, "Faster & Worse",   "right"),
+        (0.015, 0.015, "Slower & Worse",   "left"),
+    ]:
+        ax.text(qx, qy, txt, transform=ax.transAxes, fontsize=8.5,
+                ha=ha, va="top" if qy > 0.5 else "bottom",
+                color="gray", style="italic", alpha=0.75)
+
+    ax.set_xlabel("Forward-pass time saved vs full window  =  100·(1 − time_strategy / time_full)   (%)",
+                  fontsize=11)
+    ax.set_ylabel("Relative MASE change vs full  =  100·(MASE_full − MASE_strategy)/MASE_full   (%, >0 = better)",
+                  fontsize=11)
+    ax.set_title("Model × Strategy Overview — Forward-Pass Time Saved vs Accuracy Change",
+                 fontsize=13, fontweight="bold")
+    ax.grid(True, alpha=0.25)
+
+    strat_handles = [
+        Line2D([0], [0], marker="o", linestyle="none", markersize=10,
+               markerfacecolor=_STRATEGY_STYLE[s][1], markeredgecolor="white",
+               label=_STRATEGY_STYLE[s][0])
+        for s in strat_order
+    ]
+    model_handles = [
+        Line2D([0], [0], marker=marker_of[m], linestyle="none", markersize=9,
+               markerfacecolor="0.35", markeredgecolor="white", label=m)
+        for m in models
+    ]
+    leg1 = ax.legend(handles=strat_handles, title="Strategy", fontsize=9,
+                     title_fontsize=10, loc="upper left", framealpha=0.9)
+    ax.add_artist(leg1)
+    ax.legend(handles=model_handles, title="Model", fontsize=8.5, title_fontsize=10,
+              loc="center left", bbox_to_anchor=(1.01, 0.5), framealpha=0.9)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, "model_strategy_overview_time.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    return path
+
+
 # ==============================================================================
 #  PLOTS — MISC
 # ==============================================================================
@@ -2046,6 +2297,19 @@ def main() -> None:
                       f"geomean MASE {fr['geomean_full_mase']:.4f} -> {fr['geomean_strategy_mase']:.4f}  "
                       f"({fr['rel_mase_drop_pct']:+.2f}%)")
 
+        # Stage 6: measured wall-clock forward-pass time saved (twin of FLOPs).
+        time_sav = compute_time_savings(df_subset)
+        if not time_sav.empty:
+            ts_path = os.path.join(out_dir, "time_savings.csv")
+            time_sav.to_csv(ts_path, index=False, float_format="%.6g")
+            print(Fore.GREEN + f"  Saved: {ts_path}" + Fore.RESET)
+            print(Fore.CYAN + "\n--- Total forward-pass time saved vs full window ---" + Fore.RESET)
+            for _, fr in time_sav.iterrows():
+                print(f"  {fr['strategy']:<7}  saved {100*fr['pct_time_saved']:5.1f}%  "
+                      f"({fr['time_saved_s']:.3g}s of {fr['total_full_time_s']:.3g}s)  |  "
+                      f"geomean MASE {fr['geomean_full_mase']:.4f} -> {fr['geomean_strategy_mase']:.4f}  "
+                      f"({fr['rel_mase_drop_pct']:+.2f}%)")
+
         print(Fore.CYAN + "\n--- Relative improvement tables ---" + Fore.RESET)
         compute_relative_improvement_tables(df_subset, out_dir)
 
@@ -2078,7 +2342,9 @@ def main() -> None:
     # ---- Rollup-only mode: skip per-model outputs, emit the cross-model -------
     # overview + grand-total CSV from every model in the run dir, then return.
     if getattr(args, "rollup_only", False):
-        write_run_rollup(df, args.output_dir or run_dir)
+        out = args.output_dir or run_dir
+        write_run_rollup(df, out)
+        write_run_time_rollup(df, out)   # Stage 6: measured forward-pass time
         return
 
     # ---- Per-model outputs --------------------------------------------------
@@ -2096,7 +2362,9 @@ def main() -> None:
     # --rollup-only pass; here we emit it only for multi-model (e.g. standalone)
     # invocations so single-model runs don't drop a stray one-point overview.
     if df["model_short"].nunique() > 1:
-        write_run_rollup(df, args.output_dir or run_dir)
+        out = args.output_dir or run_dir
+        write_run_rollup(df, out)
+        write_run_time_rollup(df, out)   # Stage 6: measured forward-pass time
 
 
 if __name__ == "__main__":

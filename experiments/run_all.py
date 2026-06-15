@@ -83,8 +83,9 @@ MODELS_TO_RUN: List[Tuple[str, str, str]] = [
     ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
     ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
     ("amazon/chronos-bolt-base",        "chronos_bolt","ChronosBolt-Base"),
-    ("Datadog/Toto-Open-Base-1.0",      "toto",        "Toto-Open-Base"),
+    ("Datadog/Toto-2.0-313m",           "toto",        "Toto-2.0-313m"),
     ("ibm-granite/granite-timeseries-flowstate-r1", "flowstate", "FlowState-R1"),
+    ("NX-AI/TiRex",                     "tirex",       "TiRex"),
 ]
 
 DATASET_ROOT   = "logs/experiments/context_length_dataset"
