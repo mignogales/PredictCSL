@@ -72,6 +72,7 @@ MODELS = [
     ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
     ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
     ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
+    ("amazon/chronos-bolt-base",        "chronos_bolt","ChronosBolt-Base"),
 ]
 
 DATASETS = [
@@ -1469,6 +1470,18 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
           + f"  |  short-context mode: {short_mode}" + Fore.RESET)
 
     models = [m for m in MODELS if (args.models is None or m[2] in args.models)]
+    # Fail loud on an empty model filter. Otherwise the ablation runs over zero
+    # models, writes nothing, and exits 0 — which downstream surfaces as an
+    # opaque "No records for models [...]" in stage 4 (compare). A requested
+    # display name that isn't in this MODELS catalog is the usual cause.
+    if args.models is not None and not models:
+        known = [m[2] for m in MODELS]
+        raise SystemExit(
+            Fore.RED
+            + f"--models {args.models} matched none of this script's known models.\n"
+            + f"  Known: {known}\n"
+            + "  Add the missing entry to MODELS (and ensure its family has "
+            + "load_*/predict_* wrappers + dispatch)." + Fore.RESET)
     datasets = [d for d in DATASETS if (args.datasets is None or d[2] in args.datasets)]
 
     # Smoke test: keep only a random subset of (dataset, term) entries. Seeded so
