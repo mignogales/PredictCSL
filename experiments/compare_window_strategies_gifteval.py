@@ -751,11 +751,15 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def write_run_rollup(df: pd.DataFrame, out_dir: str) -> None:
+def write_run_rollup(df: pd.DataFrame, out_dir: str,
+                     plot_strategies: Optional[List[str]] = None) -> None:
     """Cross-model roll-up: per-(model, strategy) FLOPs savings + MASE change, a
     grand TOTAL row per strategy, the single overview figure, and the console
     summary.  Writes ``flops_savings_all_models.csv`` and
     ``model_strategy_overview.png`` into ``out_dir``.
+
+    ``plot_strategies`` optionally restricts which strategies appear in the
+    overview *figure* (the CSV and console totals always cover all strategies).
 
     Absolute FLOPs are an unnormalized proxy (comparable as a ratio within a
     model), so per-model rows carry the portable ``pct_flops_saved`` while the
@@ -775,7 +779,8 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     # Single run-level overview figure: each (model, strategy) point.
-    overview_path = plot_model_strategy_overview(rollup, out_dir)
+    overview_path = plot_model_strategy_overview(rollup, out_dir,
+                                                 strategies=plot_strategies)
     if overview_path:
         print(Fore.GREEN + f"\nSaved run-level overview: {overview_path}" + Fore.RESET)
 
@@ -899,12 +904,16 @@ def compute_time_savings(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def write_run_time_rollup(df: pd.DataFrame, out_dir: str) -> None:
+def write_run_time_rollup(df: pd.DataFrame, out_dir: str,
+                          plot_strategies: Optional[List[str]] = None) -> None:
     """Cross-model roll-up of measured forward-pass time saved: per-(model,
     strategy) rows, a grand TOTAL per strategy, the overview figure, and the
     console summary.  Writes ``time_savings_all_models.csv`` and
     ``model_strategy_overview_time.png`` into ``out_dir``.  Twin of
     ``write_run_rollup`` for wall-clock time rather than theoretical FLOPs.
+
+    ``plot_strategies`` optionally restricts which strategies appear in the
+    overview *figure* (the CSV and console totals always cover all strategies).
     """
     rollup_rows = []
     for model_short, df_model in df.groupby("model_short"):
@@ -919,7 +928,8 @@ def write_run_time_rollup(df: pd.DataFrame, out_dir: str) -> None:
     rollup = pd.concat(rollup_rows, ignore_index=True)
     os.makedirs(out_dir, exist_ok=True)
 
-    overview_path = plot_model_strategy_overview_time(rollup, out_dir)
+    overview_path = plot_model_strategy_overview_time(rollup, out_dir,
+                                                      strategies=plot_strategies)
     if overview_path:
         print(Fore.GREEN + f"\nSaved run-level time overview: {overview_path}" + Fore.RESET)
 
@@ -1864,7 +1874,8 @@ _STRATEGY_STYLE = {
 _MODEL_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "p"]
 
 
-def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str) -> str:
+def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str,
+                                 strategies: Optional[List[str]] = None) -> str:
     """Single run-level figure: every (model, strategy) as one point, trading off
     FLOPs saved (x) against the *relative* geomean MASE change (y).
 
@@ -1873,10 +1884,15 @@ def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str) -> str:
     better).  Colour encodes strategy, marker shape encodes model, and a faint
     line links each model's strategies so a family's spread is readable at a
     glance.  The top-right quadrant — cheaper *and* better — is the win region.
+
+    ``strategies`` optionally restricts which strategies are plotted (a subset of
+    ``_STRATEGY_STYLE`` keys, e.g. ``["pred", "best"]``); ``None`` plots all.
     """
     from matplotlib.lines import Line2D
 
     r = rollup.dropna(subset=["pct_flops_saved", "rel_mase_drop_pct"]).copy()
+    if strategies:
+        r = r[r["strategy"].isin(strategies)].copy()
     if r.empty:
         return ""
 
@@ -1965,7 +1981,8 @@ def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str) -> str:
     return path
 
 
-def plot_model_strategy_overview_time(rollup: pd.DataFrame, out_dir: str) -> str:
+def plot_model_strategy_overview_time(rollup: pd.DataFrame, out_dir: str,
+                                      strategies: Optional[List[str]] = None) -> str:
     """Stage-6 twin of ``plot_model_strategy_overview``: every (model, strategy)
     as one point, trading measured wall-clock forward-pass time saved (x) against
     the relative geomean MASE change (y).
@@ -1975,10 +1992,15 @@ def plot_model_strategy_overview_time(rollup: pd.DataFrame, out_dir: str) -> str
     marker = model.  The top-right quadrant — faster *and* better — is the win
     region.  Identical layout to the FLOPs figure so the two can sit side by side;
     only the cost axis differs (measured seconds vs theoretical MACs).
+
+    ``strategies`` optionally restricts which strategies are plotted (a subset of
+    ``_STRATEGY_STYLE`` keys, e.g. ``["pred", "best"]``); ``None`` plots all.
     """
     from matplotlib.lines import Line2D
 
     r = rollup.dropna(subset=["pct_time_saved", "rel_mase_drop_pct"]).copy()
+    if strategies:
+        r = r[r["strategy"].isin(strategies)].copy()
     if r.empty:
         return ""
 
@@ -2195,6 +2217,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--plot-strategies", type=str, nargs="+", default=None,
+        choices=list(_STRATEGY_STYLE.keys()),
+        help="Restrict the cross-model overview figures (model_strategy_overview"
+             "[_time].png) to these strategies (default: all present). The CSVs "
+             "and console totals are unaffected. E.g. --plot-strategies pred best.",
+    )
+    p.add_argument(
         "--rollup-only", action="store_true",
         help="Skip the per-model outputs and emit only the cross-model overview "
              "figure + flops_savings_all_models.csv (covering every model in the "
@@ -2343,8 +2372,8 @@ def main() -> None:
     # overview + grand-total CSV from every model in the run dir, then return.
     if getattr(args, "rollup_only", False):
         out = args.output_dir or run_dir
-        write_run_rollup(df, out)
-        write_run_time_rollup(df, out)   # Stage 6: measured forward-pass time
+        write_run_rollup(df, out, plot_strategies=args.plot_strategies)
+        write_run_time_rollup(df, out, plot_strategies=args.plot_strategies)
         return
 
     # ---- Per-model outputs --------------------------------------------------
@@ -2363,8 +2392,8 @@ def main() -> None:
     # invocations so single-model runs don't drop a stray one-point overview.
     if df["model_short"].nunique() > 1:
         out = args.output_dir or run_dir
-        write_run_rollup(df, out)
-        write_run_time_rollup(df, out)   # Stage 6: measured forward-pass time
+        write_run_rollup(df, out, plot_strategies=args.plot_strategies)
+        write_run_time_rollup(df, out, plot_strategies=args.plot_strategies)
 
 
 if __name__ == "__main__":

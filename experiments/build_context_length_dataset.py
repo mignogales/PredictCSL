@@ -192,6 +192,13 @@ TOTO_MEDIAN_QUANTILE_IDX        = 4      # middle of the 9 quantiles (0.5)
 # (curve flattens past it), mirroring SUNDIAL_MAX_CONTEXT. Raise if your GPU has
 # the headroom.
 TOTO_MAX_CONTEXT                = 4096
+# Toto 2.0 patches the time axis into fixed chunks; the context length fed to
+# forecast() must be a multiple of this patch size (verified from the einops
+# error on the 313m checkpoint). Non-multiple windows (e.g. grid point 48) and
+# short genuine series are left-padded up to the next multiple, with the padded
+# steps masked out. If you switch size tiers, confirm this against the model's
+# patch_embed config.
+TOTO_PATCH_SIZE                 = 32
 FLOWSTATE_REVISION              = "r1.1"  # GIFT-Eval checkpoint (top of leaderboard)
 FLOWSTATE_NUM_QUANTILES         = 9
 FLOWSTATE_MEDIAN_QUANTILE_IDX   = 4       # middle of the 9 output quantiles
@@ -790,13 +797,21 @@ def predict_toto(model, x: torch.Tensor, horizon: int, device: str) -> torch.Ten
     """
     seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
     b, length = seqs.shape
-    target = seqs.unsqueeze(1)                             # (B, 1, L)
+    # The patcher requires L to be a multiple of TOTO_PATCH_SIZE. Left-pad the
+    # oldest steps so the genuine context (and the forecast origin at the right)
+    # is untouched, then mask the pad as missing so it can't affect the forecast.
+    pad = (-length) % TOTO_PATCH_SIZE
+    if pad:
+        seqs = torch.cat([seqs.new_zeros((b, pad)), seqs], dim=1)  # (B, L+pad)
+    target = seqs.unsqueeze(1)                             # (B, 1, L')
     target_mask = torch.ones_like(target, dtype=torch.bool)
+    if pad:
+        target_mask[:, :, :pad] = False
     series_ids = torch.arange(b, device=device, dtype=torch.long).unsqueeze(1)  # (B, 1)
     quantiles = model.forecast(
         {"target": target, "target_mask": target_mask, "series_ids": series_ids},
         horizon=horizon,
-        has_missing_values=False,
+        has_missing_values=bool(pad),
     )                                                      # (9, B, 1, horizon)
     median = quantiles[TOTO_MEDIAN_QUANTILE_IDX, :, 0, :horizon]
     return median.to(torch.float32)                        # (B, horizon)
