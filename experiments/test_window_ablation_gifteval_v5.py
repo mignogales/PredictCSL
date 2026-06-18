@@ -73,6 +73,7 @@ MODELS = [
     ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
     ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
     ("amazon/chronos-bolt-base",        "chronos_bolt","ChronosBolt-Base"),
+    ("Datadog/Toto-2.0-313m",           "toto",        "Toto-2.0-313m"),
 ]
 
 DATASETS = [
@@ -179,6 +180,10 @@ PATCHTST_FM_MEDIAN_QUANTILE_IDX = 49
 SUNDIAL_NUM_SAMPLES = 20
 SUNDIAL_MAX_CONTEXT = 2880
 TIMEMOE_MAX_TOTAL   = 4096   # context + horizon must not exceed this
+TOTO_NUM_QUANTILES       = 9     # Toto 2.0 quantile head: [0.1..0.9]
+TOTO_MEDIAN_QUANTILE_IDX = 4     # middle of the 9 quantiles (0.5)
+TOTO_MAX_CONTEXT         = 4096  # skip wider windows (mirrors stage-1 label cap)
+TOTO_PATCH_SIZE          = 32    # forecast() context length must be a multiple of this
 
 N_BEST_WORST = 10
 PLOT_METRICS = ["mae", "mse", "rmse", "mase", "smape", "crps"]
@@ -853,6 +858,49 @@ def predict_timemoe(model, batches, horizon, device):
     return ForecastResult(median=all_preds), all_tgts
 
 
+def load_toto(model_id, device):
+    from toto2 import Toto2Model
+    model = Toto2Model.from_pretrained(model_id)
+    model.to(device).eval()
+    return model
+
+
+def predict_toto(model, batches, horizon, device):
+    """Quantile forecast (Toto 2.0); return the per-step median (B, horizon).
+
+    Mirrors stage-1's predict_toto: each univariate series is one batch element
+    with a single variate (no cross-series attention). forecast() returns
+    quantiles of shape (9, B, n_variates, horizon); take the 0.5 row (index 4).
+    The patcher requires the context length to be a multiple of TOTO_PATCH_SIZE,
+    so left-pad the oldest steps (forecast origin at the right is untouched) and
+    mask the pad as missing.
+    """
+    all_medians, all_tgts = [], []
+    for batch in tqdm(batches, desc="  Toto", leave=False):
+        x, y = batch["x"], batch["y"]
+        seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
+        b, length = seqs.shape
+        pad = (-length) % TOTO_PATCH_SIZE
+        if pad:
+            seqs = torch.cat([seqs.new_zeros((b, pad)), seqs], dim=1)  # (B, L+pad)
+        target = seqs.unsqueeze(1)                             # (B, 1, L')
+        target_mask = torch.ones_like(target, dtype=torch.bool)
+        if pad:
+            target_mask[:, :, :pad] = False
+        series_ids = torch.arange(b, device=device, dtype=torch.long).unsqueeze(1)
+        quantiles = model.forecast(
+            {"target": target, "target_mask": target_mask, "series_ids": series_ids},
+            horizon=horizon,
+            has_missing_values=bool(pad),
+        )                                                      # (9, B, 1, horizon)
+        median = quantiles[TOTO_MEDIAN_QUANTILE_IDX, :, 0, :horizon].to(torch.float32)
+        all_medians.append(median)
+        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
+    all_medians = torch.cat(all_medians, 0)
+    all_tgts = torch.cat(all_tgts, 0)
+    return ForecastResult(median=all_medians), all_tgts
+
+
 def predict_context_parroting(batches, horizon, device):
     all_preds, all_tgts = [], []
     for batch in tqdm(batches, desc="  Parroting", leave=False):
@@ -1297,6 +1345,8 @@ def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
         return predict_sundial(handle, batches, horizon, device)
     if model_family == "timemoe":
         return predict_timemoe(handle, batches, horizon, device)
+    if model_family == "toto":
+        return predict_toto(handle, batches, horizon, device)
     raise ValueError(f"Unknown model family: {model_family}")
 
 
@@ -1551,6 +1601,8 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     _handle[0] = load_sundial(model_id, device)
                 elif model_family == "timemoe":
                     _handle[0] = load_timemoe(model_id, device)
+                elif model_family == "toto":
+                    _handle[0] = load_toto(model_id, device)
             return _handle[0]
 
         for d_idx, (ge_name, term, dataset_display, to_univariate) in enumerate(datasets):
@@ -1604,6 +1656,11 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
 
                 if model_family == "timemoe" and window_size + horizon > TIMEMOE_MAX_TOTAL:
                     print(Fore.RED + f"  SKIP    {tag}  (TimeMoE ws+h={window_size + horizon} > {TIMEMOE_MAX_TOTAL})"
+                          + Fore.RESET)
+                    continue
+
+                if model_family == "toto" and window_size > TOTO_MAX_CONTEXT:
+                    print(Fore.RED + f"  SKIP    {tag}  (Toto max context={TOTO_MAX_CONTEXT} < ws)"
                           + Fore.RESET)
                     continue
 
