@@ -826,13 +826,16 @@ def load_flowstate(model_id: str, device: str):
 
 
 def predict_flowstate(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
-    """Point forecast; return the per-step prediction (B, horizon).
+    """Quantile forecast; return the per-step median (B, horizon).
 
     ``x`` is (B, W, 1) == (batch, context, channels), which is exactly FlowState's
-    ``batch_first=True`` layout, so it's passed through unreshaped. FlowState splits
-    its outputs: ``prediction_outputs`` is the point forecast of shape (B, H, C)
-    (no quantile axis), while the Q=9 quantiles live separately on
-    ``quantile_outputs`` (C, B, Q, H, 1). We use the point forecast directly.
+    ``batch_first=True`` layout, so it's passed through unreshaped. On the r1.1
+    checkpoint ``prediction_outputs`` carries the quantile axis explicitly:
+    ``(B, Q=9, H, C)`` — see the model card example, which prints
+    ``prediction_outputs.shape == (32, 9, 48, 1)``. We take the median quantile
+    (index 4 of 9) as the point forecast to stay consistent with the other
+    wrappers. A 3-D ``(B, H, C)`` output (point forecast, no quantile axis) is
+    also handled for forward-compatibility with other checkpoints.
     """
     series = x.to(device, non_blocking=True)               # (B, W, 1)
     out = model(
@@ -841,8 +844,12 @@ def predict_flowstate(model, x: torch.Tensor, horizon: int, device: str) -> torc
         prediction_length=horizon,
         batch_first=True,
     )
-    pf = out.prediction_outputs                            # (B, H, C)
-    return pf[:, :horizon, 0].to(torch.float32)
+    pf = out.prediction_outputs
+    if pf.dim() == 4:                                       # (B, Q, H, C)
+        med = pf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0]
+    else:                                                  # (B, H, C)
+        med = pf[:, :horizon, 0]
+    return med.to(torch.float32)                           # (B, horizon)
 
 
 def load_tirex(model_id: str, device: str):
