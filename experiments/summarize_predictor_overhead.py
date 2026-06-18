@@ -201,15 +201,23 @@ def build_rows(cfg: Dict, horizon: int, families: List[str]) -> List[Dict]:
     for fam in families:
         arch = MODEL_ARCH[fam]
         full_window = min(arch.max_window, GRID_MAX_WINDOW)
+        half_window = max(1, full_window // 2)
+        quarter_window = max(1, full_window // 4)
         model_id = FAMILY_REPRESENTATIVE.get(fam, fam)
-        tsfm = theoretical_flops(model_id, full_window, horizon, DEFAULT_PATCH_SIZES)
+        tsfm_full = theoretical_flops(model_id, full_window, horizon, DEFAULT_PATCH_SIZES)
+        tsfm_half = theoretical_flops(model_id, half_window, horizon, DEFAULT_PATCH_SIZES)
+        tsfm_quarter = theoretical_flops(model_id, quarter_window, horizon, DEFAULT_PATCH_SIZES)
         rows.append({
             "model": model_id,
             "family": fam,
             "full_window": full_window,
-            "tsfm_gmac": tsfm / 1e9,
+            "half_window": half_window,
+            "quarter_window": quarter_window,
+            "tsfm_gmac_full": tsfm_full / 1e9,
+            "tsfm_gmac_half": tsfm_half / 1e9,
+            "tsfm_gmac_quarter": tsfm_quarter / 1e9,
             "predictor_gmac": pred / 1e9,
-            "pct_of_full": 100.0 * pred / tsfm if tsfm > 0 else float("nan"),
+            "pct_of_full": 100.0 * pred / tsfm_full if tsfm_full > 0 else float("nan"),
         })
     rows.sort(key=lambda r: r["pct_of_full"], reverse=True)
     return rows
@@ -230,13 +238,16 @@ def print_report(cfg: Dict, source: str, horizon: int, rows: List[Dict]) -> None
           f"(~{n_params / 1e6:.2f}M params)")
     print(f"  TSFM forecast horizon   : {horizon}  "
           f"(predictor cost is horizon-independent)")
-    print("-" * 74)
-    print(f"  {'TSFM (full window)':<24}{'full_w':>8}{'TSFM GMAC':>13}{'% of full':>12}")
-    print("-" * 74)
+    print("-" * 96)
+    print(f"  {'TSFM':<22}{'full_w':>8}{'GMAC@full':>12}{'GMAC@50%':>11}"
+          f"{'GMAC@25%':>11}{'pred GMAC':>12}{'% of full':>11}")
+    print("-" * 96)
     for r in rows:
-        print(f"  {r['model']:<24}{r['full_window']:>8}"
-              f"{r['tsfm_gmac']:>13.2f}{r['pct_of_full']:>11.3f}%")
-    print("-" * 74)
+        print(f"  {r['model']:<22}{r['full_window']:>8}"
+              f"{r['tsfm_gmac_full']:>12.2f}{r['tsfm_gmac_half']:>11.2f}"
+              f"{r['tsfm_gmac_quarter']:>11.2f}{r['predictor_gmac']:>12.4f}"
+              f"{r['pct_of_full']:>10.3f}%")
+    print("-" * 96)
     pct_vals = [r["pct_of_full"] for r in rows]
     print(f"  range across models     : {min(pct_vals):.3f}%  ..  {max(pct_vals):.3f}%")
     print(f"  mean                    : {sum(pct_vals) / len(pct_vals):.3f}%")
@@ -253,11 +264,15 @@ def write_csv(path: str, cfg: Dict, horizon: int, rows: List[Dict]) -> None:
     pred_gmac = predictor_macs(cfg) / 1e9
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["model", "family", "full_window", "horizon",
-                    "tsfm_gmac", "predictor_gmac", "pct_of_full"])
+        w.writerow(["model", "family", "full_window", "half_window",
+                    "quarter_window", "horizon", "tsfm_gmac_full",
+                    "tsfm_gmac_half", "tsfm_gmac_quarter", "predictor_gmac",
+                    "pct_of_full"])
         for r in rows:
-            w.writerow([r["model"], r["family"], r["full_window"], horizon,
-                        f"{r['tsfm_gmac']:.6f}", f"{pred_gmac:.6f}",
+            w.writerow([r["model"], r["family"], r["full_window"],
+                        r["half_window"], r["quarter_window"], horizon,
+                        f"{r['tsfm_gmac_full']:.6f}", f"{r['tsfm_gmac_half']:.6f}",
+                        f"{r['tsfm_gmac_quarter']:.6f}", f"{pred_gmac:.6f}",
                         f"{r['pct_of_full']:.6f}"])
     print(f"\n  Wrote {path}")
 
