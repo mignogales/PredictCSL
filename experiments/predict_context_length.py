@@ -145,6 +145,33 @@ HP_SPACE = {
     "weight_decay":        [1e-4, 1e-3],
 }
 
+# Constrained "cheap predictor" search (set by experiments/run_all_v3.py via
+# PREDICTCSL_CHEAP_PREDICTOR=1). Forces the random search into the low-FLOP
+# corner of HP_SPACE — large patches (few tokens), narrow d_model, shallow —
+# so the predictor's own inference cost is negligible vs the labeled TSFM
+# (worst case here ≈ 0.12 GMAC/series, ~2% of a Moirai2 forward pass). Resolved
+# at import so the spawned per-GPU trial workers (which re-import this module)
+# see the same space. Only the architecture axes are pinned; the optimisation
+# axes (dropout/mask/lr/wd) keep their full range so the search still has room.
+if os.environ.get("PREDICTCSL_CHEAP_PREDICTOR") == "1":
+    HP_SPACE = {
+        "patch_length":        [64, 128],   # 128 or 64 tokens (was down to 16 -> 512)
+        "d_model":             [128],       # was [128, 256]
+        "num_hidden_layers":   [2, 4],      # was up to 8
+        "num_attention_heads": [4, 8],
+        "dropout":             [0.1, 0.2],
+        "mask_ratio":          [0.30, 0.40, 0.50],
+        "learning_rate":       [1e-4, 3e-4, 5e-4],
+        "weight_decay":        [1e-4, 1e-3],
+    }
+
+# Explicit trial-count override (PREDICTCSL_N_TRIALS), used by run_all_v3.py to
+# run a shorter search (20 trials). Applied after the smoke-test shrink so an
+# explicit value always wins. Resolved at import for the same spawn-safety reason.
+_n_trials_env = os.environ.get("PREDICTCSL_N_TRIALS")
+if _n_trials_env:
+    N_TRIALS = int(_n_trials_env)
+
 # Run root. Overridable via env so run_all.py --test can redirect predictor
 # output into its throwaway tree. Resolved at import so the spawned trial
 # workers (which persist per-trial checkpoints under this root) agree with the
