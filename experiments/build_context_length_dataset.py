@@ -826,11 +826,13 @@ def load_flowstate(model_id: str, device: str):
 
 
 def predict_flowstate(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
-    """Quantile forecast; return the median row (B, horizon).
+    """Point forecast; return the per-step prediction (B, horizon).
 
     ``x`` is (B, W, 1) == (batch, context, channels), which is exactly FlowState's
-    ``batch_first=True`` layout, so it's passed through unreshaped. The model emits
-    (B, Q, H, 1); we take the middle of its Q=9 quantiles as the point forecast.
+    ``batch_first=True`` layout, so it's passed through unreshaped. FlowState splits
+    its outputs: ``prediction_outputs`` is the point forecast of shape (B, H, C)
+    (no quantile axis), while the Q=9 quantiles live separately on
+    ``quantile_outputs`` (C, B, Q, H, 1). We use the point forecast directly.
     """
     series = x.to(device, non_blocking=True)               # (B, W, 1)
     out = model(
@@ -839,8 +841,8 @@ def predict_flowstate(model, x: torch.Tensor, horizon: int, device: str) -> torc
         prediction_length=horizon,
         batch_first=True,
     )
-    qf = out.prediction_outputs                            # (B, Q, H, 1)
-    return qf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0].to(torch.float32)
+    pf = out.prediction_outputs                            # (B, H, C)
+    return pf[:, :horizon, 0].to(torch.float32)
 
 
 def load_tirex(model_id: str, device: str):
