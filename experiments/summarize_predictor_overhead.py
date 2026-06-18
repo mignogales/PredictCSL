@@ -1,0 +1,309 @@
+#!/usr/bin/env python
+"""
+Summarize the CSL predictor's compute footprint as a percentage of each TSFM.
+
+Core question: when we forecast with a foundation model, how expensive is it to
+*also* run the context-length (CSL) predictor that recommends the window? The
+predictor is the Patch-Transformer trained in ``predict_context_length.py``; it
+runs **once per series** (a single CLS-token forward) and emits the whole
+error-vs-context curve. The "full model" is each labeled TSFM running one
+forecast at its largest context (the ``full_window`` strategy in stage 4).
+
+This script reports, per TSFM:
+
+    predictor_MACs / tsfm_full_window_MACs  x 100      (a percentage)
+
+so you can quote a line like "the predictor costs ~2% of a Moirai2 forward
+pass" (cf. the PREDICTCSL_CHEAP_PREDICTOR note in predict_context_length.py).
+
+Both sides use the **same** MAC proxy as stage 4
+(``theoretical_flops`` in compare_window_strategies_gifteval.py), so the ratio
+is internally consistent with the FLOPs columns the pipeline already emits. It
+is a proxy (ignores embeddings/norms/heads kernel constants), comparable as a
+ratio rather than an exact instruction count.
+
+Nothing here needs a GPU or torch — it reads ``best_config.json`` (the predictor
+architecture chosen by the random search) and computes MACs analytically. If the
+config file is absent (the real runs live on the server), pass the architecture
+on the command line or accept the printed defaults.
+
+Usage (run anywhere the source tree lives)::
+
+    python -m experiments.summarize_predictor_overhead
+    python -m experiments.summarize_predictor_overhead \
+        --best-config logs/experiments/context_length_predictor/<run>/best_config.json
+    python -m experiments.summarize_predictor_overhead --horizon 96 --csv overhead.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional
+
+# Reuse the EXACT FLOPs proxy + per-family architecture table that stage 4 uses,
+# so the predictor/TSFM ratio matches the pipeline's flops_savings numbers.
+from experiments.compare_window_strategies_gifteval import (
+    DEFAULT_PATCH_SIZES,
+    MODEL_ARCH,
+    _layer_macs,
+    _n_patches,
+    theoretical_flops,
+)
+
+# Grid top from build_context_length_dataset.WINDOW_GRID (the largest context any
+# TSFM is ever asked for); each family's full_window is capped by arch.max_window.
+GRID_MAX_WINDOW = 8192
+
+# Representative model id per family — only the substrings infer_model_family()
+# keys on matter; the rest is for the printout.
+FAMILY_REPRESENTATIVE: Dict[str, str] = {
+    "chronos2":     "Chronos2-Small",
+    "chronos_bolt": "ChronosBolt-Small",
+    "moirai":       "Moirai-2-Small",
+    "moirai_1_1":   "Moirai-1.1-Small",
+    "timesfm":      "TimesFM2.5-200M",
+    "patchtst_fm":  "PatchTST-FM-R1",
+    "sundial":      "Sundial-Base-128M",
+    "timemoe":      "TimeMoE-200M",
+    "toto":         "Toto-2.0-313M",
+    "flowstate":    "FlowState-r1.1",
+    "tirex":        "TiRex-35M",
+}
+
+# Fallback predictor architecture if best_config.json is not reachable locally.
+# Mirrors a mid-range pick from HP_SPACE (predict_context_length.py); override
+# with --patch-length / --d-model / --num-layers or point --best-config at the
+# real artifact.
+DEFAULT_PREDICTOR = {
+    "context_length":    8192,
+    "patch_length":      64,
+    "d_model":           128,
+    "num_hidden_layers": 4,
+    "n_windows":         18,   # len(WINDOW_GRID)
+    "n_horizons":        6,    # len(HORIZON_GRID)
+}
+
+
+# ==============================================================================
+#  PREDICTOR COST MODEL  (same MAC accounting style as theoretical_flops)
+# ==============================================================================
+
+def predictor_macs(cfg: Dict) -> float:
+    """Per-series inference MACs for the CSL Patch-Transformer.
+
+    Inference path (forward() in predict_context_length.py, eval mode, B=1):
+        patchify -> patch_embed -> prepend CLS(+horizon embed) -> encoder
+        -> LayerNorm -> curve_head on the CLS token.
+
+    The recon head is auxiliary (training only) and is *excluded* — at deploy
+    time you only read the curve from the CLS token. The encoder term uses the
+    same ``_layer_macs`` helper as the TSFM proxy (unified stack, dense FFN with
+    f = 4*d_model, no cross-attention), so the two sides are commensurable.
+    """
+    P = int(cfg["patch_length"])
+    d = int(cfg["d_model"])
+    n_layers = int(cfg["num_hidden_layers"])
+    n_patches = int(cfg["context_length"]) // P
+    n_windows = int(cfg["n_windows"])
+
+    f = 4 * d                       # dim_feedforward = d_model * 4
+    L = n_patches + 1               # patches + CLS token
+
+    patch_embed = n_patches * P * d             # Linear(P -> d) over N patches
+    encoder = n_layers * _layer_macs(L, d, f)   # dense transformer stack
+    curve_head = d * d + d * n_windows          # MLP on the single CLS token
+    return float(patch_embed + encoder + curve_head)
+
+
+def predictor_params(cfg: Dict) -> int:
+    """Analytic parameter count of the predictor (for context, not the headline).
+
+    Matches the module layout in PatchTSTContextLength: patch embed, CLS token,
+    positional + horizon embeddings, ``n_layers`` of nn.TransformerEncoderLayer
+    (norm_first, dim_ff = 4*d), final LayerNorm, and the two heads.
+    """
+    P = int(cfg["patch_length"])
+    d = int(cfg["d_model"])
+    n_layers = int(cfg["num_hidden_layers"])
+    n_patches = int(cfg["context_length"]) // P
+    n_windows = int(cfg["n_windows"])
+    n_horizons = int(cfg.get("n_horizons", DEFAULT_PREDICTOR["n_horizons"]))
+
+    f = 4 * d
+    patch_embed = P * d + d
+    cls_token = d
+    pos_embed = (n_patches + 1) * d
+    horizon_embed = n_horizons * d
+    # nn.TransformerEncoderLayer: MHA in/out proj + 2 FFN linears + 2 LayerNorms.
+    per_layer = (4 * d * d + 4 * d) + (2 * (d * f) + f + d) + (2 * 2 * d)
+    encoder = n_layers * per_layer
+    final_norm = 2 * d
+    curve_head = (d * d + d) + (d * n_windows + n_windows)
+    recon_head = d * P + P
+    return int(patch_embed + cls_token + pos_embed + horizon_embed
+               + encoder + final_norm + curve_head + recon_head)
+
+
+# ==============================================================================
+#  CONFIG LOADING
+# ==============================================================================
+
+def load_predictor_config(path: Optional[str], overrides: Dict) -> Dict:
+    """Read best_config.json if present; apply any CLI overrides on top."""
+    cfg = dict(DEFAULT_PREDICTOR)
+    source = "built-in defaults (no best_config.json found)"
+    if path and os.path.isfile(path):
+        with open(path) as fh:
+            raw = json.load(fh)
+        for k in ("context_length", "patch_length", "d_model",
+                  "num_hidden_layers", "n_windows", "n_horizons"):
+            if raw.get(k) is not None:
+                cfg[k] = raw[k]
+        # n_windows can also be derived from a stored window_grid.
+        if raw.get("window_grid") is not None:
+            cfg["n_windows"] = len(raw["window_grid"])
+        source = path
+    for k, v in overrides.items():
+        if v is not None:
+            cfg[k] = v
+    if cfg["context_length"] % cfg["patch_length"] != 0:
+        raise ValueError(
+            f"context_length={cfg['context_length']} not divisible by "
+            f"patch_length={cfg['patch_length']}.")
+    return cfg, source
+
+
+def _default_config_path() -> Optional[str]:
+    """Best-effort: newest best_config.json under the predictor cache root."""
+    root = os.environ.get(
+        "PREDICTCSL_PREDICTOR_ROOT",
+        "logs/experiments/context_length_predictor")
+    if not os.path.isdir(root):
+        return None
+    candidates: List[str] = []
+    for dirpath, _dirs, files in os.walk(root):
+        if "best_config.json" in files:
+            candidates.append(os.path.join(dirpath, "best_config.json"))
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+# ==============================================================================
+#  REPORT
+# ==============================================================================
+
+def build_rows(cfg: Dict, horizon: int, families: List[str]) -> List[Dict]:
+    pred = predictor_macs(cfg)
+    rows: List[Dict] = []
+    for fam in families:
+        arch = MODEL_ARCH[fam]
+        full_window = min(arch.max_window, GRID_MAX_WINDOW)
+        model_id = FAMILY_REPRESENTATIVE.get(fam, fam)
+        tsfm = theoretical_flops(model_id, full_window, horizon, DEFAULT_PATCH_SIZES)
+        rows.append({
+            "model": model_id,
+            "family": fam,
+            "full_window": full_window,
+            "tsfm_gmac": tsfm / 1e9,
+            "predictor_gmac": pred / 1e9,
+            "pct_of_full": 100.0 * pred / tsfm if tsfm > 0 else float("nan"),
+        })
+    rows.sort(key=lambda r: r["pct_of_full"], reverse=True)
+    return rows
+
+
+def print_report(cfg: Dict, source: str, horizon: int, rows: List[Dict]) -> None:
+    pred_gmac = predictor_macs(cfg) / 1e9
+    n_params = predictor_params(cfg)
+
+    print("=" * 74)
+    print("CSL PREDICTOR COMPUTE FOOTPRINT  (per-series, vs full-window TSFM)")
+    print("=" * 74)
+    print(f"  predictor config source : {source}")
+    print(f"  architecture            : patch={cfg['patch_length']}  "
+          f"d_model={cfg['d_model']}  layers={cfg['num_hidden_layers']}  "
+          f"ctx={cfg['context_length']}  ({cfg['context_length'] // cfg['patch_length']} patches)")
+    print(f"  predictor inference cost: {pred_gmac:.4f} GMAC / series  "
+          f"(~{n_params / 1e6:.2f}M params)")
+    print(f"  TSFM forecast horizon   : {horizon}  "
+          f"(predictor cost is horizon-independent)")
+    print("-" * 74)
+    print(f"  {'TSFM (full window)':<24}{'full_w':>8}{'TSFM GMAC':>13}{'% of full':>12}")
+    print("-" * 74)
+    for r in rows:
+        print(f"  {r['model']:<24}{r['full_window']:>8}"
+              f"{r['tsfm_gmac']:>13.2f}{r['pct_of_full']:>11.3f}%")
+    print("-" * 74)
+    pct_vals = [r["pct_of_full"] for r in rows]
+    print(f"  range across models     : {min(pct_vals):.3f}%  ..  {max(pct_vals):.3f}%")
+    print(f"  mean                    : {sum(pct_vals) / len(pct_vals):.3f}%")
+    print("=" * 74)
+    print("  Note: MAC proxy (same as stage-4 theoretical_flops); the predictor")
+    print("  runs once per series and returns the whole curve, while the TSFM cost")
+    print("  is one forecast. SSM/recurrent families (flowstate, tirex) are LINEAR")
+    print("  in context, so their proxy GMAC is a loose upper bound -> the % shown")
+    print("  for them understates the predictor's true relative cost.")
+
+
+def write_csv(path: str, cfg: Dict, horizon: int, rows: List[Dict]) -> None:
+    import csv
+    pred_gmac = predictor_macs(cfg) / 1e9
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["model", "family", "full_window", "horizon",
+                    "tsfm_gmac", "predictor_gmac", "pct_of_full"])
+        for r in rows:
+            w.writerow([r["model"], r["family"], r["full_window"], horizon,
+                        f"{r['tsfm_gmac']:.6f}", f"{pred_gmac:.6f}",
+                        f"{r['pct_of_full']:.6f}"])
+    print(f"\n  Wrote {path}")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Summarize CSL predictor cost as a % of each full TSFM.")
+    p.add_argument("--best-config", type=str, default=None,
+                   help="Path to predictor best_config.json. Default: newest "
+                        "under PREDICTCSL_PREDICTOR_ROOT (or built-in defaults).")
+    p.add_argument("--horizon", type=int, default=48,
+                   help="Forecast horizon for the TSFM cost (default 48).")
+    p.add_argument("--models", nargs="*", default=None,
+                   help="Family keys to include (default: all in MODEL_ARCH).")
+    p.add_argument("--patch-length", type=int, default=None,
+                   help="Override predictor patch_length.")
+    p.add_argument("--d-model", type=int, default=None,
+                   help="Override predictor d_model.")
+    p.add_argument("--num-layers", type=int, default=None,
+                   help="Override predictor num_hidden_layers.")
+    p.add_argument("--csv", type=str, default=None,
+                   help="Optional path to write the per-model table as CSV.")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    overrides = {
+        "patch_length":      args.patch_length,
+        "d_model":           args.d_model,
+        "num_hidden_layers": args.num_layers,
+    }
+    config_path = args.best_config or _default_config_path()
+    cfg, source = load_predictor_config(config_path, overrides)
+
+    families = args.models or list(MODEL_ARCH.keys())
+    unknown = [f for f in families if f not in MODEL_ARCH]
+    if unknown:
+        raise SystemExit(f"Unknown family keys: {unknown}\n"
+                         f"Choose from: {list(MODEL_ARCH.keys())}")
+
+    rows = build_rows(cfg, args.horizon, families)
+    print_report(cfg, source, args.horizon, rows)
+    if args.csv:
+        write_csv(args.csv, cfg, args.horizon, rows)
+
+
+if __name__ == "__main__":
+    main()
