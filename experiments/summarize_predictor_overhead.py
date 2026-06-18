@@ -31,8 +31,13 @@ Usage (run anywhere the source tree lives)::
 
     python -m experiments.summarize_predictor_overhead
     python -m experiments.summarize_predictor_overhead \
-        --best-config logs/experiments/context_length_predictor/<run>/best_config.json
+        --predictor-root logs/experiments/context_length_predictor
     python -m experiments.summarize_predictor_overhead --horizon 96 --csv overhead.csv
+
+Each labeled model trains its OWN predictor, so the per-model best_config.json
+(and hence the predictor GMAC) differs; the script loads each separately from
+<predictor-root>/<display>/best_config.json. Pass --best-config to force a single
+shared config for every model instead.
 """
 
 from __future__ import annotations
@@ -56,21 +61,27 @@ from experiments.compare_window_strategies_gifteval import (
 # TSFM is ever asked for); each family's full_window is capped by arch.max_window.
 GRID_MAX_WINDOW = 8192
 
-# Representative model id per family — only the substrings infer_model_family()
-# keys on matter; the rest is for the printout.
-FAMILY_REPRESENTATIVE: Dict[str, str] = {
-    "chronos2":     "Chronos2-Small",
-    "chronos_bolt": "ChronosBolt-Small",
-    "moirai":       "Moirai-2-Small",
-    "moirai_1_1":   "Moirai-1.1-Small",
-    "timesfm":      "TimesFM2.5-200M",
-    "patchtst_fm":  "PatchTST-FM-R1",
-    "sundial":      "Sundial-Base-128M",
-    "timemoe":      "TimeMoE-200M",
-    "toto":         "Toto-2.0-313M",
-    "flowstate":    "FlowState-r1.1",
-    "tirex":        "TiRex-35M",
-}
+# Labeled models, mirroring build_context_length_dataset.MODELS as (display, family).
+# Each labeling model trains its OWN predictor (independent random search), whose
+# best_config.json lives at <predictor_root>/<display>/best_config.json — keyed on
+# the *display* name (the dataset-dir basename used as run_label). So the predictor
+# architecture (and hence its GMAC) differs per model; we load each one separately.
+# The display string is also passed to theoretical_flops, whose infer_model_family
+# keys on substrings of it.
+MODELS: List[tuple] = [
+    ("Chronos2-Small",    "chronos2"),
+    ("Chronos2-Synth",    "chronos2"),
+    ("ChronosBolt-Small", "chronos_bolt"),
+    ("ChronosBolt-Base",  "chronos_bolt"),
+    ("Moirai2-Small",     "moirai"),
+    ("TimesFM2.5-200M",   "timesfm"),
+    ("PatchTST-FM-R1",    "patchtst_fm"),
+    ("Sundial-Base-128M", "sundial"),
+    ("TimeMoE-200M",      "timemoe"),
+    ("Toto-2.0-313m",     "toto"),
+    ("FlowState-R1",      "flowstate"),
+    ("TiRex",             "tirex"),
+]
 
 # Fallback predictor architecture if best_config.json is not reachable locally.
 # Mirrors a mid-range pick from HP_SPACE (predict_context_length.py); override
@@ -175,41 +186,53 @@ def load_predictor_config(path: Optional[str], overrides: Dict) -> Dict:
     return cfg, source
 
 
-def _default_config_path() -> Optional[str]:
-    """Best-effort: newest best_config.json under the predictor cache root."""
-    root = os.environ.get(
-        "PREDICTCSL_PREDICTOR_ROOT",
-        "logs/experiments/context_length_predictor")
-    if not os.path.isdir(root):
-        return None
-    candidates: List[str] = []
-    for dirpath, _dirs, files in os.walk(root):
-        if "best_config.json" in files:
-            candidates.append(os.path.join(dirpath, "best_config.json"))
-    if not candidates:
-        return None
-    return max(candidates, key=os.path.getmtime)
+def _resolve_predictor_root(arg_root: Optional[str]) -> str:
+    return (arg_root
+            or os.environ.get("PREDICTCSL_PREDICTOR_ROOT",
+                              "logs/experiments/context_length_predictor"))
 
 
 # ==============================================================================
 #  REPORT
 # ==============================================================================
 
-def build_rows(cfg: Dict, horizon: int, families: List[str]) -> List[Dict]:
-    pred = predictor_macs(cfg)
+def build_rows(
+    predictor_root: str,
+    forced_config: Optional[str],
+    overrides: Dict,
+    horizon: int,
+    models: List[tuple],
+) -> List[Dict]:
+    """One row per labeled model, each using ITS OWN predictor best_config.json.
+
+    Each labeling model trains a separate predictor (independent random search),
+    so the architecture — and therefore the predictor GMAC — differs per model.
+    Config is resolved at <predictor_root>/<display>/best_config.json unless
+    --best-config forces a single shared config for every row.
+    """
     rows: List[Dict] = []
-    for fam in families:
-        arch = MODEL_ARCH[fam]
+    for display, family in models:
+        if family not in MODEL_ARCH:
+            continue
+        path = forced_config or os.path.join(
+            predictor_root, display, "best_config.json")
+        cfg, _src = load_predictor_config(path, overrides)
+        found = bool(forced_config) or os.path.isfile(path)
+
+        pred = predictor_macs(cfg)
+        arch = MODEL_ARCH[family]
         full_window = min(arch.max_window, GRID_MAX_WINDOW)
         half_window = max(1, full_window // 2)
         quarter_window = max(1, full_window // 4)
-        model_id = FAMILY_REPRESENTATIVE.get(fam, fam)
-        tsfm_full = theoretical_flops(model_id, full_window, horizon, DEFAULT_PATCH_SIZES)
-        tsfm_half = theoretical_flops(model_id, half_window, horizon, DEFAULT_PATCH_SIZES)
-        tsfm_quarter = theoretical_flops(model_id, quarter_window, horizon, DEFAULT_PATCH_SIZES)
+        tsfm_full = theoretical_flops(display, full_window, horizon, DEFAULT_PATCH_SIZES)
+        tsfm_half = theoretical_flops(display, half_window, horizon, DEFAULT_PATCH_SIZES)
+        tsfm_quarter = theoretical_flops(display, quarter_window, horizon, DEFAULT_PATCH_SIZES)
         rows.append({
-            "model": model_id,
-            "family": fam,
+            "model": display,
+            "family": family,
+            "config_found": found,
+            "pred_arch": f"{cfg['patch_length']}/{cfg['d_model']}/{cfg['num_hidden_layers']}",
+            "pred_params_m": predictor_params(cfg) / 1e6,
             "full_window": full_window,
             "half_window": half_window,
             "quarter_window": quarter_window,
@@ -223,35 +246,36 @@ def build_rows(cfg: Dict, horizon: int, families: List[str]) -> List[Dict]:
     return rows
 
 
-def print_report(cfg: Dict, source: str, horizon: int, rows: List[Dict]) -> None:
-    pred_gmac = predictor_macs(cfg) / 1e9
-    n_params = predictor_params(cfg)
-
-    print("=" * 74)
+def print_report(predictor_root: str, forced_config: Optional[str],
+                 horizon: int, rows: List[Dict]) -> None:
+    print("=" * 100)
     print("CSL PREDICTOR COMPUTE FOOTPRINT  (per-series, vs full-window TSFM)")
-    print("=" * 74)
-    print(f"  predictor config source : {source}")
-    print(f"  architecture            : patch={cfg['patch_length']}  "
-          f"d_model={cfg['d_model']}  layers={cfg['num_hidden_layers']}  "
-          f"ctx={cfg['context_length']}  ({cfg['context_length'] // cfg['patch_length']} patches)")
-    print(f"  predictor inference cost: {pred_gmac:.4f} GMAC / series  "
-          f"(~{n_params / 1e6:.2f}M params)")
+    print("=" * 100)
+    src = forced_config or f"{predictor_root}/<model>/best_config.json"
+    print(f"  predictor config source : {src}")
     print(f"  TSFM forecast horizon   : {horizon}  "
           f"(predictor cost is horizon-independent)")
-    print("-" * 96)
-    print(f"  {'TSFM':<22}{'full_w':>8}{'GMAC@full':>12}{'GMAC@50%':>11}"
-          f"{'GMAC@25%':>11}{'pred GMAC':>12}{'% of full':>11}")
-    print("-" * 96)
+    print(f"  predictor arch column   : patch/d_model/layers  (* = config not "
+          f"found, using defaults)")
+    print("-" * 100)
+    print(f"  {'TSFM':<20}{'pred(p/d/L)':>13}{'full_w':>8}{'GMAC@full':>11}"
+          f"{'GMAC@50%':>10}{'GMAC@25%':>10}{'predGMAC':>10}{'% of full':>11}")
+    print("-" * 100)
     for r in rows:
-        print(f"  {r['model']:<22}{r['full_window']:>8}"
-              f"{r['tsfm_gmac_full']:>12.2f}{r['tsfm_gmac_half']:>11.2f}"
-              f"{r['tsfm_gmac_quarter']:>11.2f}{r['predictor_gmac']:>12.4f}"
+        name = r["model"] + ("" if r["config_found"] else " *")
+        print(f"  {name:<20}{r['pred_arch']:>13}{r['full_window']:>8}"
+              f"{r['tsfm_gmac_full']:>11.2f}{r['tsfm_gmac_half']:>10.2f}"
+              f"{r['tsfm_gmac_quarter']:>10.2f}{r['predictor_gmac']:>10.4f}"
               f"{r['pct_of_full']:>10.3f}%")
-    print("-" * 96)
+    print("-" * 100)
     pct_vals = [r["pct_of_full"] for r in rows]
     print(f"  range across models     : {min(pct_vals):.3f}%  ..  {max(pct_vals):.3f}%")
     print(f"  mean                    : {sum(pct_vals) / len(pct_vals):.3f}%")
-    print("=" * 74)
+    n_missing = sum(1 for r in rows if not r["config_found"])
+    if n_missing:
+        print(f"  ({n_missing}/{len(rows)} models used the fallback default config "
+              f"— marked with *)")
+    print("=" * 100)
     print("  Note: MAC proxy (same as stage-4 theoretical_flops); the predictor")
     print("  runs once per series and returns the whole curve, while the TSFM cost")
     print("  is one forecast. SSM/recurrent families (flowstate, tirex) are LINEAR")
@@ -259,34 +283,40 @@ def print_report(cfg: Dict, source: str, horizon: int, rows: List[Dict]) -> None
     print("  for them understates the predictor's true relative cost.")
 
 
-def write_csv(path: str, cfg: Dict, horizon: int, rows: List[Dict]) -> None:
+def write_csv(path: str, horizon: int, rows: List[Dict]) -> None:
     import csv
-    pred_gmac = predictor_macs(cfg) / 1e9
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["model", "family", "full_window", "half_window",
+        w.writerow(["model", "family", "config_found", "pred_arch_p_d_L",
+                    "pred_params_m", "full_window", "half_window",
                     "quarter_window", "horizon", "tsfm_gmac_full",
                     "tsfm_gmac_half", "tsfm_gmac_quarter", "predictor_gmac",
                     "pct_of_full"])
         for r in rows:
-            w.writerow([r["model"], r["family"], r["full_window"],
-                        r["half_window"], r["quarter_window"], horizon,
-                        f"{r['tsfm_gmac_full']:.6f}", f"{r['tsfm_gmac_half']:.6f}",
-                        f"{r['tsfm_gmac_quarter']:.6f}", f"{pred_gmac:.6f}",
-                        f"{r['pct_of_full']:.6f}"])
+            w.writerow([r["model"], r["family"], r["config_found"],
+                        r["pred_arch"], f"{r['pred_params_m']:.4f}",
+                        r["full_window"], r["half_window"], r["quarter_window"],
+                        horizon, f"{r['tsfm_gmac_full']:.6f}",
+                        f"{r['tsfm_gmac_half']:.6f}", f"{r['tsfm_gmac_quarter']:.6f}",
+                        f"{r['predictor_gmac']:.6f}", f"{r['pct_of_full']:.6f}"])
     print(f"\n  Wrote {path}")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Summarize CSL predictor cost as a % of each full TSFM.")
+    p.add_argument("--predictor-root", type=str, default=None,
+                   help="Root holding per-model predictors "
+                        "(<root>/<display>/best_config.json). Default: "
+                        "PREDICTCSL_PREDICTOR_ROOT or "
+                        "logs/experiments/context_length_predictor.")
     p.add_argument("--best-config", type=str, default=None,
-                   help="Path to predictor best_config.json. Default: newest "
-                        "under PREDICTCSL_PREDICTOR_ROOT (or built-in defaults).")
+                   help="Force a SINGLE best_config.json for every model "
+                        "(overrides per-model lookup under --predictor-root).")
     p.add_argument("--horizon", type=int, default=48,
                    help="Forecast horizon for the TSFM cost (default 48).")
     p.add_argument("--models", nargs="*", default=None,
-                   help="Family keys to include (default: all in MODEL_ARCH).")
+                   help="Display names to include (default: all in MODELS).")
     p.add_argument("--patch-length", type=int, default=None,
                    help="Override predictor patch_length.")
     p.add_argument("--d-model", type=int, default=None,
@@ -305,19 +335,23 @@ def main() -> None:
         "d_model":           args.d_model,
         "num_hidden_layers": args.num_layers,
     }
-    config_path = args.best_config or _default_config_path()
-    cfg, source = load_predictor_config(config_path, overrides)
+    predictor_root = _resolve_predictor_root(args.predictor_root)
 
-    families = args.models or list(MODEL_ARCH.keys())
-    unknown = [f for f in families if f not in MODEL_ARCH]
-    if unknown:
-        raise SystemExit(f"Unknown family keys: {unknown}\n"
-                         f"Choose from: {list(MODEL_ARCH.keys())}")
+    models = MODELS
+    if args.models:
+        wanted = set(args.models)
+        models = [(d, f) for (d, f) in MODELS if d in wanted]
+        unknown = wanted - {d for (d, _f) in MODELS}
+        if unknown:
+            raise SystemExit(
+                f"Unknown model display names: {sorted(unknown)}\n"
+                f"Choose from: {[d for (d, _f) in MODELS]}")
 
-    rows = build_rows(cfg, args.horizon, families)
-    print_report(cfg, source, args.horizon, rows)
+    rows = build_rows(predictor_root, args.best_config, overrides,
+                      args.horizon, models)
+    print_report(predictor_root, args.best_config, args.horizon, rows)
     if args.csv:
-        write_csv(args.csv, cfg, args.horizon, rows)
+        write_csv(args.csv, args.horizon, rows)
 
 
 if __name__ == "__main__":
