@@ -241,6 +241,8 @@ def build_rows(
             "tsfm_gmac_quarter": tsfm_quarter / 1e9,
             "predictor_gmac": pred / 1e9,
             "pct_of_full": 100.0 * pred / tsfm_full if tsfm_full > 0 else float("nan"),
+            "pct_of_half": 100.0 * pred / tsfm_half if tsfm_half > 0 else float("nan"),
+            "pct_of_quarter": 100.0 * pred / tsfm_quarter if tsfm_quarter > 0 else float("nan"),
         })
     rows.sort(key=lambda r: r["pct_of_full"], reverse=True)
     return rows
@@ -248,26 +250,28 @@ def build_rows(
 
 def print_report(predictor_root: str, forced_config: Optional[str],
                  horizon: int, rows: List[Dict]) -> None:
-    print("=" * 100)
+    print("=" * 124)
     print("CSL PREDICTOR COMPUTE FOOTPRINT  (per-series, vs full-window TSFM)")
-    print("=" * 100)
+    print("=" * 124)
     src = forced_config or f"{predictor_root}/<model>/best_config.json"
     print(f"  predictor config source : {src}")
     print(f"  TSFM forecast horizon   : {horizon}  "
           f"(predictor cost is horizon-independent)")
     print(f"  predictor arch column   : patch/d_model/layers  (* = config not "
           f"found, using defaults)")
-    print("-" * 100)
+    print("-" * 124)
     print(f"  {'TSFM':<20}{'pred(p/d/L)':>13}{'full_w':>8}{'GMAC@full':>11}"
-          f"{'GMAC@50%':>10}{'GMAC@25%':>10}{'predGMAC':>10}{'% of full':>11}")
-    print("-" * 100)
+          f"{'GMAC@50%':>10}{'GMAC@25%':>10}{'predGMAC':>10}"
+          f"{'%@full':>9}{'%@50%':>9}{'%@25%':>9}")
+    print("-" * 124)
     for r in rows:
         name = r["model"] + ("" if r["config_found"] else " *")
         print(f"  {name:<20}{r['pred_arch']:>13}{r['full_window']:>8}"
               f"{r['tsfm_gmac_full']:>11.2f}{r['tsfm_gmac_half']:>10.2f}"
               f"{r['tsfm_gmac_quarter']:>10.2f}{r['predictor_gmac']:>10.4f}"
-              f"{r['pct_of_full']:>10.3f}%")
-    print("-" * 100)
+              f"{r['pct_of_full']:>8.3f}%{r['pct_of_half']:>8.3f}%"
+              f"{r['pct_of_quarter']:>8.3f}%")
+    print("-" * 124)
     pct_vals = [r["pct_of_full"] for r in rows]
     print(f"  range across models     : {min(pct_vals):.3f}%  ..  {max(pct_vals):.3f}%")
     print(f"  mean                    : {sum(pct_vals) / len(pct_vals):.3f}%")
@@ -275,7 +279,7 @@ def print_report(predictor_root: str, forced_config: Optional[str],
     if n_missing:
         print(f"  ({n_missing}/{len(rows)} models used the fallback default config "
               f"— marked with *)")
-    print("=" * 100)
+    print("=" * 124)
     print("  Note: MAC proxy (same as stage-4 theoretical_flops); the predictor")
     print("  runs once per series and returns the whole curve, while the TSFM cost")
     print("  is one forecast. SSM/recurrent families (flowstate, tirex) are LINEAR")
@@ -291,14 +295,15 @@ def write_csv(path: str, horizon: int, rows: List[Dict]) -> None:
                     "pred_params_m", "full_window", "half_window",
                     "quarter_window", "horizon", "tsfm_gmac_full",
                     "tsfm_gmac_half", "tsfm_gmac_quarter", "predictor_gmac",
-                    "pct_of_full"])
+                    "pct_of_full", "pct_of_half", "pct_of_quarter"])
         for r in rows:
             w.writerow([r["model"], r["family"], r["config_found"],
                         r["pred_arch"], f"{r['pred_params_m']:.4f}",
                         r["full_window"], r["half_window"], r["quarter_window"],
                         horizon, f"{r['tsfm_gmac_full']:.6f}",
                         f"{r['tsfm_gmac_half']:.6f}", f"{r['tsfm_gmac_quarter']:.6f}",
-                        f"{r['predictor_gmac']:.6f}", f"{r['pct_of_full']:.6f}"])
+                        f"{r['predictor_gmac']:.6f}", f"{r['pct_of_full']:.6f}",
+                        f"{r['pct_of_half']:.6f}", f"{r['pct_of_quarter']:.6f}"])
     print(f"\n  Wrote {path}")
 
 
