@@ -74,6 +74,8 @@ MODELS = [
     ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
     ("amazon/chronos-bolt-base",        "chronos_bolt","ChronosBolt-Base"),
     ("Datadog/Toto-2.0-313m",           "toto",        "Toto-2.0-313m"),
+    ("ibm-granite/granite-timeseries-flowstate-r1", "flowstate", "FlowState-R1"),
+    ("NX-AI/TiRex",                     "tirex",       "TiRex"),
 ]
 
 DATASETS = [
@@ -184,6 +186,14 @@ TOTO_NUM_QUANTILES       = 9     # Toto 2.0 quantile head: [0.1..0.9]
 TOTO_MEDIAN_QUANTILE_IDX = 4     # middle of the 9 quantiles (0.5)
 TOTO_MAX_CONTEXT         = 4096  # skip wider windows (mirrors stage-1 label cap)
 TOTO_PATCH_SIZE          = 32    # forecast() context length must be a multiple of this
+FLOWSTATE_REVISION            = "r1.1"  # GIFT-Eval checkpoint (mirrors stage-1)
+FLOWSTATE_NUM_QUANTILES       = 9
+FLOWSTATE_MEDIAN_QUANTILE_IDX = 4       # middle of the 9 output quantiles (0.5)
+FLOWSTATE_SCALE_FACTOR        = 1.0     # neutral (treat input cadence as the base)
+FLOWSTATE_MAX_CONTEXT         = 4096    # skip wider windows (mirrors stage-1 label cap)
+TIREX_NUM_QUANTILES           = 9       # TiRex quantile head: [0.1..0.9]
+TIREX_MEDIAN_QUANTILE_IDX     = 4       # middle of the 9 quantiles (0.5)
+TIREX_MAX_CONTEXT             = 2048    # TiRex pretraining context (mirrors stage-1 cap)
 
 N_BEST_WORST = 10
 PLOT_METRICS = ["mae", "mse", "rmse", "mase", "smape", "crps"]
@@ -901,6 +911,78 @@ def predict_toto(model, batches, horizon, device):
     return ForecastResult(median=all_medians), all_tgts
 
 
+def load_flowstate(model_id, device):
+    from tsfm_public import FlowStateForPrediction
+    model = FlowStateForPrediction.from_pretrained(
+        model_id, revision=FLOWSTATE_REVISION).to(device)
+    model.eval()
+    return model
+
+
+def predict_flowstate(model, batches, horizon, device):
+    """Quantile forecast (FlowState r1.1); return the per-step median (B, horizon).
+
+    Mirrors stage-1's predict_flowstate: ``x`` is (B, W, 1), exactly FlowState's
+    ``batch_first=True`` layout, so it's passed through unreshaped.
+    ``prediction_outputs`` carries the quantile axis: (B, Q=9, H, C); take the
+    median quantile (index 4). A 3-D (B, H, C) point-forecast output is also
+    handled for forward-compatibility with other checkpoints.
+    """
+    all_medians, all_tgts = [], []
+    for batch in tqdm(batches, desc="  FlowState", leave=False):
+        x, y = batch["x"], batch["y"]
+        series = x.to(device, non_blocking=True)               # (B, W, 1)
+        out = model(
+            series,
+            scale_factor=FLOWSTATE_SCALE_FACTOR,
+            prediction_length=horizon,
+            batch_first=True,
+        )
+        pf = out.prediction_outputs
+        if pf.dim() == 4:                                      # (B, Q, H, C)
+            med = pf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0]
+        else:                                                  # (B, H, C)
+            med = pf[:, :horizon, 0]
+        all_medians.append(med.to(torch.float32))
+        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
+    all_medians = torch.cat(all_medians, 0)
+    all_tgts = torch.cat(all_tgts, 0)
+    return ForecastResult(median=all_medians), all_tgts
+
+
+def load_tirex(model_id, device):
+    from tirex import load_model
+    model = load_model(model_id)
+    # tirex.load_model handles device placement internally; .to is a no-op guard.
+    try:
+        model.to(device)
+    except Exception:
+        pass
+    return model
+
+
+def predict_tirex(model, batches, horizon, device):
+    """Quantile forecast (TiRex); return the per-step median (B, horizon).
+
+    Mirrors stage-1's predict_tirex: forecast() takes a (B, context) tensor and
+    returns (quantiles, mean), where quantiles is (B, horizon, 9) over levels
+    [0.1..0.9]; take the 0.5 row (index 4). NOTE: quantile axis order/levels
+    follow TiRex's docs, not its package source — verify against the installed
+    `tirex` before a full run.
+    """
+    all_medians, all_tgts = [], []
+    for batch in tqdm(batches, desc="  TiRex", leave=False):
+        x, y = batch["x"], batch["y"]
+        seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
+        quantiles, _mean = model.forecast(context=seqs, prediction_length=horizon)
+        median = quantiles[:, :horizon, TIREX_MEDIAN_QUANTILE_IDX]
+        all_medians.append(median.to(torch.float32))
+        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
+    all_medians = torch.cat(all_medians, 0)
+    all_tgts = torch.cat(all_tgts, 0)
+    return ForecastResult(median=all_medians), all_tgts
+
+
 def predict_context_parroting(batches, horizon, device):
     all_preds, all_tgts = [], []
     for batch in tqdm(batches, desc="  Parroting", leave=False):
@@ -1347,6 +1429,10 @@ def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
         return predict_timemoe(handle, batches, horizon, device)
     if model_family == "toto":
         return predict_toto(handle, batches, horizon, device)
+    if model_family == "flowstate":
+        return predict_flowstate(handle, batches, horizon, device)
+    if model_family == "tirex":
+        return predict_tirex(handle, batches, horizon, device)
     raise ValueError(f"Unknown model family: {model_family}")
 
 
@@ -1603,6 +1689,10 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     _handle[0] = load_timemoe(model_id, device)
                 elif model_family == "toto":
                     _handle[0] = load_toto(model_id, device)
+                elif model_family == "flowstate":
+                    _handle[0] = load_flowstate(model_id, device)
+                elif model_family == "tirex":
+                    _handle[0] = load_tirex(model_id, device)
             return _handle[0]
 
         for d_idx, (ge_name, term, dataset_display, to_univariate) in enumerate(datasets):
@@ -1661,6 +1751,16 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
 
                 if model_family == "toto" and window_size > TOTO_MAX_CONTEXT:
                     print(Fore.RED + f"  SKIP    {tag}  (Toto max context={TOTO_MAX_CONTEXT} < ws)"
+                          + Fore.RESET)
+                    continue
+
+                if model_family == "flowstate" and window_size > FLOWSTATE_MAX_CONTEXT:
+                    print(Fore.RED + f"  SKIP    {tag}  (FlowState max context={FLOWSTATE_MAX_CONTEXT} < ws)"
+                          + Fore.RESET)
+                    continue
+
+                if model_family == "tirex" and window_size > TIREX_MAX_CONTEXT:
+                    print(Fore.RED + f"  SKIP    {tag}  (TiRex max context={TIREX_MAX_CONTEXT} < ws)"
                           + Fore.RESET)
                     continue
 
