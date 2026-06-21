@@ -57,7 +57,8 @@ try:
 except ImportError:
     PatchTSTFMForPrediction = None
 
-from experiments.predict_context_length import PatchTSTContextLength
+from experiments.predict_context_length import (
+    PatchTSTContextLength, build_predictor)
 
 
 # ==============================================================================
@@ -1203,17 +1204,10 @@ def load_predictor(predictor_dir: str, device: str
                    ) -> Tuple[PatchTSTContextLength, dict]:
     with open(os.path.join(predictor_dir, "best_config.json")) as f:
         cfg = json.load(f)
-    model = PatchTSTContextLength(
-        context_length      = cfg["context_length"],
-        patch_length        = cfg["patch_length"],
-        d_model             = cfg["d_model"],
-        num_hidden_layers   = cfg["num_hidden_layers"],
-        num_attention_heads = cfg["num_attention_heads"],
-        dropout             = cfg["dropout"],
-        mask_ratio          = cfg["mask_ratio"],
-        n_windows           = cfg["n_windows"],
-        n_horizons          = cfg["n_horizons"],
-    )
+    # build_predictor branches on cfg["arch"] (defaulting to "patchtst" for
+    # pre-v4 checkpoints that predate the arch key), so a Mamba predictor loads
+    # exactly like a Transformer one here.
+    model = build_predictor(cfg, cfg["n_windows"], cfg["n_horizons"])
     state = torch.load(
         os.path.join(predictor_dir, "best_model.pt"),
         map_location="cpu",

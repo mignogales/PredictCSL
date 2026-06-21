@@ -132,9 +132,34 @@ DEVICES                = None          # None -> use all visible CUDA devices
 VRAM_BUDGET_GB_PER_DEVICE: Optional[List[float]] = None
 VRAM_BUDGET_DEFAULT_GB = 22.0
 
+# -- Predictor architecture ---------------------------------------------------
+# Selects the encoder backbone behind the (shared) patch embedding + dual heads:
+#   "patchtst" (default) -> O(N^2) Transformer encoder (v1/v3 predictor).
+#   "mamba"              -> O(N) bidirectional Mamba (selective state-space)
+#                           stack (run_all_v4.py). Linear in the token count, so
+#                           the predictor's own inference cost is much lower
+#                           against the labeled TSFM. Requires the mamba-ssm
+#                           package (CUDA) on the server; imported lazily so this
+#                           module still imports for the patchtst path without it.
+# Resolved at import (alongside the cheap/n_trials env vars) so the spawned
+# per-GPU trial workers — which re-import this module — see the same arch.
+ARCH = os.environ.get("PREDICTCSL_PREDICTOR_ARCH", "patchtst").lower()
+if ARCH not in ("patchtst", "mamba"):
+    raise ValueError(
+        f"PREDICTCSL_PREDICTOR_ARCH={ARCH!r} not understood "
+        "(expected 'patchtst' or 'mamba').")
+
 # -- Hyperparameter search space ----------------------------------------------
 # Non-overlapping patches: CONTEXT_LENGTH / patch_length tokens (must divide).
-HP_SPACE = {
+_CHEAP = os.environ.get("PREDICTCSL_CHEAP_PREDICTOR") == "1"
+
+# PatchTST (Transformer) spaces — default + the "cheap predictor" corner.
+# The cheap corner (set by run_all_v3.py via PREDICTCSL_CHEAP_PREDICTOR=1) pins
+# the architecture axes to the low-FLOP region — large patches (few tokens),
+# narrow d_model, shallow — so the predictor's own inference cost is negligible
+# vs the labeled TSFM. Only the architecture axes are pinned; the optimisation
+# axes (dropout/mask/lr/wd) keep their full range so the search still has room.
+HP_SPACE_PATCHTST = {
     "patch_length":        [16, 32, 64, 128],
     "d_model":             [128, 256],
     "num_hidden_layers":   [2, 4, 6, 8],
@@ -144,26 +169,41 @@ HP_SPACE = {
     "learning_rate":       [1e-4, 3e-4, 5e-4],
     "weight_decay":        [1e-4, 1e-3],
 }
+HP_SPACE_PATCHTST_CHEAP = {
+    **HP_SPACE_PATCHTST,
+    "patch_length":      [64, 128],   # 128 or 64 tokens (was down to 16 -> 512)
+    "d_model":           [128],       # was [128, 256]
+    "num_hidden_layers": [2, 4],      # was up to 8
+}
 
-# Constrained "cheap predictor" search (set by experiments/run_all_v3.py via
-# PREDICTCSL_CHEAP_PREDICTOR=1). Forces the random search into the low-FLOP
-# corner of HP_SPACE — large patches (few tokens), narrow d_model, shallow —
-# so the predictor's own inference cost is negligible vs the labeled TSFM
-# (worst case here ≈ 0.12 GMAC/series, ~2% of a Moirai2 forward pass). Resolved
-# at import so the spawned per-GPU trial workers (which re-import this module)
-# see the same space. Only the architecture axes are pinned; the optimisation
-# axes (dropout/mask/lr/wd) keep their full range so the search still has room.
-if os.environ.get("PREDICTCSL_CHEAP_PREDICTOR") == "1":
-    HP_SPACE = {
-        "patch_length":        [64, 128],   # 128 or 64 tokens (was down to 16 -> 512)
-        "d_model":             [128],       # was [128, 256]
-        "num_hidden_layers":   [2, 4],      # was up to 8
-        "num_attention_heads": [4, 8],
-        "dropout":             [0.1, 0.2],
-        "mask_ratio":          [0.30, 0.40, 0.50],
-        "learning_rate":       [1e-4, 3e-4, 5e-4],
-        "weight_decay":        [1e-4, 1e-3],
-    }
+# Mamba spaces. No attention heads; the SSM axes (d_state/d_conv/expand) take
+# their place. Because the bidirectional Mamba stack is linear in the token
+# count, the search can afford *smaller* patches (more tokens) than the
+# Transformer could — patch_length goes down to 16 even in the cheap corner.
+HP_SPACE_MAMBA = {
+    "patch_length":      [16, 32, 64, 128],
+    "d_model":           [128, 256],
+    "num_hidden_layers": [2, 4, 6, 8],
+    "d_state":           [8, 16],
+    "d_conv":            [4],
+    "expand":            [2],
+    "dropout":           [0.1, 0.2],
+    "mask_ratio":        [0.30, 0.40, 0.50],
+    "learning_rate":     [1e-4, 3e-4, 5e-4],
+    "weight_decay":      [1e-4, 1e-3],
+}
+HP_SPACE_MAMBA_CHEAP = {
+    **HP_SPACE_MAMBA,
+    "patch_length":      [32, 64, 128],
+    "d_model":           [128],
+    "num_hidden_layers": [2, 4],
+    "d_state":           [16],
+}
+
+if ARCH == "mamba":
+    HP_SPACE = HP_SPACE_MAMBA_CHEAP if _CHEAP else HP_SPACE_MAMBA
+else:
+    HP_SPACE = HP_SPACE_PATCHTST_CHEAP if _CHEAP else HP_SPACE_PATCHTST
 
 # Explicit trial-count override (PREDICTCSL_N_TRIALS), used by run_all_v3.py to
 # run a shorter search (20 trials). Applied after the smoke-test shrink so an
@@ -449,6 +489,192 @@ class PatchTSTContextLength(nn.Module):
         return curve_pred, recon_pred, original_patches, mask
 
 
+class _BiMambaBlock(nn.Module):
+    """Pre-norm residual block wrapping a forward + a reversed Mamba scan.
+
+    A single Mamba scan is causal (token t sees only 0..t). For an *encoder*
+    whose [CLS] token sits at position 0 and must summarise the whole sequence,
+    a lone forward scan would leave CLS blind. We run a second Mamba over the
+    flipped sequence (so its scan accumulates right-to-left, reaching position 0)
+    and sum the two directions before the residual add. The two scans have
+    independent weights.
+    """
+
+    def __init__(self, d_model: int, d_state: int, d_conv: int,
+                 expand: int, dropout: float) -> None:
+        super().__init__()
+        from mamba_ssm import Mamba  # lazy: only needed for the mamba arch
+        self.norm = nn.LayerNorm(d_model)
+        self.fwd  = Mamba(d_model=d_model, d_state=d_state,
+                          d_conv=d_conv, expand=expand)
+        self.bwd  = Mamba(d_model=d_model, d_state=d_state,
+                          d_conv=d_conv, expand=expand)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        z = self.norm(h)
+        fwd = self.fwd(z)
+        bwd = self.bwd(z.flip(dims=[1])).flip(dims=[1])
+        return h + self.drop(fwd + bwd)
+
+
+class MambaContextLength(nn.Module):
+    """Mamba (selective state-space) sibling of PatchTSTContextLength.
+
+    Identical patch embedding, learnable [CLS] + additive horizon embedding,
+    positional embedding, dual heads (curve + recon) and SimMIM-style masking —
+    only the Transformer encoder is replaced by a bidirectional Mamba stack,
+    which is O(N) in the token count instead of O(N^2). ``forward`` returns the
+    same 4-tuple as PatchTSTContextLength so every downstream caller (training
+    loop, _evaluate, stage-3 ablation) is unchanged. Exposes ``mask_ratio`` and
+    ``num_patches`` for the same reason.
+    """
+
+    def __init__(
+        self,
+        context_length: int,
+        patch_length: int,
+        d_model: int,
+        num_hidden_layers: int,
+        d_state: int,
+        d_conv: int,
+        expand: int,
+        dropout: float,
+        mask_ratio: float,
+        n_windows: int,
+        n_horizons: int,
+    ) -> None:
+        super().__init__()
+        if context_length % patch_length != 0:
+            raise ValueError(
+                f"context_length={context_length} must be divisible by "
+                f"patch_length={patch_length}.")
+
+        self.context_length = int(context_length)
+        self.patch_length   = int(patch_length)
+        self.d_model        = int(d_model)
+        self.mask_ratio     = float(mask_ratio)
+        self.n_windows      = int(n_windows)
+        self.n_horizons     = int(n_horizons)
+        self.num_patches    = self.context_length // self.patch_length
+
+        # --- Embedding (identical to PatchTSTContextLength) -------------------
+        self.patch_embed = nn.Linear(self.patch_length, self.d_model)
+        self.cls_token   = nn.Parameter(torch.zeros(1, 1, self.d_model))
+        self.pos_embed   = nn.Parameter(
+            torch.zeros(1, self.num_patches + 1, self.d_model))
+        self.horizon_embed = nn.Embedding(self.n_horizons, self.d_model)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.horizon_embed.weight, std=0.02)
+
+        # --- Bidirectional Mamba encoder -------------------------------------
+        self.layers = nn.ModuleList([
+            _BiMambaBlock(self.d_model, int(d_state), int(d_conv),
+                          int(expand), dropout)
+            for _ in range(int(num_hidden_layers))
+        ])
+        self.norm = nn.LayerNorm(self.d_model)
+
+        # --- Heads (identical to PatchTSTContextLength) ----------------------
+        self.curve_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.d_model, self.n_windows),
+        )
+        self.recon_head = nn.Linear(self.d_model, self.patch_length)
+
+    # ------------------------------------------------------------------
+    def _patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, L, 1) -> (B, N, P) non-overlapping patches."""
+        x = x.squeeze(-1)
+        return x.view(x.size(0), self.num_patches, self.patch_length)
+
+    def _build_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Per-sample mask (B, N) bool with exactly round(mask_ratio*N) True."""
+        n_mask = int(round(self.mask_ratio * self.num_patches))
+        if n_mask == 0:
+            return torch.zeros(batch_size, self.num_patches,
+                               dtype=torch.bool, device=device)
+        noise = torch.rand(batch_size, self.num_patches, device=device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        mask = torch.zeros(batch_size, self.num_patches,
+                           dtype=torch.bool, device=device)
+        mask.scatter_(1, ids_shuffle[:, :n_mask], True)
+        return mask
+
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        x: torch.Tensor,
+        horizon_idx: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Same contract as PatchTSTContextLength.forward."""
+        B = x.size(0)
+        original_patches = self._patchify(x)
+
+        if mask is None:
+            mask = (self._build_mask(B, x.device)
+                    if self.training else
+                    torch.zeros(B, self.num_patches,
+                                dtype=torch.bool, device=x.device))
+
+        embed_input = original_patches.masked_fill(mask.unsqueeze(-1), 0.0)
+
+        h = self.patch_embed(embed_input)
+        cls = self.cls_token.expand(B, -1, -1)                       # (B, 1, D)
+        h_emb = self.horizon_embed(horizon_idx).unsqueeze(1)         # (B, 1, D)
+        cls = cls + h_emb
+        h = torch.cat([cls, h], dim=1)
+        h = h + self.pos_embed
+        for layer in self.layers:
+            h = layer(h)
+        h = self.norm(h)
+
+        curve_pred = self.curve_head(h[:, 0, :])             # (B, n_windows)
+        recon_pred = self.recon_head(h[:, 1:, :])            # (B, N, P)
+        return curve_pred, recon_pred, original_patches, mask
+
+
+def build_predictor(cfg: Any, n_windows: int, n_horizons: int) -> nn.Module:
+    """Construct the predictor for a config's architecture.
+
+    ``cfg`` may be a TrialConfig (asdict-able) or a plain dict (e.g. loaded from
+    best_config.json). Configs without an ``arch`` key default to "patchtst" so
+    pre-v4 checkpoints still load. Centralises the arch branch so the training
+    probe/trial loop and the stage-3 loader build the same way.
+    """
+    cfg = cfg if isinstance(cfg, dict) else asdict(cfg)
+    arch = str(cfg.get("arch", "patchtst")).lower()
+    if arch == "mamba":
+        return MambaContextLength(
+            context_length    = cfg.get("context_length", CONTEXT_LENGTH),
+            patch_length      = cfg["patch_length"],
+            d_model           = cfg["d_model"],
+            num_hidden_layers = cfg["num_hidden_layers"],
+            d_state           = cfg["d_state"],
+            d_conv            = cfg["d_conv"],
+            expand            = cfg["expand"],
+            dropout           = cfg["dropout"],
+            mask_ratio        = cfg["mask_ratio"],
+            n_windows         = n_windows,
+            n_horizons        = n_horizons,
+        )
+    return PatchTSTContextLength(
+        context_length      = cfg.get("context_length", CONTEXT_LENGTH),
+        patch_length        = cfg["patch_length"],
+        d_model             = cfg["d_model"],
+        num_hidden_layers   = cfg["num_hidden_layers"],
+        num_attention_heads = cfg["num_attention_heads"],
+        dropout             = cfg["dropout"],
+        mask_ratio          = cfg["mask_ratio"],
+        n_windows           = n_windows,
+        n_horizons          = n_horizons,
+    )
+
+
 def compute_dual_loss(
     curve_pred: torch.Tensor,
     recon_pred: torch.Tensor,
@@ -487,41 +713,59 @@ def compute_dual_loss(
 
 @dataclass
 class TrialConfig:
+    # Shared axes (both architectures).
     patch_length:        int
     d_model:             int
     num_hidden_layers:   int
-    num_attention_heads: int
     dropout:             float
     mask_ratio:          float
     learning_rate:       float
     weight_decay:        float
+    arch:                str = "patchtst"
+    # PatchTST-only axis (None for mamba).
+    num_attention_heads: Optional[int] = None
+    # Mamba-only axes (None for patchtst).
+    d_state:             Optional[int] = None
+    d_conv:              Optional[int] = None
+    expand:              Optional[int] = None
 
     def __post_init__(self) -> None:
-        if self.d_model % self.num_attention_heads != 0:
-            raise ValueError(
-                f"d_model={self.d_model} not divisible by "
-                f"num_attention_heads={self.num_attention_heads}")
         if CONTEXT_LENGTH % self.patch_length != 0:
             raise ValueError(
                 f"context_length={CONTEXT_LENGTH} not divisible by "
                 f"patch_length={self.patch_length}")
+        if self.arch == "patchtst":
+            if self.num_attention_heads is None:
+                raise ValueError("patchtst arch requires num_attention_heads.")
+            if self.d_model % self.num_attention_heads != 0:
+                raise ValueError(
+                    f"d_model={self.d_model} not divisible by "
+                    f"num_attention_heads={self.num_attention_heads}")
+        elif self.arch == "mamba":
+            for f in ("d_state", "d_conv", "expand"):
+                if getattr(self, f) is None:
+                    raise ValueError(f"mamba arch requires {f}.")
+        else:
+            raise ValueError(f"Unknown arch {self.arch!r}.")
 
 
 def sample_trial_configs(n_trials: int, seed: int = SEED) -> List[TrialConfig]:
-    """Random search with rejection of d_model/heads/patch incompatibilities."""
+    """Random search over HP_SPACE (which is arch-specific), rejecting
+    incompatible (d_model/heads, patch/context) draws and duplicates. The arch
+    is stamped onto every config so it persists into best_config.json."""
     rng = random.Random(seed); seen, configs = set(), []
     max_attempts = n_trials * 50; attempts = 0
     while len(configs) < n_trials and attempts < max_attempts:
         attempts += 1
         cfg = {k: rng.choice(v) for k, v in HP_SPACE.items()}
-        if cfg["d_model"] % cfg["num_attention_heads"] != 0:
-            continue
         if CONTEXT_LENGTH % cfg["patch_length"] != 0:
+            continue
+        if ARCH == "patchtst" and cfg["d_model"] % cfg["num_attention_heads"] != 0:
             continue
         key = tuple(sorted(cfg.items()))
         if key in seen:
             continue
-        seen.add(key); configs.append(TrialConfig(**cfg))
+        seen.add(key); configs.append(TrialConfig(arch=ARCH, **cfg))
     return configs
 
 
@@ -552,17 +796,7 @@ def _probe_vram(
         with torch.cuda.device(torch.device(device)):
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-            model = PatchTSTContextLength(
-                context_length      = CONTEXT_LENGTH,
-                patch_length        = trial.patch_length,
-                d_model             = trial.d_model,
-                num_hidden_layers   = trial.num_hidden_layers,
-                num_attention_heads = trial.num_attention_heads,
-                dropout             = trial.dropout,
-                mask_ratio          = trial.mask_ratio,
-                n_windows           = n_windows,
-                n_horizons          = n_horizons,
-            ).to(device)
+            model = build_predictor(trial, n_windows, n_horizons).to(device)
             model.train()
             opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
@@ -771,17 +1005,7 @@ def _run_single_trial(
     n_train = x_train.shape[0]
     steps_per_epoch = max(n_train // bs, 1)
 
-    model = PatchTSTContextLength(
-        context_length      = CONTEXT_LENGTH,
-        patch_length        = trial.patch_length,
-        d_model             = trial.d_model,
-        num_hidden_layers   = trial.num_hidden_layers,
-        num_attention_heads = trial.num_attention_heads,
-        dropout             = trial.dropout,
-        mask_ratio          = trial.mask_ratio,
-        n_windows           = n_windows,
-        n_horizons          = n_horizons,
-    ).to(device)
+    model = build_predictor(trial, n_windows, n_horizons).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=trial.weight_decay)
 
@@ -1144,9 +1368,10 @@ def _persist_artifacts(results: List[Dict[str, Any]], run_label: str) -> None:
         rows.append(flat)
     df = pd.DataFrame(rows)
     keep = ["trial_idx", "val_regret", "val_win_acc", "val_curve_mse",
-            "val_recon_mse", "val_combined",
+            "val_recon_mse", "val_combined", "arch",
             "patch_length", "d_model", "num_hidden_layers",
-            "num_attention_heads", "dropout", "mask_ratio",
+            "num_attention_heads", "d_state", "d_conv", "expand",
+            "dropout", "mask_ratio",
             "learning_rate", "weight_decay",
             "auto_batch_size", "auto_lr", "peak_vram_gb",
             "device", "elapsed_seconds", "failed", "skip_reason"]
@@ -1221,6 +1446,8 @@ def main() -> None:
     print(Fore.CYAN + f"  n_train={n_train}  n_val={n_val}  "
           + f"n_windows={n_windows}  n_horizons={n_horizons}  "
           + f"windows={window_grid}" + Fore.RESET)
+    print(Fore.CYAN + f"arch={ARCH}{'  (cheap corner)' if _CHEAP else ''}"
+          + Fore.RESET)
     print(Fore.CYAN + f"N_TRIALS={N_TRIALS}  lambda_curve={LAMBDA_CURVE}  "
           + f"lambda_recon={LAMBDA_RECON}  selection={SELECTION_METRIC}"
           + Fore.RESET)
