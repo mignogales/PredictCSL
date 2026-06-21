@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from typing import Dict, List, Optional
 
@@ -88,12 +89,17 @@ MODELS: List[tuple] = [
 # with --patch-length / --d-model / --num-layers or point --best-config at the
 # real artifact.
 DEFAULT_PREDICTOR = {
+    "arch":              "patchtst",
     "context_length":    8192,
     "patch_length":      64,
     "d_model":           128,
     "num_hidden_layers": 4,
     "n_windows":         18,   # len(WINDOW_GRID)
     "n_horizons":        6,    # len(HORIZON_GRID)
+    # Mamba-only axes (used when arch == "mamba"); ignored otherwise.
+    "d_state":           16,
+    "d_conv":            4,
+    "expand":            2,
 }
 
 
@@ -101,40 +107,71 @@ DEFAULT_PREDICTOR = {
 #  PREDICTOR COST MODEL  (same MAC accounting style as theoretical_flops)
 # ==============================================================================
 
+def _mamba_block_macs(L: int, d: int, d_state: int, d_conv: int,
+                      expand: int) -> float:
+    """Per-token MACs of ONE bidirectional Mamba block over L tokens.
+
+    Mirrors _BiMambaBlock in predict_context_length.py: two independent Mamba
+    scans (forward + reversed), each with the standard projections + depthwise
+    causal conv + selective SSM recurrence. Linear in L (the whole point of the
+    v4 arch). dt_rank follows the mamba-ssm default (ceil(d/16)).
+    """
+    d_inner = expand * d
+    dt_rank = math.ceil(d / 16)
+    in_proj  = L * d * (2 * d_inner)                  # -> (x, z)
+    conv     = L * d_inner * d_conv                   # depthwise causal conv1d
+    x_proj   = L * d_inner * (dt_rank + 2 * d_state)  # -> (dt, B, C)
+    dt_proj  = L * dt_rank * d_inner
+    scan     = L * d_inner * d_state * 3              # discretize + update + out
+    out_proj = L * d_inner * d
+    one_dir = in_proj + conv + x_proj + dt_proj + scan + out_proj
+    return 2.0 * one_dir                              # forward + reversed
+
+
 def predictor_macs(cfg: Dict) -> float:
-    """Per-series inference MACs for the CSL Patch-Transformer.
+    """Per-series inference MACs for the CSL predictor (arch-aware).
 
     Inference path (forward() in predict_context_length.py, eval mode, B=1):
         patchify -> patch_embed -> prepend CLS(+horizon embed) -> encoder
         -> LayerNorm -> curve_head on the CLS token.
 
     The recon head is auxiliary (training only) and is *excluded* — at deploy
-    time you only read the curve from the CLS token. The encoder term uses the
-    same ``_layer_macs`` helper as the TSFM proxy (unified stack, dense FFN with
-    f = 4*d_model, no cross-attention), so the two sides are commensurable.
+    time you only read the curve from the CLS token. The shared (patch_embed,
+    curve_head) terms are identical across architectures; only the encoder term
+    differs: a dense Transformer stack (O(L^2) attention) for "patchtst" vs a
+    bidirectional Mamba stack (O(L)) for "mamba". The patchtst encoder uses the
+    same ``_layer_macs`` helper as the TSFM proxy so the two sides stay
+    commensurable.
     """
+    arch = str(cfg.get("arch", "patchtst")).lower()
     P = int(cfg["patch_length"])
     d = int(cfg["d_model"])
     n_layers = int(cfg["num_hidden_layers"])
     n_patches = int(cfg["context_length"]) // P
     n_windows = int(cfg["n_windows"])
 
-    f = 4 * d                       # dim_feedforward = d_model * 4
     L = n_patches + 1               # patches + CLS token
-
     patch_embed = n_patches * P * d             # Linear(P -> d) over N patches
-    encoder = n_layers * _layer_macs(L, d, f)   # dense transformer stack
     curve_head = d * d + d * n_windows          # MLP on the single CLS token
+
+    if arch == "mamba":
+        encoder = n_layers * _mamba_block_macs(
+            L, d, int(cfg.get("d_state", 16)),
+            int(cfg.get("d_conv", 4)), int(cfg.get("expand", 2)))
+    else:
+        f = 4 * d                   # dim_feedforward = d_model * 4
+        encoder = n_layers * _layer_macs(L, d, f)
     return float(patch_embed + encoder + curve_head)
 
 
 def predictor_params(cfg: Dict) -> int:
     """Analytic parameter count of the predictor (for context, not the headline).
 
-    Matches the module layout in PatchTSTContextLength: patch embed, CLS token,
-    positional + horizon embeddings, ``n_layers`` of nn.TransformerEncoderLayer
-    (norm_first, dim_ff = 4*d), final LayerNorm, and the two heads.
+    Matches the module layout in predict_context_length.py: patch embed, CLS
+    token, positional + horizon embeddings, ``n_layers`` of encoder blocks
+    (Transformer or bidirectional Mamba), final LayerNorm, and the two heads.
     """
+    arch = str(cfg.get("arch", "patchtst")).lower()
     P = int(cfg["patch_length"])
     d = int(cfg["d_model"])
     n_layers = int(cfg["num_hidden_layers"])
@@ -142,17 +179,32 @@ def predictor_params(cfg: Dict) -> int:
     n_windows = int(cfg["n_windows"])
     n_horizons = int(cfg.get("n_horizons", DEFAULT_PREDICTOR["n_horizons"]))
 
-    f = 4 * d
     patch_embed = P * d + d
     cls_token = d
     pos_embed = (n_patches + 1) * d
     horizon_embed = n_horizons * d
-    # nn.TransformerEncoderLayer: MHA in/out proj + 2 FFN linears + 2 LayerNorms.
-    per_layer = (4 * d * d + 4 * d) + (2 * (d * f) + f + d) + (2 * 2 * d)
-    encoder = n_layers * per_layer
     final_norm = 2 * d
     curve_head = (d * d + d) + (d * n_windows + n_windows)
     recon_head = d * P + P
+
+    if arch == "mamba":
+        d_inner = int(cfg.get("expand", 2)) * d
+        d_conv = int(cfg.get("d_conv", 4))
+        d_state = int(cfg.get("d_state", 16))
+        dt_rank = math.ceil(d / 16)
+        per_mamba = (d * (2 * d_inner)            # in_proj
+                     + d_inner * d_conv + d_inner  # conv weight + bias
+                     + d_inner * (dt_rank + 2 * d_state)  # x_proj
+                     + dt_rank * d_inner + d_inner         # dt_proj + bias
+                     + d_inner * d_state          # A
+                     + d_inner                    # D
+                     + d_inner * d)               # out_proj
+        per_layer = 2 * d + 2 * per_mamba         # prenorm LayerNorm + 2 scans
+    else:
+        f = 4 * d
+        # nn.TransformerEncoderLayer: MHA in/out proj + 2 FFN linears + 2 LayerNorms.
+        per_layer = (4 * d * d + 4 * d) + (2 * (d * f) + f + d) + (2 * 2 * d)
+    encoder = n_layers * per_layer
     return int(patch_embed + cls_token + pos_embed + horizon_embed
                + encoder + final_norm + curve_head + recon_head)
 
@@ -168,8 +220,9 @@ def load_predictor_config(path: Optional[str], overrides: Dict) -> Dict:
     if path and os.path.isfile(path):
         with open(path) as fh:
             raw = json.load(fh)
-        for k in ("context_length", "patch_length", "d_model",
-                  "num_hidden_layers", "n_windows", "n_horizons"):
+        for k in ("arch", "context_length", "patch_length", "d_model",
+                  "num_hidden_layers", "n_windows", "n_horizons",
+                  "d_state", "d_conv", "expand"):
             if raw.get(k) is not None:
                 cfg[k] = raw[k]
         # n_windows can also be derived from a stored window_grid.
@@ -231,6 +284,7 @@ def build_rows(
             "model": display,
             "family": family,
             "config_found": found,
+            "arch": str(cfg.get("arch", "patchtst")).lower(),
             "pred_arch": f"{cfg['patch_length']}/{cfg['d_model']}/{cfg['num_hidden_layers']}",
             "pred_params_m": predictor_params(cfg) / 1e6,
             "full_window": full_window,
@@ -257,20 +311,20 @@ def print_report(predictor_root: str, forced_config: Optional[str],
     print(f"  predictor config source : {src}")
     print(f"  TSFM forecast horizon   : {horizon}  "
           f"(predictor cost is horizon-independent)")
-    print(f"  predictor arch column   : patch/d_model/layers  (* = config not "
-          f"found, using defaults)")
+    print(f"  predictor arch column   : encoder backbone; pred(p/d/L) = "
+          f"patch/d_model/layers  (* = config not found, using defaults)")
     print("-" * 124)
-    print(f"  {'TSFM':<20}{'pred(p/d/L)':>13}{'full_w':>8}{'GMAC@full':>11}"
+    print(f"  {'TSFM':<20}{'enc':>9}{'pred(p/d/L)':>13}{'full_w':>8}{'GMAC@full':>11}"
           f"{'GMAC@50%':>10}{'GMAC@25%':>10}{'predGMAC':>10}"
-          f"{'%@full':>9}{'%@50%':>9}{'%@25%':>9}")
+          f"{'%@full':>8}{'%@50%':>8}{'%@25%':>8}")
     print("-" * 124)
     for r in rows:
         name = r["model"] + ("" if r["config_found"] else " *")
-        print(f"  {name:<20}{r['pred_arch']:>13}{r['full_window']:>8}"
+        print(f"  {name:<20}{r['arch']:>9}{r['pred_arch']:>13}{r['full_window']:>8}"
               f"{r['tsfm_gmac_full']:>11.2f}{r['tsfm_gmac_half']:>10.2f}"
               f"{r['tsfm_gmac_quarter']:>10.2f}{r['predictor_gmac']:>10.4f}"
-              f"{r['pct_of_full']:>8.3f}%{r['pct_of_half']:>8.3f}%"
-              f"{r['pct_of_quarter']:>8.3f}%")
+              f"{r['pct_of_full']:>7.3f}%{r['pct_of_half']:>7.3f}%"
+              f"{r['pct_of_quarter']:>7.3f}%")
     print("-" * 124)
     pct_vals = [r["pct_of_full"] for r in rows]
     print(f"  range across models     : {min(pct_vals):.3f}%  ..  {max(pct_vals):.3f}%")
@@ -291,13 +345,15 @@ def write_csv(path: str, horizon: int, rows: List[Dict]) -> None:
     import csv
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["model", "family", "config_found", "pred_arch_p_d_L",
+        w.writerow(["model", "family", "config_found", "encoder_arch",
+                    "pred_arch_p_d_L",
                     "pred_params_m", "full_window", "half_window",
                     "quarter_window", "horizon", "tsfm_gmac_full",
                     "tsfm_gmac_half", "tsfm_gmac_quarter", "predictor_gmac",
                     "pct_of_full", "pct_of_half", "pct_of_quarter"])
         for r in rows:
             w.writerow([r["model"], r["family"], r["config_found"],
+                        r["arch"],
                         r["pred_arch"], f"{r['pred_params_m']:.4f}",
                         r["full_window"], r["half_window"], r["quarter_window"],
                         horizon, f"{r['tsfm_gmac_full']:.6f}",

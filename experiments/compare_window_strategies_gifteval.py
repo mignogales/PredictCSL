@@ -83,6 +83,73 @@ from colorama import Fore
 CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
 
 # ==============================================================================
+#  PREDICTOR VARIANTS
+# ==============================================================================
+#
+# The base run dir (``general/``) carries the v1 predictor's curve as the "pred"
+# strategy.  The constrained/cheap (v3) and Mamba (v4) predictors write sibling
+# ablation trees (``general_v3/`` / ``general_v4/``) that SHARE the same real
+# MASE curves and window grid (the expensive GiftEval cells are symlinked — the
+# grid is dataset-derived, not predictor-derived) and differ ONLY in their
+# ``predicted_mean`` field.  So each variant's window choice can be evaluated on
+# the *same* real curves and folded in as one extra strategy, exactly the way the
+# ``period`` strategy is.
+#
+# Maps the ablation-tree suffix -> (strategy_key, display label, color).  The
+# base run_dir's OWN predictor is always "pred"; any *other* tree present as a
+# sibling is auto-discovered and added (no CLI flag, graceful when absent).
+PRED_VARIANTS: Dict[str, Tuple[str, str, str]] = {
+    "_v3": ("pred_cheap", "Predictor (cheap)", "#1F77B4"),
+    "_v4": ("pred_mamba", "Predictor Mamba",   "#9C27B0"),
+}
+
+
+def discover_pred_variants(run_dir: str) -> List[Tuple[str, str, str, str]]:
+    """Return ``(key, label, color, tree_dir)`` for every sibling predictor-variant
+    ablation tree that exists, has a ``models/`` subdir, and differs from
+    ``run_dir``.
+
+    Robust to ``run_dir`` itself being a variant (e.g. ``.../general_v3``): the
+    known suffix is stripped to recover the ``general`` stem before re-attaching
+    each variant suffix, so the base ``general`` tree and the *other* variants are
+    all discovered regardless of which tree drives the comparison.
+    """
+    run_dir = os.path.normpath(run_dir)
+    parent = os.path.dirname(run_dir)
+    base = os.path.basename(run_dir)
+
+    # Recover the stem ("general") by peeling a known variant suffix if present.
+    stem = base
+    for suf in PRED_VARIANTS:
+        if base.endswith(suf):
+            stem = base[: -len(suf)]
+            break
+
+    found: List[Tuple[str, str, str, str]] = []
+    for suf, (key, label, color) in PRED_VARIANTS.items():
+        tree = os.path.join(parent, stem + suf)
+        if os.path.normpath(tree) == run_dir:
+            continue  # this is the base tree itself (its predictor is "pred")
+        if os.path.isdir(os.path.join(tree, "models")):
+            found.append((key, label, color, tree))
+    return found
+
+
+def present_pred_variants(df: pd.DataFrame) -> List[Tuple[str, str, str]]:
+    """Return ``(key, label, color)`` for each variant whose ``{key}_mase`` column
+    is present in ``df`` and has at least one non-NaN value, in registry order.
+
+    Single source of truth so every downstream consumer (stats, savings, plots,
+    console) shows exactly the variants that were actually folded in.
+    """
+    out: List[Tuple[str, str, str]] = []
+    for _suf, (key, label, color) in PRED_VARIANTS.items():
+        col = f"{key}_mase"
+        if col in df.columns and df[col].notna().any():
+            out.append((key, label, color))
+    return out
+
+# ==============================================================================
 #  COMPLEXITY MODEL
 # ==============================================================================
 #
@@ -359,6 +426,42 @@ def _load_period_record(
         return None
 
 
+def _load_variant_pred_mean(
+    tree_dir: str,
+    dataset_display: str,
+    term: str,
+    model_short: str,
+    expected_grid: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Load a predictor-variant tree's ``predicted_mean`` for one (dataset, term,
+    model) cell, or ``None`` when unavailable / grid-mismatched.
+
+    The variant trees share the base run's window grid (symlinked cells), so a
+    length mismatch means the cell is stale/incompatible and is skipped rather
+    than silently misaligned.
+    """
+    npz_path = os.path.join(
+        tree_dir, "models", model_short, "compare_real_vs_predicted",
+        _npz_filename(dataset_display, term, model_short),
+    )
+    if not os.path.isfile(npz_path):
+        return None
+    try:
+        data = np.load(npz_path)
+        pred_mean = np.asarray(data["predicted_mean"])
+        grid = np.asarray(data["window_grid"])
+    except Exception as exc:
+        print(Fore.YELLOW + f"  Could not read variant npz {npz_path}: {exc}" + Fore.RESET)
+        return None
+    if pred_mean.shape != expected_grid.shape or grid.shape != expected_grid.shape:
+        print(Fore.YELLOW
+              + f"  Variant grid mismatch {npz_path}: {pred_mean.shape} vs "
+                f"{expected_grid.shape} — skipping this cell."
+              + Fore.RESET)
+        return None
+    return pred_mean
+
+
 def load_strategy_records(
     run_dir: str,
     cache_root: str,
@@ -380,6 +483,16 @@ def load_strategy_records(
     models_root = os.path.join(run_dir, "models")
     if not os.path.isdir(models_root):
         raise FileNotFoundError(f"No models/ dir found in {run_dir}")
+
+    # Sibling predictor-variant trees (v3 cheap, v4 Mamba, …) folded in as extra
+    # strategies, evaluated on the SAME real curves as the base "pred".
+    variants = discover_pred_variants(run_dir)
+    if variants:
+        print(Fore.CYAN
+              + "  Predictor variants discovered: "
+              + ", ".join(f"{key} ({os.path.basename(tree)})"
+                          for key, _lbl, _clr, tree in variants)
+              + Fore.RESET)
 
     records: List[dict] = []
 
@@ -507,6 +620,54 @@ def load_strategy_records(
                 period_flops = float("nan")
                 speedup_period = float("nan")
 
+            # --- Predictor-variant strategies (v3 cheap, v4 Mamba, …) ------------
+            # Each variant's curve picks a window; we score it on the SAME base
+            # real_curve so every strategy shares identical ground truth. NaN-fill
+            # the whole block when a variant cell is missing (graceful, like a
+            # missing period sidecar).
+            variant_cols: Dict[str, float] = {}
+            for vkey, _vlbl, _vclr, vtree in variants:
+                vpred = _load_variant_pred_mean(
+                    vtree, dataset_display, term, model_short, window_grid)
+                if vpred is None:
+                    var_w = var_mase = var_elapsed = float("nan")
+                    var_flops = float("nan")
+                    var_clamped = False
+                    speedup_var = float("nan")
+                    var_complexity = float("nan")
+                else:
+                    var_idx = int(np.argmin(vpred))
+                    var_clamped = bool(np.isnan(real_curve[var_idx]))
+                    if var_clamped:
+                        var_idx = full_idx  # window unavailable -> fall back to full
+                    var_w     = int(window_grid[var_idx])
+                    var_mase  = float(real_curve[var_idx])
+                    var_elapsed = _load_elapsed(
+                        cache_root, dataset_display, model_short, term, var_w)
+                    var_flops = theoretical_flops(model, var_w, horizon, patch_sizes)
+                    speedup_var = (
+                        full_elapsed / var_elapsed
+                        if var_elapsed > 0 and not math.isnan(var_elapsed)
+                        and not math.isnan(full_elapsed)
+                        else float("nan")
+                    )
+                    var_complexity = var_flops / full_flops if full_flops > 0 else float("nan")
+                variant_cols.update({
+                    f"{vkey}_window":   var_w,
+                    f"{vkey}_mase":     var_mase,
+                    f"{vkey}_clamped":  var_clamped,
+                    f"delta_{vkey}_vs_full": var_mase - full_mase,
+                    f"delta_{vkey}_vs_best": var_mase - best_mase,
+                    f"delta_{vkey}_vs_pred": var_mase - pred_mase,
+                    f"rel_gain_{vkey}_over_full": (
+                        (full_mase - var_mase) / (abs(full_mase) + 1e-12)
+                    ),
+                    f"{vkey}_elapsed_s": var_elapsed,
+                    f"speedup_{vkey}_vs_full": speedup_var,
+                    f"{vkey}_flops":    var_flops,
+                    f"complexity_ratio_{vkey}_vs_full": var_complexity,
+                })
+
             records.append({
             # identity
             "model":           model,
@@ -562,6 +723,8 @@ def load_strategy_records(
             "complexity_ratio_period_vs_full": (
                 period_flops / full_flops if full_flops > 0 else float("nan")
             ),
+            # predictor-variant strategies (v3 cheap, v4 Mamba, …); empty when none
+            **variant_cols,
         })
 
     if not records:
@@ -687,6 +850,52 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
                 }
             stats["mean_period_window"] = float(rp["period_window"].dropna().mean())
 
+    # ---- Predictor-variant strategies (v3 cheap, v4 Mamba, …) -----------------
+    # Same sub-block the primary predictor / period strategies get, per variant.
+    for vkey, _vlbl, _vclr in present_pred_variants(df):
+        rv = df.dropna(subset=["full_mase", "best_mase", f"{vkey}_mase"])
+        if rv.empty:
+            continue
+        vals = rv[f"{vkey}_mase"].values
+        stats[f"{vkey}_mase"] = {
+            "mean":    float(vals.mean()),
+            "geomean": _geomean(vals),
+            "median":  float(np.median(vals)),
+            "std":     float(vals.std()),
+            "n":       int(len(vals)),
+        }
+        stats[f"{vkey}_clamped_count"] = (
+            int(df[f"{vkey}_clamped"].sum()) if f"{vkey}_clamped" in df.columns else 0)
+        beats_full = int((rv[f"{vkey}_mase"] < rv["full_mase"]).sum())
+        stats[f"{vkey}_beats_full_count"] = beats_full
+        stats[f"{vkey}_beats_full_rate"]  = beats_full / max(len(rv), 1)
+        stats[f"{vkey}_beats_pred_count"] = int((rv[f"{vkey}_mase"] < rv["pred_mase"]).sum())
+        gain_v = rv[f"rel_gain_{vkey}_over_full"].values
+        stats[f"rel_gain_{vkey}_over_full"] = {
+            "mean":         float(gain_v.mean()),
+            "median":       float(np.median(gain_v)),
+            "pct_positive": float((gain_v > 0).mean()),
+        }
+        regret_v = rv[f"delta_{vkey}_vs_best"].values
+        stats[f"regret_{vkey}_vs_best"] = {
+            "mean":   float(regret_v.mean()),
+            "median": float(np.median(regret_v)),
+        }
+        crv = df[f"complexity_ratio_{vkey}_vs_full"].dropna().values
+        if crv.size:
+            stats[f"complexity_ratio_{vkey}_vs_full"] = {
+                "mean":   float(crv.mean()),
+                "median": float(np.median(crv)),
+            }
+        spv = df[f"speedup_{vkey}_vs_full"].dropna().values
+        if spv.size:
+            stats[f"speedup_{vkey}_vs_full"] = {
+                "mean":       float(spv.mean()),
+                "median":     float(np.median(spv)),
+                "pct_faster": float((spv > 1).mean()),
+            }
+        stats[f"mean_{vkey}_window"] = float(rv[f"{vkey}_window"].dropna().mean())
+
     return stats
 
 
@@ -718,6 +927,9 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
                    ("best", "best_flops", "best_mase")]
     if "period_flops" in df.columns:
         strat_specs.append(("period", "period_flops", "period_mase"))
+    for vkey, _vlbl, _vclr in present_pred_variants(df):
+        if f"{vkey}_flops" in df.columns:
+            strat_specs.append((vkey, f"{vkey}_flops", f"{vkey}_mase"))
 
     rows = []
     for name, flops_col, mase_col in strat_specs:
@@ -874,6 +1086,9 @@ def compute_time_savings(df: pd.DataFrame) -> pd.DataFrame:
                    ("best", "best_elapsed_s", "best_mase")]
     if "period_elapsed_s" in df.columns:
         strat_specs.append(("period", "period_elapsed_s", "period_mase"))
+    for vkey, _vlbl, _vclr in present_pred_variants(df):
+        if f"{vkey}_elapsed_s" in df.columns:
+            strat_specs.append((vkey, f"{vkey}_elapsed_s", f"{vkey}_mase"))
 
     rows = []
     for name, time_col, mase_col in strat_specs:
@@ -1489,12 +1704,26 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str) -> str:
 
     strategies = ["full_mase", "best_mase", "pred_mase"]
     labels = ["Full Window", "Best Window\n(Oracle)", "Predictor\nWindow"]
+    # Per-strategy bar colors (geom = saturated, median = lighter). Base three are
+    # fixed; period + variants append their registry color for both shades.
+    c_geom   = ["#264FA0", "#A9511B", "#3E7327"]
+    c_median = ["#7BA9D8", "#F0A86A", "#9ED67A"]
     # Append the period-window strategy when sidecars supplied it (restricted to
     # the rows that actually have a period_mase, so bars stay comparable).
     if "period_mase" in r.columns and r["period_mase"].notna().any():
         r = r.dropna(subset=["period_mase"]).copy()
         strategies.append("period_mase")
         labels.append("Period\n(2×Period)")
+        c_geom.append("#6A1B9A"); c_median.append("#C39BD3")
+    # Append each auto-discovered predictor variant (v3 cheap, v4 Mamba, …),
+    # restricted to rows that have its MASE so bars stay comparable.
+    for vkey, vlbl, vclr in present_pred_variants(r):
+        r = r.dropna(subset=[f"{vkey}_mase"]).copy()
+        strategies.append(f"{vkey}_mase")
+        labels.append(vlbl.replace(" ", "\n"))
+        c_geom.append(vclr); c_median.append(vclr)
+    c_geom   = c_geom[:len(labels)]
+    c_median = c_median[:len(labels)]
 
     # Geometric mean — exp(mean(log)) — what M4/OWA use; robust to outlier spikes
     gmeans  = [_geomean(r[s].values) for s in strategies]
@@ -1508,8 +1737,6 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str) -> str:
 
     x = np.arange(len(labels))
     wb = 0.30
-    c_geom   = ["#264FA0", "#A9511B", "#3E7327", "#6A1B9A"][:len(labels)]
-    c_median = ["#7BA9D8", "#F0A86A", "#9ED67A", "#C39BD3"][:len(labels)]
 
     fig, ax = plt.subplots(figsize=(10, 6))
     b1 = ax.bar(x - wb / 2, gmeans,  wb, label="Geometric Mean ★", color=c_geom,   alpha=0.85, edgecolor="white")
@@ -1764,6 +1991,13 @@ def plot_complexity_reduction(df: pd.DataFrame, out_dir: str) -> str:
         period_ratios = df["complexity_ratio_period_vs_full"].dropna().values
         if period_ratios.size:
             panels.append((period_ratios, "Period (2×P) / Full", "#6A1B9A"))
+    # One panel per auto-discovered predictor variant (v3 cheap, v4 Mamba, …).
+    for vkey, vlbl, vclr in present_pred_variants(df):
+        col = f"complexity_ratio_{vkey}_vs_full"
+        if col in df.columns:
+            v_ratios = df[col].dropna().values
+            if v_ratios.size:
+                panels.append((v_ratios, f"{vlbl} / Full", vclr))
 
     fig, axes = plt.subplots(1, len(panels), figsize=(7 * len(panels), 5), sharey=False)
     if len(panels) == 1:
@@ -1867,9 +2101,12 @@ def plot_complexity_vs_mase_gain(df: pd.DataFrame, out_dir: str) -> str:
 
 # Strategy display names + palette, shared with the other complexity plots.
 _STRATEGY_STYLE = {
-    "pred":   ("Predictor",     "#70AD47"),
-    "best":   ("Oracle best",   "#ED7D31"),
-    "period": ("Period (2×P)",  "#6A1B9A"),
+    "pred":       ("Predictor",         "#70AD47"),
+    # predictor variants (auto-discovered sibling trees); see PRED_VARIANTS
+    "pred_cheap": ("Predictor (cheap)", "#1F77B4"),
+    "pred_mamba": ("Predictor Mamba",   "#9C27B0"),
+    "best":       ("Oracle best",       "#ED7D31"),
+    "period":     ("Period (2×P)",      "#6A1B9A"),
 }
 _MODEL_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "p"]
 
@@ -2108,6 +2345,11 @@ def plot_per_dataset_bars(df: pd.DataFrame, out_dir: str) -> List[str]:
         strat_cols.append("period_mase")
         strat_lbls.append("Period (2×P)")
         strat_cols_clrs.append("#6A1B9A")
+    # Auto-discovered predictor variants (v3 cheap, v4 Mamba, …).
+    for vkey, vlbl, vclr in present_pred_variants(r):
+        strat_cols.append(f"{vkey}_mase")
+        strat_lbls.append(vlbl)
+        strat_cols_clrs.append(vclr)
 
     paths: List[str] = []
     for dataset_name, grp in r.groupby("dataset_display", sort=True):
@@ -2277,6 +2519,10 @@ def main() -> None:
                      ("pred_mase", "Predictor    ")]
         if "period_mase" in stats:
             mase_keys.append(("period_mase", "Period (2xP) "))
+        # Auto-discovered predictor variants (v3 cheap, v4 Mamba, …).
+        for vkey, vlbl, _vclr in present_pred_variants(df_subset):
+            if f"{vkey}_mase" in stats:
+                mase_keys.append((f"{vkey}_mase", f"{vlbl:<13}"[:13]))
         for key, name in mase_keys:
             s = stats[key]
             print(f"  {name}  mean={s['mean']:.4f}  geomean={s['geomean']:.4f}  "
@@ -2288,6 +2534,12 @@ def main() -> None:
                   f"mean window={stats.get('mean_period_window', float('nan')):.0f}")
         print(f"  Pred beats full: {stats['pred_beats_full_count']}/{stats['total_rows']} "
               f"({100*stats['pred_beats_full_rate']:.1f}%)")
+        for vkey, vlbl, _vclr in present_pred_variants(df_subset):
+            if f"{vkey}_beats_full_count" in stats:
+                print(f"  {vlbl} beats full: {stats[f'{vkey}_beats_full_count']}/{stats['total_rows']} "
+                      f"({100*stats[f'{vkey}_beats_full_rate']:.1f}%)  |  "
+                      f"regret vs oracle: mean={stats[f'regret_{vkey}_vs_best']['mean']:.4f}  "
+                      f"mean window={stats.get(f'mean_{vkey}_window', float('nan')):.0f}")
         if stats.get("pred_clamped_count", 0) > 0:
             print(
                 Fore.YELLOW

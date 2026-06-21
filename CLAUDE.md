@@ -37,6 +37,22 @@ strategy). Each stage caches its work and has a done-marker so re-runs only do
 what's missing. Per-family deterministic output paths under
 `logs/experiments/` (on the server).
 
+Two more orchestrator variants reuse `run_all.py`'s machinery verbatim and only
+swap the **stage-2 predictor** (architecture/search), redirecting it to its own
+`*_v3`/`*_v4` roots while symlinking the expensive stage-3 GiftEval cells from
+the shared `general/` tree (the window grid is dataset-derived, not
+predictor-derived, so no TSFM re-inference):
+- **`run_all_v3.py`** — same PatchTST-Transformer predictor but a *constrained*
+  HP search (low-FLOP corner: big patches, narrow `d_model`, shallow, ~20
+  trials), so the predictor's own cost is negligible vs the labeled TSFM.
+- **`run_all_v4.py`** — swaps the Transformer encoder for a **bidirectional
+  Mamba** (selective state-space) stack — O(N) in the patch-token count instead
+  of O(N²) — so the predictor is even cheaper and the search can afford smaller
+  patches. Selected via `PREDICTCSL_PREDICTOR_ARCH=mamba` (resolved at import in
+  `predict_context_length.py`, alongside `MambaContextLength` + the
+  `build_predictor` factory). Requires `mamba-ssm` + `causal-conv1d` on the
+  server (imported lazily, so the patchtst path needs neither).
+
 1. **`build_context_length_dataset.py`** — *labeling*. Generates ~50k synthetic
    series (length 8192 + horizon) with injected non-stationarity (1–4 regimes,
    level/variance shifts, per-segment trend/AR/seasonality, wave-type variety,
@@ -105,5 +121,8 @@ python -m experiments.run_all --models Chronos2-Small
 python -m experiments.run_all --skip-stages 1 2  # only ablation + compare
 python -m experiments.run_all --test             # tiny end-to-end smoke run
 python -m experiments.run_all_v2                 # + the 2×period strategy
+python -m experiments.run_all_v3                 # constrained (cheap) PatchTST predictor
+python -m experiments.run_all_v4                 # Mamba predictor (needs mamba-ssm)
+python -m experiments.run_all_v4 --cheap         # + pin the cheap Mamba corner
 ```
 Stage 1 alone: `python -m experiments.build_context_length_dataset --model-idx <i>`.
