@@ -68,28 +68,16 @@ from tqdm.auto import tqdm
 # Authoritative model catalog. --model-idx for stage 1 indexes into THIS list,
 # so we resolve indices from it directly rather than from a hand-copied mirror.
 from experiments.build_context_length_dataset import MODELS as BUILD_MODELS
+from experiments import models_config
 
 
-# Master catalog: (model_id, family, display). Order is free — stage 1 resolves
-# --model-idx by matching model_id against build_context_length_dataset.MODELS
-# (see _model_idx), so reordering or renaming here can't mislabel a model.
-# Every model_id must exist in that build catalog. Comment out a row to skip a
-# family end-to-end.
-MODELS_TO_RUN: List[Tuple[str, str, str]] = [
-    ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
-    ("autogluon/chronos-2-synth",       "chronos2",    "Chronos2-Synth"),
-    ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
-    ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
-    ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
-    # Dropped: autoregressive token-by-token decode is intractably slow at
-    # MAX_HORIZON=1024 across the full window grid (a single shard never finished).
-    # ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
-    ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
-    ("amazon/chronos-bolt-base",        "chronos_bolt","ChronosBolt-Base"),
-    ("Datadog/Toto-2.0-313m",           "toto",        "Toto-2.0-313m"),
-    ("ibm-granite/granite-timeseries-flowstate-r1", "flowstate", "FlowState-R1"),
-    ("NX-AI/TiRex",                     "tirex",       "TiRex"),
-]
+# Master run set: (model_id, family, display), sourced from the single config in
+# experiments.models_config (run=True rows). Stage 1 resolves --model-idx by
+# matching model_id against build_context_length_dataset.MODELS (see _model_idx),
+# so order here is free. To add/drop a family end-to-end, flip its `run` flag in
+# models_config — every consumer (this orchestrator + v2/v3/v4, the v5 ablation,
+# the predictor-overhead summary) picks up the change.
+MODELS_TO_RUN: List[Tuple[str, str, str]] = models_config.models_to_run()
 
 DATASET_ROOT   = "logs/experiments/context_length_dataset"
 PREDICTOR_ROOT = "logs/experiments/context_length_predictor"

@@ -59,25 +59,16 @@ except ImportError:
 
 from experiments.predict_context_length import (
     PatchTSTContextLength, build_predictor)
+from experiments import models_config
 
 
 # ==============================================================================
 #  STATIC CONFIG
 # ==============================================================================
 
-MODELS = [
-    ("autogluon/chronos-2-small",       "chronos2",    "Chronos2-Small"),
-    ("autogluon/chronos-2-synth",      "chronos2",    "Chronos2-Synth"),
-    ("Salesforce/moirai-2.0-R-small",   "moirai",      "Moirai2-Small"),
-    ("google/timesfm-2.5-200m-pytorch", "timesfm",     "TimesFM2.5-200M"),
-    ("ibm-research/patchtst-fm-r1",     "patchtst_fm", "PatchTST-FM-R1"),
-    ("thuml/sundial-base-128m",         "sundial",     "Sundial-Base-128M"),
-    ("Maple728/TimeMoE-200M",           "timemoe",     "TimeMoE-200M"),
-    ("amazon/chronos-bolt-base",        "chronos_bolt","ChronosBolt-Base"),
-    ("Datadog/Toto-2.0-313m",           "toto",        "Toto-2.0-313m"),
-    ("ibm-granite/granite-timeseries-flowstate-r1", "flowstate", "FlowState-R1"),
-    ("NX-AI/TiRex",                     "tirex",       "TiRex"),
-]
+# Run set (model_id, family, display) from the single config in
+# experiments.models_config. To add/drop a model here, flip its `run` flag there.
+MODELS = models_config.models_to_run()
 
 DATASETS = [
     ("jena_weather/10T",            "short",  "JenaWeather-10T", True),

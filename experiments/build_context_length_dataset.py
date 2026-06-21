@@ -72,6 +72,8 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 load_dotenv()
 
+from experiments import models_config
+
 
 # ==============================================================================
 #  CONFIGURATION
@@ -149,35 +151,11 @@ SPIKE_STD        = 3.0       # spike amplitude std (post-standardization scale)
 DEVICES = None               # None -> all visible CUDA devices (or CPU)
 
 # -- Models  (model_id, family, display_name) ---------------------------------
-MODELS = [
-    ("autogluon/chronos-2-small",       "chronos2",     "Chronos2-Small"),
-    ("amazon/chronos-bolt-small",       "chronos_bolt", "ChronosBolt-Small"),
-    ("Salesforce/moirai-2.0-R-small",   "moirai",       "Moirai2-Small"),
-    ("google/timesfm-2.5-200m-pytorch", "timesfm",      "TimesFM2.5-200M"),
-    ("ibm-research/patchtst-fm-r1",     "patchtst_fm",  "PatchTST-FM-R1"),
-    ("thuml/sundial-base-128m",         "sundial",      "Sundial-Base-128M"),
-    ("Maple728/TimeMoE-200M",           "timemoe",      "TimeMoE-200M"),
-    # Distinct checkpoint, same chronos2 architecture/loader (load_chronos2) —
-    # only the weights differ. Appended (not inserted) so existing --model-idx
-    # positions stay stable for direct CLI use.
-    ("autogluon/chronos-2-synth",       "chronos2",     "Chronos2-Synth"),
-    # Same chronos_bolt loader as ChronosBolt-Small, just the larger checkpoint.
-    # Appended (not inserted) to preserve existing --model-idx positions.
-    ("amazon/chronos-bolt-base",        "chronos_bolt", "ChronosBolt-Base"),
-    # Datadog Toto 2.0 — probabilistic decoder TSFM. 2.0 uses a new module
-    # (`toto2.Toto2Model`) with a quantile output head (not the 1.0 sample-based
-    # `TotoForecaster`). 313m is the size tier closest to the other Small/200M
-    # models here. Needs the `toto2` package importable in the active env.
-    ("Datadog/Toto-2.0-313m",           "toto",         "Toto-2.0-313m"),
-    # IBM Granite FlowState — SSM-encoder + functional-basis-decoder TSFM (<10M
-    # params, quantile output). Loaded via tsfm_public (same package as
-    # PatchTST-FM); load_flowstate pins revision r1.1 (the GIFT-Eval checkpoint).
-    ("ibm-granite/granite-timeseries-flowstate-r1", "flowstate", "FlowState-R1"),
-    # NX-AI TiRex — xLSTM-based zero-shot TSFM (~35M params, quantile output).
-    # Recurrent/linear-cost like FlowState, so it's variable-length (genuine-only
-    # suffix, no NaN-pad). Loaded via the `tirex` package (pip install tirex-ts).
-    ("NX-AI/TiRex",                     "tirex",        "TiRex"),
-]
+# Full loader catalog, indexed by --model-idx. Defined in experiments.models_config
+# (single source of truth); see the per-model loader/predict wrappers below for the
+# family-specific gotchas (Toto's toto2 module, FlowState's r1.1 pin, TiRex's
+# genuine-only handling, etc.). APPEND-ONLY there — --model-idx positions are stable.
+MODELS = models_config.catalog()
 
 # -- Quantile bookkeeping (per model family) ----------------------------------
 MOIRAI2_MEDIAN_IDX              = 4
