@@ -57,32 +57,21 @@ from experiments.compare_window_strategies_gifteval import (
     _n_patches,
     theoretical_flops,
 )
+from experiments import models_config
 
 # Grid top from build_context_length_dataset.WINDOW_GRID (the largest context any
 # TSFM is ever asked for); each family's full_window is capped by arch.max_window.
 GRID_MAX_WINDOW = 8192
 
-# Labeled models, mirroring build_context_length_dataset.MODELS as (display, family).
-# Each labeling model trains its OWN predictor (independent random search), whose
-# best_config.json lives at <predictor_root>/<display>/best_config.json — keyed on
-# the *display* name (the dataset-dir basename used as run_label). So the predictor
-# architecture (and hence its GMAC) differs per model; we load each one separately.
-# The display string is also passed to theoretical_flops, whose infer_model_family
-# keys on substrings of it.
-MODELS: List[tuple] = [
-    ("Chronos2-Small",    "chronos2"),
-    ("Chronos2-Synth",    "chronos2"),
-    ("ChronosBolt-Small", "chronos_bolt"),
-    ("ChronosBolt-Base",  "chronos_bolt"),
-    ("Moirai2-Small",     "moirai"),
-    ("TimesFM2.5-200M",   "timesfm"),
-    ("PatchTST-FM-R1",    "patchtst_fm"),
-    ("Sundial-Base-128M", "sundial"),
-    ("TimeMoE-200M",      "timemoe"),
-    ("Toto-2.0-313m",     "toto"),
-    ("FlowState-R1",      "flowstate"),
-    ("TiRex",             "tirex"),
-]
+# Labeled models as (display, family), from the single config in
+# experiments.models_config (run set only — a model needs a trained predictor to
+# have an overhead to report). Each labeling model trains its OWN predictor
+# (independent random search), whose best_config.json lives at
+# <predictor_root>/<display>/best_config.json — keyed on the *display* name (the
+# dataset-dir basename used as run_label). So the predictor architecture (and hence
+# its GMAC) differs per model; we load each one separately. The display string is
+# also passed to theoretical_flops, whose infer_model_family keys on substrings.
+MODELS: List[tuple] = models_config.run_pairs()
 
 # Fallback predictor architecture if best_config.json is not reachable locally.
 # Mirrors a mid-range pick from HP_SPACE (predict_context_length.py); override
