@@ -77,6 +77,10 @@ PREDICTOR_ROOT_V4   = "logs/experiments/context_length_predictor_v4"
 ABLATION_GENERAL_V4 = os.path.join(ra.ABLATION_ROOT, "general_v4")
 STRATEGY_SUBDIR_V4  = "strategy_comparison_v4"
 
+# Match v3's short search: the Mamba predictor is cheap enough that 20 trials are
+# plenty, and it keeps stage-2 wall-clock comparable across the v3/v4 variants.
+N_TRIALS_V4_DEFAULT = 20
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -91,9 +95,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--force", nargs="*", default=None, choices=list(ra.STAGES),
                    help="Force re-run of cached stages (e.g. --force 2), or --force "
                         "with no arg to force every active stage.")
-    p.add_argument("--n-trials", type=int, default=None,
-                   help="Mamba random-search trial count (default: the "
-                        "predict_context_length.py N_TRIALS, currently 60).")
+    p.add_argument("--n-trials", type=int, default=N_TRIALS_V4_DEFAULT,
+                   help=f"Mamba random-search trial count (default {N_TRIALS_V4_DEFAULT}, "
+                        "matching v3; override to widen/shorten the search).")
     p.add_argument("--cheap", action="store_true",
                    help="Also pin the constrained Mamba corner "
                         "(PREDICTCSL_CHEAP_PREDICTOR=1): narrow d_model, shallow, "
@@ -116,8 +120,7 @@ def main() -> None:
     os.environ["PREDICTCSL_PREDICTOR_ARCH"] = "mamba"
     if args.cheap:
         os.environ["PREDICTCSL_CHEAP_PREDICTOR"] = "1"
-    if args.n_trials is not None:
-        os.environ["PREDICTCSL_N_TRIALS"] = str(args.n_trials)
+    os.environ["PREDICTCSL_N_TRIALS"] = str(args.n_trials)
     # Stage 2 + stage 3 both resolve the predictor root from this env var.
     os.environ["PREDICTCSL_PREDICTOR_ROOT"] = PREDICTOR_ROOT_V4
 
@@ -158,8 +161,7 @@ def main() -> None:
     print(Fore.CYAN + f"[v4] Active stages: {sorted(active)}" + Fore.RESET)
     print(Fore.CYAN + "[v4] Predictor arch: mamba (bidirectional, O(N))"
           + ("  + cheap corner" if args.cheap else "") + Fore.RESET)
-    if args.n_trials is not None:
-        print(Fore.CYAN + f"[v4] Trials: {args.n_trials}" + Fore.RESET)
+    print(Fore.CYAN + f"[v4] Trials: {args.n_trials}" + Fore.RESET)
     print(Fore.CYAN + f"[v4] Predictor root: {PREDICTOR_ROOT_V4}" + Fore.RESET)
     print(Fore.CYAN + f"[v4] Ablation run dir: {ABLATION_GENERAL_V4}" + Fore.RESET)
     print(Fore.YELLOW + "[v4] Requires mamba-ssm + causal-conv1d on the GPU server."

@@ -1578,8 +1578,29 @@ def main() -> None:
               + f"{int(chosen['trial_idx']):03d}  ({sk}={chosen.get(sk):.4f}  "
               + f"win_acc={chosen.get('val_win_acc'):.3f})" + Fore.RESET)
     else:
-        print(Fore.YELLOW + "  No valid fresh trials — no checkpoint persisted."
-              + Fore.RESET)
+        # Every trial failed (no checkpoint to select), so no best_model.pt /
+        # best_config.json was written. Exiting 0 here would let run_all proceed
+        # to stage 3, which then dies with a confusing FileNotFoundError on the
+        # missing best_config.json. Fail FAST and LOUD instead, pointing at the
+        # most common cause for the mamba arch: mamba-ssm not importable in the
+        # active env (e.g. running run_all_v4 from a non-mamba env).
+        n_total = len(all_results)
+        n_failed = sum(1 for r in all_results if r.get("failed"))
+        reasons = sorted({str(r.get("skip_reason")) for r in all_results
+                          if r.get("failed")})
+        hint = ""
+        if ARCH == "mamba":
+            hint = ("\n  Most likely cause: mamba-ssm / causal-conv1d not "
+                    "importable in the ACTIVE env. Install them (pip install "
+                    "mamba-ssm causal-conv1d) and re-run — failed trials are "
+                    "cached as NaN, so they retry automatically (no --force "
+                    "needed).")
+        raise SystemExit(
+            Fore.RED
+            + f"  No valid trials with checkpoints ({n_failed}/{n_total} failed; "
+            + f"reasons={reasons}). Nothing persisted — best_config.json was NOT "
+            + f"written for run_label={run_label!r}.{hint}"
+            + Fore.RESET)
 
     # NOTE: per-trial best-weights (trials/trial_NNN_best.pt) are intentionally
     # kept, not deleted — they are the resume cache that lets a later run
