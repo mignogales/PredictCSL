@@ -1371,6 +1371,35 @@ def plot_real_vs_predicted_curve(
 #  RUN
 # ==============================================================================
 
+def load_handle(model_family: str, model_id: str, device: str):
+    """Load the base model for a family, or None for families that need no
+    persistent handle (timesfm recompiles per-cell; context_parroting is
+    parameter-free). Single source of truth for the per-family load dispatch,
+    shared by the ablation's lazy `ensure_handle` and the robust-timing stage."""
+    if model_family == "chronos_bolt":
+        return load_chronos_bolt(model_id, device)
+    if model_family == "chronos2":
+        return load_chronos2(model_id, device)
+    if model_family == "moirai":
+        return load_moirai_module(model_id)
+    if model_family == "moirai_1_1":
+        return load_moirai_1_1_module(model_id)
+    if model_family == "patchtst_fm":
+        return load_patchtst_fm(model_id, device)
+    if model_family == "sundial":
+        return load_sundial(model_id, device)
+    if model_family == "timemoe":
+        return load_timemoe(model_id, device)
+    if model_family == "toto":
+        return load_toto(model_id, device)
+    if model_family == "flowstate":
+        return load_flowstate(model_id, device)
+    if model_family == "tirex":
+        return load_tirex(model_id, device)
+    # timesfm (recompiled per-cell in _forecast_cell) + context_parroting need none.
+    return None
+
+
 def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
                    device, batch_size):
     """Run one model family on a uniform-width set of batches.
@@ -1419,6 +1448,53 @@ def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
     if model_family == "tirex":
         return predict_tirex(handle, batches, horizon, device)
     raise ValueError(f"Unknown model family: {model_family}")
+
+
+def build_forward(model_family, handle, model_id, batches, width, horizon,
+                  device, batch_size):
+    """Do all per-window SETUP now (weight load / compile / forecaster build) and
+    return a zero-arg ``forward()`` that runs ONLY the forward pass over ``batches``.
+
+    Separating setup from the forward lets a benchmark time the inference itself
+    rather than re-paying timesfm's reload+compile or moirai's wrapper build on
+    every repeat. For families whose ``_forecast_cell`` is already a pure forward
+    over a persistent handle, ``forward()`` is just that call. Returns
+    ``(forward, teardown)``; call ``teardown()`` once after the repeats to free any
+    model built here (no-op for persistent-handle families)."""
+    def _noop():
+        pass
+
+    if model_family == "moirai":
+        m = build_moirai_forecast(handle, horizon, width, device)
+
+        def _td():
+            del m
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        return (lambda: predict_moirai(m, batches, horizon, device)), _td
+
+    if model_family == "moirai_1_1":
+        m = build_moirai_1_1_forecast(handle, horizon, width, device)
+
+        def _td():
+            del m
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        return (lambda: predict_moirai_1_1(m, batches, horizon, device)), _td
+
+    if model_family == "timesfm":
+        tfm = load_timesfm(model_id, width, horizon, batch_size)
+
+        def _td():
+            del tfm
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        return (lambda: predict_timesfm(tfm, batches, horizon, device)), _td
+
+    # Persistent-handle families (+ context_parroting): _forecast_cell is already a
+    # pure forward, so no separate setup is needed.
+    return (lambda: _forecast_cell(model_family, handle, model_id, batches,
+                                   width, horizon, device, batch_size)), _noop
 
 
 def _merge_grouped(results, n_total, horizon, device):
@@ -1658,26 +1734,7 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
 
         def ensure_handle():
             if _handle[0] is None:
-                if model_family == "chronos_bolt":
-                    _handle[0] = load_chronos_bolt(model_id, device)
-                elif model_family == "chronos2":
-                    _handle[0] = load_chronos2(model_id, device)
-                elif model_family == "moirai":
-                    _handle[0] = load_moirai_module(model_id)
-                elif model_family == "moirai_1_1":
-                    _handle[0] = load_moirai_1_1_module(model_id)
-                elif model_family == "patchtst_fm":
-                    _handle[0] = load_patchtst_fm(model_id, device)
-                elif model_family == "sundial":
-                    _handle[0] = load_sundial(model_id, device)
-                elif model_family == "timemoe":
-                    _handle[0] = load_timemoe(model_id, device)
-                elif model_family == "toto":
-                    _handle[0] = load_toto(model_id, device)
-                elif model_family == "flowstate":
-                    _handle[0] = load_flowstate(model_id, device)
-                elif model_family == "tirex":
-                    _handle[0] = load_tirex(model_id, device)
+                _handle[0] = load_handle(model_family, model_id, device)
             return _handle[0]
 
         for d_idx, (ge_name, term, dataset_display, to_univariate) in enumerate(datasets):
@@ -1750,8 +1807,11 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     continue
 
                 print(Fore.YELLOW + f"\n  > {tag}" + Fore.RESET)
-                t_start = time.perf_counter()
 
+                # Batch building (CPU->GPU copy, pinning, width-grouping) happens
+                # OUTSIDE the timer: elapsed_seconds must capture pure forward-pass
+                # cost so it lines up with the forward-only theoretical-FLOPs proxy
+                # in the strategy comparison.
                 try:
                     if short_mode == "pad":
                         groups = cache.build_batches_padded(
@@ -1763,10 +1823,20 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 except RuntimeError as exc:
                     print(Fore.RED + f"    SKIP: {exc}" + Fore.RESET); continue
 
+                # cuda.synchronize() brackets the timer so it measures completed GPU
+                # work, not just enqueued kernel launches (forecast calls launch
+                # async). No-op on CPU. Syncing right before t_start also drains any
+                # outstanding work from the batch build so it can't leak in.
+                def _sync():
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+
                 if short_mode == "pad":
                     # Run each width-group (its own moirai/timesfm runner), then
                     # stitch back into one instance-ordered result over ALL n_total.
                     results = []
+                    _sync()
+                    t_start = time.perf_counter()
                     for L, batches_L, _ax, _ay, idx_L in groups:
                         fr_L, tgts_L = _forecast_cell(
                             model_family, ensure_handle(), model_id, batches_L,
@@ -1774,7 +1844,11 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                         results.append((idx_L, fr_L, tgts_L))
                     n_valid = cache.n_total
                     fr, tgts = _merge_grouped(results, n_valid, horizon, device)
+                    _sync()
+                    elapsed = time.perf_counter() - t_start
                     # Uniform-width (NaN-left-padded) inputs, for plotting only.
+                    # Built AFTER the timer stops — pure CPU plotting prep, not
+                    # inference.
                     all_x_np = np.full((n_valid, window_size, 1), np.nan, dtype=np.float32)
                     for L, _b, ax_L, _ay, idx_L in groups:
                         all_x_np[idx_L, -int(L):, :] = ax_L.numpy()
@@ -1784,11 +1858,13 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 else:
                     n_valid = all_x_cpu.shape[0]
                     print(f"    Samples: {n_valid}  Batches: {len(batches)}  W={window_size}  H={horizon}")
+                    _sync()
+                    t_start = time.perf_counter()
                     fr, tgts = _forecast_cell(
                         model_family, ensure_handle(), model_id, batches,
                         window_size, horizon, device, args.batch_size)
-
-                elapsed = time.perf_counter() - t_start
+                    _sync()
+                    elapsed = time.perf_counter() - t_start
 
                 metrics = compute_all_metrics(fr, tgts, cache.naive_seasonal_mae_train)
                 metrics["elapsed_seconds"] = round(elapsed, 3)

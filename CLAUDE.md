@@ -80,7 +80,11 @@ predictor-derived, so no TSFM re-inference):
    post-processing (no inference): compares MASE + wall-clock + theoretical
    FLOPs across strategies: `full_window` (max context), `best_window` (oracle
    argmin), `pred_window` (predictor zero-shot). Emits CSVs, summary stats, and
-   many plots.
+   many plots. The wall-clock ("clock-wise") path (Stage 6 / `*_time` outputs)
+   defaults to the **robust** forward-pass timing (`timing.json` mean ± std from
+   the timing stage below), falling back per-cell to the single-shot
+   `elapsed_seconds` and drawing std error bars when available
+   (`--use-robust-timing` / `--no-use-robust-timing`).
 
 **Extras / v2 path:**
 - **`period_window_eval.py`** — a 4th strategy: pick `L_i = max(2×strongest_period,
@@ -90,6 +94,29 @@ predictor-derived, so no TSFM re-inference):
   stage, re-runs the comparison.
 - **`predict_period.py`** — the original period-regression Patch-Transformer that
   `predict_context_length.py` is modeled on.
+
+**Robust timing stage (run_all_5 path):**
+- **`benchmark_window_timing_gifteval.py`** — *robust wall-clock timing*. Reads
+  each model's `comparison.csv`, collects the on-grid windows the strategies
+  actually use (`full`/`best`/`pred`/variant `*_window`; period is off-grid so it
+  keeps its single-shot timing), and times each one with `--warmup` discarded +
+  `--repeats` timed forward passes, every pass `cuda.synchronize()`-bracketed and
+  batch-build excluded. Writes `timing.json` (mean/std/min/median/cv) into the
+  same per-cell dir as `metrics.json` — and because v3/v4 symlink their
+  `datasets/`, the predictor-independent TSFM timing is measured once on
+  `general/` and reused everywhere. Multi-GPU dataset-sharding like the ablation;
+  resumes per cell.
+- **`run_all_5.py`** — reuses stages 1–4 from `run_all.py`, adds the timing stage,
+  then re-runs the comparison with `--use-robust-timing` so the wall-clock figures
+  use mean ± std.
+
+**Master orchestrator:**
+- **`master_run_all.py`** — fuses *every* `run_all*` variant into one run while
+  running each shared stage **exactly once**: Stage 1 up front, then each variant
+  as a subprocess with an explicit `--skip-stages` set, then
+  `rollup_all_predictors`. A `VARIANTS` registry is the single source of truth —
+  **add any new `run_all_*` there (with the stages it should skip) so master
+  stays the fuse-everything entry point and never recomputes a shared stage.**
 
 ## Models labeled (the TSFMs under study)
 
@@ -124,5 +151,10 @@ python -m experiments.run_all_v2                 # + the 2×period strategy
 python -m experiments.run_all_v3                 # constrained (cheap) PatchTST predictor
 python -m experiments.run_all_v4                 # Mamba predictor (needs mamba-ssm)
 python -m experiments.run_all_v4 --cheap         # + pin the cheap Mamba corner
+python -m experiments.run_all_5                   # + robust wall-clock timing stage
+python -m experiments.run_all_5 --repeats 10 --warmup 3
+python -m experiments.master_run_all              # fuse ALL variants, no repeated stages
+python -m experiments.master_run_all --only-variants v1 v5
 ```
 Stage 1 alone: `python -m experiments.build_context_length_dataset --model-idx <i>`.
+Timing stage alone: `python -m experiments.benchmark_window_timing_gifteval --run-dir logs/experiments/window_ablation_gifteval/general`.

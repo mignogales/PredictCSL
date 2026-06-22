@@ -380,6 +380,59 @@ def _load_elapsed(
         return float("nan")
 
 
+# When True (default), prefer the robust forward-pass timing produced by
+# benchmark_window_timing_gifteval.py (mean over warmed-up repeats, in timing.json)
+# over the single-shot elapsed_seconds, falling back per-cell when no timing.json
+# exists. Toggled by --use-robust-timing / --no-use-robust-timing in main().
+USE_ROBUST_TIMING = True
+
+
+def _load_robust_elapsed(
+    cache_root: str,
+    dataset_display: str,
+    model_short: str,
+    term: str,
+    window_size: int,
+) -> Tuple[float, float]:
+    """Return (mean_s, std_s) from the per-cell timing.json, or (NaN, NaN) when
+    no robust timing has been recorded for this cell."""
+    path = os.path.join(
+        _cache_dir(cache_root, dataset_display, model_short, term, window_size),
+        "timing.json",
+    )
+    if not os.path.isfile(path):
+        return float("nan"), float("nan")
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        mean = d.get("mean_s")
+        std = d.get("std_s")
+        return (
+            float(mean) if mean is not None else float("nan"),
+            float(std) if std is not None else float("nan"),
+        )
+    except Exception:
+        return float("nan"), float("nan")
+
+
+def _elapsed_and_std(
+    cache_root: str,
+    dataset_display: str,
+    model_short: str,
+    term: str,
+    window_size: int,
+) -> Tuple[float, float]:
+    """Elapsed seconds + std for one cell. Uses the robust timing.json mean/std
+    when enabled and present; otherwise the single-shot elapsed_seconds (std NaN).
+    Per-cell fallback keeps the comparison working before the timing stage has run."""
+    if USE_ROBUST_TIMING:
+        mean, std = _load_robust_elapsed(
+            cache_root, dataset_display, model_short, term, window_size)
+        if not math.isnan(mean):
+            return mean, std
+    return _load_elapsed(cache_root, dataset_display, model_short, term, window_size), float("nan")
+
+
 # ==============================================================================
 #  RUN DISCOVERY
 # ==============================================================================
@@ -571,10 +624,13 @@ def load_strategy_records(
             best_mase = float(real_curve[best_idx])
             pred_mase = float(real_curve[pred_idx])
 
-            # --- Elapsed time (from per-window metrics.json) ---------------------
-            full_elapsed = _load_elapsed(cache_root, dataset_display, model_short, term, full_w)
-            best_elapsed = _load_elapsed(cache_root, dataset_display, model_short, term, best_w)
-            pred_elapsed = _load_elapsed(cache_root, dataset_display, model_short, term, pred_w)
+            # --- Elapsed time (robust timing.json mean, else single-shot) --------
+            full_elapsed, full_elapsed_std = _elapsed_and_std(
+                cache_root, dataset_display, model_short, term, full_w)
+            best_elapsed, best_elapsed_std = _elapsed_and_std(
+                cache_root, dataset_display, model_short, term, best_w)
+            pred_elapsed, pred_elapsed_std = _elapsed_and_std(
+                cache_root, dataset_display, model_short, term, pred_w)
 
             # Speedup: how much faster than full window (>1 = faster)
             speedup_pred = (
@@ -631,6 +687,7 @@ def load_strategy_records(
                     vtree, dataset_display, term, model_short, window_grid)
                 if vpred is None:
                     var_w = var_mase = var_elapsed = float("nan")
+                    var_elapsed_std = float("nan")
                     var_flops = float("nan")
                     var_clamped = False
                     speedup_var = float("nan")
@@ -642,7 +699,7 @@ def load_strategy_records(
                         var_idx = full_idx  # window unavailable -> fall back to full
                     var_w     = int(window_grid[var_idx])
                     var_mase  = float(real_curve[var_idx])
-                    var_elapsed = _load_elapsed(
+                    var_elapsed, var_elapsed_std = _elapsed_and_std(
                         cache_root, dataset_display, model_short, term, var_w)
                     var_flops = theoretical_flops(model, var_w, horizon, patch_sizes)
                     speedup_var = (
@@ -663,6 +720,7 @@ def load_strategy_records(
                         (full_mase - var_mase) / (abs(full_mase) + 1e-12)
                     ),
                     f"{vkey}_elapsed_s": var_elapsed,
+                    f"{vkey}_elapsed_std_s": var_elapsed_std,
                     f"speedup_{vkey}_vs_full": speedup_var,
                     f"{vkey}_flops":    var_flops,
                     f"complexity_ratio_{vkey}_vs_full": var_complexity,
@@ -694,10 +752,14 @@ def load_strategy_records(
             "rel_gain_pred_over_full": (
                 (full_mase - pred_mase) / (abs(full_mase) + 1e-12)
             ),
-            # elapsed wall-clock time (seconds; NaN if not cached)
+            # elapsed wall-clock time (seconds; NaN if not cached). *_elapsed_std_s
+            # is the std across robust-timing repeats (NaN for single-shot timing).
             "full_elapsed_s":  full_elapsed,
             "best_elapsed_s":  best_elapsed,
             "pred_elapsed_s":  pred_elapsed,
+            "full_elapsed_std_s": full_elapsed_std,
+            "best_elapsed_std_s": best_elapsed_std,
+            "pred_elapsed_std_s": pred_elapsed_std,
             "speedup_pred_vs_full": speedup_pred,
             "speedup_best_vs_full": speedup_best,
             # theoretical complexity (unnormalized FLOPs proxy)
@@ -718,6 +780,7 @@ def load_strategy_records(
                 (full_mase - period_mase) / (abs(full_mase) + 1e-12)
             ),
             "period_elapsed_s": period_elapsed,
+            "period_elapsed_std_s": float("nan"),  # off-grid; single-shot only
             "speedup_period_vs_full": speedup_period,
             "period_flops":    period_flops,
             "complexity_ratio_period_vs_full": (
@@ -747,6 +810,15 @@ def load_strategy_records(
 def _geomean(vals: np.ndarray) -> float:
     """Geometric mean: exp(mean(log(x))). Clips to 1e-9 to guard against log(0)."""
     return float(np.exp(np.log(np.clip(vals, 1e-9, None)).mean()))
+
+
+def _quadrature(vals: np.ndarray) -> float:
+    """sqrt(sum of squares), ignoring NaNs — std of a sum of independent terms.
+    Returns NaN when every entry is NaN (no robust timing recorded)."""
+    arr = np.asarray(vals, dtype=np.float64)
+    if np.all(np.isnan(arr)):
+        return float("nan")
+    return float(np.sqrt(np.nansum(arr ** 2)))
 
 
 def _wgeomean(vals: np.ndarray, weights: np.ndarray) -> float:
@@ -1098,6 +1170,15 @@ def compute_time_savings(df: pd.DataFrame) -> pd.DataFrame:
         full_t  = float(sub["full_elapsed_s"].values.sum())
         strat_t = float(sub[time_col].values.sum())
         saved   = full_t - strat_t
+        # Per-cell robust-timing std (NaN for single-shot cells). The benchmark
+        # total's std is the quadrature sum (independent timings); use it for the
+        # error bar on the strategy time / time-saved axis.
+        std_col = time_col.replace("_elapsed_s", "_elapsed_std_s")
+        strat_std = _quadrature(sub[std_col].values) if std_col in sub.columns else float("nan")
+        full_std  = _quadrature(sub["full_elapsed_std_s"].values) \
+            if "full_elapsed_std_s" in sub.columns else float("nan")
+        saved_std = float(np.sqrt(np.nansum([strat_std ** 2, full_std ** 2]))) \
+            if not (math.isnan(strat_std) and math.isnan(full_std)) else float("nan")
         gm_full_mase  = _geomean(sub["full_mase"].values)
         gm_strat_mase = _geomean(sub[mase_col].values)
         rows.append({
@@ -1106,9 +1187,14 @@ def compute_time_savings(df: pd.DataFrame) -> pd.DataFrame:
             "total_instances":       int(sub["n_instances"].sum()),
             "total_full_time_s":     full_t,
             "total_strategy_time_s": strat_t,
+            "total_strategy_time_std_s": strat_std,
             "time_saved_s":          saved,
+            "time_saved_std_s":      saved_std,
             "time_ratio":            strat_t / full_t if full_t > 0 else float("nan"),
             "pct_time_saved":        saved / full_t if full_t > 0 else float("nan"),
+            "pct_time_saved_std":    (strat_std / full_t
+                                      if full_t > 0 and not math.isnan(strat_std)
+                                      else float("nan")),
             "geomean_full_mase":     gm_full_mase,
             "geomean_strategy_mase": gm_strat_mase,
             "mase_drop_vs_full":     gm_full_mase - gm_strat_mase,  # >0 = better
@@ -1159,6 +1245,9 @@ def write_run_time_rollup(df: pd.DataFrame, out_dir: str,
         ratios  = grp["time_ratio"].dropna().values
         pct_sav = grp["pct_time_saved"].dropna().values
         abs_sav = grp["time_saved_s"].dropna().values
+        # Pooled robust-timing std across models (quadrature of per-model totals).
+        tot_strat_std = (_quadrature(grp["total_strategy_time_std_s"].values)
+                         if "total_strategy_time_std_s" in grp.columns else float("nan"))
         w_rows   = grp["n_rows"].values.astype(float)
         gm_full  = _wgeomean(grp["geomean_full_mase"].values,     w_rows)
         gm_strat = _wgeomean(grp["geomean_strategy_mase"].values, w_rows)
@@ -1169,9 +1258,13 @@ def write_run_time_rollup(df: pd.DataFrame, out_dir: str,
             "total_instances":       int(inst),
             "total_full_time_s":     tot_full,
             "total_strategy_time_s": tot_strat,
+            "total_strategy_time_std_s": tot_strat_std,
             "time_saved_s":          tot_full - tot_strat,
             "time_ratio":            tot_strat / tot_full if tot_full > 0 else float("nan"),
             "pct_time_saved":        (tot_full - tot_strat) / tot_full if tot_full > 0 else float("nan"),
+            "pct_time_saved_std":    (tot_strat_std / tot_full
+                                      if tot_full > 0 and not math.isnan(tot_strat_std)
+                                      else float("nan")),
             "time_ratio_amean":      float(ratios.mean()) if ratios.size else float("nan"),
             "time_ratio_gmean":      _geomean(ratios) if ratios.size else float("nan"),
             "pct_time_saved_amean":  float(pct_sav.mean()) if pct_sav.size else float("nan"),
@@ -2271,13 +2364,22 @@ def plot_model_strategy_overview_time(rollup: pd.DataFrame, out_dir: str,
             ax.plot(sub["pct_time_saved"] * 100.0, sub["rel_mase_drop_pct"],
                     color="gray", lw=0.8, alpha=0.30, zorder=1)
 
-    # Markers: colour = strategy, shape = model.
+    # Markers: colour = strategy, shape = model. When robust-timing std is
+    # available (pct_time_saved_std), draw it as a horizontal error bar on the
+    # time-saved axis — the MASE (y) axis has no timing uncertainty.
+    has_xerr = "pct_time_saved_std" in r.columns
     for strat in strat_order:
         _, color = _STRATEGY_STYLE[strat]
         sub = r[r["strategy"] == strat]
         for _, row in sub.iterrows():
-            ax.scatter(row["pct_time_saved"] * 100.0, row["rel_mase_drop_pct"],
-                       marker=marker_of[row["model_short"]], s=170, c=color,
+            x = row["pct_time_saved"] * 100.0
+            y = row["rel_mase_drop_pct"]
+            if has_xerr:
+                xerr = row["pct_time_saved_std"]
+                if pd.notna(xerr) and xerr > 0:
+                    ax.errorbar(x, y, xerr=xerr * 100.0, fmt="none", ecolor=color,
+                                elinewidth=1.0, capsize=3, alpha=0.55, zorder=2)
+            ax.scatter(x, y, marker=marker_of[row["model_short"]], s=170, c=color,
                        edgecolors="white", linewidths=0.8, alpha=0.92, zorder=3)
 
     # Quadrant captions.
@@ -2466,6 +2568,14 @@ def parse_args() -> argparse.Namespace:
              "and console totals are unaffected. E.g. --plot-strategies pred best.",
     )
     p.add_argument(
+        "--use-robust-timing", action=argparse.BooleanOptionalAction, default=True,
+        help="Prefer the robust forward-pass timing (timing.json mean/std from "
+             "benchmark_window_timing_gifteval) over single-shot elapsed_seconds, "
+             "falling back per-cell when absent. Adds *_elapsed_std_s columns and "
+             "error bars to the time overview. Use --no-use-robust-timing to force "
+             "single-shot timing.",
+    )
+    p.add_argument(
         "--rollup-only", action="store_true",
         help="Skip the per-model outputs and emit only the cross-model overview "
              "figure + flops_savings_all_models.csv (covering every model in the "
@@ -2476,6 +2586,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    global USE_ROBUST_TIMING
+    USE_ROBUST_TIMING = args.use_robust_timing
+    print(Fore.CYAN
+          + f"Timing source: {'robust (timing.json mean/std, single-shot fallback)' if USE_ROBUST_TIMING else 'single-shot elapsed_seconds'}"
+          + Fore.RESET)
 
     patch_sizes = dict(DEFAULT_PATCH_SIZES)
     if args.patch_sizes:

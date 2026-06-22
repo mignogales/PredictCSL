@@ -1581,20 +1581,28 @@ def main() -> None:
         # Every trial failed (no checkpoint to select), so no best_model.pt /
         # best_config.json was written. Exiting 0 here would let run_all proceed
         # to stage 3, which then dies with a confusing FileNotFoundError on the
-        # missing best_config.json. Fail FAST and LOUD instead, pointing at the
-        # most common cause for the mamba arch: mamba-ssm not importable in the
-        # active env (e.g. running run_all_v4 from a non-mamba env).
+        # missing best_config.json. Fail FAST and LOUD instead, with a hint keyed
+        # on WHY the trials failed (skip_reason) rather than a fixed guess.
         n_total = len(all_results)
         n_failed = sum(1 for r in all_results if r.get("failed"))
         reasons = sorted({str(r.get("skip_reason")) for r in all_results
                           if r.get("failed")})
-        hint = ""
-        if ARCH == "mamba":
-            hint = ("\n  Most likely cause: mamba-ssm / causal-conv1d not "
-                    "importable in the ACTIVE env. Install them (pip install "
-                    "mamba-ssm causal-conv1d) and re-run — failed trials are "
-                    "cached as NaN, so they retry automatically (no --force "
-                    "needed).")
+        blob = " ".join(reasons).lower()
+        if "worker_setup_failed" in blob or "driver" in blob or "cuda" in blob:
+            hint = ("\n  Looks GPU/CUDA-related (worker setup failed). Check the "
+                    "stage log above for the exact error — common causes: the "
+                    "NVIDIA driver is too old for this torch build (torch falls "
+                    "back to CPU -> the mamba kernel can't run), or no visible "
+                    "CUDA device. Verify with `nvidia-smi` and "
+                    "`python -c \"import torch; print(torch.cuda.is_available())\"`.")
+        elif ARCH == "mamba" and ("import" in blob or "module" in blob):
+            hint = ("\n  Looks like mamba-ssm / causal-conv1d isn't importable in "
+                    "the ACTIVE env. Install them and re-run.")
+        else:
+            hint = ("\n  See the per-trial errors in the stage log above for the "
+                    "cause (e.g. OOM, bad config).")
+        hint += ("\n  Failed trials are cached as NaN, so they retry "
+                 "automatically on the next run (no --force needed).")
         raise SystemExit(
             Fore.RED
             + f"  No valid trials with checkpoints ({n_failed}/{n_total} failed; "
