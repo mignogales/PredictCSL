@@ -519,6 +519,7 @@ def load_strategy_records(
     run_dir: str,
     cache_root: str,
     patch_sizes: Dict[str, int],
+    mase_metric: str = "mase",
 ) -> pd.DataFrame:
     """
     For each row in compare_summary.csv, load the paired .npz and derive:
@@ -584,7 +585,20 @@ def load_strategy_records(
                 continue
 
             window_grid: np.ndarray = data["window_grid"]
-            real_curve: np.ndarray = data["real_curve"]      # raw MASE per window
+            # Which MASE drives the comparison: the project's `mase` (default) or
+            # the leaderboard-faithful `mase_gluonts`. Both curves are written by
+            # the ablation; fall back to `mase` if an older npz lacks the gluonts
+            # curve (or it's all-NaN).
+            if mase_metric == "mase_gluonts" and "real_curve_gluonts" in data.files \
+                    and np.any(~np.isnan(data["real_curve_gluonts"])):
+                real_curve = data["real_curve_gluonts"]      # raw gluonts MASE per window
+            else:
+                if mase_metric == "mase_gluonts":
+                    print(Fore.YELLOW
+                          + f"  {dataset_display} t={term} {model_short}: no "
+                            "real_curve_gluonts — falling back to `mase`. Re-run the "
+                            "ablation to populate it." + Fore.RESET)
+                real_curve = data["real_curve"]              # raw MASE per window
             pred_mean: np.ndarray = data["predicted_mean"]   # z-scored curve for argmin
 
             valid = ~np.isnan(real_curve)
@@ -2550,6 +2564,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--models", type=str, nargs="+", default=None,
                    help="Restrict comparison to these model_short names "
                         "(default: every model present in the run dir).")
+    p.add_argument("--mase-metric", choices=["mase", "mase_gluonts"], default="mase",
+                   help="Which MASE drives the strategy comparison + all flops/time "
+                        "savings outputs: the project's `mase` (default) or the "
+                        "leaderboard-faithful `mase_gluonts` (per-instance seasonal "
+                        "error). Use a distinct --output-dir for each to avoid "
+                        "overwriting (e.g. strategy_comparison_gluonts/).")
     p.add_argument("--output-dir", type=str, default=None,
                    help="Override output dir (default: models/<model>/strategy_comparison/). "
                         "Only safe with a single --models entry, else models clobber each other.")
@@ -2603,8 +2623,11 @@ def main() -> None:
     run_dir = args.run_dir or find_latest_run(args.cache_root)
     print(Fore.CYAN + f"Run directory: {run_dir}" + Fore.RESET)
 
+    print(Fore.CYAN + f"MASE metric: {args.mase_metric}" + Fore.RESET)
+
     # ---- Load all records ---------------------------------------------------
-    df = load_strategy_records(run_dir, args.cache_root, patch_sizes)
+    df = load_strategy_records(run_dir, args.cache_root, patch_sizes,
+                               mase_metric=args.mase_metric)
 
     if args.models:
         wanted = set(args.models)

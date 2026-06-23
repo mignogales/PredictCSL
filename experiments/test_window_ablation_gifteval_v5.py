@@ -52,6 +52,11 @@ load_dotenv()
 
 from gift_eval.data import Dataset as GiftEvalDataset
 
+# Leaderboard-faithful (gluonts) MASE primitives: per-instance seasonal error +
+# gluonts seasonality map. Used to compute the `mase_gluonts` metric alongside the
+# project's own `mase` (see compute_all_metrics).
+from experiments.gifteval_mase import get_seasonality, per_instance_seasonal_errors
+
 try:
     from tsfm_public import PatchTSTFMForPrediction
 except ImportError:
@@ -188,7 +193,7 @@ TIREX_MEDIAN_QUANTILE_IDX     = 4       # middle of the 9 quantiles (0.5)
 TIREX_MAX_CONTEXT             = 2048    # TiRex pretraining context (mirrors stage-1 cap)
 
 N_BEST_WORST = 10
-PLOT_METRICS = ["mae", "mse", "rmse", "mase", "smape", "crps"]
+PLOT_METRICS = ["mae", "mse", "rmse", "mase", "mase_gluonts", "smape", "crps"]
 CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
 CACHE_ROOT_PREDICTOR = "logs/experiments/context_length_predictor"
 
@@ -271,6 +276,16 @@ class GiftEvalCache:
         self.min_context: int = int(self.context_lengths.min())
         self.n_total: int = len(contexts)
         self.naive_seasonal_mae_train: float = self._compute_naive_mae_train()
+
+        # Leaderboard (gluonts) MASE ingredients: the seasonality lag from
+        # gluonts' map, and the per-instance seasonal error computed from each
+        # series' OWN context (mean(|x[m:]-x[:-m]|)). These feed the `mase_gluonts`
+        # metric, which — unlike `mase` (global MAE / one pooled training-set
+        # seasonal-naive MAE) — averages per-instance ratios, matching the HF
+        # GiftEval leaderboard. Cheap: one O(context) pass per series.
+        self.season_gluonts: int = get_seasonality(self.freq)
+        self.seasonal_errors_gluonts: np.ndarray = per_instance_seasonal_errors(
+            self.contexts, self.season_gluonts)
 
     def _compute_naive_mae_train(self) -> float:
         season = self.season
@@ -416,8 +431,11 @@ def compute_naive_seasonal_test_metrics(cache: GiftEvalCache) -> Dict[str, float
 
     preds = torch.from_numpy(preds_np)
     tgts = torch.from_numpy(cache.labels_np)
+    # Naive preds cover ALL instances in order, so the gluonts seasonal errors
+    # align 1:1 — pass them so the baseline has a mase_gluonts value too.
     return compute_all_metrics(
-        ForecastResult(median=preds), tgts, cache.naive_seasonal_mae_train
+        ForecastResult(median=preds), tgts, cache.naive_seasonal_mae_train,
+        seasonal_errors=cache.seasonal_errors_gluonts,
     )
 
 
@@ -480,6 +498,33 @@ def _save_per_sample_metrics(dataset_display, model_short, term, window_size, pe
     np.savez_compressed(os.path.join(d, "per_sample_metrics.npz"), **per_sample)
 
 
+def _backfill_mase_gluonts(dataset_display, model_short, term, window_size,
+                           cache: "GiftEvalCache", short_mode: str):
+    """Cheaply derive the cell's gluonts MASE from the cached per-instance MAE +
+    the data-derived seasonal errors (NO TSFM re-inference). Returns the float, or
+    None when the per-sample cache is missing / its instance set doesn't line up
+    (so the caller leaves the cell untouched)."""
+    path = os.path.join(_cache_dir(dataset_display, model_short, term, window_size),
+                        "per_sample_metrics.npz")
+    if not os.path.isfile(path):
+        return None
+    with np.load(path) as d:
+        if "mae" not in d:
+            return None
+        per_mae = np.asarray(d["mae"], dtype=np.float64)
+    # Reproduce the instance set/order stage 3 used for this cell: in skip mode
+    # only instances whose context >= window are served (ascending index order);
+    # in pad mode every instance is served (full 0..n-1 order).
+    if short_mode == "pad":
+        vi = np.arange(cache.n_total)
+    else:
+        vi = np.flatnonzero(cache.context_lengths >= window_size)
+    if vi.shape[0] != per_mae.shape[0]:
+        return None
+    se = cache.seasonal_errors_gluonts[vi]
+    return float(np.mean(per_mae / se))
+
+
 # ==============================================================================
 #  METRICS
 # ==============================================================================
@@ -506,6 +551,7 @@ def compute_all_metrics(
     forecast_result: ForecastResult,
     targets: torch.Tensor,
     naive_seasonal_mae: float = 1.0,
+    seasonal_errors: Optional[np.ndarray] = None,
 ) -> dict:
     pred = forecast_result.median
     y = targets
@@ -523,12 +569,18 @@ def compute_all_metrics(
 
     if n_valid == 0:
         return {k: float("nan") for k in
-                ["mae", "mse", "rmse", "mase", "smape", "mape", "nd", "nrmse", "crps"]}
+                ["mae", "mse", "rmse", "mase", "mase_gluonts",
+                 "smape", "mape", "nd", "nrmse", "crps"]}
 
     mae = float(abs_err[valid].mean().item())
     mse = float(sq_err[valid].mean().item())
     rmse = float(np.sqrt(mse))
     mase = mae / naive_seasonal_mae
+
+    # Leaderboard (gluonts) MASE: average of PER-INSTANCE ratios
+    # mean(|y-yhat|)_horizon / seasonal_error_instance. `seasonal_errors` must be
+    # aligned to the instances in this cell (one float per row of `pred`).
+    mase_gluonts = compute_mase_gluonts(abs_err, valid, seasonal_errors)
 
     denom_smape = (pred_safe.abs() + y_safe.abs()).clamp(min=1e-13)
     smape = float((2.0 * abs_err / denom_smape)[valid].mean().item())
@@ -544,14 +596,46 @@ def compute_all_metrics(
 
     return {
         "mae": mae, "mse": mse, "rmse": rmse, "mase": mase,
+        "mase_gluonts": mase_gluonts,
         "smape": smape, "mape": mape, "nd": nd, "nrmse": nrmse, "crps": crps,
     }
+
+
+def compute_mase_gluonts(
+    abs_err: torch.Tensor,
+    valid: torch.Tensor,
+    seasonal_errors: Optional[np.ndarray],
+) -> float:
+    """Leaderboard (gluonts) MASE aggregate from per-(instance, horizon) absolute
+    error and a per-instance seasonal error.
+
+    ``abs_err`` / ``valid`` are (N, H); ``seasonal_errors`` is length-N (one
+    seasonal error per instance, in the SAME row order as ``abs_err``). Returns
+    the mean over instances of ``mean_h(|y-yhat|) / seasonal_error`` (NaN when no
+    seasonal errors are supplied or no instance is usable)."""
+    if seasonal_errors is None:
+        return float("nan")
+    se = torch.as_tensor(
+        np.asarray(seasonal_errors, dtype=np.float64),
+        dtype=abs_err.dtype, device=abs_err.device,
+    )
+    if se.shape[0] != abs_err.shape[0]:
+        return float("nan")
+    vmask = valid.to(abs_err.dtype)
+    n_per = vmask.sum(dim=1)
+    inst_ok = n_per > 0
+    if not bool(inst_ok.any()):
+        return float("nan")
+    per_inst_mae = (abs_err * vmask).sum(dim=1) / n_per.clamp(min=1)
+    ratios = per_inst_mae[inst_ok] / se[inst_ok]
+    return float(ratios.mean().item())
 
 
 def compute_per_sample_metrics(
     forecast_result: ForecastResult,
     targets: torch.Tensor,
     naive_seasonal_mae: float = 1.0,
+    seasonal_errors: Optional[np.ndarray] = None,
 ) -> dict:
     pred = forecast_result.median
     y = targets
@@ -563,6 +647,10 @@ def compute_per_sample_metrics(
     per_rmse = np.sqrt(per_mse)
     per_mase = per_mae / naive_seasonal_mae
     out = {"mae": per_mae, "mse": per_mse, "rmse": per_rmse, "mase": per_mase}
+    if seasonal_errors is not None:
+        se = np.asarray(seasonal_errors, dtype=np.float64)
+        if se.shape[0] == per_mae.shape[0]:
+            out["mase_gluonts"] = per_mae / se
 
     if forecast_result.samples is not None:
         S = forecast_result.samples
@@ -1765,6 +1853,21 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
 
                 if _result_cached(dataset_display, model_short, term, window_size):
                     cached = _load_cached_result(dataset_display, model_short, term, window_size)
+                    # Backfill the gluonts MASE into pre-existing cells WITHOUT
+                    # re-inference: per-instance MAE is in the per_sample cache and
+                    # the seasonal error comes from the data. Lets a plain re-run of
+                    # the ablation populate `mase_gluonts` everywhere cheaply.
+                    if cached.get("mase_gluonts") is None or (
+                        isinstance(cached.get("mase_gluonts"), float)
+                        and np.isnan(cached["mase_gluonts"])
+                    ):
+                        mg = _backfill_mase_gluonts(
+                            dataset_display, model_short, term, window_size,
+                            cache, short_mode)
+                        if mg is not None:
+                            cached["mase_gluonts"] = mg
+                            _save_result(dataset_display, model_short, term,
+                                         window_size, cached)
                     print(Fore.WHITE + f"  CACHED  {tag}  -> MAE={cached['mae']:.6f}" + Fore.RESET)
                     all_results.append({
                         "model": model_id, "model_short": model_short, "model_family": model_family,
@@ -1818,7 +1921,7 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                             window_size, args.batch_size, device,
                             pin_memory=True, window_grid=window_sizes)
                     else:
-                        batches, all_x_cpu, all_y_cpu, _ = cache.build_batches(
+                        batches, all_x_cpu, all_y_cpu, valid_indices = cache.build_batches(
                             window_size, args.batch_size, device, pin_memory=True)
                 except RuntimeError as exc:
                     print(Fore.RED + f"    SKIP: {exc}" + Fore.RESET); continue
@@ -1844,6 +1947,9 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                         results.append((idx_L, fr_L, tgts_L))
                     n_valid = cache.n_total
                     fr, tgts = _merge_grouped(results, n_valid, horizon, device)
+                    # Pad mode serves every instance in 0..n-1 order (see
+                    # _merge_grouped), so the per-instance seasonal errors map 1:1.
+                    se_cell = cache.seasonal_errors_gluonts
                     _sync()
                     elapsed = time.perf_counter() - t_start
                     # Uniform-width (NaN-left-padded) inputs, for plotting only.
@@ -1865,8 +1971,13 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                         window_size, horizon, device, args.batch_size)
                     _sync()
                     elapsed = time.perf_counter() - t_start
+                    # Skip mode serves only instances with context >= window, in
+                    # ascending index order (build_batches' valid_indices) — pick the
+                    # matching per-instance seasonal errors for mase_gluonts.
+                    se_cell = cache.seasonal_errors_gluonts[valid_indices]
 
-                metrics = compute_all_metrics(fr, tgts, cache.naive_seasonal_mae_train)
+                metrics = compute_all_metrics(fr, tgts, cache.naive_seasonal_mae_train,
+                                              seasonal_errors=se_cell)
                 metrics["elapsed_seconds"] = round(elapsed, 3)
                 metrics["horizon"] = horizon
 
@@ -1875,7 +1986,8 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                         print(Fore.YELLOW + f"    {k}: {v:.6f}" + Fore.RESET)
                 print(Fore.MAGENTA + f"    TIME  {elapsed:.1f}s" + Fore.RESET)
 
-                per_sample = compute_per_sample_metrics(fr, tgts, cache.naive_seasonal_mae_train)
+                per_sample = compute_per_sample_metrics(fr, tgts, cache.naive_seasonal_mae_train,
+                                                        seasonal_errors=se_cell)
                 if not args.no_cell_cache:
                     _save_per_sample_metrics(dataset_display, model_short, term, window_size, per_sample)
 
@@ -1979,6 +2091,17 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 [ws_to_val.get(w, np.nan) for w in window_grid],
                 dtype=np.float64,
             )
+            # Parallel curve for the leaderboard (gluonts) MASE, so stage 4 can
+            # drive the strategy comparison off either metric (--mase-metric).
+            if "mase_gluonts" in mdf.columns:
+                ws_to_val_g = dict(zip(mdf["window_size"].values,
+                                       mdf["mase_gluonts"].values))
+                real_curve_gluonts = np.array(
+                    [ws_to_val_g.get(w, np.nan) for w in window_grid],
+                    dtype=np.float64,
+                )
+            else:
+                real_curve_gluonts = np.full(len(window_grid), np.nan, dtype=np.float64)
             if np.sum(~np.isnan(real_curve)) < 2:
                 print(Fore.YELLOW
                       + f"  Compare SKIP  {dataset_display} t={term} "
@@ -2025,6 +2148,7 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 ),
                 window_grid=np.asarray(window_grid),
                 real_curve=real_curve,
+                real_curve_gluonts=real_curve_gluonts,
                 real_curve_zscored=real_z,
                 predicted_curves=predicted_curves,
                 predicted_mean=pred_mean,
