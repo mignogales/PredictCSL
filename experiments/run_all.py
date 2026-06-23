@@ -360,13 +360,17 @@ def stage_4_compare(display: str, family: str, extra: Sequence[str]) -> float:
     )
 
 
-def stage_4_rollup(extra: Sequence[str]) -> float:
+def stage_4_rollup(extra: Sequence[str], out_dir: str = None) -> float:
     """Cross-model final pass: one overview figure + flops_savings_all_models.csv
-    spanning every model present in the shared run dir. No --models filter."""
+    spanning every model present in the shared run dir. No --models filter.
+
+    ``out_dir`` defaults to the run dir itself; the gluonts metric routes it to a
+    ``rollup_gluonts/`` subdir so its run-level artefacts never overwrite the
+    default-`mase` ones (which the per-model subdir split already protects)."""
     return _run(
         [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
          "--run-dir", ABLATION_GENERAL,
-         "--output-dir", ABLATION_GENERAL,
+         "--output-dir", out_dir or ABLATION_GENERAL,
          "--rollup-only", *extra],
         stage="4/rollup", display="ALL",
     )
@@ -478,6 +482,14 @@ def parse_args() -> argparse.Namespace:
               "argument to force every active stage."),
     )
     p.add_argument(
+        "--mase-metric", choices=["mase", "mase_gluonts"], default="mase",
+        help=("Which MASE drives stage 4 (compare): the project's `mase` (default) "
+              "or the leaderboard-faithful `mase_gluonts`. With `mase_gluonts` the "
+              "comparison reads the gluonts curve and writes to a separate "
+              "strategy_comparison_gluonts/ subdir so the two never collide. The "
+              "ablation always computes BOTH columns, so this only affects stage 4."),
+    )
+    p.add_argument(
         "--short-context-mode", choices=["skip", "pad"], default="skip",
         help=("Stage-3 handling of instances shorter than the ablation window. "
               "'skip' (default): exclude them at that window (original behaviour). "
@@ -555,6 +567,14 @@ def main() -> None:
     else:
         ABLATION_GENERAL = os.path.join(ABLATION_ROOT, "general")
 
+    # The gluonts MASE shares the SAME ablation cells (it's just a different metric
+    # column) but gets its own strategy-comparison subdir so its flops/time-savings
+    # outputs never overwrite the default-`mase` ones.
+    if args.mase_metric == "mase_gluonts":
+        STRATEGY_SUBDIR = STRATEGY_SUBDIR + "_gluonts"
+        print(Fore.CYAN + f"MASE metric: mase_gluonts  ->  compare subdir {STRATEGY_SUBDIR}"
+              + Fore.RESET)
+
     if args.only_stages and args.skip_stages:
         raise SystemExit("Use either --skip-stages or --only-stages, not both.")
     active = (set(args.only_stages) if args.only_stages
@@ -571,7 +591,7 @@ def main() -> None:
         "1": list(args.build_args),
         "2": list(args.predictor_args),
         "3": list(args.ablation_args) + ["--short-context-mode", args.short_context_mode],
-        "4": list(args.compare_args),
+        "4": list(args.compare_args) + ["--mase-metric", args.mase_metric],
     }
     if args.test:
         # Stage 1: few synthetic series (windows are collapsed via PREDICTCSL_TEST).
@@ -647,7 +667,9 @@ def main() -> None:
         if "4" in active:
             if not _QUIET:
                 _banner("ALL MODELS  —  cross-model overview")
-            stage_4_rollup(extras_by_stage["4"])
+            rollup_dir = (os.path.join(ABLATION_GENERAL, "rollup_gluonts")
+                          if args.mase_metric == "mase_gluonts" else ABLATION_GENERAL)
+            stage_4_rollup(extras_by_stage["4"], out_dir=rollup_dir)
 
         total = time.perf_counter() - t_start
         print(Fore.GREEN + f"\nAll done in {total/60:.1f} min." + Fore.RESET)

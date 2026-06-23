@@ -110,6 +110,28 @@ predictor-derived, so no TSFM re-inference):
   then re-runs the comparison with `--use-robust-timing` so the wall-clock figures
   use mean ± std.
 
+**Leaderboard-faithful MASE (`mase_gluonts`), computed alongside `mase`:**
+- **`gifteval_mase.py`** — leaderboard-faithful MASE primitives: gluonts'
+  `DEFAULT_SEASONALITIES` map (`D→1, W→1, H→24, S→3600, T→1440, M→12, Q→4`, with
+  `divmod` for multipliers) + per-instance `seasonal_error` (`mean(|x[m:]−x[:−m]|)`
+  over each series' own context). One auditable place for the definition.
+- **Stage 3** (`test_window_ablation_gifteval_v5.py`) now computes `mase_gluonts`
+  as a **first-class metric column** beside `mase` — it's the average of
+  per-instance ratios `mean_h(|y−ŷ|) / seasonal_error_instance`, vs `mase` =
+  `global_MAE / one pooled training-set seasonal-naive MAE` with the project's
+  custom `D→7, W→52` map. `GiftEvalCache` precomputes the per-instance seasonal
+  errors once; metrics/per-sample/`results.csv`/the ablation summary plots all
+  carry it. Pre-existing cells are **backfilled with no TSFM re-inference**
+  (`_backfill_mase_gluonts` divides the cached per-instance MAE by the
+  data-derived seasonal error), so a plain ablation re-run populates it cheaply.
+  Each `compare_*.npz` carries a parallel `real_curve_gluonts`.
+- **Stage 4** (`compare_window_strategies_gifteval.py`) takes
+  `--mase-metric {mase,mase_gluonts}` (default `mase`); with `mase_gluonts` it
+  drives the whole strategy comparison + **all flops/time-savings outputs** off
+  the gluonts curve. `run_all.py` exposes the same `--mase-metric`, routing its
+  per-model outputs to `strategy_comparison_gluonts/` and the rollup to
+  `general/rollup_gluonts/` so the two metrics never overwrite each other.
+
 **Master orchestrator:**
 - **`master_run_all.py`** — fuses *every* `run_all*` variant into one run while
   running each shared stage **exactly once**: Stage 1 up front, then each variant
@@ -153,6 +175,11 @@ python -m experiments.run_all_v4                 # Mamba predictor (needs mamba-
 python -m experiments.run_all_v4 --cheap         # + pin the cheap Mamba corner
 python -m experiments.run_all_5                   # + robust wall-clock timing stage
 python -m experiments.run_all_5 --repeats 10 --warmup 3
+# Leaderboard-faithful MASE (mase_gluonts). Step 1 backfills the metric into the
+# ablation cells WITHOUT TSFM re-inference (cells are cached); step 2 runs the
+# strategy comparison + flops-savings off the gluonts curve into *_gluonts dirs.
+python -m experiments.run_all --skip-stages 1 2 --force 3       # backfill mase_gluonts + default compare
+python -m experiments.run_all --skip-stages 1 2 3 --mase-metric mase_gluonts  # gluonts compare + flops savings
 python -m experiments.master_run_all              # fuse ALL variants, no repeated stages
 python -m experiments.master_run_all --only-variants v1 v5
 ```
