@@ -46,12 +46,16 @@ Run-level (at <run_dir>/, one figure for the whole run; via --rollup-only)
                                  (arith & geo means of ratio / %saved / abs saved)
   model_strategy_overview.png    single scatter: every (model × strategy) point,
                                  FLOPs saved (x) vs geomean MASE change (y)
+  model_strategy_overview_gluonts.png  twin scored on the leaderboard `mase_gluonts`
+                                 (emitted whenever the ablation wrote that curve and
+                                 the run isn't already --mase-metric mase_gluonts)
   time_savings_all_models.csv    Stage 6 twin: per-(model,strategy) measured
                                  forward-pass time saved + grand TOTAL row
   model_strategy_overview_time.png  single scatter: every (model × strategy) point,
                                  wall-clock forward-pass time saved (x) vs geomean
                                  MASE change (y)
-  bar_aggregate_mase.png      mean & median MASE per strategy
+  bar_aggregate_mase.png      mean & median MASE per strategy — drawn on
+                              `mase_gluonts` when available (else the primary metric)
   bar_aggregate_time.png      mean elapsed time per strategy
   scatter_pred_vs_best.png    MASE(pred) vs MASE(best)
   scatter_pred_vs_full.png    MASE(pred) vs MASE(full)
@@ -66,6 +70,7 @@ Run-level (at <run_dir>/, one figure for the whole run; via --rollup-only)
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
@@ -455,6 +460,25 @@ def find_latest_run(cache_root: str) -> str:
 
 def _npz_filename(dataset_display: str, term: str, model_short: str) -> str:
     return f"compare_{dataset_display}_t{term}_{model_short}.npz"
+
+
+def run_has_gluonts_curve(run_dir: str) -> bool:
+    """True if any compare_*.npz in this run carries a populated
+    ``real_curve_gluonts`` — i.e. the ablation has computed the leaderboard MASE.
+    Returns on the first populated curve found; for older runs that never wrote it
+    this scans the trees and returns False."""
+    models_root = os.path.join(run_dir, "models")
+    if not os.path.isdir(models_root):
+        return False
+    pattern = os.path.join(models_root, "*", "compare_real_vs_predicted", "*.npz")
+    for npz in glob.iglob(pattern):
+        try:
+            with np.load(npz) as d:
+                if "real_curve_gluonts" in d.files and np.any(~np.isnan(d["real_curve_gluonts"])):
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def _load_period_record(
@@ -1050,11 +1074,16 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def write_run_rollup(df: pd.DataFrame, out_dir: str,
-                     plot_strategies: Optional[List[str]] = None) -> None:
+                     plot_strategies: Optional[List[str]] = None,
+                     suffix: str = "", metric_label: str = "MASE") -> None:
     """Cross-model roll-up: per-(model, strategy) FLOPs savings + MASE change, a
     grand TOTAL row per strategy, the single overview figure, and the console
-    summary.  Writes ``flops_savings_all_models.csv`` and
-    ``model_strategy_overview.png`` into ``out_dir``.
+    summary.  Writes ``flops_savings_all_models{suffix}.csv`` and
+    ``model_strategy_overview{suffix}.png`` into ``out_dir``.
+
+    ``suffix`` / ``metric_label`` let a second pass on the gluonts-scored df emit a
+    parallel ``model_strategy_overview_gluonts.png`` (and CSV) without clobbering
+    the default-`mase` ones.
 
     ``plot_strategies`` optionally restricts which strategies appear in the
     overview *figure* (the CSV and console totals always cover all strategies).
@@ -1078,7 +1107,8 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str,
 
     # Single run-level overview figure: each (model, strategy) point.
     overview_path = plot_model_strategy_overview(rollup, out_dir,
-                                                 strategies=plot_strategies)
+                                                 strategies=plot_strategies,
+                                                 suffix=suffix, metric_label=metric_label)
     if overview_path:
         print(Fore.GREEN + f"\nSaved run-level overview: {overview_path}" + Fore.RESET)
 
@@ -1130,7 +1160,7 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str,
             "mean_delta_vs_full":    gm_strat - gm_full,
         })
     rollup = pd.concat([rollup, pd.DataFrame(totals)], ignore_index=True)
-    rollup_path = os.path.join(out_dir, "flops_savings_all_models.csv")
+    rollup_path = os.path.join(out_dir, f"flops_savings_all_models{suffix}.csv")
     rollup.to_csv(rollup_path, index=False, float_format="%.6g")
     print(Fore.GREEN + f"\nSaved run-level FLOPs savings: {rollup_path}" + Fore.RESET)
     print(Fore.CYAN + "\n--- Grand total FLOPs saved vs full window ---" + Fore.RESET)
@@ -1804,7 +1834,8 @@ def _plot_rel_impr_pred_vs_oracle(ds_agg: pd.DataFrame, out_dir: str) -> str:
 #  PLOTS — MASE
 # ==============================================================================
 
-def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str) -> str:
+def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
+                            metric_label: str = "MASE") -> str:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"]).copy()
     if r.empty:
         return ""
@@ -1857,8 +1888,8 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str) -> str:
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=11)
-    ax.set_ylabel("MASE", fontsize=12)
-    ax.set_title(f"MASE by Context Strategy  (n={len(r)} dataset-terms)",
+    ax.set_ylabel(metric_label, fontsize=12)
+    ax.set_title(f"{metric_label} by Context Strategy  (n={len(r)} dataset-terms)",
                  fontsize=13, fontweight="bold")
     ax.legend(fontsize=10, loc="upper right")
     ax.grid(axis="y", alpha=0.3)
@@ -2219,7 +2250,8 @@ _MODEL_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "p"]
 
 
 def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str,
-                                 strategies: Optional[List[str]] = None) -> str:
+                                 strategies: Optional[List[str]] = None,
+                                 suffix: str = "", metric_label: str = "MASE") -> str:
     """Single run-level figure: every (model, strategy) as one point, trading off
     FLOPs saved (x) against the *relative* geomean MASE change (y).
 
@@ -2295,9 +2327,10 @@ def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str,
 
     ax.set_xlabel("FLOPs saved vs full window  =  100·(1 − FLOPs_strategy / FLOPs_full)   (%)",
                   fontsize=11)
-    ax.set_ylabel("Relative MASE change vs full  =  100·(MASE_full − MASE_strategy)/MASE_full   (%, >0 = better)",
+    ax.set_ylabel(f"Relative {metric_label} change vs full  =  "
+                  f"100·({metric_label}_full − {metric_label}_strategy)/{metric_label}_full   (%, >0 = better)",
                   fontsize=11)
-    ax.set_title("Model × Strategy Overview — Compute Saved vs Accuracy Change",
+    ax.set_title(f"Model × Strategy Overview — Compute Saved vs Accuracy Change  [{metric_label}]",
                  fontsize=13, fontweight="bold")
     ax.grid(True, alpha=0.25)
 
@@ -2320,7 +2353,7 @@ def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str,
               loc="center left", bbox_to_anchor=(1.01, 0.5), framealpha=0.9)
 
     plt.tight_layout()
-    path = os.path.join(out_dir, "model_strategy_overview.png")
+    path = os.path.join(out_dir, f"model_strategy_overview{suffix}.png")
     plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     return path
 
@@ -2639,7 +2672,23 @@ def main() -> None:
                 f"Available: {available}"
             )
 
-    def _run_outputs(df_subset: pd.DataFrame, out_dir: str) -> None:
+    # ---- Parallel gluonts-scored records --------------------------------------
+    # When the primary metric is the project `mase` and the ablation has written
+    # the leaderboard curve, we ALSO score every strategy on `mase_gluonts` (its
+    # own oracle-best window) so the general bar plot can be drawn on the gluonts
+    # MASE and we can emit a second `model_strategy_overview_gluonts.png` beside
+    # the default one. No extra inference — just a second pass over the cached npz.
+    df_g: Optional[pd.DataFrame] = None
+    if args.mase_metric != "mase_gluonts" and run_has_gluonts_curve(run_dir):
+        df_g = load_strategy_records(run_dir, args.cache_root, patch_sizes,
+                                     mase_metric="mase_gluonts")
+        if args.models:
+            df_g = df_g[df_g["model_short"].isin(set(args.models))].reset_index(drop=True)
+        print(Fore.CYAN + "Gluonts MASE available: bar plot uses mase_gluonts; "
+              "adding model_strategy_overview_gluonts." + Fore.RESET)
+
+    def _run_outputs(df_subset: pd.DataFrame, out_dir: str,
+                     df_g_subset: Optional[pd.DataFrame] = None) -> None:
         os.makedirs(out_dir, exist_ok=True)
 
         csv_path = os.path.join(out_dir, "comparison.csv")
@@ -2734,8 +2783,15 @@ def main() -> None:
         compute_relative_improvement_tables(df_subset, out_dir)
 
         print(Fore.CYAN + "\n--- Generating plots ---" + Fore.RESET)
+        # General MASE bar plot uses the leaderboard `mase_gluonts` when available
+        # (falls back to the primary metric otherwise).
+        if df_g_subset is not None and not df_g_subset.empty:
+            bar_mase_path = plot_bar_aggregate_mase(df_g_subset, out_dir,
+                                                    metric_label="MASE (gluonts)")
+        else:
+            bar_mase_path = plot_bar_aggregate_mase(df_subset, out_dir)
         single_paths = [
-            plot_bar_aggregate_mase(df_subset, out_dir),
+            bar_mase_path,
             plot_bar_aggregate_time(df_subset, out_dir),
             plot_scatter(df_subset, "best_mase", "pred_mase",
                          "MASE — Best (oracle)", "MASE — Predictor",
@@ -2765,6 +2821,10 @@ def main() -> None:
         out = args.output_dir or run_dir
         write_run_rollup(df, out, plot_strategies=args.plot_strategies)
         write_run_time_rollup(df, out, plot_strategies=args.plot_strategies)
+        # Parallel gluonts overview alongside the default-`mase` one.
+        if df_g is not None:
+            write_run_rollup(df_g, out, plot_strategies=args.plot_strategies,
+                             suffix="_gluonts", metric_label="MASE (gluonts)")
         return
 
     # ---- Per-model outputs --------------------------------------------------
@@ -2774,7 +2834,9 @@ def main() -> None:
             args.output_dir
             or os.path.join(run_dir, "models", model_short, "strategy_comparison")
         )
-        _run_outputs(df_model.reset_index(drop=True), model_out_dir)
+        df_g_model = (df_g[df_g["model_short"] == model_short].reset_index(drop=True)
+                      if df_g is not None else None)
+        _run_outputs(df_model.reset_index(drop=True), model_out_dir, df_g_model)
 
     # ---- Run-level roll-up across models -------------------------------------
     # Only meaningful with >1 model in scope. run_all drives stage 4 one model at
@@ -2785,6 +2847,9 @@ def main() -> None:
         out = args.output_dir or run_dir
         write_run_rollup(df, out, plot_strategies=args.plot_strategies)
         write_run_time_rollup(df, out, plot_strategies=args.plot_strategies)
+        if df_g is not None:
+            write_run_rollup(df_g, out, plot_strategies=args.plot_strategies,
+                             suffix="_gluonts", metric_label="MASE (gluonts)")
 
 
 if __name__ == "__main__":
