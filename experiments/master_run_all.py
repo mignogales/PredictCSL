@@ -27,11 +27,32 @@ Order (per selected model, shared caches):
     5. run_all_5    --skip-stages 1 2 3 4  (robust timing + compare re-run)
     6. rollup_all_predictors               (combined cross-predictor overview)
 
+Cross-env routing
+-----------------
+A few model families can't share the main env (hard transformers/torch conflicts;
+see ``envs/README.md``), so their TSFM-loading work must run in a dedicated conda
+env. Master therefore splits every per-model subprocess by env group and prefixes
+the non-main groups with ``conda run -n <env>``:
+
+  * ``predictcsl-main``   — every family except the two below (the env master is
+    itself launched in; the main group uses the current interpreter).
+  * ``predictcsl-legacy`` — Sundial + TimeMoE (transformers==4.40.1).
+  * ``predictcsl-toto``   — Toto-2.0-313m (Python 3.12 + toto-2/toto-models).
+
+This is correct because (a) Stage 1 only loads a model when its shards are pending
+and (b) the v5 ablation lazy-imports each TSFM loader only for that model's cells —
+so a ``--models <one family>`` run in its env never touches the packages it lacks.
+``predictcsl-toto`` has no ``mamba-ssm``, so Toto is skipped for the Mamba variant
+(v4); see ``ENVS_WITHOUT_MAMBA``.
+
+  !! Launch master IN predictcsl-main:  conda run -n predictcsl-main python -m experiments.master_run_all
+
 -------------------------------------------------------------------------------
 MAINTENANCE RULE: when you add a new ``run_all_*`` orchestrator, add it to the
 ``VARIANTS`` registry below with the stages it should SKIP (everything already
-produced by an earlier entry). That keeps master_run_all the single
-fuse-everything entry point and guarantees no shared stage is recomputed.
+produced by an earlier entry). When you add a model family that needs its own
+env, add it to ``FAMILY_ENV`` (and ``ENVS_WITHOUT_MAMBA`` if that env lacks
+mamba). That keeps master_run_all the single fuse-everything entry point.
 -------------------------------------------------------------------------------
 
 Usage
@@ -50,10 +71,13 @@ import argparse
 import subprocess
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List, Optional
 
 from colorama import Fore
+
+from experiments import models_config
 
 
 @dataclass
@@ -63,6 +87,7 @@ class Variant:
     skip_stages: List[str]          # base stages already produced upstream
     extra: List[str] = field(default_factory=list)   # variant-specific flags
     takes_repeats: bool = False     # forward --repeats/--warmup (run_all_5 only)
+    needs_mamba: bool = False        # predictor needs mamba-ssm (skip mamba-less envs)
     label: str = ""                 # human description for the banner
 
 
@@ -75,16 +100,72 @@ VARIANTS: List[Variant] = [
             label="+ 2×period strategy"),
     Variant("v3", "experiments.run_all_v3", ["1"],
             label="cheap constrained PatchTST predictor"),
-    Variant("v4", "experiments.run_all_v4", ["1"],
+    Variant("v4", "experiments.run_all_v4", ["1"], needs_mamba=True,
             label="Mamba predictor"),
     Variant("v5", "experiments.run_all_5",  ["1", "2", "3", "4"], takes_repeats=True,
             label="robust wall-clock timing + compare re-run"),
 ]
 
 
+# ── Cross-env routing (see the docstring + envs/README.md) ───────────────────
+# Master must be launched IN this env; main-group models use the current
+# interpreter, env-specific groups are dispatched via `conda run -n <env>`.
+MAIN_ENV = "predictcsl-main"
+# Model family -> dedicated conda env. Families absent here run in the main group.
+FAMILY_ENV: Dict[str, str] = {
+    "sundial": "predictcsl-legacy",   # transformers==4.40.1
+    "timemoe": "predictcsl-legacy",
+    "toto":    "predictcsl-toto",      # Python 3.12 + toto-2/toto-models
+}
+# Envs without mamba-ssm -> can't run the Mamba predictor variant (v4).
+ENVS_WITHOUT_MAMBA = {"predictcsl-toto"}
+
+
 def _banner(text: str) -> None:
     bar = "═" * 78
     print(Fore.CYAN + f"\n{bar}\n  {text}\n{bar}" + Fore.RESET)
+
+
+def _env_label(env: Optional[str]) -> str:
+    return env or MAIN_ENV
+
+
+def _py(env: Optional[str], *module_and_args: str) -> List[str]:
+    """Build a ``python -m <module> [args]`` command, dispatched into ``env``.
+
+    The main group (``env`` is None or equals MAIN_ENV) runs on the current
+    interpreter; any other env is launched via ``conda run -n <env>`` so its
+    own Python/torch/transformers stack is used.
+    """
+    if env is None or env == MAIN_ENV:
+        return [sys.executable, "-m", *module_and_args]
+    return ["conda", "run", "--no-capture-output", "-n", env,
+            "python", "-m", *module_and_args]
+
+
+def _resolve_groups(models: Optional[List[str]]) -> "OrderedDict[Optional[str], List[str]]":
+    """Group the selected run-set displays by the env they must run in.
+
+    Returns an ordered map ``{env_or_None: [display, ...]}`` with the main group
+    (key None) first, then each dedicated env — so the cheap main work starts
+    before the env-switching subprocesses.
+    """
+    pairs = models_config.run_pairs()                # [(display, family)], catalog order
+    if models:
+        known = {d for d, _ in pairs}
+        bad = [m for m in models if m not in known]
+        if bad:
+            raise SystemExit(
+                f"Unknown --models: {bad}. Known: {sorted(known)}")
+        pairs = [(d, f) for d, f in pairs if d in models]
+
+    groups: "OrderedDict[Optional[str], List[str]]" = OrderedDict()
+    groups[None] = []                                # main group first, always present
+    for display, family in pairs:
+        groups.setdefault(FAMILY_ENV.get(family), []).append(display)
+    if not groups[None]:
+        del groups[None]
+    return groups
 
 
 def _run(cmd: List[str], title: str) -> None:
@@ -126,24 +207,16 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _common_flags(args) -> List[str]:
-    flags: List[str] = []
-    if args.models:
-        flags += ["--models", *args.models]
-    if args.verbose:
-        flags += ["-v"]
-    return flags
-
-
 def main() -> None:
     args = parse_args()
 
     # ---- Smoke test: just exercise the base pipeline end-to-end and exit. ----
+    # (Smoke only covers the main group; env-specific families are skipped.)
     if args.test:
-        cmd = [sys.executable, "-m", "experiments.run_all", "--test"]
+        cmd = _py(None, "experiments.run_all", "--test")
         if args.models:
             cmd += ["--models", *args.models]
-        _run(cmd, "SMOKE TEST — run_all --test (base pipeline)")
+        _run(cmd, "SMOKE TEST — run_all --test (base pipeline, main env)")
         return
 
     wanted = set(args.only_variants) if args.only_variants else {v.name for v in VARIANTS}
@@ -152,32 +225,44 @@ def main() -> None:
     if not variants:
         raise SystemExit(f"No variants selected. Known: {[v.name for v in VARIANTS]}")
 
-    common = _common_flags(args)
+    groups = _resolve_groups(args.models)
+    vflag = ["-v"] if args.verbose else []
     print(Fore.CYAN + f"Master run — variants: {[v.name for v in variants]}" + Fore.RESET)
-    print(Fore.CYAN + f"Models: {args.models or 'ALL (MODELS_TO_RUN)'}" + Fore.RESET)
+    for env, displays in groups.items():
+        print(Fore.CYAN + f"  env {_env_label(env)}: {displays}" + Fore.RESET)
 
     t_start = time.perf_counter()
 
-    # ---- Stage 1 once, up front (every variant then skips it). ---------------
-    _run([sys.executable, "-m", "experiments.run_all", "--only-stages", "1", *common],
-         "Stage 1 — dataset labeling (once, shared by all variants)")
+    # ---- Stage 1 once, per env group (each labels only its own families). ----
+    for env, displays in groups.items():
+        _run(_py(env, "experiments.run_all", "--only-stages", "1",
+                 "--models", *displays, *vflag),
+             f"Stage 1 — labeling [{_env_label(env)}]: {displays}")
 
-    # ---- Each variant, with its shared stages skipped. -----------------------
+    # ---- Each variant × env group, with its shared stages skipped. -----------
     for v in variants:
-        cmd = [sys.executable, "-m", v.module]
-        if v.skip_stages:
-            cmd += ["--skip-stages", *v.skip_stages]
-        cmd += v.extra + common
-        if v.takes_repeats:
-            if args.repeats is not None:
-                cmd += ["--repeats", str(args.repeats)]
-            if args.warmup is not None:
-                cmd += ["--warmup", str(args.warmup)]
-        _run(cmd, f"{v.name} — {v.label}  (skip stages {v.skip_stages or 'none'})")
+        for env, displays in groups.items():
+            if v.needs_mamba and _env_label(env) in ENVS_WITHOUT_MAMBA:
+                print(Fore.YELLOW
+                      + f"  ⤷ skip {v.name} for {displays} "
+                        f"({_env_label(env)} has no mamba-ssm)." + Fore.RESET)
+                continue
+            cmd = _py(env, v.module)
+            if v.skip_stages:
+                cmd += ["--skip-stages", *v.skip_stages]
+            cmd += v.extra + ["--models", *displays] + vflag
+            if v.takes_repeats:
+                if args.repeats is not None:
+                    cmd += ["--repeats", str(args.repeats)]
+                if args.warmup is not None:
+                    cmd += ["--warmup", str(args.warmup)]
+            _run(cmd, f"{v.name} [{_env_label(env)}] — {v.label}  "
+                      f"(skip stages {v.skip_stages or 'none'})")
 
     # ---- Final combined cross-predictor overview (pure post-processing). -----
+    # Reads on-disk outputs only (no TSFM load) -> runs once in the main env.
     if not args.no_rollup:
-        rollup = [sys.executable, "-m", "experiments.rollup_all_predictors"]
+        rollup = _py(None, "experiments.rollup_all_predictors")
         if args.models:
             rollup += ["--models", *args.models]
         _run(rollup, "rollup_all_predictors — combined cross-predictor overview")
