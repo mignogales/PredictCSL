@@ -310,22 +310,67 @@ def extract_uniform(
             cap.matched)
 
 
+def find_backbone(obj, pattern=DEFAULT_HOOK_PATTERN, max_depth=5):
+    """Recursively locate the nn.Module whose sub-tree carries the blocks.
+
+    Wrappers (timesfm/moirai/pipelines) bury the torch module under arbitrary
+    attribute names, so instead of guessing names we walk ``__dict__`` + ``dir``
+    and return the nn.Module with the MOST pattern-matching sub-modules (the
+    trunk), shallowest on ties. Also returns the largest nn.Module seen as a
+    fallback for diagnostics when nothing matches.
+
+    Returns ``(match, fallback)`` — either may be None.
+    """
+    rx = re.compile(pattern)
+    seen = set()
+    best = None        # (match_count, -depth, module)
+    fallback = None    # (total_modules, module)
+
+    def visit(o, depth):
+        nonlocal best, fallback
+        if depth > max_depth or id(o) in seen:
+            return
+        seen.add(id(o))
+        if isinstance(o, torch.nn.Module):
+            names = [n for n, _ in o.named_modules()]
+            cnt = sum(1 for n in names if rx.search(n))
+            if fallback is None or len(names) > fallback[0]:
+                fallback = (len(names), o)
+            if cnt > 0:
+                key = (cnt, -depth)
+                if best is None or key > best[:2]:
+                    best = (cnt, -depth, o)
+            return                      # named_modules already covered the subtree
+        children = []
+        d = getattr(o, "__dict__", None)
+        if isinstance(d, dict):
+            children.extend(d.values())
+        for name in dir(o):
+            if name.startswith("__"):
+                continue
+            try:
+                children.append(getattr(o, name))
+            except Exception:           # noqa: BLE001  (properties may raise)
+                continue
+        for v in children:
+            if isinstance(v, torch.nn.Module) or (
+                    hasattr(v, "__dict__")
+                    and not isinstance(v, (str, bytes, int, float, bool,
+                                           np.ndarray, torch.Tensor, type))):
+                visit(v, depth + 1)
+
+    visit(obj, 0)
+    return (best[2] if best else None, fallback[1] if fallback else None)
+
+
 def _resolve_backbone_from(runner):
     """Backbone for per-width runners (moirai forecast obj / timesfm wrapper)."""
-    for attr_path in ("", "module", "model", "model.model", "_model", "_torch_model"):
-        obj = runner
-        ok = True
-        for a in filter(None, attr_path.split(".")):
-            if hasattr(obj, a):
-                obj = getattr(obj, a)
-            else:
-                ok = False
-                break
-        if ok and isinstance(obj, torch.nn.Module) and any(
-                re.search(DEFAULT_HOOK_PATTERN, n) for n, _ in obj.named_modules()):
-            return obj
-    if isinstance(runner, torch.nn.Module):
+    if isinstance(runner, torch.nn.Module) and any(
+            re.search(DEFAULT_HOOK_PATTERN, n) for n, _ in runner.named_modules()):
         return runner
+    match, _ = find_backbone(runner)
+    if match is not None:
+        return match
     raise RuntimeError("Could not locate backbone for per-width runner.")
 
 
@@ -646,11 +691,24 @@ def _dump_modules(family, base, model_id, device, pattern):
                 runner = bcl._build_moirai(base, 64, 512, device)
             else:
                 runner = bcl.load_timesfm(model_id, 512, 64, 8)
-            backbone = _resolve_backbone_from(runner)
-            print("  (per-width runner backbone — built at window=512)")
         except Exception as e:                               # noqa: BLE001
-            print(Fore.RED + f"  per-width backbone resolve failed: {e}" + Fore.RESET)
+            print(Fore.RED + f"  per-width runner build failed: {e}" + Fore.RESET)
             return
+        print("  (per-width runner backbone — built at window=512)")
+        match, fb = find_backbone(runner, pattern)
+        if match is None:
+            print(Fore.RED + "  no pattern match. Largest nn.Module found — "
+                  "sample of ITS module names (to refine --hook-pattern):"
+                  + Fore.RESET)
+            if fb is not None:
+                names = [n for n, _ in fb.named_modules() if n]
+                for n in names[:40]:
+                    print(f"    {n}")
+                print(f"    … ({len(names)} total submodules)")
+            else:
+                print("    (no nn.Module reachable from the runner at all)")
+            return
+        backbone = match
     else:
         try:
             backbone = _resolve_backbone(family, base, model_id, device)

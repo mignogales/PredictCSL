@@ -127,6 +127,29 @@ def test_nested_capture_picks_block_not_mlp():
           % (d, dff))
 
 
+def test_find_backbone_through_wrapper():
+    """find_backbone must locate the trunk buried under a non-nn.Module wrapper
+    with an arbitrary attribute name (the TimesFM/Moirai failure mode)."""
+    inner = _NestedDummy(d=8, dff=32)
+
+    class _Wrapper:                       # NOT an nn.Module
+        def __init__(self, m):
+            self._weird_private_name = m
+            self.cfg = {"unrelated": 1}
+
+    w = _Wrapper(inner)
+    match, fb = E.find_backbone(w, E.DEFAULT_HOOK_PATTERN)
+    assert match is inner, f"got {type(match)}"
+    # And via a property (not in __dict__).
+    class _PropWrapper:
+        def __init__(self, m): self.__m = m
+        @property
+        def decode_model(self): return self.__m
+    match2, _ = E.find_backbone(_PropWrapper(inner), E.DEFAULT_HOOK_PATTERN)
+    assert match2 is inner
+    print("ok  find_backbone reaches trunk through wrapper attr + property")
+
+
 def test_integration(monkeypatched=True):
     model = _Dummy()
     model.eval()
@@ -170,5 +193,6 @@ if __name__ == "__main__":
     test_curves_shapes()
     test_hidden_capture()
     test_nested_capture_picks_block_not_mlp()
+    test_find_backbone_through_wrapper()
     test_integration()
     print("\nALL SELF-TESTS PASSED")
