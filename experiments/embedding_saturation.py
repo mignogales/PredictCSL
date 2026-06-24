@@ -637,18 +637,34 @@ def run_worker(args, device, shard_id, num_shards):
 
 
 def _dump_modules(family, base, model_id, device, pattern):
-    try:
-        backbone = _resolve_backbone(family, base, model_id, device)
-    except Exception as e:                                   # noqa: BLE001
-        print(Fore.RED + f"  backbone resolve failed: {e}" + Fore.RESET)
-        backbone = base if isinstance(base, torch.nn.Module) else None
+    backbone = None
+    if family in ("moirai", "timesfm"):
+        # These build a fresh runner per context width, so inspect one concrete
+        # per-width backbone (the same object the extractor hooks at run time).
+        try:
+            if family == "moirai":
+                runner = bcl._build_moirai(base, 64, 512, device)
+            else:
+                runner = bcl.load_timesfm(model_id, 512, 64, 8)
+            backbone = _resolve_backbone_from(runner)
+            print("  (per-width runner backbone — built at window=512)")
+        except Exception as e:                               # noqa: BLE001
+            print(Fore.RED + f"  per-width backbone resolve failed: {e}" + Fore.RESET)
+            return
+    else:
+        try:
+            backbone = _resolve_backbone(family, base, model_id, device)
+        except Exception as e:                               # noqa: BLE001
+            print(Fore.RED + f"  backbone resolve failed: {e}" + Fore.RESET)
+            backbone = base if isinstance(base, torch.nn.Module) else None
     if backbone is None:
-        print("  (no nn.Module backbone — moirai/timesfm build per width)")
+        print("  (no nn.Module backbone found)")
         return
     rx = re.compile(pattern)
     matched = [n for n, _ in backbone.named_modules() if rx.search(n)]
     print(f"  pattern {pattern!r} matched {len(matched)} modules:")
-    for n in matched[:6] + (["…"] if len(matched) > 12 else []) + matched[-6:]:
+    shown = matched if len(matched) <= 12 else matched[:6] + ["…"] + matched[-6:]
+    for n in shown:
         print(f"    {n}")
 
 
