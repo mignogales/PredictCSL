@@ -80,6 +80,53 @@ def test_hidden_capture():
     print("ok  HiddenCapture (regex match, last-token + mean)")
 
 
+class _NestedBlock(nn.Module):
+    """Block whose inner MLP expands to a DIFFERENT dim (dff != d)."""
+
+    def __init__(self, d, dff):
+        super().__init__()
+        self.mlp = nn.Module()
+        self.mlp.layers = nn.ModuleList([nn.Linear(d, dff), nn.Linear(dff, d)])
+
+    def forward(self, x):
+        h = torch.relu(self.mlp.layers[0](x))   # (B, W, dff)  <- WRONG dim
+        return self.mlp.layers[1](h)            # (B, W, d)    <- block output
+
+
+class _NestedDummy(nn.Module):
+    """Mimics PatchTST/T5 nesting: blocks.N + blocks.N.mlp.layers.M both match."""
+
+    def __init__(self, d=8, dff=32):
+        super().__init__()
+        self.proj = nn.Linear(1, d)
+        self.blocks = nn.ModuleList([_NestedBlock(d, dff) for _ in range(3)])
+
+    def forward(self, x):
+        h = self.proj(x)
+        for b in self.blocks:
+            h = b(h)
+        return h
+
+
+def test_nested_capture_picks_block_not_mlp():
+    """Parent block hook must fire AFTER its inner mlp.layers, so we capture the
+    d-dim block output, never the dff-dim MLP intermediate."""
+    d, dff = 8, 32
+    m = _NestedDummy(d, dff)
+    cap = E.HiddenCapture(m, E.DEFAULT_HOOK_PATTERN)
+    # Both the blocks and the inner mlp layers match the regex.
+    assert "blocks.2" in cap.matched
+    assert "blocks.2.mlp.layers.0" in cap.matched
+    with torch.no_grad():
+        m(torch.randn(2, 6, 1))
+    last, mean = cap.read()
+    cap.remove()
+    assert last.shape == (2, d), f"captured dim {last.shape[1]} != block dim {d} " \
+        f"(grabbed an MLP intermediate of dim {dff}?)"
+    print("ok  nested capture picks block output (dim %d), not mlp intermediate (%d)"
+          % (d, dff))
+
+
 def test_integration(monkeypatched=True):
     model = _Dummy()
     model.eval()
@@ -122,5 +169,6 @@ if __name__ == "__main__":
     test_saturation_math()
     test_curves_shapes()
     test_hidden_capture()
+    test_nested_capture_picks_block_not_mlp()
     test_integration()
     print("\nALL SELF-TESTS PASSED")
