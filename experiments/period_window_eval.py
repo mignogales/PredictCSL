@@ -75,6 +75,9 @@ from experiments.test_window_ablation_gifteval_v5 import (
     load_patchtst_fm,
     load_sundial,
     load_timemoe,
+    load_toto,
+    load_flowstate,
+    load_tirex,
     SUNDIAL_MAX_CONTEXT,
     TIMEMOE_MAX_TOTAL,
 )
@@ -422,6 +425,12 @@ def _make_ensure_handle(model_id: str, model_family: str, device: str):
                 handle[0] = load_sundial(model_id, device)
             elif model_family == "timemoe":
                 handle[0] = load_timemoe(model_id, device)
+            elif model_family == "toto":
+                handle[0] = load_toto(model_id, device)
+            elif model_family == "flowstate":
+                handle[0] = load_flowstate(model_id, device)
+            elif model_family == "tirex":
+                handle[0] = load_tirex(model_id, device)
         return handle[0]
 
     return ensure_handle, handle
