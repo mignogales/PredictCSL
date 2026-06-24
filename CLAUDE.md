@@ -131,6 +131,13 @@ predictor-derived, so no TSFM re-inference):
   the gluonts curve. `run_all.py` exposes the same `--mase-metric`, routing its
   per-model outputs to `strategy_comparison_gluonts/` and the rollup to
   `general/rollup_gluonts/` so the two metrics never overwrite each other.
+- Even in a **default `mase` run**, when the gluonts curve is present stage 4
+  additionally scores every strategy on `mase_gluonts` (its own oracle-best
+  window) to: draw the general `bar_aggregate_mase.png` on `mase_gluonts`, and
+  emit a parallel `model_strategy_overview_gluonts.png` (+
+  `flops_savings_all_models_gluonts.csv`) beside the default-`mase` overview. No
+  extra inference — a second pass over the cached `compare_*.npz`
+  (`run_has_gluonts_curve` gates it).
 
 **Master orchestrator:**
 - **`master_run_all.py`** — fuses *every* `run_all*` variant into one run while
