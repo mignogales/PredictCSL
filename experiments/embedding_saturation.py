@@ -92,12 +92,48 @@ except Exception:                                            # pragma: no cover
             return ""
     Fore = _NoColor()                                        # type: ignore
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:                                            # pragma: no cover
+    def load_dotenv(*_a, **_k):                              # type: ignore
+        return False
 
 from experiments import build_context_length_dataset as bcl
 from experiments import models_config
 
 load_dotenv()
+
+
+class _Tee:
+    """Mirror a stream to a log file so dump-modules / runs leave a readable log."""
+
+    def __init__(self, stream, fh):
+        self._stream = stream
+        self._fh = fh
+
+    def write(self, data):
+        self._stream.write(data)
+        self._fh.write(data)
+        self._fh.flush()
+
+    def flush(self):
+        self._stream.flush()
+        self._fh.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _install_log(path: str) -> None:
+    """Tee stdout+stderr into `path` (append). Kept open for the process life."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fh = open(path, "a", buffering=1)                        # noqa: SIM115
+    import datetime as _dt
+    fh.write(f"\n===== {_dt.datetime.now().isoformat()}  "
+             f"argv={' '.join(sys.argv[1:])} =====\n")
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+    print(Fore.CYAN + f"Logging to {path}" + Fore.RESET)
 
 # ==============================================================================
 #  CONFIG
@@ -106,7 +142,7 @@ OUT_ROOT = "logs/experiments/embedding_saturation"
 
 # Repeated-block naming across HF transformer stacks. The last module matching
 # this in execution order is the final transformer block.
-DEFAULT_HOOK_PATTERN = r"\.(?:layers?|blocks?|h)\.\d+$"
+DEFAULT_HOOK_PATTERN = r"(?:^|\.)(?:layers?|blocks?|h)\.\d+$"
 
 # Marginal-update plateau thresholds (cosine distance between consecutive
 # windows) -> L*_embed. First grid window at/under the threshold.
@@ -664,6 +700,8 @@ def parse_args():
     p.add_argument("--gpus", type=int, default=0, help="0 = all visible GPUs.")
     p.add_argument("--dump-modules", action="store_true",
                    help="Print hook-matched modules per model and exit.")
+    p.add_argument("--log-file", default=None,
+                   help="Tee stdout+stderr here (default: <out-root>/<run>.log).")
     p.add_argument("--test", action="store_true",
                    help="Smoke run: TEST_MODEL, tiny grid, few series + datasets.")
     p.add_argument("--test-datasets", type=int, default=None,
@@ -686,6 +724,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.log_file is None:
+        stem = "dump_modules" if args.dump_modules else "run"
+        if args.shard_id is not None:
+            stem += f"_shard{args.shard_id}"
+        args.log_file = os.path.join(args.out_root, f"{stem}.log")
+    _install_log(args.log_file)
     if args.shard_id is not None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         run_worker(args, device, args.shard_id, args.num_shards)
