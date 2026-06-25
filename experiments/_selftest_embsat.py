@@ -180,6 +180,41 @@ def test_find_backbone_through_wrapper():
     print("ok  find_backbone reaches trunk through wrapper attr + property")
 
 
+class _VarStepDummy(nn.Module):
+    """Fires its block a CONTEXT-dependent number of times — the TimesFM failure
+    mode (firing count grows/shrinks with context, varying S across windows)."""
+
+    def __init__(self, d=8):
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Linear(1, d)])
+
+    def forward(self, x):                       # x: (B, W, 1)
+        steps = max(1, 64 // x.shape[1])        # fewer steps for longer context
+        h = None
+        for _ in range(steps):
+            h = torch.tanh(self.layers[0](x[:, :1, :]))   # (B, 1, d) per firing
+        return h
+
+
+def test_variable_steps_alignment():
+    model = _VarStepDummy()
+    model.eval()
+    E._resolve_backbone = lambda family, base, mid, dev: base
+    E._predict_dispatch = lambda family, runner, xb, h, dev: runner(xb.to(dev))
+
+    N, W = 4, 32
+    contexts = np.random.RandomState(2).randn(N, W).astype(np.float32)
+    real_lengths = np.full(N, W, dtype=np.int64)
+    windows = [8, 16, 32]                        # widths -> steps 8, 4, 2
+    emb_last, emb_mean, _ = E.collect_grid_embeddings(
+        "dummy", model, "id", contexts, real_lengths, horizon=8,
+        windows=windows, batch_size=4, device="cpu", pattern=E.DEFAULT_HOOK_PATTERN)
+    # Running-min over {8,4,2} = 2, with earlier steps trimmed from the front.
+    assert emb_last.shape == (N, 3, 2, 8), emb_last.shape
+    assert emb_mean.shape == (N, 3, 2, 8), emb_mean.shape
+    print("ok  variable-step alignment trims to running-min S (=2)")
+
+
 def test_integration(monkeypatched=True):
     model = _Dummy()
     model.eval()
@@ -231,5 +266,6 @@ if __name__ == "__main__":
     test_read_steps_multistep()
     test_nested_capture_picks_block_not_mlp()
     test_find_backbone_through_wrapper()
+    test_variable_steps_alignment()
     test_integration()
     print("\nALL SELF-TESTS PASSED")
