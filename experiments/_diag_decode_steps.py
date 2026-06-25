@@ -42,6 +42,7 @@ from experiments.embedding_saturation import (
     _resolve_backbone,
     _resolve_backbone_from,
 )
+from experiments.master_run_all import FAMILY_ENV, _env_label
 
 
 class FiringCounter:
@@ -113,13 +114,34 @@ def probe(model_id, family, display, window, horizon, batch, device, pattern):
         print(f"  {display:<22} no block fired (matched {len(cap.matched)} modules) "
               f"— refine --hook-pattern")
         return
-    n_passes = max(cap.counts.values())                 # forwards through the stack
-    deepest = cap.matched[-1]                            # last-indexed block
-    trace = cap.token_lens[deepest][:12]
-    kind = "one-shot" if n_passes == 1 else f"autoregressive ({n_passes} passes)"
-    print(f"  {display:<22} blocks={len(cap.matched):<3} passes={n_passes:<4} {kind}")
-    print(f"      token-axis per firing of {deepest!r}: {trace}"
-          + (" …" if len(cap.token_lens[deepest]) > 12 else ""))
+    # `passes` = max firings over ALL blocks => robust to enc-dec (the generating
+    # stack is whichever fires most: the decoder for seq2seq, the trunk otherwise).
+    n_passes = max(cap.counts.values())
+    gen_block = max(cap.counts, key=lambda k: cap.counts[k])
+    trace = cap.token_lens[gen_block]
+    has_enc_dec = (any("encoder" in m for m in cap.matched)
+                   and any("decoder" in m for m in cap.matched))
+
+    if n_passes == 1:
+        print(f"  {display:<22} blocks={len(cap.matched):<3} passes=1     one-shot "
+              f"(whole H={horizon} in one forward)")
+        print(f"      token-axis of {gen_block!r}: {trace[:12]}")
+        return
+
+    # Decoder-only stacks fire once for the big-T prefill, then once per decode
+    # step at small T — strip that prefill so the step count is the output count.
+    # Enc-dec decoders carry no prefill (it lives in the encoder), so keep all.
+    rest = trace[1:] if len(trace) > 1 else trace
+    is_prefill = (len(trace) > 1 and not has_enc_dec
+                  and trace[0] > 2 * (max(rest) if rest else 0))
+    decode = rest if is_prefill else trace
+    n_dec = len(decode)
+    patch = horizon / n_dec if n_dec else horizon
+    print(f"  {display:<22} blocks={len(cap.matched):<3} passes={n_passes:<4} "
+          f"autoregressive: {n_dec} output steps, ~{patch:.0f} pts/step")
+    pre = f"prefill T={trace[0]}; " if is_prefill else ""
+    print(f"      {gen_block!r}: {pre}decode token-axis {decode[:10]}"
+          + (" …" if len(decode) > 10 else ""))
 
 
 def _models(args):
@@ -143,12 +165,18 @@ def main():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"device={device}  window={args.window}  horizon={args.horizon}\n")
     for mid, fam, disp in _models(args):
+        env = FAMILY_ENV.get(fam)
         try:
             probe(mid, fam, disp, args.window, args.horizon, args.batch,
                   device, args.hook_pattern)
         except Exception as e:                            # noqa: BLE001
-            print(f"  {disp:<22} FAILED: {type(e).__name__}: {e}")
-            traceback.print_exc()
+            if env:                                       # known cross-env family
+                print(f"  {disp:<22} needs env {_env_label(env)!r} — run: "
+                      f"conda run -n {_env_label(env)} python -m "
+                      f"experiments._diag_decode_steps --models {disp}")
+            else:
+                print(f"  {disp:<22} FAILED: {type(e).__name__}: {e}")
+                traceback.print_exc()
 
 
 if __name__ == "__main__":
