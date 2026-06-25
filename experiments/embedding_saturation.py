@@ -223,8 +223,22 @@ class HiddenCapture:
             return None
         if h.dim() == 2:                                     # (B, d) already pooled
             return h, h
-        # (B, T, d): last token = most-recent-aligned slot; mean over time.
-        return h[:, -1, :], h.mean(dim=1)
+        # General (B, ..., T, d). Most stacks emit (B, T, d), but some (e.g.
+        # Moirai) insert an extra grouping axis between batch and the token
+        # axis, so the hidden state is rank>3 — (B, group, T, d) — and the old
+        # h[:, -1, :] left a stray axis, breaking the per-series assignment.
+        # Robust reduction: keep batch (dim 0) and features (last dim), collapse
+        # everything in between.
+        #   last-token  = last index along the token axis (second-to-last dim),
+        #                 then mean any remaining middle (grouping) axes;
+        #   mean-pooled = mean over all axes except batch and feature.
+        last = h[..., -1, :]                                 # drop token axis
+        while last.dim() > 2:
+            last = last.mean(dim=1)
+        mean = h
+        while mean.dim() > 2:
+            mean = mean.mean(dim=1)
+        return last, mean
 
     def remove(self) -> None:
         for hd in self._handles:
