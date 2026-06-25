@@ -80,6 +80,36 @@ def test_hidden_capture():
     print("ok  HiddenCapture (regex match, last-token + mean)")
 
 
+class _ARDummy(nn.Module):
+    """Single block invoked TWICE per forward — stands in for a 2-step rollout."""
+
+    def __init__(self, d=8):
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Linear(1, d)])
+
+    def forward(self, x):                       # x: (B, W, 1)
+        h1 = torch.tanh(self.layers[0](x))      # fire 1: "prefill" / step 0
+        seed = x.mean(dim=1, keepdim=True)
+        h2 = torch.tanh(self.layers[0](seed))   # fire 2: "decode" / step 1
+        return h2
+
+
+def test_read_steps_multistep():
+    m = _ARDummy()
+    cap = E.HiddenCapture(m, E.DEFAULT_HOOK_PATTERN)
+    with torch.no_grad():
+        m(torch.randn(3, 10, 1))
+    steps = cap.read_steps()
+    legacy = cap.read()
+    cap.remove()
+    last, mean = steps
+    assert last.shape == (3, 2, 8), last.shape       # (B, S=2, d)
+    assert mean.shape == (3, 2, 8), mean.shape
+    # read() must equal the FINAL step (legacy single-embedding contract).
+    assert torch.allclose(legacy[0], last[:, -1, :]), "read() != final step"
+    print("ok  read_steps captures per-step (S=2) and read() == final step")
+
+
 class _NestedBlock(nn.Module):
     """Block whose inner MLP expands to a DIFFERENT dim (dff != d)."""
 
@@ -165,7 +195,8 @@ def test_integration(monkeypatched=True):
     emb_last, emb_mean, matched = E.collect_grid_embeddings(
         "dummy", model, "dummy-id", contexts, real_lengths, horizon=8,
         windows=windows, batch_size=4, device="cpu", pattern=E.DEFAULT_HOOK_PATTERN)
-    assert emb_last.shape == (N, len(windows), 8), emb_last.shape
+    # _Dummy fires once per forward -> single generation step (S=1).
+    assert emb_last.shape == (N, len(windows), 1, 8), emb_last.shape
     assert matched == ["layers.0", "layers.1"]
 
     with tempfile.TemporaryDirectory() as td:
@@ -184,7 +215,12 @@ def test_integration(monkeypatched=True):
         assert np.allclose(z["to_asymp"][:, -1], 0.0, atol=1e-5)
         assert "Lstar_marginal_0.05" in z.files
         assert "n_segments" in z.files and "real_lengths" in z.files
+        # New per-step / generation arrays and the step count.
+        assert z["to_asymp_steps"].shape == (N, len(windows), 1)
+        assert z["gen_marginal"].shape == (N, len(windows), 1)
+        assert int(z["n_steps"]) == 1
         assert summary["d_model"] == 8 and summary["n_series"] == N
+        assert summary["n_steps"] == 1
     print("ok  integration collect_grid_embeddings -> _write_cell")
 
 
@@ -192,6 +228,7 @@ if __name__ == "__main__":
     test_saturation_math()
     test_curves_shapes()
     test_hidden_capture()
+    test_read_steps_multistep()
     test_nested_capture_picks_block_not_mlp()
     test_find_backbone_through_wrapper()
     test_integration()
