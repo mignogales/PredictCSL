@@ -1556,6 +1556,7 @@ def build_forward(model_family, handle, model_id, batches, width, horizon,
         m = build_moirai_forecast(handle, horizon, width, device)
 
         def _td():
+            nonlocal m
             del m
             if device == "cuda":
                 torch.cuda.empty_cache()
@@ -1565,6 +1566,7 @@ def build_forward(model_family, handle, model_id, batches, width, horizon,
         m = build_moirai_1_1_forecast(handle, horizon, width, device)
 
         def _td():
+            nonlocal m
             del m
             if device == "cuda":
                 torch.cuda.empty_cache()
@@ -1574,6 +1576,7 @@ def build_forward(model_family, handle, model_id, batches, width, horizon,
         tfm = load_timesfm(model_id, width, horizon, batch_size)
 
         def _td():
+            nonlocal tfm
             del tfm
             if device == "cuda":
                 torch.cuda.empty_cache()
