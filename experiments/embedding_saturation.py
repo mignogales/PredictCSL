@@ -621,7 +621,11 @@ def collect_grid_embeddings(
     bar = tqdm(total=len(windows), desc=progress_desc, unit="win",
                leave=False, disable=progress_desc is None)
     try:
-      for k, L in enumerate(windows):
+      # Largest windows first: the slow (long-context) cells run early so tqdm
+      # OVER-estimates the remaining time rather than under-estimating it. k is
+      # kept as the true window index, so the embedding slots are unaffected.
+      for k in reversed(range(len(windows))):
+        L = windows[k]
         bar.set_postfix_str(f"L={int(L)}", refresh=False)
         eff = np.minimum(int(L), np.asarray(real_lengths))
         eff_buck = np.minimum(
@@ -886,7 +890,13 @@ def run_gifteval(args, family, model_id, display, base, device, windows,
 
 
 def _selected_datasets(args, DATASETS):
-    sel = [(n, t, disp, u) for (n, t, disp, u) in DATASETS if u]
+    # Use EVERY (dataset, term) cell — same 91 cells as the stage-3 error
+    # ablation, so the L*_embed vs L*_err scatter lines up 1:1. `to_univariate`
+    # is NOT an inclusion flag: it tells GiftEvalDataset to flatten a natively
+    # multivariate dataset into one univariate series per variate. Each such
+    # series then enters the saturation tensor as its own row (instance) and is
+    # aggregated over axis 0 exactly like any other instance.
+    sel = list(DATASETS)
     if args.datasets:
         sel = [r for r in sel if r[2] in args.datasets or r[0] in args.datasets]
     if args.test_datasets:
