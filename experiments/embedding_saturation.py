@@ -109,6 +109,12 @@ except Exception:                                            # pragma: no cover
     def load_dotenv(*_a, **_k):                              # type: ignore
         return False
 
+try:
+    from tqdm.auto import tqdm
+except Exception:                                            # pragma: no cover
+    def tqdm(it=None, *_a, **_k):                            # type: ignore
+        return it if it is not None else iter(())
+
 from experiments import build_context_length_dataset as bcl
 from experiments import models_config
 # Cross-env routing: single source of truth lives in master_run_all so the
@@ -472,6 +478,7 @@ def summarize_saturation(
 def collect_grid_embeddings(
     family, base, model_id, contexts: np.ndarray, real_lengths: np.ndarray,
     horizon: int, windows: List[int], batch_size: int, device: str, pattern: str,
+    progress_desc: Optional[str] = None,
 ) -> Tuple[np.ndarray, List[str]]:
     """(N, K, d) embeddings (last-token) for every series at every window.
 
@@ -480,6 +487,9 @@ def collect_grid_embeddings(
     short series runs out of context. We keep last-token embeddings (most-recent
     aligned, robust to NaN-padded models); mean-pooled stored separately by the
     caller if desired.
+
+    ``progress_desc`` (if given) labels a per-window tqdm bar so a long cell
+    shows how far the embedding sweep has progressed.
     """
     N = contexts.shape[0]
     grid = np.asarray(sorted(set(bcl.WINDOW_GRID)))
@@ -488,7 +498,11 @@ def collect_grid_embeddings(
     matched: List[str] = []
 
     d0: Optional[int] = None                                  # first-seen d_model
-    for k, L in enumerate(windows):
+    bar = tqdm(total=len(windows), desc=progress_desc, unit="win",
+               leave=False, disable=progress_desc is None)
+    try:
+      for k, L in enumerate(windows):
+        bar.set_postfix_str(f"L={int(L)}", refresh=False)
         eff = np.minimum(int(L), np.asarray(real_lengths))
         eff_buck = np.minimum(
             eff, grid[np.clip(np.searchsorted(grid, eff, side="right") - 1, 0, None)])
@@ -524,6 +538,9 @@ def collect_grid_embeddings(
                 emb_mean = np.zeros((N, len(windows), d0), dtype=np.float32)
             emb_last[idx, k, :] = last
             emb_mean[idx, k, :] = mean
+        bar.update(1)
+    finally:
+      bar.close()
     return emb_last, emb_mean, matched
 
 
@@ -614,7 +631,8 @@ def run_synthetic(args, family, model_id, display, base, device, windows):
     horizon = bcl.HORIZON_GRID[-1]
     emb_last, emb_mean, matched = collect_grid_embeddings(
         family, base, model_id, contexts, real_lengths, horizon, windows,
-        args.batch_size, device, args.hook_pattern)
+        args.batch_size, device, args.hook_pattern,
+        progress_desc=f"    synthetic {display}")
     meta = {"n_segments": n_segments, "real_lengths": real_lengths,
             "horizon": horizon, "source": "synthetic", "model": display,
             "hooked_modules": len(matched)}
@@ -674,7 +692,8 @@ def run_gifteval(args, family, model_id, display, base, device, windows,
             grid = [w for w in windows if w <= cache.max_context] or [windows[0]]
             emb_last, emb_mean, matched = collect_grid_embeddings(
                 family, base, model_id, contexts, real_lengths, horizon, grid,
-                args.batch_size, device, args.hook_pattern)
+                args.batch_size, device, args.hook_pattern,
+                progress_desc=f"    {prog} {display} {dataset_display}/t{term}")
             meta = {"real_lengths": real_lengths, "horizon": horizon,
                     "source": "gifteval", "dataset": dataset_display, "term": term,
                     "model": display, "hooked_modules": len(matched)}
