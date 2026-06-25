@@ -30,6 +30,25 @@ falls below a threshold (plateau). Non-monotonicity in d(L) — the marginal
 update rising again after a plateau — is the embedding-space fingerprint of
 "stale context perturbs the representation", i.e. more-context-hurts.
 
+Per-output-step capture (autoregressive models)
+-----------------------------------------------
+Many TSFMs do NOT produce a long horizon in one forward — they roll it out
+autoregressively in output patches, re-running the backbone once per step
+(measured with experiments._diag_decode_steps: ChronosBolt 16×64, Moirai2
+16×64, TimeMoE 64-pt steps, Sundial ~512-pt steps; ChronosBolt even re-encodes
+the *growing* context each step). We therefore log the final-block embedding at
+EVERY generation step, giving e(L, k): the representation as the model emits
+output-patch k. Embeddings are stored as (N, K_windows, S_steps, d). One-shot
+models (Chronos2, Toto, FlowState, and — when it forecasts in a single step —
+PatchTST-FM) have S==1 and collapse to the original single-embedding case.
+
+This adds a second saturation axis read "as we generate": for the context axis
+the canonical curve uses step 0 (the context-only encoding, before any
+self-generated history); `*_steps` arrays carry the per-step context curves; and
+`gen_marginal[k, s]` asks whether emitting step s moved the representation — so
+long horizons can reveal later patches saturating at a different context length
+than the first.
+
 Headline test (done in post-processing, not here): does L*_embed line up with
 L*_err = argmin of the error curve from the stage-1 / stage-3 ablation? If yes,
 useful context is detectable from internal states with NO forecast scoring, no
@@ -59,7 +78,8 @@ Hooking
 We do NOT hand-maintain per-architecture module paths. Instead we hook every
 sub-module whose qualified name ends in a repeated-block index
 (``.layers.N`` / ``.blocks.N`` / ``.block.N`` / ``.h.N`` — the standard HF
-ModuleList naming for T5, PatchTST, Llama/TimeMoE, GPT2-style, Moirai, …) and
+ModuleList naming for T5, PatchTST, Llama/TimeMoE, GPT2-style, Moirai, … — plus
+``.stacked_xf.N`` for TimesFM 2.5, whose blocks use a non-standard name) and
 keep the output of the LAST one that fires (= the final transformer block).
 Forward hooks fire in execution order, so this is robust across the whole model
 zoo. For encoder-decoder models (chronos / T5) we prefer the last *encoder*
@@ -161,9 +181,13 @@ def _install_log(path: str) -> None:
 # ==============================================================================
 OUT_ROOT = "logs/experiments/embedding_saturation"
 
-# Repeated-block naming across HF transformer stacks. The last module matching
-# this in execution order is the final transformer block.
-DEFAULT_HOOK_PATTERN = r"(?:^|\.)(?:layers?|blocks?|h)\.\d+$"
+# Repeated-block naming across transformer stacks: T5/PatchTST `block.N`,
+# Llama/TimeMoE/Moirai `layers.N`, GPT2 `h.N`, and TimesFM 2.5's `stacked_xf.N`.
+# TimesFM's blocks are NOT named layers/blocks, so without `stacked_xf` here its
+# trunk is invisible to the hook and find_backbone gives up (the observed
+# "Could not locate backbone for per-width runner"). `_block_level` keeps only
+# the top-level blocks, so adding a stack name to this alternation is safe.
+DEFAULT_HOOK_PATTERN = r"(?:^|\.)(?:layers?|blocks?|h|stacked_xf)\.\d+$"
 
 # Marginal-update plateau thresholds (cosine distance between consecutive
 # windows) -> L*_embed. First grid window at/under the threshold.
@@ -185,66 +209,106 @@ TEST_MODEL = "Chronos2-Small"
 # ==============================================================================
 #  HIDDEN-STATE CAPTURE
 # ==============================================================================
-class HiddenCapture:
-    """Register forward hooks on repeated-block modules; keep the last fired.
+def _reduce_hidden(h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reduce a block output to ``(last_token (B, d), mean_pooled (B, d))``.
 
-    Keeps two slots: the last fired block whose qualified name contains
-    "encoder" (the context summary for enc-dec models) and the last fired block
-    overall (the natural probe for decoder-only models). After a forward pass,
-    :meth:`read` returns ``(last_token (B, d), mean_pooled (B, d))`` from the
-    encoder slot if any encoder block fired, else the overall slot.
+    General shape is (B, ..., T, d). Most stacks emit (B, T, d), but some (e.g.
+    Moirai) insert an extra grouping axis — (B, group, T, d) — so we keep batch
+    (dim 0) and features (last dim) and collapse everything in between:
+      last-token  = last index along the token axis, then mean any grouping axes;
+      mean-pooled = mean over all axes except batch and feature.
+    """
+    if h.dim() == 2:                                         # already pooled (B, d)
+        return h, h
+    last = h[..., -1, :]                                     # drop token axis
+    while last.dim() > 2:
+        last = last.mean(dim=1)
+    mean = h
+    while mean.dim() > 2:
+        mean = mean.mean(dim=1)
+    return last, mean
+
+
+def _block_level(names: List[str]) -> set:
+    """Matched names that are NOT nested under another matched name.
+
+    The hook regex matches both a repeated block (``encoder.block.5``) and the
+    repeated sub-layers inside it (``encoder.block.5.layer.2``). The block's own
+    forward hook fires AFTER its children and returns the post-residual block
+    output — the embedding we want — so we log only the top-level blocks and skip
+    the inner intermediates (this also slashes the transient log size).
+    """
+    s = set(names)
+    return {n for n in names
+            if not any(o != n and n.startswith(o + ".") for o in s)}
+
+
+class HiddenCapture:
+    """Log top-level block hidden states across a forward/generate, per step.
+
+    The hook regex is registered on every repeated block; we log only the
+    top-level blocks (:func:`_block_level`) in execution order. After a forward,
+    :meth:`read_steps` returns the chosen final block's per-generation-step
+    embeddings ``(B, S, d)`` (last-token and mean-pooled). For a single-forward
+    (one-shot) model S==1. The chosen block prefers the deepest *encoder* block
+    (the context summary for enc-dec models, which ChronosBolt re-runs each step
+    over the growing context) and otherwise the deepest block overall
+    (decoder-only). :meth:`read` keeps the legacy single-embedding contract (the
+    final generation step).
     """
 
     def __init__(self, model: torch.nn.Module, pattern: str):
         self._rx = re.compile(pattern)
         self._handles = []
-        self._last_overall: Optional[torch.Tensor] = None
-        self._last_encoder: Optional[torch.Tensor] = None
         self.matched: List[str] = []
         for name, mod in model.named_modules():
             if self._rx.search(name):
                 self.matched.append(name)
-                is_enc = "encoder" in name.lower()
                 self._handles.append(
-                    mod.register_forward_hook(self._make_hook(is_enc)))
+                    mod.register_forward_hook(self._make_hook(name)))
+        self._block_set = _block_level(self.matched)
+        # execution-order log: list[(name, last (B, d) cpu, mean (B, d) cpu)]
+        self._log: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
 
-    def _make_hook(self, is_encoder: bool):
+    def _make_hook(self, name: str):
         def hook(_module, _inp, out):
+            if name not in self._block_set:
+                return
             t = out[0] if isinstance(out, (tuple, list)) else out
             if not torch.is_tensor(t) or t.dim() < 2:
                 return
-            h = t.detach().to(torch.float32)
-            self._last_overall = h
-            if is_encoder:
-                self._last_encoder = h
+            last, mean = _reduce_hidden(t.detach().to(torch.float32))
+            self._log.append((name, last.cpu(), mean.cpu()))
         return hook
 
     def reset(self) -> None:
-        self._last_overall = None
-        self._last_encoder = None
+        self._log = []
+
+    def _pick_name(self) -> Optional[str]:
+        """Final block whose per-step firings we read: deepest encoder if any
+        encoder block fired (enc-dec context summary), else the last block fired
+        overall (decoder-only / single trunk)."""
+        if not self._log:
+            return None
+        enc = [n for (n, _, _) in self._log if "encoder" in n.lower()]
+        return enc[-1] if enc else self._log[-1][0]
+
+    def read_steps(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """``(last (B, S, d), mean (B, S, d))`` over the S generation steps."""
+        name = self._pick_name()
+        if name is None:
+            return None
+        seq = [(l, m) for (n, l, m) in self._log if n == name]
+        last = torch.stack([l for (l, _) in seq], dim=1)     # (B, S, d)
+        mean = torch.stack([m for (_, m) in seq], dim=1)
+        return last, mean
 
     def read(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        h = self._last_encoder if self._last_encoder is not None else self._last_overall
-        if h is None:
+        steps = self.read_steps()
+        if steps is None:
             return None
-        if h.dim() == 2:                                     # (B, d) already pooled
-            return h, h
-        # General (B, ..., T, d). Most stacks emit (B, T, d), but some (e.g.
-        # Moirai) insert an extra grouping axis between batch and the token
-        # axis, so the hidden state is rank>3 — (B, group, T, d) — and the old
-        # h[:, -1, :] left a stray axis, breaking the per-series assignment.
-        # Robust reduction: keep batch (dim 0) and features (last dim), collapse
-        # everything in between.
-        #   last-token  = last index along the token axis (second-to-last dim),
-        #                 then mean any remaining middle (grouping) axes;
-        #   mean-pooled = mean over all axes except batch and feature.
-        last = h[..., -1, :]                                 # drop token axis
-        while last.dim() > 2:
-            last = last.mean(dim=1)
-        mean = h
-        while mean.dim() > 2:
-            mean = mean.mean(dim=1)
-        return last, mean
+        last, mean = steps
+        return last[:, -1, :], mean[:, -1, :]                # legacy: final step
 
     def remove(self) -> None:
         for hd in self._handles:
@@ -303,7 +367,10 @@ def _resolve_backbone(family, base, model_id, device):
 def extract_uniform(
     family, base, model_id, x_all, width, horizon, batch_size, device, pattern,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """Embeddings for a uniform-width batch. Returns (last (n,d), mean (n,d))."""
+    """Embeddings for a uniform-width batch.
+
+    Returns ``(last (n, S, d), mean (n, S, d))`` where S is the number of
+    generation steps the model used for this horizon (1 for one-shot models)."""
     n = x_all.shape[0]
     if family == "moirai":
         runner = bcl._build_moirai(base, horizon, width, device)
@@ -324,7 +391,7 @@ def extract_uniform(
                 xb = x_all[start:start + batch_size]
                 cap.reset()
                 _predict_dispatch(family, runner, xb, horizon, device)
-                got = cap.read()
+                got = cap.read_steps()
                 if got is None:
                     raise RuntimeError(
                         f"No hidden state captured for family={family} "
@@ -472,6 +539,45 @@ def summarize_saturation(
     return out
 
 
+def saturation_curves_steps(emb: np.ndarray) -> Dict[str, np.ndarray]:
+    """Context-axis saturation curves per generation step.
+
+    emb: (N, K, S, d). Returns (N, K, S): for each output step s, the same
+    to_asymp/marginal curves over the K context windows. Step 0 is the
+    context-only encoding; later steps fold in self-generated history.
+    """
+    N, K, S, _ = emb.shape
+    to_asymp = np.zeros((N, K, S), dtype=np.float32)
+    marginal = np.zeros((N, K, S), dtype=np.float32)
+    for s in range(S):
+        c = saturation_curves(emb[:, :, s, :])
+        to_asymp[:, :, s] = c["to_asymp"]
+        marginal[:, :, s] = c["marginal"]
+    return {"to_asymp": to_asymp, "marginal": marginal}
+
+
+def generation_curves(emb: np.ndarray) -> Dict[str, np.ndarray]:
+    """Step-axis saturation: how the representation moves AS we generate.
+
+    emb: (N, K, S, d). Returns (N, K, S):
+      gen_to_asymp[:, k, s] = cos_dist(e(L_k, s), e(L_k, S-1))  (0 at the last step)
+      gen_marginal[:, k, s] = cos_dist(e(L_k, s), e(L_k, s-1))  (0 at s=0)
+    For one-shot models (S==1) both are all-zero. Non-trivial gen_marginal at
+    late steps is "emitting this output-patch perturbed the representation".
+    """
+    N, K, S, _ = emb.shape
+    gen_to_asymp = np.zeros((N, K, S), dtype=np.float32)
+    gen_marginal = np.zeros((N, K, S), dtype=np.float32)
+    for k in range(K):
+        e = emb[:, k, :, :]                                   # (N, S, d)
+        e_last = e[:, -1, :]
+        for s in range(S):
+            gen_to_asymp[:, k, s] = _cos_dist_rows(e[:, s, :], e_last)
+            if s > 0:
+                gen_marginal[:, k, s] = _cos_dist_rows(e[:, s, :], e[:, s - 1, :])
+    return {"gen_to_asymp": gen_to_asymp, "gen_marginal": gen_marginal}
+
+
 # ==============================================================================
 #  EMBEDDING COLLECTION OVER THE GRID
 # ==============================================================================
@@ -480,13 +586,15 @@ def collect_grid_embeddings(
     horizon: int, windows: List[int], batch_size: int, device: str, pattern: str,
     progress_desc: Optional[str] = None,
 ) -> Tuple[np.ndarray, List[str]]:
-    """(N, K, d) embeddings (last-token) for every series at every window.
+    """(N, K, S, d) embeddings (last-token) for every series at every window.
 
     Mirrors forecast_window: each series is fed its last min(L, real_len)
     genuine samples, bucketed down to the grid, so the embedding flattens once a
-    short series runs out of context. We keep last-token embeddings (most-recent
-    aligned, robust to NaN-padded models); mean-pooled stored separately by the
-    caller if desired.
+    short series runs out of context. The S axis is the number of generation
+    steps the model uses for ``horizon`` (1 for one-shot models), so e[:, k, s]
+    is the final-block embedding when emitting output-patch s at context L_k. We
+    keep last-token embeddings (most-recent aligned, robust to NaN-padded
+    models); mean-pooled stored separately by the caller if desired.
 
     ``progress_desc`` (if given) labels a per-window tqdm bar so a long cell
     shows how far the embedding sweep has progressed.
@@ -498,6 +606,7 @@ def collect_grid_embeddings(
     matched: List[str] = []
 
     d0: Optional[int] = None                                  # first-seen d_model
+    s0: Optional[int] = None                                  # first-seen n_steps
     bar = tqdm(total=len(windows), desc=progress_desc, unit="win",
                leave=False, disable=progress_desc is None)
     try:
@@ -516,7 +625,7 @@ def collect_grid_embeddings(
             # --- shape diagnostics: shape mismatches here are the failure mode
             # the user has hit, so we make them loud and actionable rather than
             # letting a bare numpy broadcast error bubble up context-free.
-            if last.ndim != 2 or last.shape[0] != idx.shape[0]:
+            if last.ndim != 3 or last.shape[0] != idx.shape[0]:
                 raise RuntimeError(
                     f"embedding row count mismatch: family={family} "
                     f"window L={int(L)} bucket-width={int(width)} expected "
@@ -524,20 +633,27 @@ def collect_grid_embeddings(
                     f"mean.shape={tuple(mean.shape)}, x_grp.shape={tuple(x_grp.shape)}. "
                     f"(N={N}, n_windows={len(windows)})")
             if d0 is None:
-                d0 = last.shape[1]
-            if last.shape[1] != d0:
+                d0, s0 = last.shape[2], last.shape[1]
+            if last.shape[2] != d0:
                 raise RuntimeError(
                     f"embedding d_model changed across windows: family={family} "
                     f"window L={int(L)} bucket-width={int(width)} got "
-                    f"d={last.shape[1]} but first window gave d={d0}. The hooked "
+                    f"d={last.shape[2]} but first window gave d={d0}. The hooked "
                     f"module ({len(matched)} matched) returns a different feature "
                     f"width per context size — refine --hook-pattern / inspect "
                     f"with --dump-modules.")
+            if last.shape[1] != s0:
+                raise RuntimeError(
+                    f"generation-step count changed across windows: family={family} "
+                    f"window L={int(L)} bucket-width={int(width)} got "
+                    f"S={last.shape[1]} but first window gave S={s0}. The per-cell "
+                    f"step axis must be constant (same horizon); a varying step "
+                    f"count means the decode loop depends on context length.")
             if emb_last is None:
-                emb_last = np.zeros((N, len(windows), d0), dtype=np.float32)
-                emb_mean = np.zeros((N, len(windows), d0), dtype=np.float32)
-            emb_last[idx, k, :] = last
-            emb_mean[idx, k, :] = mean
+                emb_last = np.zeros((N, len(windows), s0, d0), dtype=np.float32)
+                emb_mean = np.zeros((N, len(windows), s0, d0), dtype=np.float32)
+            emb_last[idx, k, :, :] = last
+            emb_mean[idx, k, :, :] = mean
         bar.update(1)
     finally:
       bar.close()
@@ -581,21 +697,60 @@ def _plots(out_dir, windows, curves, summary, title):
     plt.close(fig)
 
 
+def _gen_plot(out_dir, gen_curves, title):
+    """Step-axis drift at the longest context: did each output-patch move the rep?"""
+    g = gen_curves["gen_marginal"]                            # (N, K, S)
+    if g.shape[2] < 2:                                        # one-shot: nothing to show
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    gm = g[:, -1, :]                                          # longest window, (N, S)
+    steps = np.arange(gm.shape[1])
+    med = np.median(gm, axis=0)
+    q1, q3 = np.percentile(gm, [25, 75], axis=0)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(steps, med, marker="o", label="median")
+    ax.fill_between(steps, q1, q3, alpha=0.2, label="IQR")
+    ax.set_xlabel("generation step (output patch)")
+    ax.set_ylabel("cosine dist to previous step")
+    ax.set_title(f"{title}\nrepresentation drift as we generate")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "plots", "generation_drift.png"), dpi=120)
+    plt.close(fig)
+
+
 def _write_cell(out_dir, windows, emb_last, emb_mean, meta, save_embeddings, title):
     os.makedirs(out_dir, exist_ok=True)
+    # emb_last/emb_mean: (N, K, S, d). Canonical context-axis saturation uses
+    # step 0 — the context-only encoding, before any self-generated history (for
+    # one-shot models S==1 so this is exactly the single embedding as before).
+    S = emb_last.shape[2]
+    e0 = emb_last[:, :, 0, :]                                 # (N, K, d)
+    curves = saturation_curves(e0)
     # Centered (anisotropy-robust) saturation alongside raw: subtract per-window
     # mean embedding across the cell before the cosine.
-    curves = saturation_curves(emb_last)
-    centered = emb_last - emb_last.mean(axis=0, keepdims=True)
+    centered = e0 - e0.mean(axis=0, keepdims=True)
     curves_centered = saturation_curves(centered)
     summary_arrays = summarize_saturation(curves, np.asarray(windows))
+    # Per-step context curves + step-axis "as we generate" curves.
+    step_curves = saturation_curves_steps(emb_last)          # (N, K, S)
+    gen_curves = generation_curves(emb_last)                 # (N, K, S)
 
     np.savez_compressed(
         os.path.join(out_dir, "saturation.npz"),
-        windows=np.asarray(windows),
+        windows=np.asarray(windows), n_steps=np.int64(S),
         to_asymp=curves["to_asymp"], marginal=curves["marginal"],
         to_asymp_centered=curves_centered["to_asymp"],
         marginal_centered=curves_centered["marginal"],
+        to_asymp_steps=step_curves["to_asymp"],
+        marginal_steps=step_curves["marginal"],
+        gen_to_asymp=gen_curves["gen_to_asymp"],
+        gen_marginal=gen_curves["gen_marginal"],
         **summary_arrays,
         **{k: np.asarray(v) for k, v in meta.items() if np.ndim(v) >= 1},
     )
@@ -607,7 +762,8 @@ def _write_cell(out_dir, windows, emb_last, emb_mean, meta, save_embeddings, tit
     summary = {
         "n_series": int(emb_last.shape[0]),
         "n_windows": int(emb_last.shape[1]),
-        "d_model": int(emb_last.shape[2]),
+        "n_steps": int(S),
+        "d_model": int(emb_last.shape[3]),
         "windows": list(map(int, windows)),
         **{k: float(np.median(v)) for k, v in summary_arrays.items()},
         **{k: v for k, v in meta.items() if np.ndim(v) == 0},
@@ -615,6 +771,7 @@ def _write_cell(out_dir, windows, emb_last, emb_mean, meta, save_embeddings, tit
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     _plots(out_dir, windows, curves, summary_arrays, title)
+    _gen_plot(out_dir, gen_curves, title)
     return summary
 
 
