@@ -37,11 +37,22 @@ horizon, no ground truth.
 
 Sources
 -------
+* gifteval  — reuses the v5 GiftEvalCache + DATASETS, so cells line up 1:1 with
+  the error ablation for the L*_embed vs L*_err scatter. This is the default
+  source (see --sources).
 * synthetic — reuses build_context_length_dataset.generate_dataset (the same
   non-stationary pool). We know each series' regime count, so saturation can be
-  checked against regime structure.
-* gifteval  — reuses the v5 GiftEvalCache + DATASETS, so cells line up 1:1 with
-  the error ablation for the L*_embed vs L*_err scatter.
+  checked against regime structure. Still wired up but OFF by default.
+
+NOTE (for later — synthetic saturation): the embedding saturation of the
+synthetic pool *on its own* isn't very interesting — it's just "does the model
+settle". It becomes interesting only once we **control the synthetic generator**
+and draw parallels between saturation behavior and known data characteristics
+(regime count / shift magnitude / per-segment trend-AR-seasonality / spike
+density / wave type). Then L*_embed becomes a probe of *which* data property
+drives representational saturation. generate_dataset already returns n_segments
+per series; the next step is to expose the rest of the per-series generative
+metadata and correlate it against L*_embed. Deferred for now; gifteval first.
 
 Hooking
 -------
@@ -462,6 +473,7 @@ def collect_grid_embeddings(
     emb_mean: Optional[np.ndarray] = None
     matched: List[str] = []
 
+    d0: Optional[int] = None                                  # first-seen d_model
     for k, L in enumerate(windows):
         eff = np.minimum(int(L), np.asarray(real_lengths))
         eff_buck = np.minimum(
@@ -473,10 +485,29 @@ def collect_grid_embeddings(
             last, mean, matched = extract_uniform(
                 family, base, model_id, x_grp, int(width), horizon,
                 batch_size, device, pattern)
+            # --- shape diagnostics: shape mismatches here are the failure mode
+            # the user has hit, so we make them loud and actionable rather than
+            # letting a bare numpy broadcast error bubble up context-free.
+            if last.ndim != 2 or last.shape[0] != idx.shape[0]:
+                raise RuntimeError(
+                    f"embedding row count mismatch: family={family} "
+                    f"window L={int(L)} bucket-width={int(width)} expected "
+                    f"{idx.shape[0]} rows got last.shape={tuple(last.shape)}, "
+                    f"mean.shape={tuple(mean.shape)}, x_grp.shape={tuple(x_grp.shape)}. "
+                    f"(N={N}, n_windows={len(windows)})")
+            if d0 is None:
+                d0 = last.shape[1]
+            if last.shape[1] != d0:
+                raise RuntimeError(
+                    f"embedding d_model changed across windows: family={family} "
+                    f"window L={int(L)} bucket-width={int(width)} got "
+                    f"d={last.shape[1]} but first window gave d={d0}. The hooked "
+                    f"module ({len(matched)} matched) returns a different feature "
+                    f"width per context size — refine --hook-pattern / inspect "
+                    f"with --dump-modules.")
             if emb_last is None:
-                d = last.shape[1]
-                emb_last = np.zeros((N, len(windows), d), dtype=np.float32)
-                emb_mean = np.zeros((N, len(windows), d), dtype=np.float32)
+                emb_last = np.zeros((N, len(windows), d0), dtype=np.float32)
+                emb_mean = np.zeros((N, len(windows), d0), dtype=np.float32)
             emb_last[idx, k, :] = last
             emb_mean[idx, k, :] = mean
     return emb_last, emb_mean, matched
@@ -586,37 +617,71 @@ def run_gifteval(args, family, model_id, display, base, device, windows,
     from gift_eval.data import Dataset as GiftEvalDataset
 
     wanted = _selected_datasets(args, DATASETS)
-    for d_idx, (ge_name, term, dataset_display, to_univariate) in enumerate(wanted):
-        if num_shards > 1 and d_idx % num_shards != shard_id:
-            continue
+    # Cells this shard owns — enumerate them so we can print true progress
+    # (i/total) instead of a silent stream that gives no sense of how far in we are.
+    my_cells = [(d_idx, row) for d_idx, row in enumerate(wanted)
+                if num_shards <= 1 or d_idx % num_shards == shard_id]
+    total = len(my_cells)
+    shard_tag = f" shard {shard_id}/{num_shards}" if num_shards > 1 else ""
+    print(Fore.CYAN + f"  gifteval{shard_tag}: {total} cells for {display}"
+          + Fore.RESET)
+    n_done = n_skip = n_fail = 0
+    for pos, (d_idx, (ge_name, term, dataset_display, to_univariate)) in enumerate(
+            my_cells, start=1):
+        prog = f"[{pos}/{total}]"
         out_dir = os.path.join(
             args.out_root, "gifteval", dataset_display, display, f"t{term}")
         if _done(out_dir) and not args.force:
+            n_skip += 1
+            print(Fore.YELLOW + f"  {prog} [skip] {dataset_display}/t{term} (cached)"
+                  + Fore.RESET)
             continue
         try:
             ge = GiftEvalDataset(name=ge_name, term=term, to_univariate=to_univariate)
             cache = GiftEvalCache(ge, dataset_display)
         except Exception as e:                               # noqa: BLE001
-            print(Fore.RED + f"  [warn] load failed {dataset_display}/{term}: {e}"
+            n_fail += 1
+            print(Fore.RED + f"  {prog} [warn] load failed {dataset_display}/t{term}: {e}"
                   + Fore.RESET)
+            traceback.print_exc()
             continue
-        contexts = np.stack([
-            np.pad(c, (max(0, windows[-1] - len(c)), 0))[-windows[-1]:]
-            if len(c) < windows[-1] else c[-windows[-1]:]
-            for c in cache.contexts]).astype(np.float32)
-        real_lengths = np.minimum(cache.context_lengths, windows[-1]).astype(np.int64)
-        horizon = cache.horizon
-        grid = [w for w in windows if w <= cache.max_context] or [windows[0]]
-        emb_last, emb_mean, matched = collect_grid_embeddings(
-            family, base, model_id, contexts, real_lengths, horizon, grid,
-            args.batch_size, device, args.hook_pattern)
-        meta = {"real_lengths": real_lengths, "horizon": horizon,
-                "source": "gifteval", "dataset": dataset_display, "term": term,
-                "model": display, "hooked_modules": len(matched)}
-        _write_cell(out_dir, grid, emb_last, emb_mean, meta,
-                    args.save_embeddings, f"{dataset_display} t{term} — {display}")
-        print(Fore.GREEN + f"  [done] gifteval/{dataset_display}/{display}/t{term}"
-              + Fore.RESET)
+        # Each cell is isolated: a shape mismatch in one dataset must not abort
+        # the remaining cells for this model. Log the failing cell's full shape
+        # context so the mismatch is diagnosable from the log alone.
+        try:
+            print(Fore.CYAN + f"  {prog} {dataset_display}/t{term} …" + Fore.RESET)
+            contexts = np.stack([
+                np.pad(c, (max(0, windows[-1] - len(c)), 0))[-windows[-1]:]
+                if len(c) < windows[-1] else c[-windows[-1]:]
+                for c in cache.contexts]).astype(np.float32)
+            real_lengths = np.minimum(
+                cache.context_lengths, windows[-1]).astype(np.int64)
+            horizon = cache.horizon
+            grid = [w for w in windows if w <= cache.max_context] or [windows[0]]
+            emb_last, emb_mean, matched = collect_grid_embeddings(
+                family, base, model_id, contexts, real_lengths, horizon, grid,
+                args.batch_size, device, args.hook_pattern)
+            meta = {"real_lengths": real_lengths, "horizon": horizon,
+                    "source": "gifteval", "dataset": dataset_display, "term": term,
+                    "model": display, "hooked_modules": len(matched)}
+            _write_cell(out_dir, grid, emb_last, emb_mean, meta,
+                        args.save_embeddings, f"{dataset_display} t{term} — {display}")
+            n_done += 1
+            print(Fore.GREEN + f"  {prog} [done] gifteval/{dataset_display}/{display}"
+                  f"/t{term}" + Fore.RESET)
+        except Exception as e:                               # noqa: BLE001
+            n_fail += 1
+            print(Fore.RED + f"  {prog} [FAIL] {dataset_display}/t{term} ({display}): "
+                  f"{type(e).__name__}: {e}" + Fore.RESET)
+            print(Fore.RED + f"    n_series={len(cache.contexts)} "
+                  f"max_context={cache.max_context} horizon={cache.horizon} "
+                  f"grid={[w for w in windows if w <= cache.max_context] or [windows[0]]}"
+                  + Fore.RESET)
+            traceback.print_exc()
+            continue
+    print(Fore.CYAN + f"  gifteval{shard_tag} {display}: "
+          f"{n_done} done, {n_skip} skipped, {n_fail} failed (of {total})"
+          + Fore.RESET)
 
 
 def _selected_datasets(args, DATASETS):
@@ -810,8 +875,10 @@ def coordinate(args):
 # ==============================================================================
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--sources", nargs="+", default=["synthetic", "gifteval"],
-                   choices=["synthetic", "gifteval"])
+    p.add_argument("--sources", nargs="+", default=["gifteval"],
+                   choices=["synthetic", "gifteval"],
+                   help="Default: gifteval only. Add 'synthetic' to also run the "
+                        "synthetic pool (see the NOTE in the module docstring).")
     p.add_argument("--models", nargs="+", default=None,
                    help="Display names (default: full run set; TEST_MODEL with --test).")
     p.add_argument("--datasets", nargs="+", default=None,
