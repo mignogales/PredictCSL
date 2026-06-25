@@ -100,6 +100,10 @@ except Exception:                                            # pragma: no cover
 
 from experiments import build_context_length_dataset as bcl
 from experiments import models_config
+# Cross-env routing: single source of truth lives in master_run_all so the
+# experiment dispatches Sundial/TimeMoE -> predictcsl-legacy and Toto ->
+# predictcsl-toto exactly like the rest of the pipeline.
+from experiments.master_run_all import FAMILY_ENV, _env_label, _py
 
 load_dotenv()
 
@@ -726,28 +730,79 @@ def _dump_modules(family, base, model_id, device, pattern):
         print(f"    {n}")
 
 
+def _resolve_env_groups(args) -> "Dict[Optional[str], List[str]]":
+    """Group selected models by the conda env they must load in (main first)."""
+    triples = _models_to_run(args)                       # [(model_id, family, display)]
+    groups: Dict[Optional[str], List[str]] = {None: []}  # None == main env
+    for (_mid, family, display) in triples:
+        groups.setdefault(FAMILY_ENV.get(family), []).append(display)
+    if not groups[None]:
+        del groups[None]
+    return groups
+
+
+def _reconstruct_flags(args, displays: List[str]) -> List[str]:
+    """Serialize this run's config into flags for a per-env/per-shard child.
+
+    --test is intentionally NOT re-passed (windows/synth sizes are already
+    concrete and PREDICTCSL_TEST is inherited via the environment); --gpus /
+    --shard-id / --num-shards / --log-file are set per dispatch.
+    """
+    f = ["--sources", *args.sources, "--models", *displays,
+         "--windows", *map(str, args.windows),
+         "--batch-size", str(args.batch_size),
+         "--synth-series", str(args.synth_series),
+         "--synth-seed", str(args.synth_seed),
+         "--hook-pattern", args.hook_pattern,
+         "--out-root", args.out_root]
+    if args.datasets:
+        f += ["--datasets", *args.datasets]
+    if args.test_datasets is not None:
+        f += ["--test-datasets", str(args.test_datasets)]
+    if args.save_embeddings:
+        f += ["--save-embeddings"]
+    if args.force:
+        f += ["--force"]
+    if args.dump_modules:
+        f += ["--dump-modules"]
+    return f
+
+
+def _group_cmd(args, env, displays, shard_id, num_shards) -> List[str]:
+    label = _env_label(env)
+    stem = (f"dump_modules_{label}" if args.dump_modules
+            else f"run_{label}_shard{shard_id}")
+    flags = _reconstruct_flags(args, displays) + [
+        "--gpus", "1", "--shard-id", str(shard_id), "--num-shards", str(num_shards),
+        "--log-file", os.path.join(args.out_root, stem + ".log")]
+    return _py(env, "experiments.embedding_saturation", *flags)
+
+
 def coordinate(args):
-    """Spawn one worker subprocess per GPU; round-robin the gifteval datasets."""
-    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if args.gpus:
-        n_gpus = args.gpus
-    if n_gpus <= 1 or args.dump_modules:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        run_worker(args, device, shard_id=0, num_shards=1)
-        return
-    print(Fore.CYAN + f"Coordinator: {n_gpus} GPU(s)." + Fore.RESET)
-    procs = []
-    for i in range(n_gpus):
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(i))
-        cmd = [sys.executable, "-m", "experiments.embedding_saturation",
-               *sys.argv[1:], "--shard-id", str(i), "--num-shards", str(n_gpus),
-               "--gpus", "1"]
-        procs.append(subprocess.Popen(cmd, env=env))
-    fail = 0
-    for p in procs:
-        fail += p.wait() != 0
-    if fail:
-        raise SystemExit(f"{fail} worker(s) failed.")
+    """Dispatch per conda-env group; within a group, shard datasets across GPUs.
+
+    Main-env models reuse the current interpreter; legacy/toto models are
+    launched via ``conda run -n <env>`` (FAMILY_ENV from master_run_all).
+    """
+    n_gpus = args.gpus or (torch.cuda.device_count()
+                           if torch.cuda.is_available() else 0)
+    groups = _resolve_env_groups(args)
+    fails = 0
+    for env, displays in groups.items():
+        print(Fore.CYAN + f"\n### env {_env_label(env)}: {displays}" + Fore.RESET)
+        if args.dump_modules or n_gpus <= 1:
+            cmd = _group_cmd(args, env, displays, shard_id=0, num_shards=1)
+            print(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
+            fails += subprocess.run(cmd, env=os.environ).returncode != 0
+        else:
+            procs = []
+            for i in range(n_gpus):
+                cenv = dict(os.environ, CUDA_VISIBLE_DEVICES=str(i))
+                cmd = _group_cmd(args, env, displays, shard_id=i, num_shards=n_gpus)
+                procs.append(subprocess.Popen(cmd, env=cenv))
+            fails += sum(p.wait() != 0 for p in procs)
+    if fails:
+        raise SystemExit(Fore.RED + f"{fails} group/worker(s) failed." + Fore.RESET)
 
 
 # ==============================================================================
