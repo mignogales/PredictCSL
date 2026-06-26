@@ -870,7 +870,13 @@ def predict_patchtst_fm(model, batches, horizon, device):
             past_values = torch.cat([pad, past_values], dim=1)
         elif past_values.shape[1] > ctx_len:
             past_values = past_values[:, -ctx_len:]
-        output = model(inputs=past_values, prediction_length=horizon)
+        # tsfm_public's multi-step rollout (forecast_single_step) builds its mask
+        # with a bare `torch.ones(f_i)` (no device arg) -> CPU, tripping a device
+        # mismatch against the CUDA hidden state when horizon exceeds the model's
+        # single-shot length (long-term GiftEval). Run under a default-device
+        # context so those factory tensors land on `device`.
+        with torch.device(device):
+            output = model(inputs=past_values, prediction_length=horizon)
         raw = output[0]
         if raw.dim() == 4:
             qf = raw[:, :, :horizon, 0]
