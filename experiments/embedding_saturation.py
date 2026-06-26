@@ -263,6 +263,7 @@ class HiddenCapture:
         # execution-order log: list[(name, last (B, d) cpu, mean (B, d) cpu)]
         self._log: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
         self._final_name: Optional[str] = None   # cached after first read
+        self._expected_batch: Optional[int] = None  # true input batch (set per forward)
 
     def _make_hook(self, name: str):
         def hook(_module, _inp, out):
@@ -276,20 +277,34 @@ class HiddenCapture:
             self._log.append((name, last.cpu(), mean.cpu()))
         return hook
 
-    def reset(self) -> None:
+    def reset(self, expected_batch: Optional[int] = None) -> None:
         self._log = []                            # keep _final_name across batches
+        self._expected_batch = expected_batch     # true batch of the next forward
 
     def _pick_name(self) -> Optional[str]:
         """Final block whose per-step firings we read: deepest encoder if any
         encoder block fired (enc-dec context summary), else the last block fired
-        overall (decoder-only / single trunk). Honors the cached name."""
+        overall (decoder-only / single trunk). Honors the cached name.
+
+        Firings are restricted to those whose leading dim equals the true input
+        batch, so we never pick a block that folds another axis into dim 0. Toto's
+        space-wise transformer layers reshape to ``(B*num_patches, num_variates,
+        d)`` — leading dim ``B*num_patches`` — while its time-wise layers keep
+        ``(B*num_variates, num_patches, d)`` with leading dim ``B`` (univariate
+        here); the batch filter keeps the time-wise layer (last-token = the
+        most-recent context patch) and drops the patch-folded one."""
         if self._final_name is not None:
             return self._final_name if any(
                 n == self._final_name for (n, _, _) in self._log) else None
         if not self._log:
             return None
-        enc = [n for (n, _, _) in self._log if "encoder" in n.lower()]
-        return enc[-1] if enc else self._log[-1][0]
+        eb = self._expected_batch
+        log = [(n, l) for (n, l, _) in self._log
+               if eb is None or l.shape[0] == eb]
+        if not log:                               # nothing matched the batch -> keep all
+            log = [(n, l) for (n, l, _) in self._log]
+        enc = [n for (n, _) in log if "encoder" in n.lower()]
+        return enc[-1] if enc else log[-1][0]
 
     def read_steps(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """``(last (B, S, d), mean (B, S, d))`` over the S generation steps."""
@@ -390,7 +405,7 @@ def extract_uniform(
         with torch.no_grad():
             for start in range(0, n, batch_size):
                 xb = x_all[start:start + batch_size]
-                cap.reset()
+                cap.reset(xb.shape[0])
                 _predict_dispatch(family, runner, xb, horizon, device)
                 got = cap.read_steps()
                 if got is None:
@@ -735,6 +750,144 @@ def _gen_plot(out_dir, gen_curves, title):
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "plots", "generation_drift.png"), dpi=120)
     plt.close(fig)
+
+
+# ==============================================================================
+#  COMBINED (CROSS-MODEL) PLOTS PER DATASET
+# ==============================================================================
+_TERM_ORDER = {"short": 0, "medium": 1, "long": 2}
+
+
+def _term_sort_key(t: str):
+    return (_TERM_ORDER.get(t, 99), t)
+
+
+def _load_cell_curves(cell_dir: str) -> Optional[dict]:
+    """Read one cell's saturation.npz -> median curves + L* (None if absent)."""
+    path = os.path.join(cell_dir, "saturation.npz")
+    if not os.path.exists(path):
+        return None
+    z = np.load(path)
+    thr = MARGINAL_THRESHOLDS[0]
+    lstar_key = f"Lstar_marginal_{thr}"
+    return {
+        "windows": z["windows"].astype(np.float64),
+        "marginal": np.median(z["marginal"], axis=0),
+        "to_asymp": np.median(z["to_asymp"], axis=0),
+        "lstar": float(np.median(z[lstar_key])) if lstar_key in z.files else np.nan,
+        "n_series": int(z["marginal"].shape[0]),
+    }
+
+
+def _collect_dataset_cells(dataset_dir: str) -> "Dict[str, Dict[str, dict]]":
+    """``{term: {model: curves}}`` for one dataset dir (skips empty cells)."""
+    by_term: Dict[str, Dict[str, dict]] = {}
+    for model in sorted(os.listdir(dataset_dir)):
+        model_dir = os.path.join(dataset_dir, model)
+        if not os.path.isdir(model_dir) or model == "combined":
+            continue
+        for term_dir in sorted(os.listdir(model_dir)):
+            if not term_dir.startswith("t"):
+                continue
+            term = term_dir[1:]
+            curves = _load_cell_curves(os.path.join(model_dir, term_dir))
+            if curves is not None:
+                by_term.setdefault(term, {})[model] = curves
+    return by_term
+
+
+def combine_dataset_plots(out_root: str) -> int:
+    """Per-dataset overlay of every model's saturation curves.
+
+    Walks ``<out_root>/gifteval/<dataset>/<model>/t<term>/saturation.npz`` and,
+    for each dataset, draws one figure (rows = {marginal, to_asymp}, columns =
+    terms present) with one line per model — each line the median curve over that
+    cell's instances, against the shared context grid. A companion grouped-bar
+    figure compares the median ``L*_embed`` (marginal <= %.2f) per model per term.
+    Pure post-processing over the cached cells; writes into
+    ``<dataset>/combined/`` and returns the number of datasets plotted.
+    """ % MARGINAL_THRESHOLDS[0]
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        print(Fore.RED + "  matplotlib unavailable — cannot combine plots." + Fore.RESET)
+        return 0
+    ge_root = os.path.join(out_root, "gifteval")
+    if not os.path.isdir(ge_root):
+        print(Fore.RED + f"  no gifteval tree at {ge_root}" + Fore.RESET)
+        return 0
+
+    n_plotted = 0
+    for dataset in sorted(os.listdir(ge_root)):
+        dataset_dir = os.path.join(ge_root, dataset)
+        if not os.path.isdir(dataset_dir):
+            continue
+        by_term = _collect_dataset_cells(dataset_dir)
+        if not by_term:
+            continue
+        terms = sorted(by_term, key=_term_sort_key)
+        models = sorted({m for cells in by_term.values() for m in cells})
+        cmap = plt.get_cmap("tab10" if len(models) <= 10 else "tab20")
+        color = {m: cmap(i % cmap.N) for i, m in enumerate(models)}
+        out_dir = os.path.join(dataset_dir, "combined")
+        os.makedirs(out_dir, exist_ok=True)
+
+        # --- overlay curves: rows {marginal, to_asymp} x cols terms ---
+        ncols = len(terms)
+        fig, axes = plt.subplots(2, ncols, figsize=(1 + 4.5 * ncols, 8),
+                                 squeeze=False)
+        for ci, term in enumerate(terms):
+            cells = by_term[term]
+            for ri, metric in enumerate(("marginal", "to_asymp")):
+                ax = axes[ri][ci]
+                for m in models:
+                    c = cells.get(m)
+                    if c is None:
+                        continue
+                    ax.plot(c["windows"], c[metric], marker="o", ms=3,
+                            color=color[m], label=m)
+                ax.set_xscale("log")
+                ax.set_xlabel("context length")
+                ax.set_ylabel("cosine distance")
+                if ri == 0:
+                    ax.set_title(f"t{term}  ({metric})")
+                else:
+                    ax.set_title(metric)
+        # One shared legend (models) on the right so subplots stay uncluttered.
+        handles = [plt.Line2D([], [], color=color[m], marker="o", ms=4, label=m)
+                   for m in models]
+        fig.legend(handles=handles, loc="center right", fontsize=8,
+                   title="model", borderaxespad=0.2)
+        fig.suptitle(f"{dataset} — embedding saturation by model")
+        fig.tight_layout(rect=(0, 0, 0.86, 0.97))
+        fig.savefig(os.path.join(out_dir, "saturation_by_model.png"), dpi=120)
+        plt.close(fig)
+
+        # --- grouped-bar L*_embed per model per term ---
+        fig, ax = plt.subplots(figsize=(1.5 + 1.1 * len(models), 4.5))
+        x = np.arange(len(models))
+        w = 0.8 / max(1, len(terms))
+        for ti, term in enumerate(terms):
+            vals = [by_term[term].get(m, {}).get("lstar", np.nan) for m in models]
+            ax.bar(x + ti * w, vals, w, label=f"t{term}")
+        ax.set_xticks(x + w * (len(terms) - 1) / 2)
+        ax.set_xticklabels(models, rotation=30, ha="right", fontsize=8)
+        ax.set_ylabel(f"median L*_embed (marginal<={MARGINAL_THRESHOLDS[0]})")
+        ax.set_yscale("log")
+        ax.set_title(f"{dataset} — saturation length by model")
+        ax.legend(title="term", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "Lstar_by_model.png"), dpi=120)
+        plt.close(fig)
+
+        n_plotted += 1
+        print(Fore.GREEN + f"  [combined] {dataset}: {len(models)} models, "
+              f"terms={terms} -> {out_dir}" + Fore.RESET)
+    print(Fore.CYAN + f"combined plots written for {n_plotted} dataset(s)."
+          + Fore.RESET)
+    return n_plotted
 
 
 def _write_cell(out_dir, windows, emb_last, emb_mean, meta, save_embeddings, title):
@@ -1107,6 +1260,9 @@ def parse_args():
     p.add_argument("--gpus", type=int, default=0, help="0 = all visible GPUs.")
     p.add_argument("--dump-modules", action="store_true",
                    help="Print hook-matched modules per model and exit.")
+    p.add_argument("--combine", action="store_true",
+                   help="Post-process: write per-dataset cross-model combined "
+                        "plots from the cached cells, then exit (no inference).")
     p.add_argument("--log-file", default=None,
                    help="Tee stdout+stderr here (default: <out-root>/<run>.log).")
     p.add_argument("--test", action="store_true",
@@ -1137,6 +1293,9 @@ def main():
             stem += f"_shard{args.shard_id}"
         args.log_file = os.path.join(args.out_root, f"{stem}.log")
     _install_log(args.log_file)
+    if args.combine:
+        combine_dataset_plots(args.out_root)
+        return
     if args.shard_id is not None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         run_worker(args, device, args.shard_id, args.num_shards)
