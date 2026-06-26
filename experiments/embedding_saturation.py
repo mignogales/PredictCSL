@@ -178,6 +178,44 @@ def _install_log(path: str) -> None:
     sys.stderr = _Tee(sys.stderr, fh)
     print(Fore.CYAN + f"Logging to {path}" + Fore.RESET)
 
+
+def _dump_error_report(out_root: str, tag: str, context: "Dict[str, object]"
+                       ) -> Optional[str]:
+    """Write a self-contained ``<out_root>/errors/<tag>.log`` for one failure.
+
+    Captures the live exception's full traceback (via ``traceback.format_exc()``,
+    so call from inside an ``except`` block), plus environment (python/torch/CUDA)
+    and the per-cell ``context`` (model, dataset, shapes, grid, horizon, …). One
+    file per failing cell, named for the cell, so it can be sent on its own for
+    diagnosis. Best-effort: never raises — logging must not mask the real error."""
+    import datetime as _dt
+    import platform
+    try:
+        err_dir = os.path.join(out_root, "errors")
+        os.makedirs(err_dir, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", tag).strip("_") or "error"
+        path = os.path.join(err_dir, f"{safe}.log")
+        with open(path, "w") as f:
+            f.write(f"timestamp : {_dt.datetime.now().isoformat()}\n")
+            f.write(f"argv      : {' '.join(sys.argv[1:])}\n")
+            f.write(f"python    : {sys.version.split()[0]}  "
+                    f"torch={getattr(torch, '__version__', '?')}\n")
+            f.write(f"platform  : {platform.platform()}\n")
+            try:
+                if torch.cuda.is_available():
+                    f.write(f"gpu       : {torch.cuda.get_device_name(0)}  "
+                            f"cuda={torch.version.cuda}\n")
+            except Exception:                                # noqa: BLE001
+                pass
+            f.write("\n--- context ---\n")
+            for k, v in context.items():
+                f.write(f"{k} : {v}\n")
+            f.write("\n--- traceback ---\n")
+            f.write(traceback.format_exc())
+        return path
+    except Exception:                                        # noqa: BLE001
+        return None
+
 # ==============================================================================
 #  CONFIG
 # ==============================================================================
@@ -307,11 +345,24 @@ class HiddenCapture:
         return enc[-1] if enc else log[-1][0]
 
     def read_steps(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """``(last (B, S, d), mean (B, S, d))`` over the S generation steps."""
+        """``(last (B, S, d), mean (B, S, d))`` over the S generation steps.
+
+        Only firings at the true input batch form the step axis. An enc-dec model
+        may re-fire the chosen block inside its decode loop with the batch folded
+        over quantiles / samples (ChronosBolt's long-horizon path expands B -> B*9
+        on the autoregressive continuation): those are not per-series embeddings
+        and cannot be stacked with the context-batch firing, so they are dropped.
+        Falls back to all firings if the batch filter would empty the sequence, so
+        the embedding is never lost outright."""
         name = self._pick_name()
         if name is None:
             return None
         seq = [(l, m) for (n, l, m) in self._log if n == name]
+        eb = self._expected_batch
+        if eb is not None:
+            filt = [(l, m) for (l, m) in seq if l.shape[0] == eb]
+            if filt:
+                seq = filt
         if not seq:
             return None
         last = torch.stack([l for (l, _) in seq], dim=1)     # (B, S, d)
@@ -1001,6 +1052,13 @@ def run_gifteval(args, family, model_id, display, base, device, windows,
             print(Fore.RED + f"  {prog} [warn] load failed {dataset_display}/t{term}: {e}"
                   + Fore.RESET)
             traceback.print_exc()
+            rpt = _dump_error_report(
+                args.out_root, f"{display}__{dataset_display}__t{term}__load",
+                {"phase": "dataset load", "model": display, "family": family,
+                 "model_id": model_id, "dataset": dataset_display,
+                 "ge_name": ge_name, "term": term, "error": f"{type(e).__name__}: {e}"})
+            if rpt:
+                print(Fore.RED + f"    error report -> {rpt}" + Fore.RESET)
             continue
         # Each cell is isolated: a shape mismatch in one dataset must not abort
         # the remaining cells for this model. Log the failing cell's full shape
@@ -1029,13 +1087,24 @@ def run_gifteval(args, family, model_id, display, base, device, windows,
                   f"/t{term}" + Fore.RESET)
         except Exception as e:                               # noqa: BLE001
             n_fail += 1
+            grid_used = [w for w in windows if w <= cache.max_context] or [windows[0]]
             print(Fore.RED + f"  {prog} [FAIL] {dataset_display}/t{term} ({display}): "
                   f"{type(e).__name__}: {e}" + Fore.RESET)
             print(Fore.RED + f"    n_series={len(cache.contexts)} "
                   f"max_context={cache.max_context} horizon={cache.horizon} "
-                  f"grid={[w for w in windows if w <= cache.max_context] or [windows[0]]}"
-                  + Fore.RESET)
+                  f"grid={grid_used}" + Fore.RESET)
             traceback.print_exc()
+            rpt = _dump_error_report(
+                args.out_root, f"{display}__{dataset_display}__t{term}",
+                {"phase": "embedding extraction", "model": display, "family": family,
+                 "model_id": model_id, "dataset": dataset_display, "term": term,
+                 "error": f"{type(e).__name__}: {e}",
+                 "n_series": len(cache.contexts), "max_context": cache.max_context,
+                 "horizon": cache.horizon, "grid": grid_used,
+                 "hook_pattern": args.hook_pattern, "batch_size": args.batch_size,
+                 "device": device})
+            if rpt:
+                print(Fore.RED + f"    error report -> {rpt}" + Fore.RESET)
             continue
     print(Fore.CYAN + f"  gifteval{shard_tag} {display}: "
           f"{n_done} done, {n_skip} skipped, {n_fail} failed (of {total})"
@@ -1094,6 +1163,13 @@ def run_worker(args, device, shard_id, num_shards):
         except Exception as e:                               # noqa: BLE001
             print(Fore.RED + f"  load failed: {e}" + Fore.RESET)
             traceback.print_exc()
+            rpt = _dump_error_report(
+                args.out_root, f"{display}__model_load",
+                {"phase": "model load", "model": display, "family": family,
+                 "model_id": model_id, "device": device,
+                 "error": f"{type(e).__name__}: {e}"})
+            if rpt:
+                print(Fore.RED + f"    error report -> {rpt}" + Fore.RESET)
             continue
         if args.dump_modules:
             _dump_modules(family, base, model_id, device, args.hook_pattern)
@@ -1108,6 +1184,14 @@ def run_worker(args, device, shard_id, num_shards):
         except Exception as e:                               # noqa: BLE001
             print(Fore.RED + f"  run failed for {display}: {e}" + Fore.RESET)
             traceback.print_exc()
+            rpt = _dump_error_report(
+                args.out_root, f"{display}__run",
+                {"phase": "run (synthetic/gifteval)", "model": display,
+                 "family": family, "model_id": model_id, "device": device,
+                 "sources": args.sources, "hook_pattern": args.hook_pattern,
+                 "error": f"{type(e).__name__}: {e}"})
+            if rpt:
+                print(Fore.RED + f"    error report -> {rpt}" + Fore.RESET)
         finally:
             del base
             if bcl._is_cuda(device):
