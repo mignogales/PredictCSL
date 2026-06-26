@@ -157,6 +157,54 @@ def test_nested_capture_picks_block_not_mlp():
           % (d, dff))
 
 
+class _PatchFoldDummy(nn.Module):
+    """Mimics Toto's space-time arch: a time-wise block (leading dim B) followed
+    by a space-wise block that folds the patch axis into the batch (leading dim
+    B*P). The space-wise block fires LAST, so without the batch filter _pick_name
+    would grab the patch-folded output — the reported Toto failure (1850 rows for
+    370 series, P=5)."""
+
+    def __init__(self, d=8, n_patches=5):
+        super().__init__()
+        self.d = d
+        self.P = n_patches
+        self.layers = nn.ModuleList([nn.Linear(1, d), nn.Linear(d, d)])
+
+    def forward(self, x):                       # x: (B, W, 1)
+        B = x.shape[0]
+        toks = x[:, :1, :].expand(B, self.P, 1)          # (B, P, 1)
+        h_time = torch.tanh(self.layers[0](toks))        # (B, P, d)  fire 1: leading dim B
+        folded = h_time.reshape(B * self.P, 1, self.d)   # space-wise: patches -> batch
+        return self.layers[1](folded)                    # (B*P, 1, d) fire 2 (last): dim B*P
+
+
+def test_toto_patchfold_batch_filter():
+    """The batch filter must keep the time-wise block (leading dim B) and reject
+    the space-wise block that folds patches into the batch dim (leading dim B*P)."""
+    B, P, d = 4, 5, 8
+    m = _PatchFoldDummy(d=d, n_patches=P)
+    m.eval()
+    cap = E.HiddenCapture(m, E.DEFAULT_HOOK_PATTERN)
+    cap.reset(B)                               # tell the capture the true batch
+    with torch.no_grad():
+        m(torch.randn(B, 10, 1))
+    last, mean = cap.read_steps()
+    chosen = cap._final_name
+    cap.remove()
+    assert last.shape == (B, 1, d), last.shape   # B rows, NOT B*P
+    assert mean.shape == (B, 1, d), mean.shape
+    assert chosen == "layers.0", f"picked {chosen!r} (space-wise?), want time-wise layers.0"
+    # Without the batch hint, the last-fired (patch-folded) block wins -> B*P rows.
+    cap2 = E.HiddenCapture(m, E.DEFAULT_HOOK_PATTERN)
+    cap2.reset()                               # expected_batch=None -> no filter
+    with torch.no_grad():
+        m(torch.randn(B, 10, 1))
+    naive, _ = cap2.read_steps()
+    cap2.remove()
+    assert naive.shape == (B * P, 1, d), naive.shape
+    print("ok  Toto patch-fold: batch filter keeps time-wise block (B rows, not B*P)")
+
+
 def test_find_backbone_through_wrapper():
     """find_backbone must locate the trunk buried under a non-nn.Module wrapper
     with an arbitrary attribute name (the TimesFM/Moirai failure mode)."""
@@ -259,13 +307,53 @@ def test_integration(monkeypatched=True):
     print("ok  integration collect_grid_embeddings -> _write_cell")
 
 
+def test_combine_dataset_plots():
+    """combine_dataset_plots overlays every model's cells per dataset."""
+    try:
+        import matplotlib  # noqa: F401
+    except Exception:
+        print("skip combine_dataset_plots (no matplotlib)")
+        return
+    rng = np.random.RandomState(3)
+    windows = [32, 64, 128, 256]
+    with tempfile.TemporaryDirectory() as td:
+        out_root = td
+        # Two models x two terms, plus a one-term model, under one dataset.
+        layout = {
+            "Chronos2-Small": ["short", "long"],
+            "Toto-2.0-313m": ["short", "long"],
+            "TiRex": ["short"],
+        }
+        for model, terms in layout.items():
+            for term in terms:
+                N = 5
+                emb = rng.randn(N, len(windows), 1, 8).astype(np.float32)
+                meta = {"real_lengths": np.full(N, windows[-1], dtype=np.int64),
+                        "horizon": 8, "source": "gifteval", "dataset": "ETTm1-H",
+                        "term": term, "model": model, "hooked_modules": 1}
+                cell = os.path.join(out_root, "gifteval", "ETTm1-H", model, f"t{term}")
+                E._write_cell(cell, windows, emb, emb, meta,
+                              save_embeddings=False, title=f"{model} t{term}")
+        n = E.combine_dataset_plots(out_root)
+        assert n == 1, n
+        cdir = os.path.join(out_root, "gifteval", "ETTm1-H", "combined")
+        assert os.path.exists(os.path.join(cdir, "saturation_by_model.png"))
+        assert os.path.exists(os.path.join(cdir, "Lstar_by_model.png"))
+        # The "combined" dir must not be mistaken for a model on a re-run.
+        n2 = E.combine_dataset_plots(out_root)
+        assert n2 == 1, n2
+    print("ok  combine_dataset_plots overlays models per dataset (2 figs)")
+
+
 if __name__ == "__main__":
     test_saturation_math()
     test_curves_shapes()
     test_hidden_capture()
     test_read_steps_multistep()
     test_nested_capture_picks_block_not_mlp()
+    test_toto_patchfold_batch_filter()
     test_find_backbone_through_wrapper()
     test_variable_steps_alignment()
     test_integration()
+    test_combine_dataset_plots()
     print("\nALL SELF-TESTS PASSED")
