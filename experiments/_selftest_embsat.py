@@ -205,6 +205,44 @@ def test_toto_patchfold_batch_filter():
     print("ok  Toto patch-fold: batch filter keeps time-wise block (B rows, not B*P)")
 
 
+class _EncDecQuantileDummy(nn.Module):
+    """Enc-dec whose chosen encoder block re-fires during the decode loop with a
+    batch folded over quantiles (B -> B*Q) — the ChronosBolt long-horizon failure
+    where read_steps tried to stack [B, d] with [B*Q, d]."""
+
+    def __init__(self, d=8, q=9):
+        super().__init__()
+        self.q = q
+        self.encoder = nn.Module()
+        self.encoder.block = nn.ModuleList([nn.Linear(1, d)])
+
+    def forward(self, x):                       # x: (B, W, 1)
+        h = self.encoder.block[0](x)                       # fire 1: (B, W, d)
+        xq = x.repeat_interleave(self.q, dim=0)            # quantile-expanded context
+        _ = self.encoder.block[0](xq)                      # fire 2: (B*Q, W, d)
+        return h
+
+
+def test_encdec_quantile_refire_batch_filter():
+    """read_steps must keep only the true-batch firing and not crash stacking a
+    quantile-expanded (B*Q) decode re-encode with the (B) context encode."""
+    B, Q, d = 4, 9, 8
+    m = _EncDecQuantileDummy(d=d, q=Q)
+    m.eval()
+    cap = E.HiddenCapture(m, E.DEFAULT_HOOK_PATTERN)
+    assert "encoder.block.0" in cap.matched, cap.matched
+    cap.reset(B)
+    with torch.no_grad():
+        m(torch.randn(B, 6, 1))
+    last, mean = cap.read_steps()              # must not raise (B vs B*Q stack)
+    chosen = cap._final_name
+    cap.remove()
+    assert last.shape == (B, 1, d), last.shape
+    assert mean.shape == (B, 1, d), mean.shape
+    assert chosen == "encoder.block.0", chosen
+    print("ok  enc-dec quantile re-fire: read_steps keeps true-batch firing (no stack crash)")
+
+
 def test_find_backbone_through_wrapper():
     """find_backbone must locate the trunk buried under a non-nn.Module wrapper
     with an arbitrary attribute name (the TimesFM/Moirai failure mode)."""
@@ -345,6 +383,28 @@ def test_combine_dataset_plots():
     print("ok  combine_dataset_plots overlays models per dataset (2 figs)")
 
 
+def test_dump_error_report():
+    """_dump_error_report writes a sendable per-failure log with the traceback."""
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            raise ValueError("boom: synthetic failure for the self-test")
+        except Exception:  # noqa: BLE001
+            path = E._dump_error_report(
+                td, "Toto-2.0-313m__ETTm1-H__tlong",
+                {"phase": "embedding extraction", "model": "Toto-2.0-313m",
+                 "horizon": 480, "grid": [32, 64, 128]})
+        assert path is not None and os.path.exists(path), path
+        assert path.endswith("Toto-2.0-313m__ETTm1-H__tlong.log"), path
+        with open(path) as f:
+            body = f.read()
+        assert "--- traceback ---" in body
+        assert "boom: synthetic failure" in body          # the live exception
+        assert "ValueError" in body
+        assert "phase : embedding extraction" in body      # the context block
+        assert "horizon : 480" in body
+    print("ok  _dump_error_report writes traceback + context to a sendable log")
+
+
 if __name__ == "__main__":
     test_saturation_math()
     test_curves_shapes()
@@ -352,8 +412,10 @@ if __name__ == "__main__":
     test_read_steps_multistep()
     test_nested_capture_picks_block_not_mlp()
     test_toto_patchfold_batch_filter()
+    test_encdec_quantile_refire_batch_filter()
     test_find_backbone_through_wrapper()
     test_variable_steps_alignment()
     test_integration()
     test_combine_dataset_plots()
+    test_dump_error_report()
     print("\nALL SELF-TESTS PASSED")
