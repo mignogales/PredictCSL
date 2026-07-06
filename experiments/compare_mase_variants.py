@@ -46,6 +46,15 @@ Run on the SERVER (needs the TSFMs, GIFT_EVAL data, and gluonts):
     python -m experiments.compare_mase_variants \
         --configs ETTm1-15T/short JenaWeather-H/medium BizITObsApp/long \
         --model Chronos2-Small --window 512
+
+    # reproduce the leaderboard exactly (every instance at its own full context,
+    # nothing dropped) -> mase_real is directly comparable to the published number
+    python -m experiments.compare_mase_variants --dataset ETTm1-15T --term short \
+        --model Chronos2-Small --leaderboard
+
+    # same setup but sweep the input context length (the effect you asked about)
+    python -m experiments.compare_mase_variants --dataset ETTm1-15T --term short \
+        --model Chronos2-Small --leaderboard --context-length 512
 """
 
 from __future__ import annotations
@@ -63,13 +72,45 @@ from gift_eval.data import Dataset as GiftEvalDataset
 
 from experiments import models_config
 from experiments.gifteval_mase import get_seasonality, gluonts_leaderboard_mase
+from experiments.build_context_length_dataset import WINDOW_GRID
 from experiments.test_window_ablation_gifteval_v5 import (
     DATASETS,
     GiftEvalCache,
     compute_all_metrics,
     load_handle,
     _forecast_cell,
+    _merge_grouped,
+    SUNDIAL_MAX_CONTEXT,
+    TIMEMOE_MAX_TOTAL,
+    TOTO_MAX_CONTEXT,
+    FLOWSTATE_MAX_CONTEXT,
+    TIREX_MAX_CONTEXT,
 )
+
+# Practical ceiling for "full native context" in --leaderboard mode: the ablation
+# grid's max, and a common TSFM context limit (PatchTST-FM is fixed at 8192).
+# Keeps us from feeding a 69k-step series to a model that would OOM — the real
+# leaderboard likewise runs each model at its own (bounded) default context.
+LEADERBOARD_CONTEXT_CEILING = 8192
+
+
+def model_context_cap(family: str, horizon: int, requested: int) -> int:
+    """Clamp a requested context length to what ``family`` actually accepts,
+    mirroring the stage-3 ablation's per-model caps (Sundial 2880, TimeMoE
+    ctx+h<=4096, Toto/FlowState 4096, TiRex 2048). Uncapped families keep
+    ``requested`` (already bounded by the ceiling / instance length)."""
+    cap = requested
+    hard = {
+        "sundial": SUNDIAL_MAX_CONTEXT,
+        "toto": TOTO_MAX_CONTEXT,
+        "flowstate": FLOWSTATE_MAX_CONTEXT,
+        "tirex": TIREX_MAX_CONTEXT,
+    }
+    if family == "timemoe":
+        cap = min(cap, TIMEMOE_MAX_TOTAL - horizon)
+    if family in hard:
+        cap = min(cap, hard[family])
+    return max(int(cap), 1)
 
 
 # ----------------------------------------------------------------------------
@@ -126,17 +167,43 @@ def real_gluonts_mase(cache, valid_indices, starts, fr, freq):
 #  Per-config evaluation
 # ----------------------------------------------------------------------------
 
+def _forecast_padded(cache, family, handle, model_id, cap, horizon, args):
+    """Pad-mode (leaderboard-faithful) forecasting: EVERY instance is served at
+    its own genuine context, truncated only to ``cap`` — none dropped. Reuses the
+    ablation's width-bucketed batching + merge. Returns (fr, tgts) over all
+    ``cache.n_total`` instances in 0..n-1 order."""
+    # Bucket widths down to the grid to bound the number of per-width runners, but
+    # inject the cap itself so every instance long enough uses EXACTLY the cap (not
+    # the grid point below it) — the context sweep must hit the requested length.
+    grid = sorted(set(WINDOW_GRID) | {int(cap)})
+    groups = cache.build_batches_padded(
+        cap, args.batch_size, args.device,
+        pin_memory=(args.device == "cuda"), window_grid=grid)
+    results = []
+    for L, batches_L, _ax, _ay, idx_L in groups:
+        fr_L, tgts_L = _forecast_cell(family, handle, model_id, batches_L, L,
+                                      horizon, args.device, args.batch_size)
+        results.append((idx_L, fr_L, tgts_L))
+    return _merge_grouped(results, cache.n_total, horizon, args.device)
+
+
 def evaluate_config(display, term, model_id, family, handle, args):
     """Run the model on one (dataset display, term) and return the three MASE
     variants for it (plus book-keeping). ``handle`` is the already-loaded base
-    model, reused across datasets. Returns a result dict."""
+    model, reused across datasets. Returns a result dict.
+
+    Two setups:
+      * default (ablation): skip-mode batching at a FIXED window — instances with
+        context < window are dropped, and context is truncated to ``window``.
+      * ``--leaderboard``: pad-mode — every instance forecast at its OWN full
+        context (capped to the model's limit / ``--context-length``), nothing
+        dropped. This reproduces the GiftEval setup, so ``mase_real`` here is
+        directly comparable to the leaderboard number.
+    """
     ge_name, to_univariate = resolve_dataset(display, term)
     ge_dataset = GiftEvalDataset(name=ge_name, term=term, to_univariate=to_univariate)
     cache = GiftEvalCache(ge_dataset, display)
     freq, horizon = cache.freq, cache.horizon
-
-    window = cache.max_context if args.full else (args.window or min(cache.max_context, 1024))
-    window = min(window, cache.max_context)
 
     # Per-instance forecast-start Periods, captured in GiftEvalCache's iteration
     # order (same len(label) >= horizon filter), so they align 1:1 with cache rows.
@@ -149,20 +216,34 @@ def evaluate_config(display, term, model_id, family, handle, args):
         raise RuntimeError(
             f"start capture ({len(starts)}) != cache instances ({cache.n_total}).")
 
-    batches, all_x, all_y, valid_indices = cache.build_batches(
-        window, args.batch_size, args.device, pin_memory=(args.device == "cuda"))
-    fr, tgts = _forecast_cell(family, handle, model_id, batches, window, horizon,
-                              args.device, args.batch_size)
-    starts_served = [starts[i] for i in valid_indices]
+    if args.leaderboard:
+        # Context ceiling: --context-length if given, else the full-native ceiling.
+        # Clamp to the model's own cap and to the longest available context.
+        requested = args.context_length or LEADERBOARD_CONTEXT_CEILING
+        cap = model_context_cap(family, horizon, min(requested, cache.max_context))
+        fr, tgts = _forecast_padded(cache, family, handle, model_id, cap, horizon, args)
+        served_indices = np.arange(cache.n_total)
+        window = cap                    # reported context ceiling (per-instance <= this)
+    else:
+        window = (cache.max_context if args.full
+                  else (args.window or min(cache.max_context, 1024)))
+        window = min(window, cache.max_context)
+        batches, _ax, _ay, valid_indices = cache.build_batches(
+            window, args.batch_size, args.device, pin_memory=(args.device == "cuda"))
+        fr, tgts = _forecast_cell(family, handle, model_id, batches, window, horizon,
+                                  args.device, args.batch_size)
+        served_indices = valid_indices
 
-    se_served = cache.seasonal_errors_gluonts[valid_indices]
+    starts_served = [starts[i] for i in served_indices]
+    se_served = cache.seasonal_errors_gluonts[np.asarray(served_indices)]
     metrics = compute_all_metrics(fr, tgts, cache.naive_seasonal_mae_train,
                                   seasonal_errors=se_served)
 
     real_val = None
     if not args.no_real:
         try:
-            real_val, _, _ = real_gluonts_mase(cache, valid_indices, starts_served, fr, freq)
+            real_val, _, _ = real_gluonts_mase(
+                cache, np.asarray(served_indices), starts_served, fr, freq)
         except ImportError as e:
             print(f"[mase_real] gluonts not importable ({e}); skipping.", file=sys.stderr)
             args.no_real = True     # don't retry per config
@@ -172,7 +253,7 @@ def evaluate_config(display, term, model_id, family, handle, args):
 
     return {
         "display": display, "term": term, "freq": freq, "window": window,
-        "n_total": cache.n_total, "n_served": len(valid_indices),
+        "n_total": cache.n_total, "n_served": len(served_indices),
         "season_proj": cache.season, "season_gl": get_seasonality(freq),
         "mase": metrics["mase"], "mase_gluonts": metrics["mase_gluonts"],
         "mase_real": real_val,
@@ -241,14 +322,27 @@ def main():
                     help="explicit 'Display/term' tokens (overrides --dataset/--term)")
     ap.add_argument("--model", required=True, help="model display, e.g. Chronos2-Small")
     grp = ap.add_mutually_exclusive_group()
-    grp.add_argument("--window", type=int, default=None, help="context window size")
+    grp.add_argument("--window", type=int, default=None,
+                     help="ablation mode: fixed context window (instances shorter "
+                          "than it are dropped)")
     grp.add_argument("--full", action="store_true",
-                     help="use each dataset's max available context")
+                     help="ablation mode: use each dataset's max available context")
+    ap.add_argument("--leaderboard", action="store_true",
+                    help="reproduce the GiftEval setup: every instance forecast at "
+                         "its OWN full context (no dropping), so mase_real matches "
+                         "the leaderboard. Combine with --context-length to sweep.")
+    ap.add_argument("--context-length", type=int, default=None,
+                    help="(--leaderboard only) cap each instance's context at this "
+                         "many steps — the 'slightly different input context length' "
+                         "knob. Omit for full native context (<= model cap).")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-real", action="store_true",
                     help="skip the gluonts-machinery mase_real value")
     args = ap.parse_args()
+
+    if args.context_length is not None and not args.leaderboard:
+        raise SystemExit("--context-length only applies with --leaderboard.")
 
     if not args.dataset and not args.configs:
         raise SystemExit("Provide --dataset (one or more) or --configs.")
@@ -275,9 +369,13 @@ def main():
 
     # ---- Per-dataset table ----------------------------------------------------
     have_real = any(r["mase_real"] is not None for r in results)
+    if args.leaderboard:
+        ctx_desc = (f"leaderboard / ctx<={args.context_length}" if args.context_length
+                    else "leaderboard / full native ctx")
+    else:
+        ctx_desc = "full" if args.full else (args.window or "auto<=1024")
     print("\n" + "=" * 92)
-    print(f"MASE comparison — {args.model}   (window: "
-          f"{'full' if args.full else (args.window or 'auto<=1024')})")
+    print(f"MASE comparison — {args.model}   (context: {ctx_desc})")
     print("=" * 92)
     hdr = f"{'dataset/term':<26}{'served':>10}{'mase':>12}{'mase_gluonts':>14}"
     hdr += f"{'mase_real':>12}" if have_real else ""

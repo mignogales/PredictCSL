@@ -170,6 +170,19 @@ DATASETS = [
     ("electricity/H",               "long",   "Electricity-H",   False),
     ("electricity/D",               "short",  "Electricity-D",   False),
     ("electricity/W",               "short",  "Electricity-W",   False),
+    # ---- Irregular / missing-value datasets (Monash "*_with_missing") --------
+    # Added to close the gap vs the full GiftEval catalog (these are the ones with
+    # irregular sampling / injected missing values). Stored as univariate series
+    # collections -> to_univariate=False. Terms follow GiftEval's freq rule
+    # (sub-daily MED_LONG datasets get medium/long; daily+ get short). Any
+    # (name, term) that gift_eval rejects is skipped at load time (the ablation
+    # loop guards GiftEvalDataset/Cache construction), so a wrong guess self-heals
+    # instead of crashing the run — check the load log to see which combos stuck.
+    ("kdd_cup_2018_with_missing/H", "short",  "KDDCup2018-H",   False),
+    ("kdd_cup_2018_with_missing/H", "medium", "KDDCup2018-H",   False),
+    ("kdd_cup_2018_with_missing/H", "long",   "KDDCup2018-H",   False),
+    ("car_parts_with_missing",      "short",  "CarParts",       False),
+    ("temperature_rain_with_missing", "short", "TempRain",      False),
 ]
 
 MOIRAI2_QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -1890,8 +1903,19 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
             ds_key = (ge_name, term)
             if ds_key not in ge_cache:
                 print(Fore.CYAN + f"\n  Loading GiftEval: {ge_name}  term={term}" + Fore.RESET)
-                ge_dataset = GiftEvalDataset(name=ge_name, term=term, to_univariate=to_univariate)
-                cache = GiftEvalCache(ge_dataset, dataset_display)
+                # Guard construction so an unsupported (name, term) or a
+                # to_univariate mismatch (raises in GiftEvalCache) skips this
+                # dataset with a warning instead of sinking the whole run. Lets
+                # newly-added configs (e.g. the *_with_missing datasets) self-heal
+                # if a term/flag guess is off.
+                try:
+                    ge_dataset = GiftEvalDataset(name=ge_name, term=term,
+                                                 to_univariate=to_univariate)
+                    cache = GiftEvalCache(ge_dataset, dataset_display)
+                except Exception as exc:  # noqa: BLE001
+                    print(Fore.RED + f"    SKIP dataset {ge_name} term={term} "
+                          f"({dataset_display}): {exc}" + Fore.RESET)
+                    continue
                 ge_cache[ds_key] = cache
                 print(Fore.CYAN
                       + f"    freq={cache.freq}  horizon={cache.horizon}  "
