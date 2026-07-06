@@ -107,3 +107,104 @@ def seasonal_error(context: np.ndarray, season: int) -> float:
 def per_instance_seasonal_errors(contexts: Sequence[np.ndarray], season: int) -> np.ndarray:
     """Per-instance seasonal error for a list of contexts (one float per series)."""
     return np.array([seasonal_error(c, season) for c in contexts], dtype=np.float64)
+
+
+# ==============================================================================
+#  Leaderboard MASE via the ACTUAL gluonts machinery
+# ==============================================================================
+# Everything above PORTS the gluonts definition in numpy — cheap and backfillable
+# from cached per-instance MAE. The function below instead runs gluonts' own
+# ``evaluate_forecasts`` + ``ev.MASE`` on real Forecast objects: the exact path the
+# HF GiftEval leaderboard uses, and the ground truth the port reproduces (validated
+# to <1%). Stage 3 records its output as the ``mase_gluonts_real`` metric column and
+# the standalone ``compare_mase_variants`` script uses it for verification. gluonts
+# is imported lazily so the port keeps working without it.
+
+
+class _ListTestData:
+    """Minimal stand-in for gluonts' ``split.TestData``: ``evaluate_forecasts``
+    only needs re-iterable ``.input`` / ``.label`` (entry dicts) and to zip them.
+    Lists satisfy the re-iteration it does internally (seasonal error over
+    ``.input``, then labels over ``.label``)."""
+
+    def __init__(self, inputs, labels):
+        self.input = inputs
+        self.label = labels
+
+    def __iter__(self):
+        return zip(self.input, self.label)
+
+    def __len__(self):
+        return len(self.input)
+
+
+def _build_gluonts_forecasts(median, starts, quantiles=None, quantile_levels=None,
+                             samples=None):
+    """Per-instance gluonts Forecast objects — QuantileForecast when the model
+    emits quantiles, else SampleForecast (from samples, or the median as a lone
+    sample). ``median`` is (N, H); ``quantiles`` (N, Q, H); ``samples`` (N, S, H);
+    ``starts[i]`` is the pandas Period at which instance i's forecast begins."""
+    from gluonts.model.forecast import QuantileForecast, SampleForecast
+
+    median = np.asarray(median, dtype=np.float64)
+    n, _h = median.shape
+    forecasts = []
+
+    if quantiles is not None and quantile_levels is not None:
+        q = np.asarray(quantiles, dtype=np.float64)          # (N, Q, H)
+        keys = [str(float(l)) for l in quantile_levels]
+        has_median = any(abs(float(l) - 0.5) < 1e-9 for l in quantile_levels)
+        for i in range(n):
+            arrays, fkeys = q[i], list(keys)
+            if not has_median:                                # ensure a 0.5 key
+                arrays = np.concatenate([arrays, median[i][None, :]], axis=0)
+                fkeys = fkeys + ["0.5"]
+            forecasts.append(QuantileForecast(
+                forecast_arrays=arrays, start_date=starts[i],
+                forecast_keys=fkeys, item_id=str(i)))
+    elif samples is not None:
+        s = np.asarray(samples, dtype=np.float64)            # (N, S, H)
+        for i in range(n):
+            forecasts.append(SampleForecast(
+                samples=s[i], start_date=starts[i], item_id=str(i)))
+    else:
+        for i in range(n):                                    # median-only fallback
+            forecasts.append(SampleForecast(
+                samples=median[i][None, :], start_date=starts[i], item_id=str(i)))
+
+    return forecasts
+
+
+def gluonts_leaderboard_mase(median, starts, contexts, labels, freq,
+                             quantiles=None, quantile_levels=None, samples=None):
+    """Aggregate MASE from gluonts' own ``evaluate_forecasts`` + ``ev.MASE``.
+
+    All array args are indexed 0..N-1 in the SAME instance order: row ``i`` of
+    ``median`` / ``labels`` (each (N, H)), ``contexts[i]`` (that series' full
+    context, from which gluonts derives its per-instance seasonal error), and
+    ``starts[i]`` (the forecast-start Period) are the same instance. Lazy-imports
+    gluonts (raises ImportError if unavailable). Returns the MASE float.
+    """
+    from gluonts.model import evaluate_forecasts
+    from gluonts.ev.metrics import MASE
+
+    forecasts = _build_gluonts_forecasts(
+        median, starts, quantiles=quantiles,
+        quantile_levels=quantile_levels, samples=samples)
+
+    labels = np.asarray(labels, dtype=np.float64)
+    inputs, label_entries = [], []
+    for i in range(len(forecasts)):
+        ctx = np.asarray(contexts[i], dtype=np.float64)
+        inputs.append({"start": starts[i] - len(ctx), "target": ctx})
+        label_entries.append({"start": starts[i], "target": labels[i]})
+    test_data = _ListTestData(inputs, label_entries)
+
+    df = evaluate_forecasts(
+        forecasts, test_data=test_data, metrics=[MASE()],
+        axis=None, seasonality=get_seasonality(freq))
+    col = next((c for c in df.columns if str(c).upper().startswith("MASE")), None)
+    if col is None:
+        raise RuntimeError(
+            f"No MASE column in evaluate_forecasts output: {list(df.columns)}")
+    return float(np.asarray(df[col]).ravel()[0])

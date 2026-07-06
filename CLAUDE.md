@@ -139,6 +139,26 @@ predictor-derived, so no TSFM re-inference):
   extra inference — a second pass over the cached `compare_*.npz`
   (`run_has_gluonts_curve` gates it).
 
+**Machinery-faithful MASE (`mase_gluonts_real`) — the third metric:**
+`mase_gluonts` is a *numpy port* of the leaderboard definition; `mase_gluonts_real`
+runs gluonts' **own** `evaluate_forecasts` + `ev.MASE` on real Forecast objects (the
+exact HF-GiftEval path). Validated to match the port to <1% (see
+`compare_mase_variants.py`). Threaded through the pipeline as a **third parallel
+metric**, mirroring `mase_gluonts` at every touchpoint:
+- **`gifteval_mase.py`** — `gluonts_leaderboard_mase(...)` (lazy gluonts import) +
+  `_build_gluonts_forecasts` / `_ListTestData`. Shared by stage 3 and the
+  standalone `compare_mase_variants.py`.
+- **Stage 3** — `GiftEvalCache` also captures per-instance forecast-start Periods
+  (`cache.starts`); on **fresh** inference `cell_mase_gluonts_real` runs the
+  machinery and fills the `mase_gluonts_real` column. **Cached cells** can't re-run
+  it (no stored forecasts) so they **stand in with the port** value (`--force 3`
+  recomputes the true value). Each `compare_*.npz` carries `real_curve_gluonts_real`.
+- **Stage 4 / `run_all.py`** — `--mase-metric` gains `mase_gluonts_real`, routing to
+  `strategy_comparison_gluonts_real/` + `general/rollup_gluonts_real/`. A default
+  `mase` run also emits the `*_gluonts_real` twins (`bar_aggregate_mase_gluonts_real.png`,
+  `model_strategy_overview_gluonts_real.png`, `flops_savings_all_models_gluonts_real.csv`)
+  when `run_has_gluonts_real_curve` finds the curve.
+
 **Master orchestrator:**
 - **`master_run_all.py`** — fuses *every* `run_all*` variant into one run while
   running each shared stage **exactly once**: Stage 1 up front, then each variant
