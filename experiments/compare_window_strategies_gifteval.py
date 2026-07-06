@@ -1410,6 +1410,44 @@ def infer_freq_from_display(dataset_display: str) -> str:
     return "Unknown"
 
 
+# Canonical domain order for the by-domain plot/table.
+DOMAIN_ORDER = ["Energy", "Nature", "Environment", "Health", "Transport", "Other"]
+
+# Maps a dataset (by a keyword in its display name, freq-suffix-agnostic) to one of
+# the analysis domains. EDIT HERE to re-bucket a dataset. Datasets that match no
+# keyword fall into "Other" (web/cloudops/sales/finance — bizitobs, bitbrains,
+# car_parts, hierarchical_sales, m4, restaurant). The Nature/Environment split
+# follows: Nature = physical/biological processes (weather, river flow), Environment
+# = environmental monitoring (air quality, rainfall/climate).
+_DOMAIN_KEYWORDS: List[Tuple[str, str]] = [
+    ("ett",             "Energy"),        # electricity transformer temperature
+    ("electricity",     "Energy"),
+    ("solar",           "Energy"),
+    ("jenaweather",     "Nature"),
+    ("saugeen",         "Nature"),        # river flow
+    ("kddcup",          "Environment"),   # KDD Cup 2018 air quality
+    ("temprain",        "Environment"),   # temperature_rain
+    ("hospital",        "Health"),
+    ("covid",           "Health"),
+    ("usbirths",        "Health"),
+    ("loopseattle",     "Transport"),
+    ("sztaxi",          "Transport"),
+    ("mdense",          "Transport"),     # M_DENSE road sensors
+]
+
+
+def infer_domain_from_display(dataset_display: str) -> str:
+    """Map a dataset_display to an analysis domain (Energy / Nature / Environment /
+    Health / Transport), falling back to 'Other'. Frequency-suffix-agnostic: the
+    keyword scan ignores the trailing '-<freq>' token."""
+    base = dataset_display.rsplit("-", 1)[0] if "-" in dataset_display else dataset_display
+    key = base.lower().replace("_", "").replace("-", "")
+    for kw, domain in _DOMAIN_KEYWORDS:
+        if kw in key:
+            return domain
+    return "Other"
+
+
 def compute_relative_improvement_tables(
     df: pd.DataFrame,
     out_dir: str,
@@ -1421,6 +1459,8 @@ def compute_relative_improvement_tables(
     2. rel_improvement_by_dataset.csv  — mean over models/terms per dataset
     3. rel_improvement_by_frequency.csv — mean over datasets per frequency
     4. rel_improvement_by_horizon.csv  — mean over datasets per horizon value
+    5. rel_improvement_by_domain.csv   — mean per domain (Energy/Nature/Environment/
+                                          Health/Transport/Other), + rel_impr_by_domain.png
 
     Relative improvement (%) is defined as:
       rel_impr_oracle = (full_mase - best_mase) / full_mase * 100
@@ -1526,6 +1566,32 @@ def compute_relative_improvement_tables(
     print(Fore.GREEN + f"  Saved: {hor_path}" + Fore.RESET)
 
     # ------------------------------------------------------------------
+    # 5. By domain (Energy / Nature / Environment / Health / Transport / Other)
+    # ------------------------------------------------------------------
+    r["domain"] = r["dataset_display"].apply(infer_domain_from_display)
+    domain_agg = (
+        r.groupby("domain", sort=False)
+        .agg(
+            n_rows=("full_mase", "count"),
+            full_mase_mean=("full_mase", "mean"),
+            best_mase_mean=("best_mase", "mean"),
+            pred_mase_mean=("pred_mase", "mean"),
+            rel_impr_oracle_mean=("rel_impr_oracle_pct", "mean"),
+            rel_impr_pred_mean=("rel_impr_pred_pct", "mean"),
+            rel_impr_oracle_median=("rel_impr_oracle_pct", "median"),
+            rel_impr_pred_median=("rel_impr_pred_pct", "median"),
+        )
+        .reset_index()
+    )
+    domain_agg["_order"] = domain_agg["domain"].apply(
+        lambda d: DOMAIN_ORDER.index(d) if d in DOMAIN_ORDER else len(DOMAIN_ORDER)
+    )
+    domain_agg = domain_agg.sort_values("_order").drop(columns="_order")
+    domain_path = os.path.join(out_dir, "rel_improvement_by_domain.csv")
+    domain_agg.to_csv(domain_path, index=False, float_format="%.4f")
+    print(Fore.GREEN + f"  Saved: {domain_path}" + Fore.RESET)
+
+    # ------------------------------------------------------------------
     # Console summary
     # ------------------------------------------------------------------
     def _fmt_table(frame: pd.DataFrame, title: str) -> None:
@@ -1578,12 +1644,26 @@ def compute_relative_improvement_tables(
         "Relative improvement vs full window — by horizon",
     )
 
+    _fmt_table(
+        domain_agg[["domain", "n_rows",
+                    "full_mase_mean", "best_mase_mean", "pred_mase_mean",
+                    "rel_impr_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
+            "full_mase_mean": "full",
+            "best_mase_mean": "oracle",
+            "pred_mase_mean": "pred",
+            "rel_impr_oracle_mean": "Δoracle%",
+            "rel_impr_pred_mean":   "Δpred%",
+        }),
+        "Relative improvement vs full window — by domain",
+    )
+
     # ------------------------------------------------------------------
     # Plots
     # ------------------------------------------------------------------
     _plot_rel_impr_by_dataset(ds_agg, out_dir)
     _plot_rel_impr_by_frequency(freq_agg, out_dir)
     _plot_rel_impr_by_horizon(hor_agg, out_dir)
+    _plot_rel_impr_by_domain(domain_agg, out_dir)
     _plot_rel_impr_pred_vs_oracle(ds_agg, out_dir)
 
 
@@ -1696,6 +1776,68 @@ def _plot_rel_impr_by_frequency(freq_agg: pd.DataFrame, out_dir: str) -> str:
     ax.grid(axis="y", alpha=0.25)
     plt.tight_layout()
     path = os.path.join(out_dir, "rel_impr_by_frequency.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(Fore.GREEN + f"  Saved: {path}" + Fore.RESET)
+    return path
+
+
+def _plot_rel_impr_by_domain(domain_agg: pd.DataFrame, out_dir: str) -> str:
+    """
+    Vertical grouped bar chart: Δoracle% and Δpred% per domain (Energy / Nature /
+    Environment / Health / Transport / Other). Median overlaid as a dot. Twin of
+    ``_plot_rel_impr_by_frequency`` — mean ± median across datasets/models/terms.
+    """
+    data = domain_agg.copy()
+    if data.empty:
+        return ""
+
+    n = len(data)
+    x = np.arange(n)
+    w = 0.32
+    fig, ax = plt.subplots(figsize=(max(8, n * 1.3 + 2), 6))
+
+    oracle_mean = data["rel_impr_oracle_mean"].values
+    pred_mean   = data["rel_impr_pred_mean"].values
+    oracle_med  = data["rel_impr_oracle_median"].values
+    pred_med    = data["rel_impr_pred_median"].values
+    domain_labels = [f"{d}\n(n={int(nr)})" for d, nr in
+                     zip(data["domain"].values, data["n_rows"].values)]
+
+    b1 = ax.bar(x - w / 2, oracle_mean, w, label="Oracle — mean",
+                color="#ED7D31", alpha=0.82, edgecolor="white")
+    b2 = ax.bar(x + w / 2, pred_mean,   w, label="Predictor — mean",
+                color="#70AD47", alpha=0.82, edgecolor="white")
+
+    # Median dots
+    ax.scatter(x - w / 2, oracle_med, s=45, color="#A84000", zorder=4,
+               label="Oracle — median", marker="D")
+    ax.scatter(x + w / 2, pred_med,   s=45, color="#2A6E10", zorder=4,
+               label="Predictor — median", marker="D")
+
+    # Annotate mean bars
+    y_rng = max(np.abs(oracle_mean).max(), np.abs(pred_mean).max(), 1e-3)
+    pad   = y_rng * 0.03
+    for b, val in zip(list(b1) + list(b2), list(oracle_mean) + list(pred_mean)):
+        h = b.get_height()
+        ypos = h + pad if h >= 0 else h - pad
+        va   = "bottom" if h >= 0 else "top"
+        ax.text(b.get_x() + b.get_width() / 2, ypos,
+                f"{val:.1f}%", ha="center", va=va, fontsize=8.5, color="#222222")
+
+    ax.axhline(0, color="black", lw=1.0, ls="--", alpha=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(domain_labels, fontsize=10)
+    ax.set_ylabel("Relative MASE improvement over full window (%)", fontsize=10)
+    ax.set_title(
+        "Relative MASE Improvement vs Full Window — by domain\n"
+        "(mean ± median across all datasets / models / terms)",
+        fontsize=12, fontweight="bold",
+    )
+    ax.legend(fontsize=9, ncol=2)
+    ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    path = os.path.join(out_dir, "rel_impr_by_domain.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(Fore.GREEN + f"  Saved: {path}" + Fore.RESET)
