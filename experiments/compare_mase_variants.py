@@ -128,28 +128,46 @@ def build_gluonts_forecasts(fr, starts, freq):
     return forecasts
 
 
+class _ListTestData:
+    """Minimal stand-in for gluonts' ``split.TestData``: ``evaluate_forecasts``
+    only needs ``.input`` and ``.label`` (each a re-iterable of entry dicts) and
+    to zip them together. Lists satisfy the re-iteration it does internally
+    (seasonal error over ``.input``, then labels over ``.label``)."""
+
+    def __init__(self, inputs, labels):
+        self.input = inputs
+        self.label = labels
+
+    def __iter__(self):
+        return zip(self.input, self.label)
+
+    def __len__(self):
+        return len(self.input)
+
+
 def real_gluonts_mase(cache, valid_indices, starts, fr, freq):
     """Score ``fr`` with the actual gluonts leaderboard machinery.
 
-    Builds a filtered test_data (one (input, label) pair per served instance, in
-    forecast order) and runs ``evaluate_forecasts`` with ``MASE`` and the gluonts
-    seasonality. Returns (mase_value, column_name) or raises on import failure.
+    Builds a filtered TestData (one input/label per served instance, in forecast
+    order) and runs ``evaluate_forecasts`` with ``MASE`` and the gluonts
+    seasonality. Returns (mase_value, column_name, season) or raises on import
+    failure.
     """
     from gluonts.model import evaluate_forecasts
     from gluonts.ev.metrics import MASE
 
     forecasts = build_gluonts_forecasts(fr, starts, freq)
 
-    # (input, label) per served instance. Input target = the series' FULL context
-    # (gluonts derives the per-instance seasonal error from it), label target =
-    # the horizon ground truth — exactly the pieces GiftEvalCache already holds.
-    test_data = []
+    # Per served instance: input target = the series' FULL context (gluonts derives
+    # the per-instance seasonal error from it), label target = the horizon ground
+    # truth — exactly the pieces GiftEvalCache already holds.
+    inputs, labels = [], []
     for k, i in enumerate(valid_indices):
         ctx = np.asarray(cache.contexts[i], dtype=np.float64)
         lbl = np.asarray(cache.labels_np[i], dtype=np.float64)
-        inp = {"start": starts[k] - len(ctx), "target": ctx}
-        out = {"start": starts[k], "target": lbl}
-        test_data.append((inp, out))
+        inputs.append({"start": starts[k] - len(ctx), "target": ctx})
+        labels.append({"start": starts[k], "target": lbl})
+    test_data = _ListTestData(inputs, labels)
 
     season = get_seasonality(freq)
     df = evaluate_forecasts(
