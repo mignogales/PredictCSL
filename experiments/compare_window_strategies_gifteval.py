@@ -463,11 +463,10 @@ def _npz_filename(dataset_display: str, term: str, model_short: str) -> str:
     return f"compare_{dataset_display}_t{term}_{model_short}.npz"
 
 
-def run_has_gluonts_curve(run_dir: str) -> bool:
-    """True if any compare_*.npz in this run carries a populated
-    ``real_curve_gluonts`` — i.e. the ablation has computed the leaderboard MASE.
-    Returns on the first populated curve found; for older runs that never wrote it
-    this scans the trees and returns False."""
+def run_has_curve(run_dir: str, curve_key: str) -> bool:
+    """True if any compare_*.npz in this run carries a populated ``curve_key``.
+    Returns on the first populated curve found; older runs that never wrote it
+    scan the trees and return False."""
     models_root = os.path.join(run_dir, "models")
     if not os.path.isdir(models_root):
         return False
@@ -475,11 +474,23 @@ def run_has_gluonts_curve(run_dir: str) -> bool:
     for npz in glob.iglob(pattern):
         try:
             with np.load(npz) as d:
-                if "real_curve_gluonts" in d.files and np.any(~np.isnan(d["real_curve_gluonts"])):
+                if curve_key in d.files and np.any(~np.isnan(d[curve_key])):
                     return True
         except Exception:
             continue
     return False
+
+
+def run_has_gluonts_curve(run_dir: str) -> bool:
+    """True if the ablation has computed the ported leaderboard MASE
+    (``real_curve_gluonts`` / the `mase_gluonts` metric)."""
+    return run_has_curve(run_dir, "real_curve_gluonts")
+
+
+def run_has_gluonts_real_curve(run_dir: str) -> bool:
+    """True if the ablation has computed the gluonts-machinery MASE
+    (``real_curve_gluonts_real`` / the `mase_gluonts_real` metric)."""
+    return run_has_curve(run_dir, "real_curve_gluonts_real")
 
 
 def _load_period_record(
@@ -610,18 +621,23 @@ def load_strategy_records(
                 continue
 
             window_grid: np.ndarray = data["window_grid"]
-            # Which MASE drives the comparison: the project's `mase` (default) or
-            # the leaderboard-faithful `mase_gluonts`. Both curves are written by
-            # the ablation; fall back to `mase` if an older npz lacks the gluonts
-            # curve (or it's all-NaN).
-            if mase_metric == "mase_gluonts" and "real_curve_gluonts" in data.files \
-                    and np.any(~np.isnan(data["real_curve_gluonts"])):
-                real_curve = data["real_curve_gluonts"]      # raw gluonts MASE per window
+            # Which MASE drives the comparison: the project's `mase` (default), the
+            # ported leaderboard `mase_gluonts` (real_curve_gluonts), or the actual
+            # gluonts-machinery `mase_gluonts_real` (real_curve_gluonts_real). All
+            # curves are written by the ablation; fall back to `mase` if an older npz
+            # lacks the requested one (or it's all-NaN).
+            _curve_key = {
+                "mase_gluonts": "real_curve_gluonts",
+                "mase_gluonts_real": "real_curve_gluonts_real",
+            }.get(mase_metric)
+            if _curve_key and _curve_key in data.files \
+                    and np.any(~np.isnan(data[_curve_key])):
+                real_curve = data[_curve_key]                # raw requested MASE per window
             else:
-                if mase_metric == "mase_gluonts":
+                if _curve_key:
                     print(Fore.YELLOW
                           + f"  {dataset_display} t={term} {model_short}: no "
-                            "real_curve_gluonts — falling back to `mase`. Re-run the "
+                            f"{_curve_key} — falling back to `mase`. Re-run the "
                             "ablation to populate it." + Fore.RESET)
                 real_curve = data["real_curve"]              # raw MASE per window
             pred_mean: np.ndarray = data["predicted_mean"]   # z-scored curve for argmin
@@ -2599,12 +2615,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--models", type=str, nargs="+", default=None,
                    help="Restrict comparison to these model_short names "
                         "(default: every model present in the run dir).")
-    p.add_argument("--mase-metric", choices=["mase", "mase_gluonts"], default="mase",
+    p.add_argument("--mase-metric",
+                   choices=["mase", "mase_gluonts", "mase_gluonts_real"], default="mase",
                    help="Which MASE drives the strategy comparison + all flops/time "
-                        "savings outputs: the project's `mase` (default) or the "
-                        "leaderboard-faithful `mase_gluonts` (per-instance seasonal "
-                        "error). Use a distinct --output-dir for each to avoid "
-                        "overwriting (e.g. strategy_comparison_gluonts/).")
+                        "savings outputs: the project's `mase` (default), the ported "
+                        "leaderboard `mase_gluonts` (per-instance seasonal error), or "
+                        "`mase_gluonts_real` (the actual gluonts evaluate_forecasts "
+                        "machinery). Use a distinct --output-dir for each to avoid "
+                        "overwriting (e.g. strategy_comparison_gluonts_real/).")
     p.add_argument("--output-dir", type=str, default=None,
                    help="Override output dir (default: models/<model>/strategy_comparison/). "
                         "Only safe with a single --models entry, else models clobber each other.")
@@ -2689,8 +2707,22 @@ def main() -> None:
         print(Fore.CYAN + "Gluonts MASE available: bar plot uses mase_gluonts; "
               "adding model_strategy_overview_gluonts." + Fore.RESET)
 
+    # Same idea for the ACTUAL gluonts-machinery MASE (`mase_gluonts_real`): when
+    # it isn't already the primary metric, score every strategy on it too so the
+    # *_gluonts_real twin plots/CSVs get emitted beside the others.
+    df_gr: Optional[pd.DataFrame] = None
+    if args.mase_metric != "mase_gluonts_real" and run_has_gluonts_real_curve(run_dir):
+        df_gr = load_strategy_records(run_dir, args.cache_root, patch_sizes,
+                                      mase_metric="mase_gluonts_real")
+        if args.models:
+            df_gr = df_gr[df_gr["model_short"].isin(set(args.models))].reset_index(drop=True)
+        print(Fore.CYAN + "Gluonts-real MASE available: adding "
+              "bar_aggregate_mase_gluonts_real + model_strategy_overview_gluonts_real."
+              + Fore.RESET)
+
     def _run_outputs(df_subset: pd.DataFrame, out_dir: str,
-                     df_g_subset: Optional[pd.DataFrame] = None) -> None:
+                     df_g_subset: Optional[pd.DataFrame] = None,
+                     df_gr_subset: Optional[pd.DataFrame] = None) -> None:
         os.makedirs(out_dir, exist_ok=True)
 
         csv_path = os.path.join(out_dir, "comparison.csv")
@@ -2794,9 +2826,15 @@ def main() -> None:
             bar_mase_gluonts_path = plot_bar_aggregate_mase(
                 df_g_subset, out_dir, metric_label="MASE (gluonts)",
                 fname="bar_aggregate_mase_gluonts.png")
+        bar_mase_gluonts_real_path = ""
+        if df_gr_subset is not None and not df_gr_subset.empty:
+            bar_mase_gluonts_real_path = plot_bar_aggregate_mase(
+                df_gr_subset, out_dir, metric_label="MASE (gluonts-real)",
+                fname="bar_aggregate_mase_gluonts_real.png")
         single_paths = [
             bar_mase_path,
             bar_mase_gluonts_path,
+            bar_mase_gluonts_real_path,
             plot_bar_aggregate_time(df_subset, out_dir),
             plot_scatter(df_subset, "best_mase", "pred_mase",
                          "MASE — Best (oracle)", "MASE — Predictor",
@@ -2826,10 +2864,13 @@ def main() -> None:
         out = args.output_dir or run_dir
         write_run_rollup(df, out, plot_strategies=args.plot_strategies)
         write_run_time_rollup(df, out, plot_strategies=args.plot_strategies)
-        # Parallel gluonts overview alongside the default-`mase` one.
+        # Parallel gluonts overviews alongside the default-`mase` one.
         if df_g is not None:
             write_run_rollup(df_g, out, plot_strategies=args.plot_strategies,
                              suffix="_gluonts", metric_label="MASE (gluonts)")
+        if df_gr is not None:
+            write_run_rollup(df_gr, out, plot_strategies=args.plot_strategies,
+                             suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
         return
 
     # ---- Per-model outputs --------------------------------------------------
@@ -2841,7 +2882,10 @@ def main() -> None:
         )
         df_g_model = (df_g[df_g["model_short"] == model_short].reset_index(drop=True)
                       if df_g is not None else None)
-        _run_outputs(df_model.reset_index(drop=True), model_out_dir, df_g_model)
+        df_gr_model = (df_gr[df_gr["model_short"] == model_short].reset_index(drop=True)
+                       if df_gr is not None else None)
+        _run_outputs(df_model.reset_index(drop=True), model_out_dir,
+                     df_g_model, df_gr_model)
 
     # ---- Run-level roll-up across models -------------------------------------
     # Only meaningful with >1 model in scope. run_all drives stage 4 one model at
@@ -2855,6 +2899,9 @@ def main() -> None:
         if df_g is not None:
             write_run_rollup(df_g, out, plot_strategies=args.plot_strategies,
                              suffix="_gluonts", metric_label="MASE (gluonts)")
+        if df_gr is not None:
+            write_run_rollup(df_gr, out, plot_strategies=args.plot_strategies,
+                             suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
 
 
 if __name__ == "__main__":

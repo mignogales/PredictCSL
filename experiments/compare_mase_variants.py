@@ -62,7 +62,7 @@ load_dotenv()
 from gift_eval.data import Dataset as GiftEvalDataset
 
 from experiments import models_config
-from experiments.gifteval_mase import get_seasonality
+from experiments.gifteval_mase import get_seasonality, gluonts_leaderboard_mase
 from experiments.test_window_ablation_gifteval_v5 import (
     DATASETS,
     GiftEvalCache,
@@ -101,101 +101,25 @@ def resolve_model(display: str):
 #  The real (leaderboard) gluonts MASE
 # ----------------------------------------------------------------------------
 
-def build_gluonts_forecasts(fr, starts, freq):
-    """Turn a ForecastResult (+ per-instance start Periods) into gluonts Forecast
-    objects — QuantileForecast when the model emits quantiles, else SampleForecast.
-
-    ``fr.median`` is (N, H); ``fr.quantiles`` (N, Q, H); ``fr.samples`` (N, S, H).
-    ``starts[i]`` is the pandas Period at which instance i's forecast begins.
-    """
-    from gluonts.model.forecast import QuantileForecast, SampleForecast
-
-    median = fr.median.detach().cpu().float().numpy()
-    n, h = median.shape
-    forecasts = []
-
-    if fr.quantiles is not None and fr.quantile_levels is not None:
-        q = fr.quantiles.detach().cpu().float().numpy()          # (N, Q, H)
-        keys = [str(float(l)) for l in fr.quantile_levels]
-        has_median = any(abs(float(l) - 0.5) < 1e-9 for l in fr.quantile_levels)
-        for i in range(n):
-            arrays = q[i]                                         # (Q, H)
-            fkeys = list(keys)
-            if not has_median:
-                arrays = np.concatenate([arrays, median[i][None, :]], axis=0)
-                fkeys = fkeys + ["0.5"]
-            forecasts.append(QuantileForecast(
-                forecast_arrays=arrays, start_date=starts[i],
-                forecast_keys=fkeys, item_id=str(i),
-            ))
-    elif fr.samples is not None:
-        s = fr.samples.detach().cpu().float().numpy()            # (N, S, H)
-        for i in range(n):
-            forecasts.append(SampleForecast(
-                samples=s[i], start_date=starts[i], item_id=str(i)))
-    else:
-        # Median only: a single-sample forecast whose 0.5 quantile is the median.
-        for i in range(n):
-            forecasts.append(SampleForecast(
-                samples=median[i][None, :], start_date=starts[i], item_id=str(i)))
-
-    return forecasts
-
-
-class _ListTestData:
-    """Minimal stand-in for gluonts' ``split.TestData``: ``evaluate_forecasts``
-    only needs ``.input`` and ``.label`` (each a re-iterable of entry dicts) and
-    to zip them together. Lists satisfy the re-iteration it does internally
-    (seasonal error over ``.input``, then labels over ``.label``)."""
-
-    def __init__(self, inputs, labels):
-        self.input = inputs
-        self.label = labels
-
-    def __iter__(self):
-        return zip(self.input, self.label)
-
-    def __len__(self):
-        return len(self.input)
-
-
 def real_gluonts_mase(cache, valid_indices, starts, fr, freq):
-    """Score ``fr`` with the actual gluonts leaderboard machinery.
+    """Score ``fr`` with the actual gluonts leaderboard machinery (shared with the
+    stage-3 ``mase_gluonts_real`` column via ``gifteval_mase``).
 
-    Builds a filtered TestData (one input/label per served instance, in forecast
-    order) and runs ``evaluate_forecasts`` with ``MASE`` and the gluonts
-    seasonality. Returns (mase_value, column_name, season) or raises on import
-    failure.
+    ``valid_indices`` are the served instances (rows of ``fr``); ``starts`` their
+    forecast-start Periods. Returns (mase_value, "MASE", season) or raises on
+    import failure.
     """
-    from gluonts.model import evaluate_forecasts
-    from gluonts.ev.metrics import MASE
-
-    forecasts = build_gluonts_forecasts(fr, starts, freq)
-
-    # Per served instance: input target = the series' FULL context (gluonts derives
-    # the per-instance seasonal error from it), label target = the horizon ground
-    # truth — exactly the pieces GiftEvalCache already holds.
-    inputs, labels = [], []
-    for k, i in enumerate(valid_indices):
-        ctx = np.asarray(cache.contexts[i], dtype=np.float64)
-        lbl = np.asarray(cache.labels_np[i], dtype=np.float64)
-        inputs.append({"start": starts[k] - len(ctx), "target": ctx})
-        labels.append({"start": starts[k], "target": lbl})
-    test_data = _ListTestData(inputs, labels)
-
-    season = get_seasonality(freq)
-    df = evaluate_forecasts(
-        forecasts,
-        test_data=test_data,
-        metrics=[MASE()],
-        axis=None,
-        seasonality=season,
-    )
-    # evaluate_forecasts returns a 1-row DataFrame with a column like "MASE[0.5]".
-    col = next((c for c in df.columns if str(c).upper().startswith("MASE")), None)
-    if col is None:
-        raise RuntimeError(f"No MASE column in evaluate_forecasts output: {list(df.columns)}")
-    return float(np.asarray(df[col]).ravel()[0]), str(col), season
+    median = fr.median.detach().cpu().float().numpy()
+    quantiles = (fr.quantiles.detach().cpu().float().numpy()
+                 if fr.quantiles is not None else None)
+    samples = (fr.samples.detach().cpu().float().numpy()
+               if fr.samples is not None else None)
+    contexts = [cache.contexts[i] for i in valid_indices]
+    labels = cache.labels_np[np.asarray(valid_indices)]
+    val = gluonts_leaderboard_mase(
+        median, starts, contexts, labels, freq,
+        quantiles=quantiles, quantile_levels=fr.quantile_levels, samples=samples)
+    return val, "MASE", get_seasonality(freq)
 
 
 # ----------------------------------------------------------------------------

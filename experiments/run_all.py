@@ -482,12 +482,14 @@ def parse_args() -> argparse.Namespace:
               "argument to force every active stage."),
     )
     p.add_argument(
-        "--mase-metric", choices=["mase", "mase_gluonts"], default="mase",
-        help=("Which MASE drives stage 4 (compare): the project's `mase` (default) "
-              "or the leaderboard-faithful `mase_gluonts`. With `mase_gluonts` the "
-              "comparison reads the gluonts curve and writes to a separate "
-              "strategy_comparison_gluonts/ subdir so the two never collide. The "
-              "ablation always computes BOTH columns, so this only affects stage 4."),
+        "--mase-metric", choices=["mase", "mase_gluonts", "mase_gluonts_real"],
+        default="mase",
+        help=("Which MASE drives stage 4 (compare): the project's `mase` (default), "
+              "the ported leaderboard `mase_gluonts`, or the actual gluonts-machinery "
+              "`mase_gluonts_real`. The non-default metrics read their own curve and "
+              "write to a separate strategy_comparison_gluonts[_real]/ subdir so they "
+              "never collide. The ablation computes ALL columns, so this only affects "
+              "stage 4."),
     )
     p.add_argument(
         "--short-context-mode", choices=["skip", "pad"], default="skip",
@@ -567,12 +569,14 @@ def main() -> None:
     else:
         ABLATION_GENERAL = os.path.join(ABLATION_ROOT, "general")
 
-    # The gluonts MASE shares the SAME ablation cells (it's just a different metric
-    # column) but gets its own strategy-comparison subdir so its flops/time-savings
-    # outputs never overwrite the default-`mase` ones.
-    if args.mase_metric == "mase_gluonts":
-        STRATEGY_SUBDIR = STRATEGY_SUBDIR + "_gluonts"
-        print(Fore.CYAN + f"MASE metric: mase_gluonts  ->  compare subdir {STRATEGY_SUBDIR}"
+    # The gluonts MASEs share the SAME ablation cells (just different metric
+    # columns) but each gets its own strategy-comparison subdir so its flops/time
+    # -savings outputs never overwrite the default-`mase` ones.
+    _MASE_SUBDIR_SUFFIX = {"mase_gluonts": "_gluonts",
+                           "mase_gluonts_real": "_gluonts_real"}
+    if args.mase_metric in _MASE_SUBDIR_SUFFIX:
+        STRATEGY_SUBDIR = STRATEGY_SUBDIR + _MASE_SUBDIR_SUFFIX[args.mase_metric]
+        print(Fore.CYAN + f"MASE metric: {args.mase_metric}  ->  compare subdir {STRATEGY_SUBDIR}"
               + Fore.RESET)
 
     if args.only_stages and args.skip_stages:
@@ -667,8 +671,10 @@ def main() -> None:
         if "4" in active:
             if not _QUIET:
                 _banner("ALL MODELS  —  cross-model overview")
-            rollup_dir = (os.path.join(ABLATION_GENERAL, "rollup_gluonts")
-                          if args.mase_metric == "mase_gluonts" else ABLATION_GENERAL)
+            _rollup_subdir = {"mase_gluonts": "rollup_gluonts",
+                              "mase_gluonts_real": "rollup_gluonts_real"}
+            rollup_dir = (os.path.join(ABLATION_GENERAL, _rollup_subdir[args.mase_metric])
+                          if args.mase_metric in _rollup_subdir else ABLATION_GENERAL)
             stage_4_rollup(extras_by_stage["4"], out_dir=rollup_dir)
 
         total = time.perf_counter() - t_start
