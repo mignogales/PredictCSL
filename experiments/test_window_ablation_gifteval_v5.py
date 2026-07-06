@@ -213,6 +213,14 @@ PLOT_METRICS = ["mae", "mse", "rmse", "mase", "mase_gluonts", "smape", "crps"]
 CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
 CACHE_ROOT_PREDICTOR = "logs/experiments/context_length_predictor"
 
+# Version stamp for the gluonts-MASE computation (model cells + naive baseline).
+# Bump whenever the `mase_gluonts` definition changes so cached cells re-derive it
+# cheaply (backfill from per-instance MAE, NO TSFM re-inference) on the next
+# `--force 3` pass instead of silently keeping stale numbers.
+#   v1: initial port      v2: seasonal_error zero-fallback fixed to 1.0 (gluonts),
+#                             was 1e-9 -> exploded MASE on constant/intermittent cells
+MASE_GLUONTS_VER = 2
+
 
 # ==============================================================================
 #  FORECAST CONTAINER
@@ -476,15 +484,25 @@ def compute_naive_seasonal_test_metrics(cache: GiftEvalCache) -> Dict[str, float
     )
 
     # gluonts-season forecast -> leaderboard-faithful `mase_gluonts` normaliser.
+    # Mask NaN targets exactly like the model path (compute_all_metrics): the
+    # *_with_missing datasets carry NaN horizon labels, and an unmasked mean would
+    # turn the whole naive baseline into NaN — leaving those cells with no
+    # denominator (they'd silently drop out of the normalised aggregate).
     gl_preds = torch.from_numpy(_seasonal_naive_preds(cache, cache.season_gluonts))
-    gl_abs = (gl_preds - tgts).abs()
-    gl_valid = torch.ones_like(gl_abs, dtype=torch.bool)
+    gl_valid = ~torch.isnan(tgts)
+    gl_abs = (gl_preds - torch.nan_to_num(tgts, nan=0.0)).abs()
     metrics["mase_gluonts"] = compute_mase_gluonts(
         gl_abs, gl_valid, cache.seasonal_errors_gluonts)
+    # The naive has no stored forecast objects to run the real gluonts machinery,
+    # so stand in with the port (as cached model cells do; they match <1%). Keeps
+    # `--mase-metric mase_gluonts_real` normalisation working (naive denominator).
+    metrics["mase_gluonts_real"] = metrics["mase_gluonts"]
 
-    # Cache-version sentinel: distinguishes this faithful naive from legacy caches
-    # whose `mase_gluonts` used the project season for the forecast (see loader).
+    # Cache-version sentinels: `_gluonts_naive_faithful` marks the gluonts-season
+    # forecast (vs the old project-season one); `_gluonts_naive_ver` tracks the
+    # gluonts-MASE definition so a seasonal-error fix invalidates stale naives too.
     metrics["_gluonts_naive_faithful"] = True
+    metrics["_gluonts_naive_ver"] = MASE_GLUONTS_VER
     return metrics
 
 
@@ -495,10 +513,11 @@ def load_or_compute_naive_baseline(
     if os.path.isfile(path):
         with open(path, "r") as f:
             cached = json.load(f)
-        # Fresh caches carry the faithful gluonts-season `mase_gluonts`; older ones
-        # tiled the naive forecast with the project season, so their normaliser is
-        # wrong for D/W/S. Recompute those (needs the loaded cache anyway).
-        if cached.get("_gluonts_naive_faithful"):
+        # Reuse only a faithful naive at the CURRENT gluonts-MASE version. Older
+        # caches (project-season forecast, or a superseded seasonal_error) are
+        # recomputed here (the loaded cache is on hand anyway, so it's cheap).
+        if cached.get("_gluonts_naive_faithful") \
+                and cached.get("_gluonts_naive_ver", 0) >= MASE_GLUONTS_VER:
             return cached
     metrics = compute_naive_seasonal_test_metrics(cache)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1974,18 +1993,26 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                         return v is None or (isinstance(v, float) and np.isnan(v))
 
                     changed = False
-                    if _missing("mase_gluonts"):
+                    # Backfill when absent OR when the cached value predates the
+                    # current gluonts-MASE version (e.g. the seasonal_error fix).
+                    # Both paths are cheap: derive from the per-instance MAE cache,
+                    # no TSFM re-inference.
+                    _stale_ver = cached.get("_mase_gluonts_ver", 0) < MASE_GLUONTS_VER
+                    if _missing("mase_gluonts") or _stale_ver:
                         mg = _backfill_mase_gluonts(
                             dataset_display, model_short, term, window_size,
                             cache, short_mode)
                         if mg is not None:
                             cached["mase_gluonts"] = mg
+                            cached["_mase_gluonts_ver"] = MASE_GLUONTS_VER
                             changed = True
                     # A cached cell has no stored forecast objects, so the real
                     # gluonts machinery can't be re-run here. Stand in with the port
                     # `mase_gluonts` (they match to <1%; a forced --force 3 re-run
-                    # recomputes the true value from fresh forecasts).
-                    if _missing("mase_gluonts_real") and not _missing("mase_gluonts"):
+                    # recomputes the true value from fresh forecasts). Refresh the
+                    # stand-in whenever the port was just re-derived.
+                    if (_missing("mase_gluonts_real") or _stale_ver) \
+                            and not _missing("mase_gluonts"):
                         cached["mase_gluonts_real"] = cached["mase_gluonts"]
                         changed = True
                     if changed:

@@ -85,23 +85,29 @@ def seasonal_error(context: np.ndarray, season: int) -> float:
     """Port of gluonts ``calculate_seasonal_error`` over a single instance's
     context: ``mean(|x[m:] - x[:-m]|)``.
 
-    Matches gluonts' fallback to ``m = 1`` when the context is shorter than the
-    seasonal lag, ignores NaNs (contexts are already NaN->0 in the ablation
-    cache, but be defensive), and clamps the result to a tiny floor so MASE never
-    divides by zero.
+    Matches gluonts EXACTLY, including its critical zero-fallback: when the
+    seasonal difference is ~0 (constant / intermittent context) gluonts returns
+    **1.0**, not a tiny epsilon —
+    ``return seasonal_mae if not np.isclose(seasonal_mae, 0.0) else 1.0``.
+
+    The old code clamped to ``1e-9`` instead, which exploded such a cell's MASE to
+    ~1e6 (model/naive MAE ÷ ~0) and dragged the normalised leaderboard geomean far
+    below its true value (e.g. 0.55 vs the board's ~0.75). Also falls back to lag
+    ``m = 1`` when the context is shorter than the seasonal lag, and ignores NaNs.
     """
     x = np.asarray(context, dtype=np.float64)
     n = x.shape[0]
     m = season if 0 < season < n else 1
     if n <= m:
-        # Not enough history to form a single seasonal difference.
-        level = float(np.nanmean(np.abs(x))) if n else 0.0
-        return max(level, 1e-9)
+        # Not enough history even for a lag-1 difference -> gluonts sentinel.
+        return 1.0
     diff = np.abs(x[m:] - x[:-m])
     diff = diff[~np.isnan(diff)]
     if diff.size == 0:
-        return 1e-9
-    return max(float(diff.mean()), 1e-9)
+        return 1.0
+    mae = float(diff.mean())
+    # gluonts: near-zero seasonal error -> 1.0 (avoids the MASE blow-up), never 0.
+    return mae if not np.isclose(mae, 0.0) else 1.0
 
 
 def per_instance_seasonal_errors(contexts: Sequence[np.ndarray], season: int) -> np.ndarray:
