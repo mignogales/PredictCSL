@@ -101,32 +101,42 @@ def _load(path: str) -> Optional[dict]:
         return None
 
 
-def _pick_window(windows: List[Tuple[int, str]], how: str, metric: str
-                 ) -> Optional[Tuple[int, dict]]:
-    """Return (window_size, metrics_dict) for the chosen selection strategy, or
-    None if no window has a finite value for `metric`."""
+def _cell_value(md: dict, metric: str, prefer_real: bool) -> Optional[float]:
+    """The MASE value for a cell. With ``prefer_real`` we use the ACTUAL gluonts
+    machinery value (``mase_gluonts_real``) when it's finite, falling back to the
+    requested ``metric`` (the numpy port) otherwise — so a run mixing fresh cells
+    (real populated) and cached cells (port only) still aggregates cleanly."""
+    if prefer_real:
+        rv = md.get("mase_gluonts_real")
+        if rv is not None and math.isfinite(rv):
+            return float(rv)
+    v = md.get(metric)
+    return float(v) if (v is not None and math.isfinite(v)) else None
+
+
+def _pick_window(windows: List[Tuple[int, str]], how: str, metric: str,
+                 prefer_real: bool) -> Optional[Tuple[int, dict, float]]:
+    """Return (window_size, metrics_dict, value) for the chosen selection strategy,
+    or None if no window has a finite value."""
     loaded = []
     for w, mp in windows:
         d = _load(mp)
         if d is None:
             continue
-        v = d.get(metric)
-        if v is None or not math.isfinite(v):
+        v = _cell_value(d, metric, prefer_real)
+        if v is None:
             continue
         loaded.append((w, d, v))
     if not loaded:
         return None
     if how == "full":
-        w, d, _ = max(loaded, key=lambda t: t[0])
+        return max(loaded, key=lambda t: t[0])
     elif how == "best":
-        w, d, _ = min(loaded, key=lambda t: t[2])
+        return min(loaded, key=lambda t: t[2])
     else:  # explicit int
         want = int(how)
         match = [t for t in loaded if t[0] == want]
-        if not match:
-            return None
-        w, d, _ = match[0]
-    return w, d
+        return match[0] if match else None
 
 
 def _geomean(vals: List[float]) -> float:
@@ -137,14 +147,16 @@ def _geomean(vals: List[float]) -> float:
 
 
 def collect(run_dir: str, metric: str, window: str,
-            models_filter: Optional[List[str]]) -> None:
+            models_filter: Optional[List[str]], prefer_real: bool,
+            common_cells: bool, degen_mase: float, breakdown: int) -> None:
     datasets_root = os.path.join(run_dir, "datasets")
     if not os.path.isdir(datasets_root):
         raise SystemExit(
             f"No 'datasets/' under {run_dir!r}. Point --run-dir at the folder that "
             f"contains datasets/ (e.g. .../window_ablation_gifteval/general).")
 
-    # per model: list of (dataset, term, model_mase, naive_mase_or_None, mismatch)
+    # per model: list of Cell(dataset, term, model_mase, naive_mase_or_None,
+    #                         mismatch, degenerate)
     rows: Dict[str, List[tuple]] = defaultdict(list)
     naive_missing: Dict[str, List[str]] = defaultdict(list)
 
@@ -154,6 +166,7 @@ def collect(run_dir: str, metric: str, window: str,
             continue
 
         # --- naive baseline per term (the denominator) --------------------
+        # The naive has no gluonts-machinery value, so it always uses the port.
         naive_dir = os.path.join(ddir, "_naive_seasonal")
         naive_by_term: Dict[str, Optional[float]] = {}
         naive_faithful: Dict[str, bool] = {}
@@ -177,73 +190,125 @@ def collect(run_dir: str, metric: str, window: str,
             if models_filter and model not in models_filter:
                 continue
             for term, tdir in _term_dirs(mdir):
-                picked = _pick_window(_windows(tdir), window, metric)
+                picked = _pick_window(_windows(tdir), window, metric, prefer_real)
                 if picked is None:
                     continue
-                _w, md = picked
-                mv = md.get(metric)
-                if mv is None or not math.isfinite(mv):
-                    continue
+                _w, _md, mv = picked
                 nv = naive_by_term.get(term)
                 if nv is None:
                     naive_missing[model].append(f"{dataset}/t{term}")
-                # Flag only when the denominator is actually wrong: legacy cache
-                # AND a frequency where the two season maps disagree.
                 mismatch = legacy_suffix and not naive_faithful.get(term, False)
-                rows[model].append((dataset, term, float(mv), nv, mismatch))
+                # Degenerate: model or naive MASE is astronomically large, i.e. the
+                # per-instance seasonal error hit its 1e-9 floor (near-constant /
+                # intermittent series). These cancel in the ratio but wreck raw
+                # geomean/mean — flag so they can be excluded from the diagnosis.
+                degen = mv > degen_mase or (nv is not None and nv > degen_mase)
+                rows[model].append((dataset, term, mv, nv, mismatch, degen))
 
     if not rows:
         raise SystemExit(f"No model cells found under {datasets_root} for metric={metric!r}.")
 
-    _report(rows, naive_missing, metric, window)
+    # Optionally restrict to the (dataset, term) cells present for EVERY model, so
+    # the per-model geomeans are computed over an identical set and are actually
+    # comparable (raw/norm then collapses to one shared constant).
+    if common_cells and len(rows) > 1:
+        cell_sets = [set((c[0], c[1]) for c in cells) for cells in rows.values()]
+        shared = set.intersection(*cell_sets)
+        for model in rows:
+            rows[model] = [c for c in rows[model] if (c[0], c[1]) in shared]
+        print(f"[--common-cells] intersecting to {len(shared)} cells shared by all "
+              f"{len(rows)} models.\n")
+
+    _report(rows, naive_missing, metric, window, prefer_real, degen_mase, breakdown)
 
 
-def _report(rows, naive_missing, metric, window) -> None:
-    print("=" * 92)
-    print(f"GiftEval leaderboard-style aggregate  |  metric={metric}  window={window}")
-    print("=" * 92)
-    print(f"{'model':<22} {'cells':>5} {'raw_gmean':>10} {'norm_gmean':>11} "
-          f"{'mean':>9} {'median':>9} {'no_naive':>8} {'season?':>8}")
-    print("-" * 92)
+def _report(rows, naive_missing, metric, window, prefer_real, degen_mase,
+            breakdown) -> None:
+    print("=" * 100)
+    src = "mase_gluonts_real (gluonts machinery), port fallback" if prefer_real else metric
+    print(f"GiftEval leaderboard-style aggregate  |  value={src}  window={window}")
+    print("=" * 100)
+    # norm_g   : the leaderboard value (geomean of model/naive over ALL cells)
+    # norm_g*  : same but EXCLUDING degenerate (seasonal-error-floor) cells
+    # G_naive  : geomean of the naive denominator over the normalised cells
+    #            (= raw_g/norm_g; a shared constant iff cells match across models)
+    print(f"{'model':<20} {'cells':>5} {'raw_g':>8} {'norm_g':>8} {'norm_g*':>8} "
+          f"{'G_naive':>8} {'median':>8} {'degen':>6} {'no_nv':>6} {'seas?':>6}")
+    print("-" * 100)
 
-    board = []
     for model in sorted(rows):
         cells = rows[model]
-        raw = [mv for _, _, mv, _, _ in cells]
-        ratios = [mv / nv for _, _, mv, nv, _ in cells if nv]
-        n_mismatch = sum(1 for _, _, _, nv, mm in cells if nv and mm)
+        raw = [mv for _, _, mv, _, _, _ in cells]
+        ratios = [mv / nv for _, _, mv, nv, _, _ in cells if nv]
+        ratios_clean = [mv / nv for _, _, mv, nv, _, dg in cells if nv and not dg]
+        naive_vals = [nv for _, _, _, nv, _, _ in cells if nv]
+        n_degen = sum(1 for *_, dg in cells if dg)
+        n_mismatch = sum(1 for _, _, _, nv, mm, _ in cells if nv and mm)
         srt = sorted(raw)
         median = srt[len(srt) // 2] if srt else float("nan")
         raw_g = _geomean(raw)
         norm_g = _geomean(ratios)
-        board.append((model, norm_g))
-        print(f"{model:<22} {len(cells):>5} {raw_g:>10.4f} {norm_g:>11.4f} "
-              f"{(sum(raw)/len(raw)):>9.4f} {median:>9.4f} "
-              f"{len(naive_missing.get(model, [])):>8} {n_mismatch:>8}")
+        norm_g_clean = _geomean(ratios_clean)
+        g_naive = _geomean(naive_vals)
+        print(f"{model:<20} {len(cells):>5} {raw_g:>8.4f} {norm_g:>8.4f} "
+              f"{norm_g_clean:>8.4f} {g_naive:>8.4f} {median:>8.4f} "
+              f"{n_degen:>6} {len(naive_missing.get(model, [])):>6} {n_mismatch:>6}")
 
-    print("-" * 92)
-    print("norm_gmean = leaderboard value: exp(mean(log( MASE_model / MASE_seasonalnaive )))")
-    print("raw_gmean  = exp(mean(log(MASE_model)))  -- NOT normalised (what the summary reports)")
+    print("-" * 100)
+    print("norm_g  = LEADERBOARD value: exp(mean(log( MASE_model / MASE_seasonalnaive )))")
+    print("norm_g* = same, excluding degenerate cells (model or naive MASE > "
+          f"{degen_mase:g}; seasonal-error floor)")
+    print("G_naive = geomean of the seasonal-naive denominator; raw_g / norm_g")
     print()
 
-    # coverage / caveat detail
+    # --- Per-dataset breakdown: which cells drive the geomean --------------
+    # Sorted by ratio: the smallest ratios (models crushing seasonal naive) pull
+    # the geomean DOWN; compare these against the public per-dataset leaderboard
+    # numbers to find where your run diverges (missing hard cells, different
+    # forecasts, or degenerate series).
+    if breakdown > 0:
+        for model in sorted(rows):
+            scored = sorted(
+                ((c[0], c[1], c[2], c[3], c[2] / c[3], c[5])
+                 for c in rows[model] if c[3]),
+                key=lambda t: t[4])
+            if not scored:
+                continue
+            print(f"--- {model}: {len(scored)} normalised cells, "
+                  f"{breakdown} lowest & highest ratios (model/naive) ---")
+            print(f"    {'dataset/term':<28} {'model':>12} {'naive':>12} {'ratio':>8}  flag")
+            def _line(t):
+                ds, tm, mv, nv, rt, dg = t
+                flag = "DEGEN" if dg else ""
+                print(f"    {ds + '/t' + tm:<28} {mv:>12.3g} {nv:>12.3g} {rt:>8.3f}  {flag}")
+            if len(scored) <= 2 * breakdown:
+                for t in scored:                       # few cells: show all once
+                    _line(t)
+            else:
+                for t in scored[:breakdown]:
+                    _line(t)
+                print(f"    {'...':<28}")
+                for t in scored[-breakdown:]:
+                    _line(t)
+            print()
+
+    # --- coverage / caveat detail -----------------------------------------
     any_missing = any(naive_missing.values())
-    any_mismatch = any(mm for cells in rows.values() for *_, mm in cells)
+    any_mismatch = any(mm for cells in rows.values() for *_, mm, _ in cells)
     if any_missing:
-        print("!! Cells with NO naive baseline (excluded from norm_gmean):")
+        print("!! Cells with NO naive baseline (excluded from norm_g):")
         for model, miss in naive_missing.items():
             if miss:
                 shown = ", ".join(miss[:8]) + (" ..." if len(miss) > 8 else "")
                 print(f"   {model}: {len(miss)} cells -> {shown}")
         print()
     if any_mismatch:
-        print("!! 'season?' counts D/W/S cells whose Seasonal-Naive cache is LEGACY")
-        print("   (no _gluonts_naive_faithful sentinel): its denominator tiled with the")
-        print("   PROJECT season map, not gluonts' (D->1,W->1,S->3600). Re-run stage 3")
-        print("   (or --force 3) to refresh those cells for an exact leaderboard match.")
+        print("!! 'seas?' counts D/W/S cells whose Seasonal-Naive cache is LEGACY")
+        print("   (no _gluonts_naive_faithful sentinel). Re-run stage 3 (--force 3).")
         print()
-    print("Reminder: norm_gmean only matches the board if the cell set matches the")
-    print("board's ~97 (dataset x term) configs. Check 'cells' per model above.")
+    print("Reminder: norm_g matches the board ONLY over the board's exact 97 configs.")
+    print("If G_naive differs across models, their cell sets differ — use --common-cells")
+    print("for an apples-to-apples cross-model comparison.")
 
 
 def parse_args():
@@ -258,12 +323,27 @@ def parse_args():
                    help="Per-cell window: 'full' (max, default), 'best' (argmin), or an int.")
     p.add_argument("--models", nargs="+", default=None,
                    help="Restrict to these model display names (default: all found).")
+    p.add_argument("--prefer-real", action="store_true",
+                   help="Use the ACTUAL gluonts-machinery value (mase_gluonts_real) "
+                        "per cell when finite, falling back to --metric. Rules out "
+                        "port-vs-machinery as the source of any leaderboard gap.")
+    p.add_argument("--common-cells", action="store_true",
+                   help="Restrict to the (dataset, term) cells present for EVERY "
+                        "selected model, so cross-model geomeans are comparable.")
+    p.add_argument("--degen-mase", type=float, default=100.0,
+                   help="A cell whose model or naive MASE exceeds this is treated as "
+                        "degenerate (seasonal-error floor); reported and excluded "
+                        "from norm_g* (default: 100).")
+    p.add_argument("--breakdown", type=int, default=0, metavar="N",
+                   help="Print, per model, the N lowest- and highest-ratio cells so "
+                        "you can see which datasets drive the geomean (default: 0=off).")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    collect(args.run_dir, args.metric, args.window, args.models)
+    collect(args.run_dir, args.metric, args.window, args.models,
+            args.prefer_real, args.common_cells, args.degen_mase, args.breakdown)
 
 
 if __name__ == "__main__":
