@@ -436,29 +436,56 @@ def _naive_cache_path(dataset_display: str, term: str) -> str:
     )
 
 
-def compute_naive_seasonal_test_metrics(cache: GiftEvalCache) -> Dict[str, float]:
-    season = cache.season
+def _seasonal_naive_preds(cache: GiftEvalCache, season: int) -> np.ndarray:
+    """Seasonal-naive forecast: repeat each series' last ``season`` values across
+    the horizon (plain persistence when ``season == 1``). Series shorter than one
+    season fall back to the last observed value. Returns an (n_total, horizon)
+    float32 array with NaNs zeroed."""
     horizon = cache.horizon
-    n = cache.n_total
-
-    preds_np = np.empty((n, horizon), dtype=np.float32)
+    preds = np.empty((cache.n_total, horizon), dtype=np.float32)
     for i, ctx in enumerate(cache.contexts):
         if len(ctx) >= season:
             tail = ctx[-season:]
             repeats = (horizon // season) + 1
-            preds_np[i] = np.tile(tail, repeats)[:horizon]
+            preds[i] = np.tile(tail, repeats)[:horizon]
         else:
-            preds_np[i] = ctx[-1] if len(ctx) else 0.0
-    preds_np = np.nan_to_num(preds_np, nan=0.0)
+            preds[i] = ctx[-1] if len(ctx) else 0.0
+    return np.nan_to_num(preds, nan=0.0)
 
-    preds = torch.from_numpy(preds_np)
+
+def compute_naive_seasonal_test_metrics(cache: GiftEvalCache) -> Dict[str, float]:
+    """Seasonal-naive baseline metrics for one (dataset, term).
+
+    Two seasonalities are in play and MUST NOT be conflated:
+      * project metrics (mae/mse/`mase`) use the project season map (D->7, W->52),
+        matching the rest of the ablation and the naive reference lines in plots;
+      * the leaderboard `mase_gluonts` normaliser must use gluonts' Seasonal-Naive,
+        i.e. the forecast tiled with ``get_seasonality(freq)`` (D->1, W->1). So we
+        compute `mase_gluonts` from a SEPARATE gluonts-season forecast and splice it
+        in — otherwise D/W/S datasets would divide by the wrong baseline and the
+        normalised aggregate wouldn't line up with the HF GiftEval leaderboard.
+    """
     tgts = torch.from_numpy(cache.labels_np)
-    # Naive preds cover ALL instances in order, so the gluonts seasonal errors
-    # align 1:1 — pass them so the baseline has a mase_gluonts value too.
-    return compute_all_metrics(
-        ForecastResult(median=preds), tgts, cache.naive_seasonal_mae_train,
+
+    # Project-season forecast -> mae/mse/`mase` + the plot reference lines. Naive
+    # preds cover ALL instances in order, so the gluonts seasonal errors align 1:1.
+    proj_preds = torch.from_numpy(_seasonal_naive_preds(cache, cache.season))
+    metrics = compute_all_metrics(
+        ForecastResult(median=proj_preds), tgts, cache.naive_seasonal_mae_train,
         seasonal_errors=cache.seasonal_errors_gluonts,
     )
+
+    # gluonts-season forecast -> leaderboard-faithful `mase_gluonts` normaliser.
+    gl_preds = torch.from_numpy(_seasonal_naive_preds(cache, cache.season_gluonts))
+    gl_abs = (gl_preds - tgts).abs()
+    gl_valid = torch.ones_like(gl_abs, dtype=torch.bool)
+    metrics["mase_gluonts"] = compute_mase_gluonts(
+        gl_abs, gl_valid, cache.seasonal_errors_gluonts)
+
+    # Cache-version sentinel: distinguishes this faithful naive from legacy caches
+    # whose `mase_gluonts` used the project season for the forecast (see loader).
+    metrics["_gluonts_naive_faithful"] = True
+    return metrics
 
 
 def load_or_compute_naive_baseline(
@@ -467,7 +494,12 @@ def load_or_compute_naive_baseline(
     path = _naive_cache_path(cache.dataset_display, term)
     if os.path.isfile(path):
         with open(path, "r") as f:
-            return json.load(f)
+            cached = json.load(f)
+        # Fresh caches carry the faithful gluonts-season `mase_gluonts`; older ones
+        # tiled the naive forecast with the project season, so their normaliser is
+        # wrong for D/W/S. Recompute those (needs the loaded cache anyway).
+        if cached.get("_gluonts_naive_faithful"):
+            return cached
     metrics = compute_naive_seasonal_test_metrics(cache)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
