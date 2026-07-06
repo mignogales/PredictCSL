@@ -54,8 +54,9 @@ Run-level (at <run_dir>/, one figure for the whole run; via --rollup-only)
   model_strategy_overview_time.png  single scatter: every (model × strategy) point,
                                  wall-clock forward-pass time saved (x) vs geomean
                                  MASE change (y)
-  bar_aggregate_mase.png      mean & median MASE per strategy — drawn on
-                              `mase_gluonts` when available (else the primary metric)
+  bar_aggregate_mase.png      mean & median MASE per strategy (primary metric)
+  bar_aggregate_mase_gluonts.png  same, scored on `mase_gluonts` — emitted
+                              alongside when the leaderboard curve is available
   bar_aggregate_time.png      mean elapsed time per strategy
   scatter_pred_vs_best.png    MASE(pred) vs MASE(best)
   scatter_pred_vs_full.png    MASE(pred) vs MASE(full)
@@ -1835,7 +1836,8 @@ def _plot_rel_impr_pred_vs_oracle(ds_agg: pd.DataFrame, out_dir: str) -> str:
 # ==============================================================================
 
 def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
-                            metric_label: str = "MASE") -> str:
+                            metric_label: str = "MASE",
+                            fname: str = "bar_aggregate_mase.png") -> str:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"]).copy()
     if r.empty:
         return ""
@@ -1896,7 +1898,7 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
     ax.set_ylim(bottom=0)
 
     plt.tight_layout()
-    path = os.path.join(out_dir, "bar_aggregate_mase.png")
+    path = os.path.join(out_dir, fname)
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     return path
@@ -2783,15 +2785,18 @@ def main() -> None:
         compute_relative_improvement_tables(df_subset, out_dir)
 
         print(Fore.CYAN + "\n--- Generating plots ---" + Fore.RESET)
-        # General MASE bar plot uses the leaderboard `mase_gluonts` when available
-        # (falls back to the primary metric otherwise).
+        # Primary MASE bar plot on the run's default metric. When the leaderboard
+        # `mase_gluonts` curve is also present, emit a parallel gluonts-scored bar
+        # plot beside it (separate file) so both metrics are available.
+        bar_mase_path = plot_bar_aggregate_mase(df_subset, out_dir)
+        bar_mase_gluonts_path = ""
         if df_g_subset is not None and not df_g_subset.empty:
-            bar_mase_path = plot_bar_aggregate_mase(df_g_subset, out_dir,
-                                                    metric_label="MASE (gluonts)")
-        else:
-            bar_mase_path = plot_bar_aggregate_mase(df_subset, out_dir)
+            bar_mase_gluonts_path = plot_bar_aggregate_mase(
+                df_g_subset, out_dir, metric_label="MASE (gluonts)",
+                fname="bar_aggregate_mase_gluonts.png")
         single_paths = [
             bar_mase_path,
+            bar_mase_gluonts_path,
             plot_bar_aggregate_time(df_subset, out_dir),
             plot_scatter(df_subset, "best_mase", "pred_mase",
                          "MASE — Best (oracle)", "MASE — Predictor",

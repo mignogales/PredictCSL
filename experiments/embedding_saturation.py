@@ -1314,6 +1314,17 @@ def coordinate(args):
                 cmd = _group_cmd(args, env, displays, shard_id=i, num_shards=n_gpus)
                 procs.append(subprocess.Popen(cmd, env=cenv))
             fails += sum(p.wait() != 0 for p in procs)
+    # Once every model/shard has populated its per-cell saturation.npz, draw the
+    # cross-model per-dataset overlays. Pure post-processing over the cached
+    # cells (no inference), so it runs regardless of partial failures — and only
+    # for the gifteval tree the combine walker understands.
+    if not args.dump_modules and "gifteval" in args.sources:
+        print(Fore.CYAN + "\n### combining per-dataset cross-model plots" + Fore.RESET)
+        try:
+            combine_dataset_plots(args.out_root)
+        except Exception as e:                               # noqa: BLE001
+            print(Fore.RED + f"  combine failed: {e}" + Fore.RESET)
+            traceback.print_exc()
     if fails:
         raise SystemExit(Fore.RED + f"{fails} group/worker(s) failed." + Fore.RESET)
 
