@@ -57,6 +57,9 @@ Run-level (at <run_dir>/, one figure for the whole run; via --rollup-only)
   bar_aggregate_mase.png      mean & median MASE per strategy (primary metric)
   bar_aggregate_mase_gluonts.png  same, scored on `mase_gluonts` — emitted
                               alongside when the leaderboard curve is available
+  bar_aggregate_mase_gluonts_normalized.png  the gluonts MASE divided per cell by
+                              the seasonal-naive baseline (Seasonal Naive = 1.0) —
+                              the leaderboard-faithful aggregation
   bar_aggregate_time.png      mean elapsed time per strategy
   scatter_pred_vs_best.png    MASE(pred) vs MASE(best)
   scatter_pred_vs_full.png    MASE(pred) vs MASE(full)
@@ -551,6 +554,34 @@ def _load_variant_pred_mean(
     return pred_mean
 
 
+def _load_naive_baselines(run_dir: str) -> Dict[str, dict]:
+    """Per-(dataset, term) seasonal-naive baseline metrics that stage 3 writes to
+    ``run_dir/naive_baselines.json`` (keyed ``'<dataset_display>/t<term>'``). These
+    are the denominators for the leaderboard-style normalised MASE. Empty dict if
+    the file is absent (older runs) — callers then leave ``naive_mase`` NaN."""
+    path = os.path.join(run_dir, "naive_baselines.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _resolve_gluonts_df(df_primary: pd.DataFrame,
+                        df_g: Optional[pd.DataFrame],
+                        mase_metric: str) -> Optional[pd.DataFrame]:
+    """The `mase_gluonts`-scored frame for the leaderboard-normalised view: the
+    parallel ``df_g`` when the run's primary metric is something else, or the
+    primary frame itself when it's already scored on `mase_gluonts`."""
+    if df_g is not None and not df_g.empty:
+        return df_g
+    if mase_metric == "mase_gluonts":
+        return df_primary
+    return None
+
+
 def load_strategy_records(
     run_dir: str,
     cache_root: str,
@@ -573,6 +604,15 @@ def load_strategy_records(
     models_root = os.path.join(run_dir, "models")
     if not os.path.isdir(models_root):
         raise FileNotFoundError(f"No models/ dir found in {run_dir}")
+
+    # Seasonal-naive denominators for the leaderboard-style normalised MASE. Which
+    # field to divide by tracks the active metric: the leaderboard normalises the
+    # gluonts MASE by the gluonts Seasonal-Naive, the project `mase` by its own.
+    naive_baselines = _load_naive_baselines(run_dir)
+    _naive_field = {
+        "mase_gluonts": "mase_gluonts",
+        "mase_gluonts_real": "mase_gluonts_real",
+    }.get(mase_metric, "mase")
 
     # Sibling predictor-variant trees (v3 cheap, v4 Mamba, …) folded in as extra
     # strategies, evaluated on the SAME real curves as the base "pred".
@@ -678,6 +718,14 @@ def load_strategy_records(
             full_mase = float(real_curve[full_idx])
             best_mase = float(real_curve[best_idx])
             pred_mase = float(real_curve[pred_idx])
+
+            # Seasonal-naive denominator for this cell (leaderboard-style
+            # normalisation: MASE_strategy / MASE_seasonalnaive). NaN when the
+            # baseline is missing (older runs) so the row drops out of the
+            # normalised aggregate but stays in the absolute one.
+            naive_mase = float(
+                naive_baselines.get(f"{dataset_display}/t{term}", {})
+                .get(_naive_field, float("nan")))
 
             # --- Elapsed time (robust timing.json mean, else single-shot) --------
             full_elapsed, full_elapsed_std = _elapsed_and_std(
@@ -800,6 +848,9 @@ def load_strategy_records(
             "full_mase":       full_mase,
             "best_mase":       best_mase,
             "pred_mase":       pred_mase,
+            # Seasonal-naive baseline for this cell (denominator of the
+            # leaderboard-style normalised MASE; NaN if unavailable).
+            "naive_mase":      naive_mase,
             # MASE deltas
             "delta_pred_vs_full": pred_mase - full_mase,
             "delta_best_vs_full": best_mase - full_mase,
@@ -892,6 +943,10 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"])
     stats: dict = {}
 
+    # Seasonal-naive normaliser present? Then also report the leaderboard-style
+    # normalised geomean (geomean of MASE_strategy / MASE_seasonalnaive), over the
+    # subset of rows that actually have a baseline.
+    has_naive = "naive_mase" in r.columns and r["naive_mase"].notna().any()
     for strategy in ("full_mase", "best_mase", "pred_mase"):
         vals = r[strategy].values
         stats[strategy] = {
@@ -901,6 +956,12 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
             "std":     float(vals.std()),
             "n":       int(len(vals)),
         }
+        if has_naive:
+            m = r["naive_mase"].notna() & (r["naive_mase"] > 0)
+            if m.any():
+                ratio = (r.loc[m, strategy] / r.loc[m, "naive_mase"]).values
+                stats[strategy]["geomean_norm"] = _geomean(ratio)
+                stats[strategy]["n_norm"] = int(m.sum())
 
     stats["pred_clamped_count"] = int(df["pred_clamped"].sum()) if "pred_clamped" in df.columns else 0
     pred_beats_full = int((r["pred_mase"] < r["full_mase"]).sum())
@@ -1995,10 +2056,28 @@ def _plot_rel_impr_pred_vs_oracle(ds_agg: pd.DataFrame, out_dir: str) -> str:
 
 def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
                             metric_label: str = "MASE",
-                            fname: str = "bar_aggregate_mase.png") -> str:
+                            fname: str = "bar_aggregate_mase.png",
+                            normalize: bool = False) -> str:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"]).copy()
     if r.empty:
         return ""
+
+    # Leaderboard-style normalisation: divide every strategy's MASE by this cell's
+    # seasonal-naive baseline before aggregating, so bars read relative to Seasonal
+    # Naive (=1.0), exactly like the HF GiftEval board. Needs the `naive_mase`
+    # column; restrict to rows that carry a usable baseline.
+    if normalize:
+        if "naive_mase" not in r.columns:
+            return ""
+        r = r[r["naive_mase"].notna() & (r["naive_mase"] > 0)].copy()
+        if r.empty:
+            return ""
+
+    def _vals(col: str) -> np.ndarray:
+        # Read the divisor live from the current `r` — period/variant appends below
+        # further filter `r`, so capturing the array up front would misalign it.
+        v = r[col].values
+        return v / r["naive_mase"].values if normalize else v
 
     strategies = ["full_mase", "best_mase", "pred_mase"]
     labels = ["Full Window", "Best Window\n(Oracle)", "Predictor\nWindow"]
@@ -2024,9 +2103,9 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
     c_median = c_median[:len(labels)]
 
     # Geometric mean — exp(mean(log)) — what M4/OWA use; robust to outlier spikes
-    gmeans  = [_geomean(r[s].values) for s in strategies]
+    gmeans  = [_geomean(_vals(s)) for s in strategies]
     # Median — nonparametric sanity check
-    medians = [r[s].median() for s in strategies]
+    medians = [float(np.median(_vals(s))) for s in strategies]
 
     # Identify datasets driving spikes (top 5 % by full_mase)
     thresh_95 = float(np.percentile(r["full_mase"].values, 95))
@@ -2045,6 +2124,12 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
         v = b.get_height()
         ax.text(b.get_x() + b.get_width() / 2, v + y_top * 0.01,
                 f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+
+    # Seasonal-Naive reference (=1.0) for the normalised view — below the line
+    # beats the leaderboard baseline, above loses to it.
+    if normalize:
+        ax.axhline(1.0, color="black", lw=1.2, ls="--", alpha=0.7,
+                   label="Seasonal Naive (=1.0)")
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=11)
@@ -2916,6 +3001,28 @@ def main() -> None:
         print(f"  Regret vs oracle:     mean={stats['regret_pred_vs_best']['mean']:.4f}  "
               f"median={stats['regret_pred_vs_best']['median']:.4f}")
 
+        # Three headline aggregations on the FULL-window strategy, side by side:
+        #   (1) the project's original `mase` geomean,
+        #   (2) the absolute leaderboard `mase_gluonts` geomean,
+        #   (3) the seasonal-naive-NORMALISED `mase_gluonts` geomean (the number
+        #       that matches the HF GiftEval leaderboard).
+        # `gl_df` is the gluonts-scored frame: the parallel df_g when the primary
+        # metric is the project `mase`, else df_subset itself (already gluonts).
+        gl_df = _resolve_gluonts_df(df_subset, df_g_subset, args.mase_metric)
+        if gl_df is not None and not gl_df.empty:
+            gstats = compute_summary_stats(gl_df)
+            gfull = gstats.get("full_mase", {})
+            print(Fore.CYAN + "\n--- Aggregate MASE (full window) ---" + Fore.RESET)
+            print(f"  (1) original `mase`         geomean : {stats['full_mase']['geomean']:.4f}")
+            print(f"  (2) mase_gluonts (absolute) geomean : {gfull.get('geomean', float('nan')):.4f}")
+            if "geomean_norm" in gfull:
+                print(f"  (3) mase_gluonts NORMALISED geomean : {gfull['geomean_norm']:.4f}"
+                      f"  <- leaderboard-style (÷ seasonal-naive, n={gfull.get('n_norm', 0)})")
+            else:
+                print(Fore.YELLOW + "  (3) normalised mase_gluonts: no naive baseline "
+                      "found — re-run stage 3 (or --force 3) to write naive_baselines.json"
+                      + Fore.RESET)
+
         if "speedup_pred_vs_full" in stats:
             sp = stats["speedup_pred_vs_full"]
             print(Fore.CYAN + "\n--- Timing summary ---" + Fore.RESET)
@@ -2973,10 +3080,23 @@ def main() -> None:
             bar_mase_gluonts_real_path = plot_bar_aggregate_mase(
                 df_gr_subset, out_dir, metric_label="MASE (gluonts-real)",
                 fname="bar_aggregate_mase_gluonts_real.png")
+        # Leaderboard-faithful view: the gluonts MASE normalised by the seasonal-
+        # naive baseline per cell (Seasonal Naive = 1.0). This is the number that
+        # lines up with the HF GiftEval board.
+        bar_mase_gluonts_norm_path = ""
+        gl_df_for_norm = _resolve_gluonts_df(df_subset, df_g_subset, args.mase_metric)
+        if gl_df_for_norm is not None and not gl_df_for_norm.empty \
+                and "naive_mase" in gl_df_for_norm.columns:
+            bar_mase_gluonts_norm_path = plot_bar_aggregate_mase(
+                gl_df_for_norm, out_dir,
+                metric_label="MASE (gluonts, norm. vs seasonal-naive)",
+                fname="bar_aggregate_mase_gluonts_normalized.png",
+                normalize=True)
         single_paths = [
             bar_mase_path,
             bar_mase_gluonts_path,
             bar_mase_gluonts_real_path,
+            bar_mase_gluonts_norm_path,
             plot_bar_aggregate_time(df_subset, out_dir),
             plot_scatter(df_subset, "best_mase", "pred_mase",
                          "MASE — Best (oracle)", "MASE — Predictor",
