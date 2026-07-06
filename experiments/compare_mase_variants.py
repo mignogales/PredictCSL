@@ -26,12 +26,26 @@ for the horizon, context long enough for the window), so the three are directly
 comparable to each other; ``mase_real`` here is the leaderboard *definition*
 applied to that set, not a full-test-split leaderboard submission.
 
+Multiple (dataset, term) configs can be scored at once and aggregated across
+them. The per-config MASE is aggregated by GEOMETRIC mean (the GiftEval
+leaderboard's aggregation — each config weighted equally), with the arithmetic
+mean shown alongside.
+
 Run on the SERVER (needs the TSFMs, GIFT_EVAL data, and gluonts):
 
+    # single config
     python -m experiments.compare_mase_variants --dataset ETTm1-15T --term short \
         --model Chronos2-Small --window 512
-    python -m experiments.compare_mase_variants --dataset JenaWeather-H --term medium \
+
+    # several datasets x terms (cartesian product), aggregated
+    python -m experiments.compare_mase_variants \
+        --dataset ETTm1-15T ETTm2-15T JenaWeather-H --term short medium long \
         --model Moirai2-Small --full
+
+    # explicit config list
+    python -m experiments.compare_mase_variants \
+        --configs ETTm1-15T/short JenaWeather-H/medium BizITObsApp/long \
+        --model Chronos2-Small --window 512
 """
 
 from __future__ import annotations
@@ -185,14 +199,122 @@ def real_gluonts_mase(cache, valid_indices, starts, fr, freq):
 
 
 # ----------------------------------------------------------------------------
+#  Per-config evaluation
+# ----------------------------------------------------------------------------
+
+def evaluate_config(display, term, model_id, family, handle, args):
+    """Run the model on one (dataset display, term) and return the three MASE
+    variants for it (plus book-keeping). ``handle`` is the already-loaded base
+    model, reused across datasets. Returns a result dict."""
+    ge_name, to_univariate = resolve_dataset(display, term)
+    ge_dataset = GiftEvalDataset(name=ge_name, term=term, to_univariate=to_univariate)
+    cache = GiftEvalCache(ge_dataset, display)
+    freq, horizon = cache.freq, cache.horizon
+
+    window = cache.max_context if args.full else (args.window or min(cache.max_context, 1024))
+    window = min(window, cache.max_context)
+
+    # Per-instance forecast-start Periods, captured in GiftEvalCache's iteration
+    # order (same len(label) >= horizon filter), so they align 1:1 with cache rows.
+    starts = []
+    for _, test_label in ge_dataset.test_data:
+        if len(test_label["target"]) < horizon:   # same drop rule GiftEvalCache applies
+            continue
+        starts.append(test_label["start"])
+    if len(starts) != cache.n_total:
+        raise RuntimeError(
+            f"start capture ({len(starts)}) != cache instances ({cache.n_total}).")
+
+    batches, all_x, all_y, valid_indices = cache.build_batches(
+        window, args.batch_size, args.device, pin_memory=(args.device == "cuda"))
+    fr, tgts = _forecast_cell(family, handle, model_id, batches, window, horizon,
+                              args.device, args.batch_size)
+    starts_served = [starts[i] for i in valid_indices]
+
+    se_served = cache.seasonal_errors_gluonts[valid_indices]
+    metrics = compute_all_metrics(fr, tgts, cache.naive_seasonal_mae_train,
+                                  seasonal_errors=se_served)
+
+    real_val = None
+    if not args.no_real:
+        try:
+            real_val, _, _ = real_gluonts_mase(cache, valid_indices, starts_served, fr, freq)
+        except ImportError as e:
+            print(f"[mase_real] gluonts not importable ({e}); skipping.", file=sys.stderr)
+            args.no_real = True     # don't retry per config
+        except Exception as e:      # noqa: BLE001 - surface but keep going
+            print(f"[mase_real] {display}/{term}: evaluate_forecasts failed: {e}",
+                  file=sys.stderr)
+
+    return {
+        "display": display, "term": term, "freq": freq, "window": window,
+        "n_total": cache.n_total, "n_served": len(valid_indices),
+        "season_proj": cache.season, "season_gl": get_seasonality(freq),
+        "mase": metrics["mase"], "mase_gluonts": metrics["mase_gluonts"],
+        "mase_real": real_val,
+    }
+
+
+# ----------------------------------------------------------------------------
+#  Config list + aggregation helpers
+# ----------------------------------------------------------------------------
+
+def build_config_list(args):
+    """Resolve the requested (display, term) configs. Prefers explicit
+    ``--configs display/term`` tokens; otherwise takes the cartesian product of
+    ``--dataset`` x ``--term``, silently dropping combos absent from DATASETS."""
+    valid = {(d[2], d[1]) for d in DATASETS}
+    configs = []
+    if args.configs:
+        for tok in args.configs:
+            if "/" not in tok:
+                raise SystemExit(f"--configs token '{tok}' must be 'Display/term'.")
+            disp, term = tok.rsplit("/", 1)
+            if (disp, term) not in valid:
+                raise SystemExit(f"Config '{disp}/{term}' not in DATASETS.")
+            configs.append((disp, term))
+    else:
+        for disp in args.dataset:
+            for term in args.term:
+                if (disp, term) in valid:
+                    configs.append((disp, term))
+                else:
+                    print(f"[skip] {disp}/{term} not in DATASETS.", file=sys.stderr)
+    if not configs:
+        raise SystemExit("No valid (dataset, term) configs to evaluate.")
+    # De-dup while preserving order.
+    seen, out = set(), []
+    for c in configs:
+        if c not in seen:
+            seen.add(c); out.append(c)
+    return out
+
+
+def _gmean(vals):
+    a = np.asarray([v for v in vals if v is not None and np.isfinite(v) and v > 0],
+                   dtype=np.float64)
+    return float(np.exp(np.log(a).mean())) if a.size else float("nan")
+
+
+def _amean(vals):
+    a = np.asarray([v for v in vals if v is not None and np.isfinite(v)], dtype=np.float64)
+    return float(a.mean()) if a.size else float("nan")
+
+
+# ----------------------------------------------------------------------------
 #  Main
 # ----------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dataset", required=True, help="dataset display, e.g. ETTm1-15T")
-    ap.add_argument("--term", default="short", choices=["short", "medium", "long"])
+    ap.add_argument("--dataset", nargs="+", default=[],
+                    help="one or more dataset displays, e.g. ETTm1-15T JenaWeather-H")
+    ap.add_argument("--term", nargs="+", default=["short"],
+                    choices=["short", "medium", "long"],
+                    help="term(s); applied to every --dataset (cartesian product)")
+    ap.add_argument("--configs", nargs="*", default=None,
+                    help="explicit 'Display/term' tokens (overrides --dataset/--term)")
     ap.add_argument("--model", required=True, help="model display, e.g. Chronos2-Small")
     grp = ap.add_mutually_exclusive_group()
     grp.add_argument("--window", type=int, default=None, help="context window size")
@@ -200,84 +322,72 @@ def main():
                      help="use each dataset's max available context")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--no-real", action="store_true",
+                    help="skip the gluonts-machinery mase_real value")
     args = ap.parse_args()
 
-    ge_name, to_univariate = resolve_dataset(args.dataset, args.term)
+    if not args.dataset and not args.configs:
+        raise SystemExit("Provide --dataset (one or more) or --configs.")
+
+    configs = build_config_list(args)
     model_id, family = resolve_model(args.model)
-
-    print(f"Dataset : {args.dataset} (ge_name={ge_name}, term={args.term})")
     print(f"Model   : {args.model} (family={family}, id={model_id})")
+    print(f"Configs : {len(configs)}  ->  " +
+          ", ".join(f"{d}/{t}" for d, t in configs) + "\n")
 
-    ge_dataset = GiftEvalDataset(name=ge_name, term=args.term, to_univariate=to_univariate)
-    cache = GiftEvalCache(ge_dataset, args.dataset)
-    freq, horizon = cache.freq, cache.horizon
-    print(f"freq={freq}  horizon={horizon}  n_instances={cache.n_total}  "
-          f"context: min={cache.min_context} max={cache.max_context}")
-
-    window = cache.max_context if args.full else (args.window or min(cache.max_context, 1024))
-    window = min(window, cache.max_context)
-    print(f"window  = {window}\n")
-
-    # Per-instance forecast-start Periods, captured in GiftEvalCache's iteration
-    # order (same len(label) >= horizon filter), so they align 1:1 with cache rows.
-    starts = []
-    for _, test_label in ge_dataset.test_data:
-        lbl = test_label["target"]
-        if len(lbl) < horizon:            # same drop rule GiftEvalCache applies
-            continue
-        starts.append(test_label["start"])
-    if len(starts) != cache.n_total:
-        raise RuntimeError(
-            f"start capture ({len(starts)}) != cache instances ({cache.n_total}); "
-            "iteration order mismatch.")
-
-    # ---- Run the model once (skip-mode batching, same as the ablation) --------
-    batches, all_x, all_y, valid_indices = cache.build_batches(
-        window, args.batch_size, args.device, pin_memory=(args.device == "cuda"))
+    # Load the base model once and reuse it across all datasets.
     handle = load_handle(family, model_id, args.device)
-    fr, tgts = _forecast_cell(family, handle, model_id, batches, window, horizon,
-                              args.device, args.batch_size)
-    starts_served = [starts[i] for i in valid_indices]
-    print(f"served instances (context >= {window}): {len(valid_indices)}/{cache.n_total}\n")
 
-    # ---- (1) + (2): project mase and the ported gluonts mase ------------------
-    se_served = cache.seasonal_errors_gluonts[valid_indices]
-    metrics = compute_all_metrics(fr, tgts, cache.naive_seasonal_mae_train,
-                                  seasonal_errors=se_served)
-    mase_project = metrics["mase"]
-    mase_port = metrics["mase_gluonts"]
+    results = []
+    for i, (disp, term) in enumerate(configs, 1):
+        print(f"[{i}/{len(configs)}] {disp}/{term} ...", flush=True)
+        try:
+            results.append(evaluate_config(disp, term, model_id, family, handle, args))
+        except Exception as e:  # noqa: BLE001 - one bad config shouldn't sink the run
+            print(f"  ! failed: {e}", file=sys.stderr)
 
-    # ---- (3): the real gluonts leaderboard machinery --------------------------
-    real_val, real_col, real_season = None, None, None
-    try:
-        real_val, real_col, real_season = real_gluonts_mase(
-            cache, valid_indices, starts_served, fr, freq)
-    except ImportError as e:
-        print(f"[mase_real] gluonts not importable here ({e}); skipping the "
-              "leaderboard-machinery value.", file=sys.stderr)
-    except Exception as e:  # noqa: BLE001 - surface but don't crash the comparison
-        print(f"[mase_real] evaluate_forecasts failed: {e}", file=sys.stderr)
+    if not results:
+        raise SystemExit("No config produced a result.")
 
-    # ---- Report ---------------------------------------------------------------
-    print("=" * 64)
-    print(f"MASE comparison — {args.model} on {args.dataset}/{args.term} @ w={window}")
-    print("=" * 64)
-    print(f"  season (project map)  : {cache.season}")
-    print(f"  season (gluonts map)  : {get_seasonality(freq)}")
-    print(f"  naive_seasonal_mae    : {cache.naive_seasonal_mae_train:.6f}")
-    print("-" * 64)
-    print(f"  1. mase        (project custom)      : {mase_project:.6f}")
-    print(f"  2. mase_gluonts(repo port)           : {mase_port:.6f}")
-    if real_val is not None:
-        print(f"  3. mase_real   (gluonts {real_col:<10}) : {real_val:.6f}")
-        diff = abs(real_val - mase_port)
-        rel = diff / abs(real_val) if real_val else float("nan")
-        print("-" * 64)
-        print(f"  |port - real| = {diff:.3e}   (rel {rel:.2%})   "
+    # ---- Per-dataset table ----------------------------------------------------
+    have_real = any(r["mase_real"] is not None for r in results)
+    print("\n" + "=" * 92)
+    print(f"MASE comparison — {args.model}   (window: "
+          f"{'full' if args.full else (args.window or 'auto<=1024')})")
+    print("=" * 92)
+    hdr = f"{'dataset/term':<26}{'served':>10}{'mase':>12}{'mase_gluonts':>14}"
+    hdr += f"{'mase_real':>12}" if have_real else ""
+    print(hdr)
+    print("-" * 92)
+    for r in results:
+        line = (f"{r['display'] + '/' + r['term']:<26}"
+                f"{r['n_served']:>4}/{r['n_total']:<5}"
+                f"{r['mase']:>12.6f}{r['mase_gluonts']:>14.6f}")
+        if have_real:
+            rv = r["mase_real"]
+            line += f"{rv:>12.6f}" if rv is not None else f"{'n/a':>12}"
+        print(line)
+
+    # ---- Aggregates across datasets ------------------------------------------
+    # The GiftEval leaderboard aggregates per-config MASE by GEOMETRIC mean (each
+    # config weighted equally); the arithmetic mean is shown alongside.
+    print("-" * 92)
+    for label, fn in (("geomean (leaderboard)", _gmean), ("arithmetic mean", _amean)):
+        line = f"{label:<26}{'':>10}"
+        line += f"{fn([r['mase'] for r in results]):>12.6f}"
+        line += f"{fn([r['mase_gluonts'] for r in results]):>14.6f}"
+        if have_real:
+            line += f"{fn([r['mase_real'] for r in results]):>12.6f}"
+        print(line)
+    print("=" * 92)
+
+    if have_real:
+        # port-vs-real fidelity on the geomeans.
+        g_port = _gmean([r["mase_gluonts"] for r in results])
+        g_real = _gmean([r["mase_real"] for r in results])
+        rel = abs(g_port - g_real) / g_real if g_real else float("nan")
+        print(f"geomean |port - real| rel = {rel:.2%}   "
               f"{'OK ✓' if rel < 0.01 else 'CHECK'}")
-    else:
-        print("  3. mase_real   (gluonts machinery)   : <unavailable>")
-    print("=" * 64)
 
 
 if __name__ == "__main__":
