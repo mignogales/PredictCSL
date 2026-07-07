@@ -216,6 +216,13 @@ def collect(run_dir: str, metric: str, window: str,
         shared = set.intersection(*cell_sets)
         for model in rows:
             rows[model] = [c for c in rows[model] if (c[0], c[1]) in shared]
+        # Rebuild naive_missing from the intersected rows, else the no_naive column
+        # keeps its stale pre-intersection count (cells already dropped here).
+        naive_missing.clear()
+        for model, cells in rows.items():
+            for ds, tm, _mv, nv, _mm, _dg in cells:
+                if nv is None:
+                    naive_missing[model].append(f"{ds}/t{tm}")
         print(f"[--common-cells] intersecting to {len(shared)} cells shared by all "
               f"{len(rows)} models.\n")
 
