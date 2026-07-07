@@ -68,6 +68,7 @@ except ImportError:
 from experiments.predict_context_length import (
     PatchTSTContextLength, build_predictor)
 from experiments import models_config
+from experiments import datasets_config
 
 
 # ==============================================================================
@@ -78,113 +79,12 @@ from experiments import models_config
 # experiments.models_config. To add/drop a model here, flip its `run` flag there.
 MODELS = models_config.models_to_run()
 
-DATASETS = [
-    ("jena_weather/10T",            "short",  "JenaWeather-10T", True),
-    ("jena_weather/10T",            "medium", "JenaWeather-10T", True),
-    ("jena_weather/10T",            "long",   "JenaWeather-10T", True),
-    ("jena_weather/H",              "short",  "JenaWeather-H",   True),
-    ("jena_weather/H",              "medium", "JenaWeather-H",   True),
-    ("jena_weather/H",              "long",   "JenaWeather-H",   True),
-    ("jena_weather/D",              "short",  "JenaWeather-D",   True),
-    ("bizitobs_application",        "short",  "BizITObsApp",     True),
-    ("bizitobs_application",        "medium", "BizITObsApp",     True),
-    ("bizitobs_application",        "long",   "BizITObsApp",     True),
-    ("bizitobs_service",            "short",  "BizITObsService", True),
-    ("bizitobs_service",            "medium", "BizITObsService", True),
-    ("bizitobs_service",            "long",   "BizITObsService", True),
-    ("bizitobs_l2c/5T",             "short",  "BizITObsL2C-5T",  True),
-    ("bizitobs_l2c/5T",             "medium", "BizITObsL2C-5T",  True),
-    ("bizitobs_l2c/5T",             "long",   "BizITObsL2C-5T",  True),
-    ("bizitobs_l2c/H",              "short",  "BizITObsL2C-H",   True),
-    ("bizitobs_l2c/H",              "medium", "BizITObsL2C-H",   True),
-    ("bizitobs_l2c/H",              "long",   "BizITObsL2C-H",   True),
-    ("bitbrains_fast_storage/5T",   "short",  "BitbrainsFS-5T",  True),
-    ("bitbrains_fast_storage/5T",   "medium", "BitbrainsFS-5T",  True),
-    ("bitbrains_fast_storage/5T",   "long",   "BitbrainsFS-5T",  True),
-    ("bitbrains_fast_storage/H",    "short",  "BitbrainsFS-H",   True),
-    ("bitbrains_rnd/5T",            "short",  "BitbrainsRnD-5T", True),
-    ("bitbrains_rnd/5T",            "medium", "BitbrainsRnD-5T", True),
-    ("bitbrains_rnd/5T",            "long",   "BitbrainsRnD-5T", True),
-    ("bitbrains_rnd/H",             "short",  "BitbrainsRnD-H",  True),
-    ("restaurant",                  "short",  "Restaurant",      False),
-    ("ett1/15T",                    "short",  "ETTm1-15T",       True),
-    ("ett1/15T",                    "medium", "ETTm1-15T",       True),
-    ("ett1/15T",                    "long",   "ETTm1-15T",       True),
-    ("ett1/H",                      "short",  "ETTm1-H",         True),
-    ("ett1/H",                      "medium", "ETTm1-H",         True),
-    ("ett1/H",                      "long",   "ETTm1-H",         True),
-    ("ett1/D",                      "short",  "ETTm1-D",         True),
-    ("ett1/W",                      "short",  "ETTm1-W",         True),
-    ("ett2/15T",                    "short",  "ETTm2-15T",       True),
-    ("ett2/15T",                    "medium", "ETTm2-15T",       True),
-    ("ett2/15T",                    "long",   "ETTm2-15T",       True),
-    ("ett2/H",                      "short",  "ETTm2-H",         True),
-    ("ett2/H",                      "medium", "ETTm2-H",         True),
-    ("ett2/H",                      "long",   "ETTm2-H",         True),
-    ("ett2/D",                      "short",  "ETTm2-D",         True),
-    ("ett2/W",                      "short",  "ETTm2-W",         True),
-    ("LOOP_SEATTLE/5T",             "short",  "LoopSeattle-5T",  False),
-    ("LOOP_SEATTLE/5T",             "medium", "LoopSeattle-5T",  False),
-    ("LOOP_SEATTLE/5T",             "long",   "LoopSeattle-5T",  False),
-    ("LOOP_SEATTLE/H",              "short",  "LoopSeattle-H",   False),
-    ("LOOP_SEATTLE/H",              "medium", "LoopSeattle-H",   False),
-    ("LOOP_SEATTLE/H",              "long",   "LoopSeattle-H",   False),
-    ("LOOP_SEATTLE/D",              "short",  "LoopSeattle-D",   False),
-    ("SZ_TAXI/15T",                 "short",  "SZTaxi-15T",      False),
-    ("SZ_TAXI/15T",                 "medium", "SZTaxi-15T",      False),
-    ("SZ_TAXI/15T",                 "long",   "SZTaxi-15T",      False),
-    ("SZ_TAXI/H",                   "short",  "SZTaxi-H",        False),
-    ("M_DENSE/H",                   "short",  "MDense-H",        False),
-    ("M_DENSE/H",                   "medium", "MDense-H",        False),
-    ("M_DENSE/H",                   "long",   "MDense-H",        False),
-    ("M_DENSE/D",                   "short",  "MDense-D",        False),
-    ("solar/10T",                   "short",  "Solar-10T",       False),
-    ("solar/10T",                   "medium", "Solar-10T",       False),
-    ("solar/10T",                   "long",   "Solar-10T",       False),
-    ("solar/H",                     "short",  "Solar-H",         False),
-    ("solar/H",                     "medium", "Solar-H",         False),
-    ("solar/H",                     "long",   "Solar-H",         False),
-    ("solar/D",                     "short",  "Solar-D",         False),
-    ("solar/W",                     "short",  "Solar-W",         False),
-    ("hierarchical_sales/D",        "short",  "HierSales-D",     False),
-    ("hierarchical_sales/W",        "short",  "HierSales-W",     False),
-    ("m4_yearly",                   "short",  "M4-Yearly",       False),
-    ("m4_quarterly",                "short",  "M4-Quarterly",    False),
-    ("m4_monthly",                  "short",  "M4-Monthly",      False),
-    ("m4_weekly",                   "short",  "M4-Weekly",       False),
-    ("m4_daily",                    "short",  "M4-Daily",        False),
-    ("m4_hourly",                   "short",  "M4-Hourly",       False),
-    ("hospital",                    "short",  "Hospital",        False),
-    ("covid_deaths",                "short",  "CovidDeaths-D",   False),
-    ("us_births/D",                 "short",  "USBirths-D",      False),
-    ("us_births/W",                 "short",  "USBirths-W",      False),
-    ("us_births/M",                 "short",  "USBirths-M",      False),
-    ("saugeenday/D",                "short",  "SaugeenDay-D",    False),
-    ("saugeenday/W",                "short",  "SaugeenDay-W",    False),
-    ("saugeenday/M",                "short",  "SaugeenDay-M",    False),
-    ("electricity/15T",             "short",  "Electricity-15T", False),
-    ("electricity/15T",             "medium", "Electricity-15T", False),
-    ("electricity/15T",             "long",   "Electricity-15T", False),
-    ("electricity/H",               "short",  "Electricity-H",   False),
-    ("electricity/H",               "medium", "Electricity-H",   False),
-    ("electricity/H",               "long",   "Electricity-H",   False),
-    ("electricity/D",               "short",  "Electricity-D",   False),
-    ("electricity/W",               "short",  "Electricity-W",   False),
-    # ---- Irregular / missing-value datasets (Monash "*_with_missing") --------
-    # Added to close the gap vs the full GiftEval catalog (these are the ones with
-    # irregular sampling / injected missing values). Stored as univariate series
-    # collections -> to_univariate=False. Terms follow GiftEval's freq rule
-    # (sub-daily MED_LONG datasets get medium/long; daily+ get short). Any
-    # (name, term) that gift_eval rejects is skipped at load time (the ablation
-    # loop guards GiftEvalDataset/Cache construction), so a wrong guess self-heals
-    # instead of crashing the run — check the load log to see which combos stuck.
-    ("kdd_cup_2018_with_missing/H", "short",  "KDDCup2018-H",   False),
-    ("kdd_cup_2018_with_missing/H", "medium", "KDDCup2018-H",   False),
-    ("kdd_cup_2018_with_missing/H", "long",   "KDDCup2018-H",   False),
-    ("kdd_cup_2018_with_missing/D", "short",  "KDDCup2018-D",   False),
-    ("car_parts_with_missing",      "short",  "CarParts",       False),
-    ("temperature_rain_with_missing", "short", "TempRain",      False),
-]
+# Run set (ge_name, term, display, to_univariate) from the single config in
+# experiments.datasets_config. To add/drop a dataset cell here, flip its `run`
+# flag there. Every downstream stage (period eval, robust timing, MASE variants,
+# embedding saturation) imports DATASETS from this module, so the config reaches
+# the whole pipeline.
+DATASETS = datasets_config.datasets_to_run()
 
 MOIRAI2_QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 MOIRAI2_MEDIAN_IDX = 4
