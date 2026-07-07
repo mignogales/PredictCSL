@@ -181,6 +181,7 @@ DATASETS = [
     ("kdd_cup_2018_with_missing/H", "short",  "KDDCup2018-H",   False),
     ("kdd_cup_2018_with_missing/H", "medium", "KDDCup2018-H",   False),
     ("kdd_cup_2018_with_missing/H", "long",   "KDDCup2018-H",   False),
+    ("kdd_cup_2018_with_missing/D", "short",  "KDDCup2018-D",   False),
     ("car_parts_with_missing",      "short",  "CarParts",       False),
     ("temperature_rain_with_missing", "short", "TempRain",      False),
 ]
