@@ -197,6 +197,17 @@ def parse_args() -> argparse.Namespace:
                    help="Robust-timing repeats, forwarded to run_all_5.")
     p.add_argument("--warmup", type=int, default=None,
                    help="Robust-timing warm-up passes, forwarded to run_all_5.")
+    p.add_argument("--force", nargs="*", default=None,
+                   metavar="STAGE",
+                   help="Forwarded verbatim to every variant (and the stage-1 "
+                        "pre-run) as run_all's --force: pass stage numbers "
+                        "(e.g. --force 3 4) to re-run those stages even when their "
+                        "done-marker is present, or --force with no argument to "
+                        "force all active stages. Needed after adding datasets/"
+                        "models to a catalog, since the stage-level done-markers "
+                        "are coarse (per-model) and won't otherwise notice new "
+                        "cells — the per-cell caches inside each stage still make "
+                        "the re-run cheap (only the new cells compute).")
     p.add_argument("--no-rollup", action="store_true",
                    help="Skip the final cross-predictor rollup_all_predictors pass.")
     p.add_argument("--test", action="store_true",
@@ -227,6 +238,16 @@ def main() -> None:
 
     groups = _resolve_groups(args.models)
     vflag = ["-v"] if args.verbose else []
+    # --force forwarding: None -> no flag; [] -> bare --force (all active stages);
+    # [...] -> --force <stages>. Passed to every subprocess verbatim; run_all only
+    # acts on it for stages that are active (not in that variant's --skip-stages),
+    # so forcing e.g. stage 3 is a no-op on variants that reuse it.
+    if args.force is None:
+        fflag: List[str] = []
+    elif args.force == []:
+        fflag = ["--force"]
+    else:
+        fflag = ["--force", *args.force]
     print(Fore.CYAN + f"Master run — variants: {[v.name for v in variants]}" + Fore.RESET)
     for env, displays in groups.items():
         print(Fore.CYAN + f"  env {_env_label(env)}: {displays}" + Fore.RESET)
@@ -236,7 +257,7 @@ def main() -> None:
     # ---- Stage 1 once, per env group (each labels only its own families). ----
     for env, displays in groups.items():
         _run(_py(env, "experiments.run_all", "--only-stages", "1",
-                 "--models", *displays, *vflag),
+                 "--models", *displays, *vflag, *fflag),
              f"Stage 1 — labeling [{_env_label(env)}]: {displays}")
 
     # ---- Each variant × env group, with its shared stages skipped. -----------
@@ -250,7 +271,7 @@ def main() -> None:
             cmd = _py(env, v.module)
             if v.skip_stages:
                 cmd += ["--skip-stages", *v.skip_stages]
-            cmd += v.extra + ["--models", *displays] + vflag
+            cmd += v.extra + ["--models", *displays] + vflag + fflag
             if v.takes_repeats:
                 if args.repeats is not None:
                     cmd += ["--repeats", str(args.repeats)]
