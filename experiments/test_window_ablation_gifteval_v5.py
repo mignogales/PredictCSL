@@ -680,6 +680,24 @@ def compute_per_sample_metrics(
 #  MODEL LOADERS + INFERENCE
 # ==============================================================================
 
+def _run_batches(batches, desc, step):
+    """Drive the standard per-batch forecast loop shared by every predictor.
+
+    ``step(x, y)`` runs one batch and returns ``(outs, tgt)`` where ``outs`` is a
+    dict of named per-batch tensors to accumulate and ``tgt`` the per-batch
+    target. Each named tensor and the targets are concatenated along dim 0;
+    returns ``(dict[str, Tensor], targets)``.
+    """
+    acc, tgts = {}, []
+    for batch in tqdm(batches, desc=desc, leave=False):
+        outs, tgt = step(batch["x"], batch["y"])
+        for key, val in outs.items():
+            acc.setdefault(key, []).append(val)
+        tgts.append(tgt)
+    cat = {key: torch.cat(vals, 0) for key, vals in acc.items()}
+    return cat, torch.cat(tgts, 0)
+
+
 def load_chronos_bolt(model_id, device):
     from chronos import ChronosBoltPipeline
     return ChronosBoltPipeline.from_pretrained(
@@ -689,15 +707,12 @@ def load_chronos_bolt(model_id, device):
 
 
 def predict_chronos_bolt(pipeline, batches, horizon, device):
-    all_samples, all_tgts = [], []
-    for batch in tqdm(batches, desc="  Chronos-Bolt", leave=False):
-        x, y = batch["x"], batch["y"]
-        context = x[:, :, 0]
-        samples = pipeline.predict(inputs=context, prediction_length=horizon)
-        all_samples.append(samples.to(device=device, dtype=torch.float32, non_blocking=True))
-        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
-    all_samples = torch.cat(all_samples, 0)
-    all_tgts = torch.cat(all_tgts, 0)
+    def step(x, y):
+        samples = pipeline.predict(inputs=x[:, :, 0], prediction_length=horizon)
+        return ({"samples": samples.to(device=device, dtype=torch.float32, non_blocking=True)},
+                y[:, :, 0].to(device, non_blocking=True))
+    out, all_tgts = _run_batches(batches, "  Chronos-Bolt", step)
+    all_samples = out["samples"]
     median = torch.median(all_samples, dim=1).values
     return ForecastResult(median=median, samples=all_samples), all_tgts
 
@@ -711,19 +726,17 @@ def load_chronos2(model_id, device):
 
 
 def predict_chronos2(pipeline, batches, horizon, device):
-    all_quantiles, all_tgts = [], []
-    for batch in tqdm(batches, desc="  Chronos2", leave=False):
-        x, y = batch["x"], batch["y"]
+    def step(x, y):
         context = x.permute(0, 2, 1)
         samples = pipeline.predict(inputs=context, prediction_length=horizon)
         samples = (torch.stack(samples, dim=0).squeeze(1)
                    if isinstance(samples, list) else samples)
         if samples.dim() == 4:
             samples = samples.squeeze(2)
-        all_quantiles.append(samples.to(device=device, dtype=torch.float32, non_blocking=True))
-        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
-    all_quantiles = torch.cat(all_quantiles, 0)
-    all_tgts = torch.cat(all_tgts, 0)
+        return ({"quantiles": samples.to(device=device, dtype=torch.float32, non_blocking=True)},
+                y[:, :, 0].to(device, non_blocking=True))
+    out, all_tgts = _run_batches(batches, "  Chronos2", step)
+    all_quantiles = out["quantiles"]
     median = torch.median(all_quantiles, dim=1).values
     return ForecastResult(median=median,
                           quantiles=all_quantiles,
@@ -744,17 +757,14 @@ def build_moirai_forecast(module, horizon, window_size, device):
 
 
 def predict_moirai(model, batches, horizon, device):
-    all_quantiles, all_tgts = [], []
-    for batch in tqdm(batches, desc="  Moirai", leave=False):
-        x, y = batch["x"], batch["y"]
+    def step(x, y):
         x_cpu = x[:, :, 0].numpy()
         context_list = [x_cpu[i] for i in range(x_cpu.shape[0])]
         forecast = model.predict(past_target=context_list)
         forecast_t = torch.as_tensor(forecast[:, :, :horizon], dtype=torch.float32, device=device)
-        all_quantiles.append(forecast_t)
-        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
-    all_quantiles = torch.cat(all_quantiles, 0)
-    all_tgts = torch.cat(all_tgts, 0)
+        return {"quantiles": forecast_t}, y[:, :, 0].to(device, non_blocking=True)
+    out, all_tgts = _run_batches(batches, "  Moirai", step)
+    all_quantiles = out["quantiles"]
     median = all_quantiles[:, MOIRAI2_MEDIAN_IDX, :]
     return ForecastResult(
         median=median, quantiles=all_quantiles,
@@ -777,9 +787,7 @@ def build_moirai_1_1_forecast(module, horizon, window_size, device):
 
 
 def predict_moirai_1_1(model, batches, horizon, device):
-    all_samples, all_tgts = [], []
-    for batch in tqdm(batches, desc="  Moirai1.1", leave=False):
-        x_cpu, y_cpu = batch["x"], batch["y"]
+    def step(x_cpu, y_cpu):
         x = x_cpu.to(device, non_blocking=True)
         y = y_cpu.to(device, non_blocking=True)
         bs, ctx_len, _ = x.shape
@@ -793,10 +801,9 @@ def predict_moirai_1_1(model, batches, horizon, device):
         if samples.dim() == 4:
             samples = samples.squeeze(-1)
         samples = samples[:, :, :horizon].to(torch.float32)
-        all_samples.append(samples)
-        all_tgts.append(y[:, :, 0])
-    all_samples = torch.cat(all_samples, 0)
-    all_tgts = torch.cat(all_tgts, 0)
+        return {"samples": samples}, y[:, :, 0]
+    out, all_tgts = _run_batches(batches, "  Moirai1.1", step)
+    all_samples = out["samples"]
     median = torch.median(all_samples, dim=1).values
     return ForecastResult(median=median, samples=all_samples), all_tgts
 
@@ -817,9 +824,8 @@ def load_timesfm(model_id, window_size, horizon, batch_size):
 
 def predict_timesfm(model, batches, horizon, device):
     PATCH_SIZE = 32
-    all_medians, all_quantiles, all_tgts = [], [], []
-    for batch in tqdm(batches, desc="  TimesFM", leave=False):
-        x, y = batch["x"], batch["y"]
+
+    def step(x, y):
         bs, ws, _ = x.shape
         x_np = x[:, :, 0].numpy()
         remainder = ws % PATCH_SIZE
@@ -841,14 +847,11 @@ def predict_timesfm(model, batches, horizon, device):
         qf = torch.as_tensor(
             quantile_forecast[:, :horizon, 1:], dtype=torch.float32, device=device
         ).permute(0, 2, 1)
-        all_medians.append(pf)
-        all_quantiles.append(qf)
-        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
-    all_medians = torch.cat(all_medians, 0)
-    all_quantiles = torch.cat(all_quantiles, 0)
-    all_tgts = torch.cat(all_tgts, 0)
+        return ({"median": pf, "quantiles": qf},
+                y[:, :, 0].to(device, non_blocking=True))
+    out, all_tgts = _run_batches(batches, "  TimesFM", step)
     return ForecastResult(
-        median=all_medians, quantiles=all_quantiles,
+        median=out["median"], quantiles=out["quantiles"],
         quantile_levels=TIMESFM_QUANTILE_LEVELS,
     ), all_tgts
 
@@ -862,9 +865,7 @@ def load_patchtst_fm(model_id, device):
 
 
 def predict_patchtst_fm(model, batches, horizon, device):
-    all_quantiles, all_tgts = [], []
-    for batch in tqdm(batches, desc="  PatchTST-FM", leave=False):
-        x_cpu, y_cpu = batch["x"], batch["y"]
+    def step(x_cpu, y_cpu):
         x = x_cpu.to(device, non_blocking=True)
         y = y_cpu.to(device, non_blocking=True)
         B = x.shape[0]
@@ -896,19 +897,17 @@ def predict_patchtst_fm(model, batches, horizon, device):
             if pred_len < horizon:
                 pad = qf[:, :, -1:].expand(B, qf.shape[1], horizon - pred_len)
                 qf = torch.cat([qf, pad], dim=2)
-            all_quantiles.append(qf.to(torch.float32))
+            preds = qf.to(torch.float32)
         elif raw.dim() == 3:
             preds = raw[:, :, :horizon].unsqueeze(1) if raw.shape[1] == 1 else raw[:, :, :horizon]
-            all_quantiles.append(preds.to(torch.float32))
+            preds = preds.to(torch.float32)
         elif raw.dim() == 2:
-            preds = raw[:, :horizon].unsqueeze(1)
-            all_quantiles.append(preds.to(torch.float32))
+            preds = raw[:, :horizon].unsqueeze(1).to(torch.float32)
         else:
             raise ValueError(f"Unexpected output shape {raw.shape}")
-        all_tgts.append(y[:, :, 0])
-
-    all_quantiles = torch.cat(all_quantiles, 0)
-    all_tgts = torch.cat(all_tgts, 0)
+        return {"quantiles": preds}, y[:, :, 0]
+    out, all_tgts = _run_batches(batches, "  PatchTST-FM", step)
+    all_quantiles = out["quantiles"]
     if all_quantiles.shape[1] == len(PATCHTST_FM_QUANTILE_LEVELS):
         median = all_quantiles[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :]
         return ForecastResult(
@@ -926,18 +925,15 @@ def load_sundial(model_id, device):
 
 
 def predict_sundial(model, batches, horizon, device):
-    all_samples, all_tgts = [], []
-    for batch in tqdm(batches, desc="  Sundial", leave=False):
-        x, y = batch["x"], batch["y"]
+    def step(x, y):
         seqs = x[:, :, 0].to(device, non_blocking=True)
         samples = model.generate(
             seqs, max_new_tokens=horizon, num_samples=SUNDIAL_NUM_SAMPLES,
         )
         samples = samples[:, :, :horizon].to(torch.float32)
-        all_samples.append(samples)
-        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
-    all_samples = torch.cat(all_samples, 0)
-    all_tgts = torch.cat(all_tgts, 0)
+        return {"samples": samples}, y[:, :, 0].to(device, non_blocking=True)
+    out, all_tgts = _run_batches(batches, "  Sundial", step)
+    all_samples = out["samples"]
     median = torch.median(all_samples, dim=1).values
     return ForecastResult(median=median, samples=all_samples), all_tgts
 
@@ -950,20 +946,16 @@ def load_timemoe(model_id, device):
 
 
 def predict_timemoe(model, batches, horizon, device):
-    all_preds, all_tgts = [], []
-    for batch in tqdm(batches, desc="  TimeMoE", leave=False):
-        x, y = batch["x"], batch["y"]
+    def step(x, y):
         seqs = x[:, :, 0].to(device, non_blocking=True)
         mean = seqs.mean(dim=-1, keepdim=True)
         std = seqs.std(dim=-1, keepdim=True)
         normed = (seqs - mean) / (std + 1e-8)
         out = model.generate(normed, max_new_tokens=horizon)
         preds = out[:, -horizon:].to(torch.float32) * std + mean
-        all_preds.append(preds)
-        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
-    all_preds = torch.cat(all_preds, 0)
-    all_tgts = torch.cat(all_tgts, 0)
-    return ForecastResult(median=all_preds), all_tgts
+        return {"preds": preds}, y[:, :, 0].to(device, non_blocking=True)
+    out, all_tgts = _run_batches(batches, "  TimeMoE", step)
+    return ForecastResult(median=out["preds"]), all_tgts
 
 
 def load_toto(model_id, device):
@@ -983,9 +975,7 @@ def predict_toto(model, batches, horizon, device):
     so left-pad the oldest steps (forecast origin at the right is untouched) and
     mask the pad as missing.
     """
-    all_medians, all_tgts = [], []
-    for batch in tqdm(batches, desc="  Toto", leave=False):
-        x, y = batch["x"], batch["y"]
+    def step(x, y):
         seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
         b, length = seqs.shape
         pad = (-length) % TOTO_PATCH_SIZE
@@ -1002,11 +992,9 @@ def predict_toto(model, batches, horizon, device):
             has_missing_values=bool(pad),
         )                                                      # (9, B, 1, horizon)
         median = quantiles[TOTO_MEDIAN_QUANTILE_IDX, :, 0, :horizon].to(torch.float32)
-        all_medians.append(median)
-        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
-    all_medians = torch.cat(all_medians, 0)
-    all_tgts = torch.cat(all_tgts, 0)
-    return ForecastResult(median=all_medians), all_tgts
+        return {"median": median}, y[:, :, 0].to(device, non_blocking=True)
+    out, all_tgts = _run_batches(batches, "  Toto", step)
+    return ForecastResult(median=out["median"]), all_tgts
 
 
 def load_flowstate(model_id, device):
@@ -1026,9 +1014,7 @@ def predict_flowstate(model, batches, horizon, device):
     median quantile (index 4). A 3-D (B, H, C) point-forecast output is also
     handled for forward-compatibility with other checkpoints.
     """
-    all_medians, all_tgts = [], []
-    for batch in tqdm(batches, desc="  FlowState", leave=False):
-        x, y = batch["x"], batch["y"]
+    def step(x, y):
         series = x.to(device, non_blocking=True)               # (B, W, 1)
         out = model(
             series,
@@ -1041,11 +1027,9 @@ def predict_flowstate(model, batches, horizon, device):
             med = pf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0]
         else:                                                  # (B, H, C)
             med = pf[:, :horizon, 0]
-        all_medians.append(med.to(torch.float32))
-        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
-    all_medians = torch.cat(all_medians, 0)
-    all_tgts = torch.cat(all_tgts, 0)
-    return ForecastResult(median=all_medians), all_tgts
+        return {"median": med.to(torch.float32)}, y[:, :, 0].to(device, non_blocking=True)
+    out, all_tgts = _run_batches(batches, "  FlowState", step)
+    return ForecastResult(median=out["median"]), all_tgts
 
 
 def load_tirex(model_id, device):
@@ -1068,23 +1052,17 @@ def predict_tirex(model, batches, horizon, device):
     follow TiRex's docs, not its package source — verify against the installed
     `tirex` before a full run.
     """
-    all_medians, all_tgts = [], []
-    for batch in tqdm(batches, desc="  TiRex", leave=False):
-        x, y = batch["x"], batch["y"]
+    def step(x, y):
         seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
         quantiles, _mean = model.forecast(context=seqs, prediction_length=horizon)
         median = quantiles[:, :horizon, TIREX_MEDIAN_QUANTILE_IDX]
-        all_medians.append(median.to(torch.float32))
-        all_tgts.append(y[:, :, 0].to(device, non_blocking=True))
-    all_medians = torch.cat(all_medians, 0)
-    all_tgts = torch.cat(all_tgts, 0)
-    return ForecastResult(median=all_medians), all_tgts
+        return {"median": median.to(torch.float32)}, y[:, :, 0].to(device, non_blocking=True)
+    out, all_tgts = _run_batches(batches, "  TiRex", step)
+    return ForecastResult(median=out["median"]), all_tgts
 
 
 def predict_context_parroting(batches, horizon, device):
-    all_preds, all_tgts = [], []
-    for batch in tqdm(batches, desc="  Parroting", leave=False):
-        x_cpu, y_cpu = batch["x"], batch["y"]
+    def step(x_cpu, y_cpu):
         x = x_cpu.to(device, non_blocking=True)
         y = y_cpu.to(device, non_blocking=True)
         ws = x.shape[1]
@@ -1093,9 +1071,9 @@ def predict_context_parroting(batches, horizon, device):
         else:
             repeats = (horizon // ws) + 1
             pred = x[:, :, 0].repeat(1, repeats)[:, -horizon:]
-        all_preds.append(pred)
-        all_tgts.append(y[:, :, 0])
-    return ForecastResult(median=torch.cat(all_preds, 0)), torch.cat(all_tgts, 0)
+        return {"preds": pred}, y[:, :, 0]
+    out, all_tgts = _run_batches(batches, "  Parroting", step)
+    return ForecastResult(median=out["preds"]), all_tgts
 
 
 # ==============================================================================
