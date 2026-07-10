@@ -101,6 +101,10 @@ def family_full_window(family: str, horizon: int, window_sizes: List[int],
         cap = min(cap, PATCHTST_FM_CTX)
     elif family == "chronos2":
         cap = min(cap, CHRONOS2_MAX_CONTEXT)
+    elif family == "toto":
+        cap = min(cap, abl.TOTO_MAX_CONTEXT)
+    # chronos_bolt / moirai: no v5 skip constant; rely on the model's own context
+    # (their native context_length truncates internally). NOTE verify on server.
     grid = [w for w in sorted(set(window_sizes)) if w <= cap]
     return grid[-1] if grid else None
 

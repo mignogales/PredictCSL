@@ -321,11 +321,226 @@ def _chronos2_mask(handle, last_timesteps: int, full_len: int):
                   "on the server.")
 
 
+def _warn_if_noop(family: str, state: dict) -> None:
+    """Fail loud (once) if we intended to mask but never edited/created a mask."""
+    if (state.get("applied", 0) == 0 and state.get("saw_none", 0) > 0
+            and not _DECODER_NOOP_WARNED[0]):
+        _DECODER_NOOP_WARNED[0] = True
+        print(f"[context_attention_mask] WARNING: family {family!r} never received "
+              "an editable attention mask — the masked forecast equals the "
+              "full-context one. The hook needs a per-model tweak for this "
+              "model/version (verify on the server).")
+
+
+def _config_int(inner, names):
+    """First present int among ``names`` on ``inner.config`` or its
+    ``chronos_config`` (attr or dict)."""
+    cfg = getattr(inner, "config", None)
+    for obj in (getattr(cfg, "chronos_config", None), cfg):
+        if obj is None:
+            continue
+        for n in names:
+            v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
+            if v:
+                return int(v)
+    return None
+
+
+# ==============================================================================
+#  T5 encoder-decoder: Chronos-Bolt
+# ==============================================================================
+#  Standard HF T5 (``T5Attention``). The forecast is a single decoder query token
+#  cross-attending to the encoder; the same additive encoder mask governs encoder
+#  self-attention AND decoder cross-attention. Hiding the oldest context-patch key
+#  columns in every ``T5Attention`` whose key dim is the context length therefore
+#  (a) keeps visible encoder reps from mixing in old context (self-attn) and (b)
+#  stops the decoder query from reading old context (cross-attn). Decoder
+#  self-attention has key dim 1 → hide resolves to 0, auto-skipped.
+
+def _chronosbolt_mask(handle, last_timesteps: int, full_len: int):
+    inner = _chronos2_inner_module(handle)
+    state = {"applied": 0, "saw_none": 0}
+
+    def make_wrapper(orig):
+        def wrapper(*args, **kwargs):
+            # T5Attention.forward(self, hidden_states, mask=None, key_value_states, ...)
+            from_kwargs = "mask" in kwargs
+            m = kwargs.get("mask", None)
+            if m is None and len(args) >= 2:
+                m = args[1]
+            if torch.is_tensor(m) and m.is_floating_point() and m.shape[-1] > 1:
+                kv = m.shape[-1]
+                visible = max(1, round(int(last_timesteps) * kv / int(full_len)))
+                hide = max(0, kv - visible)
+                if hide > 0:
+                    m = m.clone()
+                    m[..., :hide] = torch.finfo(m.dtype).min  # key-padding: all q rows
+                    if from_kwargs:
+                        kwargs = {**kwargs, "mask": m}
+                    else:
+                        args = tuple(m if i == 1 else a for i, a in enumerate(args))
+                    state["applied"] += 1
+            return orig(*args, **kwargs)
+        return wrapper
+
+    patched = []
+    for module in inner.modules():
+        if type(module).__name__ == "T5Attention":
+            orig = module.forward
+            module.forward = make_wrapper(orig)
+            patched.append((module, orig))
+    if not patched:
+        raise RuntimeError("No T5Attention modules found on Chronos-Bolt — verify "
+                           "the class name on the server.")
+    return patched, state
+
+
+# ==============================================================================
+#  Moirai2 (decoder-only, single patch, uni2ts) + Toto (decoder-only, DataDog)
+#  -- EXPERIMENTAL: both use custom attention whose internals we can only
+#  partially see and cannot test locally. Validate on the server (the top-grid
+#  sanity check: at L == full window the masked curve must equal the sliced one).
+# ==============================================================================
+
+def _rect_hide_bool(m, hide: int):
+    """Set the oldest ``hide`` key columns to False (not-attend) for the visible
+    query rows of a boolean (True=attend) SDPA mask. Rectangular so old query rows
+    keep their causal mask (no fully-masked row)."""
+    q, kv = m.shape[-2], m.shape[-1]
+    start = max(0, hide - (kv - q))
+    m[..., start:, :hide] = False
+    return m
+
+
+def _moirai2_mask(handle, last_timesteps: int, full_len: int):
+    """Edit uni2ts's boolean packed-causal mask to drop the oldest context
+    patches. NOTE: patch size + the presence of trailing predict tokens are
+    inferred; verify the attention class name and mask polarity on the server."""
+    patch = _config_int(handle, ["patch_size", "patch_len"]) or \
+        getattr(handle, "patch_size", None)
+    state = {"applied": 0, "saw_none": 0, "hide": None}
+
+    def make_wrapper(orig):
+        def wrapper(*args, **kwargs):
+            m = kwargs.get("attention_mask", None)
+            from_kwargs = "attention_mask" in kwargs
+            if m is None:
+                for a in args[1:]:
+                    if torch.is_tensor(a) and a.dtype == torch.bool and a.dim() >= 2:
+                        m = a
+                        break
+            if not (torch.is_tensor(m) and m.dtype == torch.bool):
+                state["saw_none"] += 1
+                return orig(*args, **kwargs)
+            kv = m.shape[-1]
+            if state["hide"] is None:
+                if patch:
+                    n_ctx = max(1, round(int(full_len) / patch))
+                    vis = max(1, round(int(last_timesteps) / patch))
+                    state["hide"] = max(0, min(kv - 1, n_ctx - vis))
+                else:
+                    vis = max(1, round(int(last_timesteps) * kv / int(full_len)))
+                    state["hide"] = max(0, kv - vis)
+            hide = state["hide"]
+            if hide > 0:
+                m = _rect_hide_bool(m.clone(), hide)
+                if from_kwargs:
+                    kwargs = {**kwargs, "attention_mask": m}
+                state["applied"] += 1
+            return orig(*args, **kwargs)
+        return wrapper
+
+    patched = []
+    for module in handle.modules():
+        if type(module).__name__.endswith("Attention"):
+            orig = module.forward
+            module.forward = make_wrapper(orig)
+            patched.append((module, orig))
+    if not patched:
+        raise RuntimeError("No *Attention modules found on Moirai2 — verify class "
+                           "names on the server.")
+    return patched, state
+
+
+def _toto_mask(handle, last_timesteps: int, full_len: int):
+    """Wrap Toto's ``TimeWiseMultiheadAttention`` (causal, time axis) to build/edit
+    a boolean SDPA mask restricting attention to the last ``last_timesteps``.
+    Toto uses ``is_causal`` SDPA (no mask at prefill), so we CONSTRUCT a causal
+    boolean mask with the oldest context columns dropped. NOTE: assumes Toto 2.0's
+    single-pass (CPM) decode; verify patch size + seq layout on the server."""
+    patch = _config_int(handle, ["patch_size", "input_patch_size", "patch_len"])
+    state = {"applied": 0, "saw_none": 0}
+
+    def _hide(seq_len):
+        if patch:
+            n_ctx = max(1, round(int(full_len) / patch))
+            vis = max(1, round(int(last_timesteps) / patch))
+            return max(0, min(seq_len - 1, n_ctx - vis))
+        vis = max(1, round(int(last_timesteps) * seq_len / int(full_len)))
+        return max(0, seq_len - vis)
+
+    def make_wrapper(orig):
+        def wrapper(*args, **kwargs):
+            # forward(self, layer_idx, inputs[b,var,seq,emb], attention_mask, kv_cache)
+            inputs = args[1] if len(args) >= 2 else kwargs.get("inputs")
+            m = kwargs.get("attention_mask", None)
+            if m is None and len(args) >= 3:
+                m = args[2]
+            if not torch.is_tensor(inputs):
+                state["saw_none"] += 1
+                return orig(*args, **kwargs)
+            seq_len = inputs.shape[-2]
+            hide = _hide(seq_len)
+            if hide <= 0:
+                return orig(*args, **kwargs)
+            if torch.is_tensor(m) and m.dtype == torch.bool:
+                m = _rect_hide_bool(m.clone(), hide)
+            elif torch.is_tensor(m) and m.is_floating_point():
+                q, kv = m.shape[-2], m.shape[-1]
+                start = max(0, hide - (kv - q))
+                m = m.clone()
+                m[..., start:, :hide] = torch.finfo(m.dtype).min
+            else:
+                # No mask (is_causal path): build a causal boolean mask (True=attend)
+                # then drop the oldest columns for the visible rows.
+                causal = torch.ones((seq_len, seq_len), dtype=torch.bool,
+                                    device=inputs.device).tril()
+                causal[hide:, :hide] = False
+                m = causal
+            kwargs = {**kwargs, "attention_mask": m}
+            # drop a positional mask if present so our kwarg wins
+            if len(args) >= 3:
+                args = args[:2] + (None,) + args[3:]
+            state["applied"] += 1
+            return orig(*args, **kwargs)
+        return wrapper
+
+    patched = []
+    for module in handle.modules():
+        if type(module).__name__ == "TimeWiseMultiheadAttention":
+            orig = module.forward
+            module.forward = make_wrapper(orig)
+            patched.append((module, orig))
+    if not patched:
+        raise RuntimeError("No TimeWiseMultiheadAttention on Toto — verify class "
+                           "name against the installed toto2 on the server.")
+    return patched, state
+
+
+def _restore_forwards(patched):
+    for module, orig in patched:
+        try:
+            del module.forward
+        except AttributeError:
+            module.forward = orig
+
+
 # ==============================================================================
 #  Public entry point
 # ==============================================================================
 
-SUPPORTED_FAMILIES = {"patchtst_fm", "sundial", "timemoe", "chronos2"}
+SUPPORTED_FAMILIES = {"patchtst_fm", "sundial", "timemoe", "chronos2",
+                      "chronos_bolt", "moirai", "toto"}
 
 
 @contextmanager
@@ -354,6 +569,17 @@ def context_attention_mask(
     if family == "chronos2":
         with _chronos2_mask(model, last_timesteps, full_len):
             yield
+        return
+
+    if family in ("chronos_bolt", "moirai", "toto"):
+        installer = {"chronos_bolt": _chronosbolt_mask,
+                     "moirai": _moirai2_mask, "toto": _toto_mask}[family]
+        patched, state = installer(model, last_timesteps, full_len)
+        try:
+            yield
+        finally:
+            _restore_forwards(patched)
+            _warn_if_noop(family, state)
         return
 
     if family in ("sundial", "timemoe"):
