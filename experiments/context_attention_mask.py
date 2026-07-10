@@ -134,18 +134,28 @@ def _is_attention_module(module) -> bool:
 
 
 def _edit_attention_mask(am, state, last_timesteps: int, full_len: int):
-    """Return ``am`` with the oldest key columns set to ``-inf``, or None if it
-    isn't an editable additive mask (a pure ``is_causal`` SDPA path).
+    """Return ``am`` with the oldest key columns ``-inf``'d for the VISIBLE query
+    rows only, or None if it isn't an editable additive mask.
 
     ``hide_count`` is computed once, at the prefill call (first mask we see), from
     the prefill token count ``P``: with ``P`` tokens spanning ``full_len``
     timesteps, the visible tail of ``last_timesteps`` is
-    ``round(last_timesteps * P / full_len)`` tokens, so we hide the leading
-    ``P - visible`` columns — and keep hiding exactly that many as the KV cache
-    grows during decode (the hidden columns are always the oldest)."""
+    ``round(last_timesteps * P / full_len)`` tokens, so the leading ``P - visible``
+    columns are "old" — and stay old as the KV cache grows during decode.
+
+    RECTANGULAR, not a full column block: we only drop the old key columns for
+    query rows whose absolute position is in the visible region (>= hide). Old
+    query rows keep their normal causal mask. This is essential for a causal
+    decoder — a full column block makes the oldest query rows fully ``-inf``,
+    which NaNs their softmax; the NaN then flows into their K vectors, and since
+    ``NaN + (-inf) = NaN`` the ``-inf`` can no longer suppress them, so the NaN
+    floods every row (the empty-slice / garbage curves seen on Sundial). The
+    forecast-relevant rows (the last position + any decode/future rows) still see
+    only the last ``last_timesteps``, which is all we need."""
     if not torch.is_tensor(am) or not am.is_floating_point():
         state["saw_none"] += 1
         return None
+    q = am.shape[-2]
     kv = am.shape[-1]
     if state["hide_count"] is None:
         visible = max(1, round(int(last_timesteps) * kv / int(full_len)))
@@ -153,9 +163,12 @@ def _edit_attention_mask(am, state, last_timesteps: int, full_len: int):
     hide = state["hide_count"]
     if hide <= 0:
         return None
-    state["applied"] += 1
+    # The q rows are the LAST q positions of a length-kv sequence, so row r has
+    # absolute position (kv - q) + r; mask old columns only where abs pos >= hide.
+    start_row = max(0, hide - (kv - q))
     am = am.clone()
-    am[..., :hide] = torch.finfo(am.dtype).min
+    am[..., start_row:, :hide] = torch.finfo(am.dtype).min
+    state["applied"] += 1
     return am
 
 
