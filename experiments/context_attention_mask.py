@@ -133,61 +133,186 @@ def _is_attention_module(module) -> bool:
     return any(hasattr(module, p) for p in ("q_proj", "k_proj", "qkv", "Wqkv"))
 
 
-def _install_decoder_mask(model, last_timesteps: int, full_len: int) -> List:
-    """Hook every attention module to ``-inf`` the oldest key columns.
+def _edit_attention_mask(am, state, last_timesteps: int, full_len: int):
+    """Return ``am`` with the oldest key columns set to ``-inf``, or None if it
+    isn't an editable additive mask (a pure ``is_causal`` SDPA path).
 
-    ``hide_count`` is computed once, at the prefill call (first time the hook sees
-    a mask), from the prefill token count ``P``: with ``P`` tokens spanning
-    ``full_len`` timesteps, the visible tail of ``last_timesteps`` is
+    ``hide_count`` is computed once, at the prefill call (first mask we see), from
+    the prefill token count ``P``: with ``P`` tokens spanning ``full_len``
+    timesteps, the visible tail of ``last_timesteps`` is
     ``round(last_timesteps * P / full_len)`` tokens, so we hide the leading
     ``P - visible`` columns — and keep hiding exactly that many as the KV cache
     grows during decode (the hidden columns are always the oldest)."""
-    state = {"hide_count": None}
+    if not torch.is_tensor(am) or not am.is_floating_point():
+        state["saw_none"] += 1
+        return None
+    kv = am.shape[-1]
+    if state["hide_count"] is None:
+        visible = max(1, round(int(last_timesteps) * kv / int(full_len)))
+        state["hide_count"] = max(0, kv - visible)
+    hide = state["hide_count"]
+    if hide <= 0:
+        return None
+    state["applied"] += 1
+    am = am.clone()
+    am[..., :hide] = torch.finfo(am.dtype).min
+    return am
 
-    def pre_hook(module, args, kwargs):
-        am = kwargs.get("attention_mask", None)
-        from_kwargs = "attention_mask" in kwargs
-        if am is None and len(args) >= 2:
-            am = args[1]
-        if not torch.is_tensor(am) or not am.is_floating_point():
-            # No explicit additive mask (e.g. a pure ``is_causal`` SDPA path) —
-            # nothing to edit. If this fires for a model you expect to mask, the
-            # decoder path needs a per-module tweak (verify on the server).
-            return None
 
-        kv = am.shape[-1]
-        if state["hide_count"] is None:
-            visible = max(1, round(int(last_timesteps) * kv / int(full_len)))
-            state["hide_count"] = max(0, kv - visible)
-        hide = state["hide_count"]
-        if hide <= 0:
-            return None
+def _install_decoder_mask(model, last_timesteps: int, full_len: int):
+    """Wrap every attention module's ``forward`` to ``-inf`` its oldest key columns.
 
-        am = am.clone()
-        am[..., :hide] = torch.finfo(am.dtype).min
-        if from_kwargs:
-            kwargs = {**kwargs, "attention_mask": am}
-            return args, kwargs
-        args = tuple(am if i == 1 else a for i, a in enumerate(args))
-        return args, kwargs
+    We monkeypatch ``module.forward`` (rather than register a
+    ``forward_pre_hook(..., with_kwargs=True)``) so this works on torch < 2.0 too
+    — the legacy Sundial/TimeMoE env (transformers==4.40.1) may ship an older
+    torch that lacks ``with_kwargs``. ``attention_mask`` is taken from a kwarg or
+    the 2nd positional arg (``SundialAttention.forward(hidden_states,
+    attention_mask, ...)``). ``state["applied"]`` counts real edits so the caller
+    can fail loud if a model never hands us an additive mask."""
+    state = {"hide_count": None, "applied": 0, "saw_none": 0}
 
-    handles = []
+    def make_wrapper(orig):
+        def wrapper(*args, **kwargs):
+            if "attention_mask" in kwargs:
+                edited = _edit_attention_mask(
+                    kwargs["attention_mask"], state, last_timesteps, full_len)
+                if edited is not None:
+                    kwargs = {**kwargs, "attention_mask": edited}
+            elif len(args) >= 2:
+                edited = _edit_attention_mask(
+                    args[1], state, last_timesteps, full_len)
+                if edited is not None:
+                    args = tuple(edited if i == 1 else a for i, a in enumerate(args))
+            return orig(*args, **kwargs)
+        return wrapper
+
+    patched = []
     for module in model.modules():
         if _is_attention_module(module):
-            handles.append(
-                module.register_forward_pre_hook(pre_hook, with_kwargs=True))
-    if not handles:
+            orig = module.forward
+            module.forward = make_wrapper(orig)
+            patched.append((module, orig))
+    if not patched:
         raise RuntimeError(
             "No attention submodules found to hook — check "
             "_is_attention_module against the installed model on the server.")
-    return handles
+    return patched, state
+
+
+_DECODER_NOOP_WARNED = [False]
+
+
+# ==============================================================================
+#  Encoder with future-token readout: Chronos-2
+# ==============================================================================
+#  Chronos-2 is encoder-only but reads the forecast ONLY from appended *future*
+#  patch tokens (``hidden_states[:, -num_output_patches:]``), which are the
+#  trailing tokens; the *context* patches lead the sequence. So — unlike
+#  PatchTST-FM, whose head reads every context token — hiding the oldest context
+#  patches as attention keys genuinely restricts the forecast to the last
+#  ``last_timesteps`` (old-context hidden states are never read). We mask only
+#  ``TimeSelfAttention`` (temporal); ``GroupSelfAttention`` is cross-series and
+#  trivial for our one-series-per-instance batches.
+
+def _chronos2_inner_module(handle):
+    """Locate the nn.Module inside the Chronos2Pipeline handle."""
+    for attr in ("model", "inner_model", "module"):
+        m = getattr(handle, attr, None)
+        if isinstance(m, torch.nn.Module):
+            return m
+    if isinstance(handle, torch.nn.Module):
+        return handle
+    raise AttributeError(
+        "Could not locate the Chronos-2 torch module on the pipeline handle; "
+        "check the attribute name on the server.")
+
+
+def _chronos2_patch_step(inner) -> int:
+    """Timesteps advanced per context patch (input_patch_stride, or _size)."""
+    cfg = getattr(inner, "config", None)
+    cc = getattr(cfg, "chronos_config", None)
+    def _get(obj, name):
+        if obj is None:
+            return None
+        return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+    for obj in (cc, cfg):
+        for name in ("input_patch_stride", "input_patch_size", "patch_size"):
+            v = _get(obj, name)
+            if v:
+                return int(v)
+    raise AttributeError(
+        "Could not infer Chronos-2 input patch stride/size from config; "
+        "check the attribute names on the server.")
+
+
+def _is_time_self_attention(module) -> bool:
+    return type(module).__name__ == "TimeSelfAttention"
+
+
+@contextmanager
+def _chronos2_mask(handle, last_timesteps: int, full_len: int):
+    inner = _chronos2_inner_module(handle)
+    step = _chronos2_patch_step(inner)
+    # hide_count is in CONTEXT-patch units. full_len must be <= Chronos-2's
+    # context_length (see the caller's cap) so the context isn't internally
+    # right-truncated and this patch count is exact; we only ever touch the
+    # leading (oldest-context) columns, never the trailing future tokens.
+    n_ctx = max(1, round(int(full_len) / step))
+    vis = max(1, round(int(last_timesteps) / step))
+    hide = max(0, n_ctx - vis)
+    state = {"applied": 0, "saw_none": 0}
+
+    def make_wrapper(orig):
+        def wrapper(*args, **kwargs):
+            if hide > 0:
+                from_kwargs = "attention_mask" in kwargs
+                am = kwargs.get("attention_mask", None)
+                if am is None and len(args) >= 2:
+                    am = args[1]
+                if torch.is_tensor(am) and am.is_floating_point():
+                    am = am.clone()
+                    am[..., :hide] = torch.finfo(am.dtype).min
+                    if from_kwargs:
+                        kwargs = {**kwargs, "attention_mask": am}
+                    else:
+                        args = tuple(am if i == 1 else a for i, a in enumerate(args))
+                    state["applied"] += 1
+                else:
+                    state["saw_none"] += 1
+            return orig(*args, **kwargs)
+        return wrapper
+
+    patched = []
+    for module in inner.modules():
+        if _is_time_self_attention(module):
+            orig = module.forward
+            module.forward = make_wrapper(orig)
+            patched.append((module, orig))
+    if not patched:
+        raise RuntimeError(
+            "No TimeSelfAttention modules found on Chronos-2 — verify the class "
+            "name against the installed chronos package on the server.")
+    try:
+        yield
+    finally:
+        for module, orig in patched:
+            try:
+                del module.forward
+            except AttributeError:
+                module.forward = orig
+        if hide > 0 and state["applied"] == 0 and not _DECODER_NOOP_WARNED[0]:
+            _DECODER_NOOP_WARNED[0] = True
+            print("[context_attention_mask] WARNING: Chronos-2 TimeSelfAttention "
+                  "never received an additive attention_mask to edit — the masked "
+                  "forecast equals the full-context one. Verify the mask plumbing "
+                  "on the server.")
 
 
 # ==============================================================================
 #  Public entry point
 # ==============================================================================
 
-SUPPORTED_FAMILIES = {"patchtst_fm", "sundial", "timemoe"}
+SUPPORTED_FAMILIES = {"patchtst_fm", "sundial", "timemoe", "chronos2"}
 
 
 @contextmanager
@@ -213,13 +338,32 @@ def context_attention_mask(
             yield
         return
 
+    if family == "chronos2":
+        with _chronos2_mask(model, last_timesteps, full_len):
+            yield
+        return
+
     if family in ("sundial", "timemoe"):
-        handles = _install_decoder_mask(model, last_timesteps, full_len)
+        patched, state = _install_decoder_mask(model, last_timesteps, full_len)
         try:
             yield
         finally:
-            for h in handles:
-                h.remove()
+            for module, orig in patched:
+                try:
+                    del module.forward           # restore the class method
+                except AttributeError:
+                    module.forward = orig
+        # Fail loud (once) if we intended to mask but never edited a real mask —
+        # otherwise the "masked" forecast is silently the full-context one.
+        if state["applied"] == 0 and state["saw_none"] > 0 \
+                and not _DECODER_NOOP_WARNED[0]:
+            _DECODER_NOOP_WARNED[0] = True
+            print(
+                f"[context_attention_mask] WARNING: family {family!r} never "
+                "received an additive attention_mask to edit (pure is_causal SDPA "
+                "path?) — the masked forecast equals the full-context one. The "
+                "decoder hook needs a per-module tweak for this model/transformers "
+                "version before the masking curve is meaningful.")
         return
 
     raise NotImplementedError(
