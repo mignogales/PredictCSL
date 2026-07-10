@@ -170,18 +170,70 @@ TEST_MODEL = "TiRex"                                          # small + fast rec
 # ==============================================================================
 #  STATE CAPTURE
 # ==============================================================================
-def _seq_from_output(out) -> Optional[torch.Tensor]:
+def _describe(out, depth=0) -> str:
+    """Compact human-readable shape/type of a hook output (for diagnostics)."""
+    if torch.is_tensor(out):
+        return f"T{tuple(out.shape)}"
+    if isinstance(out, (tuple, list)) and depth < 2:
+        inner = ", ".join(_describe(x, depth + 1) for x in out[:4])
+        more = ",…" if len(out) > 4 else ""
+        return f"{type(out).__name__}({inner}{more})"
+    if isinstance(out, dict) and depth < 2:
+        return "dict{" + ",".join(list(out.keys())[:6]) + "}"
+    for a in ("last_hidden_state", "hidden_states"):
+        if hasattr(out, a):
+            return f"{type(out).__name__}.{a}"
+    return type(out).__name__
+
+
+def _pick_seq_tensor(out):
+    """The hidden-sequence tensor inside a hook output (tensor / tuple / object).
+
+    An SSM/xLSTM block may return a bare tensor, a ``(hidden, residual/state)``
+    tuple, or an HF output object. We take the highest-rank tensor (the hidden
+    sequence is rank>=3: batch, time, feature — higher than a compact carry), and
+    for objects prefer ``last_hidden_state`` / ``hidden_states``. Returns None if
+    no tensor is reachable."""
+    if torch.is_tensor(out):
+        return out
+    for a in ("last_hidden_state", "hidden_states"):
+        v = getattr(out, a, None)
+        if torch.is_tensor(v):
+            return v
+        if isinstance(v, (tuple, list)) and v and torch.is_tensor(v[-1]):
+            return v[-1]
+    if isinstance(out, (tuple, list)):
+        tens = [x for x in out if torch.is_tensor(x) and x.dim() >= 2]
+        if tens:
+            return max(tens, key=lambda x: (x.dim(), x.numel()))
+    if isinstance(out, dict):
+        tens = [x for x in out.values() if torch.is_tensor(x) and x.dim() >= 2]
+        if tens:
+            return max(tens, key=lambda x: (x.dim(), x.numel()))
+    return None
+
+
+def _seq_from_output(out, batch: Optional[int] = None) -> Optional[torch.Tensor]:
     """Reduce a block output to a per-position sequence ``(B, T, d)`` (or None).
 
-    Accepts a tensor or a (tuple/list) whose first tensor element is the hidden
-    sequence. Extra middle axes (grouping) are mean-collapsed so only batch,
-    time, feature survive."""
-    t = out[0] if isinstance(out, (tuple, list)) and out else out
+    Extra middle axes (grouping / variate) are mean-collapsed. When ``batch`` is
+    known we orient the tensor so its LEADING axis is the batch: if the batch
+    axis sits elsewhere (channels-first ``(B, d, T)`` would keep B leading, but
+    some SSMs transpose to ``(T, B, d)`` or fold a variate axis first), we move
+    the batch axis to the front so downstream (B, T, d) assumptions hold. If no
+    axis equals ``batch`` the tensor is returned as-is and the caller's batch
+    check will surface it."""
+    t = _pick_seq_tensor(out)
     if not torch.is_tensor(t) or t.dim() < 2:
         return None
     t = t.detach().to(torch.float32)
     if t.dim() == 2:                                         # (B, d) — single step
         return t.unsqueeze(1)                               # (B, 1, d)
+    # Orient batch to the front when we can identify it unambiguously.
+    if batch is not None and t.shape[0] != batch:
+        cands = [ax for ax in range(t.dim()) if t.shape[ax] == batch]
+        if len(cands) == 1:
+            t = t.movedim(cands[0], 0)
     # General (B, ..., T, d): collapse everything between batch and (T, d).
     while t.dim() > 3:
         t = t.mean(dim=1)
@@ -252,6 +304,9 @@ class StateCapture:
         # execution-order logs
         self._seq_log: List[Tuple[str, torch.Tensor]] = []      # (name, (B,T,d) cpu)
         self._state_log: List[Tuple[str, torch.Tensor]] = []    # (name, (B,dS) cpu)
+        # diagnostics: what each block firing looked like + why it was kept/dropped
+        self._diag: List[str] = []
+        self._n_block_fires = 0
         for name, mod in backbone.named_modules():
             if not name:
                 continue
@@ -266,7 +321,17 @@ class StateCapture:
 
     def _block_hook(self, name):
         def hook(_m, _i, out):
-            seq = _seq_from_output(out)
+            self._n_block_fires += 1
+            seq = _seq_from_output(out, self._batch)
+            # Record the first firing per distinct block name so the failure path
+            # can show what each block actually emitted (bounded, cheap).
+            if self._n_block_fires <= 3 * max(1, len(self.matched_blocks)):
+                kept = seq is not None and (
+                    self._batch is None or seq.shape[0] == self._batch)
+                self._diag.append(
+                    f"{name}: raw={_describe(out)} "
+                    f"seq={tuple(seq.shape) if seq is not None else None} "
+                    f"{'KEEP' if kept else 'drop'}")
             if seq is None:
                 return
             if self._batch is not None and seq.shape[0] != self._batch:
@@ -299,6 +364,16 @@ class StateCapture:
         if self._state_log:
             return seq, self._state_log[-1][1], "true_state"
         return seq, seq[:, -1, :], "block_output"
+
+    def diag(self) -> str:
+        """One-line-per-firing summary of what the block hooks saw (for errors)."""
+        if not self._diag:
+            return (f"no block firings recorded "
+                    f"(batch={self._batch}, hooked {len(self.matched_blocks)} "
+                    f"blocks, {self._n_block_fires} total fires)")
+        head = (f"batch={self._batch}, {self._n_block_fires} block fires, "
+                f"{len(self._seq_log)} kept; per-firing:")
+        return head + "\n      " + "\n      ".join(self._diag)
 
     def remove(self) -> None:
         for hd in self._handles:
@@ -419,8 +494,11 @@ def collect_state(
                             raise RuntimeError(
                                 f"No state captured for family={family} "
                                 f"(block_pattern={block_pattern!r}, matched "
-                                f"{len(cap.matched_blocks)} blocks). Use "
-                                f"--dump-modules / --block-pattern.")
+                                f"{len(cap.matched_blocks)} blocks). The block "
+                                f"hooks fired but nothing survived extraction — "
+                                f"see the per-firing shapes below, then refine "
+                                f"--block-pattern (or run --probe-forward).\n"
+                                f"    {cap.diag()}")
                         seq, state, src = got                 # (b,T,d), (b,dS), str
                         source_seen.add(src)
                         sv = state.numpy()                    # (b, d_state)
@@ -772,6 +850,51 @@ def _dump_modules(family, base, pattern):
         print(f"    {n}")
 
 
+def probe_forward(family, base, device, block_pattern):
+    """Run ONE real forward and print what every block / state-hint module emits.
+
+    This is the definitive diagnostic when the block hooks match but nothing is
+    captured: it shows the exact output type + tensor shape of each fired module
+    (e.g. a channels-first ``(B, d, T)`` layout, a tuple, or a folded leading
+    dim), so the extractor / ``--block-pattern`` can be matched to reality."""
+    backbone = _resolve_recurrent_backbone(family, base)
+    rx = re.compile(block_pattern)
+    seen: List[Tuple[str, str, str]] = []                    # (name, kind, desc)
+    handles = []
+
+    def mk(name, kind):
+        def h(_m, _i, out):
+            seq = _seq_from_output(out, batch=2)
+            extra = f"  -> seq={tuple(seq.shape) if seq is not None else None}"
+            seen.append((name, kind, _describe(out) + extra))
+        return h
+
+    for name, mod in backbone.named_modules():
+        if not name:
+            continue
+        if rx.search(name):
+            handles.append(mod.register_forward_hook(mk(name, "block")))
+        elif any(hh in name.lower() for hh in STATE_NAME_HINTS):
+            handles.append(mod.register_forward_hook(mk(name, "state")))
+
+    xb = torch.randn(2, 256, 1)                              # (B, W, 1)
+    try:
+        with torch.no_grad():
+            _predict_dispatch(family, base, xb, 16, device)
+    except Exception as e:                                   # noqa: BLE001
+        print(Fore.RED + f"  probe forward raised: {type(e).__name__}: {e}"
+              + Fore.RESET)
+        traceback.print_exc()
+    finally:
+        for hd in handles:
+            hd.remove()
+
+    print(Fore.CYAN + f"  forward probe: {len(seen)} firings (B=2, W=256):"
+          + Fore.RESET)
+    for name, kind, desc in seen:
+        print(f"    [{kind:5s}] {name:44s} {desc}")
+
+
 def run_worker(args, device, shard_id, num_shards):
     for (model_id, family, display) in _models_to_run(args):
         print(Fore.CYAN + f"\n=== {display} ({family}) on {device} ===" + Fore.RESET)
@@ -788,8 +911,10 @@ def run_worker(args, device, shard_id, num_shards):
                  "model_id": model_id, "device": device,
                  "error": f"{type(e).__name__}: {e}"})
             continue
-        if args.dump_modules:
+        if args.dump_modules or args.probe_forward:
             _dump_modules(family, base, args.block_pattern)
+            if args.probe_forward:
+                probe_forward(family, base, device, args.block_pattern)
             del base
             if bcl._is_cuda(device):
                 torch.cuda.empty_cache()
@@ -841,12 +966,14 @@ def _reconstruct_flags(args, displays):
         f += ["--force"]
     if args.dump_modules:
         f += ["--dump-modules"]
+    if args.probe_forward:
+        f += ["--probe-forward"]
     return f
 
 
 def _group_cmd(args, env, displays, shard_id, num_shards):
     label = _env_label(env)
-    stem = (f"dump_modules_{label}" if args.dump_modules
+    stem = (f"dump_modules_{label}" if (args.dump_modules or args.probe_forward)
             else f"run_{label}_shard{shard_id}")
     flags = _reconstruct_flags(args, displays) + [
         "--gpus", "1", "--shard-id", str(shard_id), "--num-shards", str(num_shards),
@@ -861,7 +988,7 @@ def coordinate(args):
     fails = 0
     for env, displays in groups.items():
         print(Fore.CYAN + f"\n### env {_env_label(env)}: {displays}" + Fore.RESET)
-        if args.dump_modules or n_gpus <= 1:
+        if args.dump_modules or args.probe_forward or n_gpus <= 1:
             cmd = _group_cmd(args, env, displays, shard_id=0, num_shards=1)
             print(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
             fails += subprocess.run(cmd, env=os.environ).returncode != 0
@@ -905,6 +1032,11 @@ def parse_args():
     p.add_argument("--gpus", type=int, default=0, help="0 = all visible GPUs.")
     p.add_argument("--dump-modules", action="store_true",
                    help="Print hook-matched block + state modules and exit.")
+    p.add_argument("--probe-forward", action="store_true",
+                   help="Load each model, run ONE forward, and print the output "
+                        "type + shape every block / state module emits, then exit. "
+                        "The definitive diagnostic when blocks match but nothing "
+                        "is captured.")
     p.add_argument("--log-file", default=None)
     p.add_argument("--test", action="store_true",
                    help="Smoke run: TEST_MODEL, tiny grid, few series + datasets.")
@@ -928,7 +1060,7 @@ def parse_args():
 def main():
     args = parse_args()
     if args.log_file is None:
-        stem = "dump_modules" if args.dump_modules else "run"
+        stem = "dump_modules" if (args.dump_modules or args.probe_forward) else "run"
         if args.shard_id is not None:
             stem += f"_shard{args.shard_id}"
         args.log_file = os.path.join(args.out_root, f"{stem}.log")
