@@ -164,6 +164,11 @@ ASYMPTOTE_THRESHOLDS = (0.10, 0.05, 0.02)
 DEFAULT_SYNTH_SERIES = 2000
 DEFAULT_SYNTH_SEED = 1234
 DEFAULT_BATCH_SIZE = 64
+# Cap batch*width per forward. FlowState's FFT conv needs ~2*L*batch*d complex
+# scratch (an 8 GiB single alloc at L=4096, batch=64), so keep batch*L <= this;
+# at L=4096 the batch drops to 16, at L=32 it stays at batch_size. Tuned for a
+# ~24 GB card — lower it on smaller GPUs, raise / set 0 (off) on bigger ones.
+DEFAULT_MAX_BATCH_TOKENS = 65536
 TEST_MODEL = "TiRex"                                          # small + fast recurrent
 
 
@@ -465,7 +470,7 @@ def collect_state(
     family, base, model_id, contexts: np.ndarray, real_lengths: np.ndarray,
     horizon: int, windows: List[int], batch_size: int, device: str,
     block_pattern: str, progress_desc: Optional[str] = None,
-    prefer_longest: bool = True,
+    prefer_longest: bool = True, max_batch_tokens: int = 0,
 ) -> Dict[str, object]:
     """Run the WINDOW_GRID sweep once, returning both saturation axes.
 
@@ -475,7 +480,12 @@ def collect_state(
                     NaN-padded at the tail for short series, plus per-series
                     ``traj_stride`` (timesteps per state position = width / T) to
                     convert a position L* into timesteps.
-    """
+
+    ``max_batch_tokens`` caps ``batch × width`` per forward so memory stays bounded
+    at long windows: FlowState convolves via an FFT whose intermediate scales with
+    ``L × batch`` (an 8 GiB single alloc at L=4096, batch=64), so the batch is
+    shrunk to ``max_batch_tokens // width`` (>=1) as the window grows. 0 disables
+    the cap (fixed ``batch_size``)."""
     N = contexts.shape[0]
     grid = np.asarray(sorted(set(bcl.WINDOW_GRID)))
     backbone = _resolve_recurrent_backbone(family, base)
@@ -504,13 +514,18 @@ def collect_state(
                 eff_buck = np.minimum(
                     eff, grid[np.clip(
                         np.searchsorted(grid, eff, side="right") - 1, 0, None)])
+                # Shrink the batch as the window grows so batch*width stays under
+                # the token budget (bounds FlowState's FFT-conv memory).
+                bs = batch_size
+                if max_batch_tokens > 0:
+                    bs = max(1, min(batch_size, max_batch_tokens // max(1, L)))
                 for width in np.unique(eff_buck):
                     idx = np.flatnonzero(eff_buck == width)
                     x_grp = torch.from_numpy(np.ascontiguousarray(
                         contexts[idx, -int(width):])).unsqueeze(-1)
-                    for start in range(0, len(idx), batch_size):
-                        bidx = idx[start:start + batch_size]
-                        xb = x_grp[start:start + batch_size]
+                    for start in range(0, len(idx), bs):
+                        bidx = idx[start:start + bs]
+                        xb = x_grp[start:start + bs]
                         cap.reset(xb.shape[0])
                         _predict_dispatch(family, base, xb, horizon, device)
                         got = cap.read()
@@ -551,6 +566,8 @@ def collect_state(
                             traj_asym[bidx, :T] = c["to_asymp"]
                             traj_len[bidx] = T
                             traj_stride[bidx] = float(width) / max(1, T)
+                if bcl._is_cuda(device):        # release FFT-conv scratch per window
+                    torch.cuda.empty_cache()
                 bar.update(1)
     finally:
         cap.remove()
@@ -735,7 +752,8 @@ def run_synthetic(args, family, model_id, display, base, device, windows):
     res = collect_state(family, base, model_id, contexts, real_lengths, horizon,
                         ws, args.batch_size, device, args.block_pattern,
                         progress_desc=f"    synthetic {display}",
-                        prefer_longest=not args.deepest_block)
+                        prefer_longest=not args.deepest_block,
+                        max_batch_tokens=args.max_batch_tokens)
     meta = {"n_segments": n_segments, "real_lengths": real_lengths,
             "horizon": horizon, "source": "synthetic", "model": display}
     summary = _write_cell(out_dir, ws, res, meta, f"synthetic — {display}")
@@ -794,7 +812,8 @@ def run_gifteval(args, family, model_id, display, base, device, windows,
                 family, base, model_id, contexts, real_lengths, cache.horizon,
                 ws, args.batch_size, device, args.block_pattern,
                 progress_desc=f"    {prog} {display} {dataset_display}/t{term}",
-                prefer_longest=not args.deepest_block)
+                prefer_longest=not args.deepest_block,
+                max_batch_tokens=args.max_batch_tokens)
             meta = {"real_lengths": real_lengths, "horizon": cache.horizon,
                     "source": "gifteval", "dataset": dataset_display, "term": term,
                     "model": display}
@@ -980,6 +999,7 @@ def _reconstruct_flags(args, displays):
     f = ["--sources", *args.sources, "--models", *displays,
          "--windows", *map(str, args.windows),
          "--batch-size", str(args.batch_size),
+         "--max-batch-tokens", str(args.max_batch_tokens),
          "--synth-series", str(args.synth_series),
          "--synth-seed", str(args.synth_seed),
          "--block-pattern", args.block_pattern,
@@ -1049,6 +1069,9 @@ def parse_args():
     p.add_argument("--windows", type=int, nargs="+", default=None,
                    help="Override the context grid (default WINDOW_GRID).")
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    p.add_argument("--max-batch-tokens", type=int, default=DEFAULT_MAX_BATCH_TOKENS,
+                   help="Cap batch*width per forward so long windows shrink the "
+                        "batch (bounds FlowState's FFT-conv memory). 0 disables.")
     p.add_argument("--synth-series", type=int, default=DEFAULT_SYNTH_SERIES)
     p.add_argument("--synth-seed", type=int, default=DEFAULT_SYNTH_SEED)
     p.add_argument("--block-pattern", default=DEFAULT_BLOCK_PATTERN,
