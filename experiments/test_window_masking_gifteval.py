@@ -75,6 +75,8 @@ PATCHTST_FM_CTX = 8192          # PatchTST-FM's fixed native context
 # window must stay <= this so the context-patch count is exact (no truncation).
 # NOTE: verify against pipeline.model.config on the server (8192 is the assumption).
 CHRONOS2_MAX_CONTEXT = 8192
+# Moirai2-R-small: max_seq_len(512 tokens) x patch(16) = 8192 for context+horizon.
+MOIRAI_MAX_TOTAL = 8192
 
 # Curves we build + overlay. mase_gluonts_real needs gluonts; it degrades to NaN
 # (v5's cell_mase_gluonts_real warns once) so it never sinks the run.
@@ -97,6 +99,8 @@ def family_full_window(family: str, horizon: int, window_sizes: List[int],
         cap = min(cap, abl.SUNDIAL_MAX_CONTEXT)
     elif family == "timemoe":
         cap = min(cap, abl.TIMEMOE_MAX_TOTAL - int(horizon))
+    elif family == "moirai":
+        cap = min(cap, MOIRAI_MAX_TOTAL - int(horizon))
     elif family == "patchtst_fm":
         cap = min(cap, PATCHTST_FM_CTX)
     elif family == "chronos2":

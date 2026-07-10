@@ -142,6 +142,7 @@ def per_series_mae(pred: torch.Tensor, target: np.ndarray) -> np.ndarray:
 FAMILY_MAX_CONTEXT = {"sundial": 2880, "toto": 4096, "patchtst_fm": 8192,
                       "chronos2": 8192}
 TIMEMOE_MAX_TOTAL = 4096                      # context + horizon must not exceed this
+MOIRAI_MAX_TOTAL = 8192                       # max_seq_len(512) x patch(16); ctx+horizon
 
 # Env split: these two need the legacy transformers==4.40.1 env; the rest run in
 # the main env. Used by the 'main' / 'legacy' group tokens.
@@ -154,6 +155,8 @@ def family_full_window(family: str, horizon: int, max_grid: int):
     cap = max_grid
     if family == "timemoe":
         cap = min(cap, TIMEMOE_MAX_TOTAL - int(horizon))
+    elif family == "moirai":
+        cap = min(cap, MOIRAI_MAX_TOTAL - int(horizon))
     elif family in FAMILY_MAX_CONTEXT:
         cap = min(cap, FAMILY_MAX_CONTEXT[family])
     grid = [w for w in sorted(set(WINDOW_GRID)) if w <= cap]
@@ -190,114 +193,120 @@ def resolve_models(tokens):
     return res
 
 
+def _gen_signal(token, args):
+    """Materialize one signal's pool. Targets are full MAX_HORIZON width (sliced
+    to each horizon later), so the same data is reused across horizons."""
+    tok = token.lower()
+    if tok == "synthetic":
+        c, t, _ns, rl = generate_dataset(args.n_series, args.seed)
+        return c, t, rl, "synthetic"
+    if tok == "sine":
+        n_comp = 1
+    elif tok.startswith("wave") and tok[4:].isdigit():
+        n_comp = int(tok[4:])
+    else:
+        raise SystemExit(f"Unknown --signals token {token!r} "
+                         "(use 'synthetic', 'sine', or 'wave<N>').")
+    c, t, _ns, rl = generate_wave_dataset(
+        args.n_series, args.seed, n_comp, args.wave_noise)
+    return c, t, rl, f"wave{n_comp}"
+
+
 def run_model(spec, args) -> None:
-    """One model: all signals -> per-signal overlays + a combined overview."""
-    full_window = family_full_window(spec.family, args.horizon, args.full_window)
-    if full_window is None:
-        print(f"[{spec.display}] SKIP: no servable window under caps.")
-        return
-    grid = [w for w in WINDOW_GRID
-            if w <= full_window and (args.windows is None or w in args.windows)]
-    if not grid:
-        print(f"[{spec.display}] SKIP: empty window grid.")
-        return
-
-    print(f"[{spec.display}] loading on {args.device} (full_window={full_window})...")
+    """One model: every horizon x every signal -> per-signal overlays + a combined
+    overview per horizon. Output tree: <Model>/h<H>/<signal>/."""
+    print(f"[{spec.display}] loading on {args.device}...")
     base = setup_model(spec.family, spec.model_id, args.device)
-
-    def gen_signal(token):
-        tok = token.lower()
-        if tok == "synthetic":
-            c, t, _ns, rl = generate_dataset(args.n_series, args.seed)
-            return c, t, rl, "synthetic"
-        if tok == "sine":
-            n_comp = 1
-        elif tok.startswith("wave") and tok[4:].isdigit():
-            n_comp = int(tok[4:])
-        else:
-            raise SystemExit(f"Unknown --signals token {token!r} "
-                             "(use 'synthetic', 'sine', or 'wave<N>').")
-        c, t, _ns, rl = generate_wave_dataset(
-            args.n_series, args.seed, n_comp, args.wave_noise)
-        return c, t, rl, f"wave{n_comp}"
-
     n = args.n_series
-    overview = []                     # (sig_tag, sliced_mean, masked_mean)
-    for token in args.signals:
-        contexts, targets, real_lengths, sig_tag = gen_signal(token)
-        targets = targets[:, :args.horizon]
-        print(f"[{spec.display}] signal={sig_tag}: {n} series")
+    # Generate each signal pool once (horizon-independent) and reuse.
+    signal_data = {tok: _gen_signal(tok, args) for tok in args.signals}
 
-        sliced = np.full((n, len(grid)), np.nan, dtype=np.float32)
-        masked = np.full((n, len(grid)), np.nan, dtype=np.float32)
-        for j, L in enumerate(grid):
-            with torch.no_grad():
-                pred_s = forecast_window(
-                    spec.family, base, spec.model_id, contexts, L, real_lengths,
-                    args.horizon, args.batch_size, args.device)
-                pred_m = forecast_masked(
-                    spec.family, base, spec.model_id, contexts, full_window,
-                    real_lengths, args.horizon, L, args.batch_size, args.device)
-            sliced[:, j] = per_series_mae(pred_s, targets)
-            masked[:, j] = per_series_mae(pred_m, targets)
-            print(f"  [{sig_tag}] L={L:5d}  sliced={np.nanmean(sliced[:, j]):.4f}  "
-                  f"masked={np.nanmean(masked[:, j]):.4f}")
+    for H in args.horizons:
+        full_window = family_full_window(spec.family, H, args.full_window)
+        if full_window is None:
+            print(f"[{spec.display}] h={H}: SKIP (no servable window under caps).")
+            continue
+        grid = [w for w in WINDOW_GRID
+                if w <= full_window and (args.windows is None or w in args.windows)]
+        if not grid:
+            print(f"[{spec.display}] h={H}: SKIP (empty window grid).")
+            continue
+        print(f"[{spec.display}] h={H}  full_window={full_window}  grid={grid}")
 
-        out_dir = Path(args.out) / spec.display / sig_tag
-        out_dir.mkdir(parents=True, exist_ok=True)
-        sliced_mean = np.nanmean(sliced, axis=0)
-        masked_mean = np.nanmean(masked, axis=0)
-        # Per-series normalization: divide each series' curve by its own value at
-        # the largest window, so heterogeneous scales don't swamp the average.
-        denom_s = sliced[:, [-1]]
-        denom_m = masked[:, [-1]]
-        sliced_norm = np.nanmean(sliced / np.where(denom_s == 0, np.nan, denom_s), axis=0)
-        masked_norm = np.nanmean(masked / np.where(denom_m == 0, np.nan, denom_m), axis=0)
-        np.savez(out_dir / "curves.npz",
-                 grid=np.array(grid), sliced=sliced, masked=masked,
-                 sliced_mean=sliced_mean, masked_mean=masked_mean,
-                 sliced_norm=sliced_norm, masked_norm=masked_norm,
-                 horizon=args.horizon, full_window=full_window)
+        overview = []                 # (sig_tag, sliced_mean, masked_mean)
+        for token in args.signals:
+            contexts, targets_full, real_lengths, sig_tag = signal_data[token]
+            targets = targets_full[:, :H]
 
-        for fname, ys, ylabel in [
-            ("overlay_mae.png", (sliced_mean, masked_mean), "mean MAE"),
-            ("overlay_mae_normalized.png", (sliced_norm, masked_norm),
-             "mean MAE (÷ own value at max window)"),
-        ]:
-            plt.figure(figsize=(7, 4.5))
-            plt.plot(grid, ys[0], "o-", label="sliced (feed last L)")
-            plt.plot(grid, ys[1], "s--", label="masked (full window, attend last L)")
-            plt.xscale("log", base=2)
-            plt.xlabel("effective context L (timesteps)")
-            plt.ylabel(ylabel)
-            plt.title(f"{spec.display} [{sig_tag}] — h={args.horizon}, "
-                      f"full={full_window}, n={n}")
-            plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
-            plt.savefig(out_dir / fname, dpi=130); plt.close()
-        print(f"[{spec.display}] wrote {out_dir}")
-        overview.append((sig_tag, sliced_mean, masked_mean))
+            sliced = np.full((n, len(grid)), np.nan, dtype=np.float32)
+            masked = np.full((n, len(grid)), np.nan, dtype=np.float32)
+            for j, L in enumerate(grid):
+                with torch.no_grad():
+                    pred_s = forecast_window(
+                        spec.family, base, spec.model_id, contexts, L, real_lengths,
+                        H, args.batch_size, args.device)
+                    pred_m = forecast_masked(
+                        spec.family, base, spec.model_id, contexts, full_window,
+                        real_lengths, H, L, args.batch_size, args.device)
+                sliced[:, j] = per_series_mae(pred_s, targets)
+                masked[:, j] = per_series_mae(pred_m, targets)
+                print(f"  [h{H}/{sig_tag}] L={L:5d}  "
+                      f"sliced={np.nanmean(sliced[:, j]):.4f}  "
+                      f"masked={np.nanmean(masked[:, j]):.4f}")
 
-    # Combined overview: one subplot per signal (raw MAE overlay), side by side.
-    if len(overview) > 1:
-        k = len(overview)
-        fig, axes = plt.subplots(1, k, figsize=(5 * k, 4.2), squeeze=False)
-        for ax, (sig_tag, s_mean, m_mean) in zip(axes[0], overview):
-            ax.plot(grid, s_mean, "o-", label="sliced")
-            ax.plot(grid, m_mean, "s--", label="masked")
-            ax.set_xscale("log", base=2)
-            ax.set_xlabel("context L")
-            ax.set_title(sig_tag)
-            ax.grid(True, alpha=0.3)
-        axes[0][0].set_ylabel("mean MAE")
-        axes[0][0].legend(fontsize=8)
-        fig.suptitle(f"{spec.display} — masked vs sliced by signal "
-                     f"(h={args.horizon}, full={full_window}, n={n})",
-                     fontweight="bold")
-        fig.tight_layout()
-        ov_path = Path(args.out) / spec.display / "overview_by_signal.png"
-        fig.savefig(ov_path, dpi=130)
-        plt.close(fig)
-        print(f"[{spec.display}] wrote {ov_path}")
+            out_dir = Path(args.out) / spec.display / f"h{H}" / sig_tag
+            out_dir.mkdir(parents=True, exist_ok=True)
+            sliced_mean = np.nanmean(sliced, axis=0)
+            masked_mean = np.nanmean(masked, axis=0)
+            # Per-series normalization by each series' own value at the largest window.
+            denom_s = sliced[:, [-1]]
+            denom_m = masked[:, [-1]]
+            sliced_norm = np.nanmean(sliced / np.where(denom_s == 0, np.nan, denom_s), axis=0)
+            masked_norm = np.nanmean(masked / np.where(denom_m == 0, np.nan, denom_m), axis=0)
+            np.savez(out_dir / "curves.npz",
+                     grid=np.array(grid), sliced=sliced, masked=masked,
+                     sliced_mean=sliced_mean, masked_mean=masked_mean,
+                     sliced_norm=sliced_norm, masked_norm=masked_norm,
+                     horizon=H, full_window=full_window)
+
+            for fname, ys, ylabel in [
+                ("overlay_mae.png", (sliced_mean, masked_mean), "mean MAE"),
+                ("overlay_mae_normalized.png", (sliced_norm, masked_norm),
+                 "mean MAE (÷ own value at max window)"),
+            ]:
+                plt.figure(figsize=(7, 4.5))
+                plt.plot(grid, ys[0], "o-", label="sliced (feed last L)")
+                plt.plot(grid, ys[1], "s--", label="masked (full window, attend last L)")
+                plt.xscale("log", base=2)
+                plt.xlabel("effective context L (timesteps)")
+                plt.ylabel(ylabel)
+                plt.title(f"{spec.display} [{sig_tag}] — h={H}, "
+                          f"full={full_window}, n={n}")
+                plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
+                plt.savefig(out_dir / fname, dpi=130); plt.close()
+            print(f"[{spec.display}] wrote {out_dir}")
+            overview.append((sig_tag, sliced_mean, masked_mean))
+
+        # Combined overview per horizon: one subplot per signal.
+        if len(overview) > 1:
+            k = len(overview)
+            fig, axes = plt.subplots(1, k, figsize=(5 * k, 4.2), squeeze=False)
+            for ax, (sig_tag, s_mean, m_mean) in zip(axes[0], overview):
+                ax.plot(grid, s_mean, "o-", label="sliced")
+                ax.plot(grid, m_mean, "s--", label="masked")
+                ax.set_xscale("log", base=2)
+                ax.set_xlabel("context L")
+                ax.set_title(sig_tag)
+                ax.grid(True, alpha=0.3)
+            axes[0][0].set_ylabel("mean MAE")
+            axes[0][0].legend(fontsize=8)
+            fig.suptitle(f"{spec.display} — masked vs sliced by signal "
+                         f"(h={H}, full={full_window}, n={n})", fontweight="bold")
+            fig.tight_layout()
+            ov_path = Path(args.out) / spec.display / f"h{H}" / "overview_by_signal.png"
+            fig.savefig(ov_path, dpi=130)
+            plt.close(fig)
+            print(f"[{spec.display}] wrote {ov_path}")
 
     del base
     if str(args.device).startswith("cuda"):
@@ -316,7 +325,9 @@ def main() -> None:
                     help="convenience alias for a single --models entry.")
     ap.add_argument("--n-series", type=int, default=256)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--horizon", type=int, default=64)
+    ap.add_argument("--horizons", type=int, nargs="+", default=[64, 256, 1024],
+                    help=f"forecast horizons; each gets its own h<H>/ folder "
+                         f"(must be <= MAX_HORIZON={MAX_HORIZON}).")
     ap.add_argument("--full-window", type=int, default=max(WINDOW_GRID),
                     help="upper bound on the full input length (capped per family).")
     ap.add_argument("--windows", type=int, nargs="*", default=None,
@@ -331,6 +342,10 @@ def main() -> None:
     ap.add_argument("--wave-noise", type=float, default=0.0,
                     help="iid noise std added to wave signals.")
     args = ap.parse_args()
+
+    bad = [h for h in args.horizons if h > MAX_HORIZON or h < 1]
+    if bad:
+        raise SystemExit(f"--horizons {bad} out of range (1..{MAX_HORIZON}).")
 
     specs = resolve_models([args.model] if args.model else args.models)
     if not specs:
