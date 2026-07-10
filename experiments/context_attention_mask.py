@@ -412,23 +412,40 @@ def _rect_hide_bool(m, hide: int):
     return m
 
 
+def _moirai2_patch_size(handle):
+    v = _config_int(handle, ["patch_size", "patch_len"])
+    if v:
+        return v
+    for a in ("patch_size", "patch_len"):
+        x = getattr(handle, a, None)
+        if x:
+            return int(x)
+    hp = getattr(handle, "hparams", None)
+    if hp is not None:
+        x = hp.get("patch_size") if isinstance(hp, dict) else getattr(hp, "patch_size", None)
+        if x:
+            return int(x)
+    return None
+
+
 def _moirai2_mask(handle, last_timesteps: int, full_len: int):
-    """Edit uni2ts's boolean packed-causal mask to drop the oldest context
-    patches. NOTE: patch size + the presence of trailing predict tokens are
-    inferred; verify the attention class name and mask polarity on the server."""
-    patch = _config_int(handle, ["patch_size", "patch_len"]) or \
-        getattr(handle, "patch_size", None)
+    """Edit uni2ts ``GroupedQueryAttention``'s boolean causal mask (True=attend) to
+    drop the oldest context patches.
+
+    uni2ts calls ``self.self_attn(x, x, x, attn_mask=mask, query_time_id=..., ...)``
+    — RoPE lives in the time_id projection (relative), so keeping full-window
+    positions is fine (this is why Sundial aligned). Two things the earlier version
+    got wrong: the mask kwarg is ``attn_mask`` (not ``attention_mask``), and the
+    hide must be sized in CONTEXT patches (patch=16) so the appended prediction
+    tokens — which trail the context in the same sequence — are never touched."""
+    patch = _moirai2_patch_size(handle)
     state = {"applied": 0, "saw_none": 0, "hide": None}
 
     def make_wrapper(orig):
         def wrapper(*args, **kwargs):
-            m = kwargs.get("attention_mask", None)
-            from_kwargs = "attention_mask" in kwargs
-            if m is None:
-                for a in args[1:]:
-                    if torch.is_tensor(a) and a.dtype == torch.bool and a.dim() >= 2:
-                        m = a
-                        break
+            key = ("attn_mask" if "attn_mask" in kwargs
+                   else ("attention_mask" if "attention_mask" in kwargs else None))
+            m = kwargs.get(key) if key else None
             if not (torch.is_tensor(m) and m.dtype == torch.bool):
                 state["saw_none"] += 1
                 return orig(*args, **kwargs)
@@ -437,15 +454,15 @@ def _moirai2_mask(handle, last_timesteps: int, full_len: int):
                 if patch:
                     n_ctx = max(1, round(int(full_len) / patch))
                     vis = max(1, round(int(last_timesteps) / patch))
-                    state["hide"] = max(0, min(kv - 1, n_ctx - vis))
-                else:
+                    hide = n_ctx - vis
+                else:  # no patch size found -> proportional over the whole seq
                     vis = max(1, round(int(last_timesteps) * kv / int(full_len)))
-                    state["hide"] = max(0, kv - vis)
+                    hide = kv - vis
+                state["hide"] = max(0, min(kv - 1, hide))
             hide = state["hide"]
             if hide > 0:
                 m = _rect_hide_bool(m.clone(), hide)
-                if from_kwargs:
-                    kwargs = {**kwargs, "attention_mask": m}
+                kwargs = {**kwargs, key: m}
                 state["applied"] += 1
             return orig(*args, **kwargs)
         return wrapper
