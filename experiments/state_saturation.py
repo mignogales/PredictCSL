@@ -229,9 +229,11 @@ def _seq_from_output(out, batch: Optional[int] = None) -> Optional[torch.Tensor]
     t = t.detach().to(torch.float32)
     if t.dim() == 2:                                         # (B, d) — single step
         return t.unsqueeze(1)                               # (B, 1, d)
-    # Orient batch to the front when we can identify it unambiguously.
+    # Orient batch to the front when we can identify it unambiguously. Exclude
+    # the last axis (features) from candidates so a batch that coincides with
+    # d_model is never mistaken for the feature axis (FlowState is (T, B, d)).
     if batch is not None and t.shape[0] != batch:
-        cands = [ax for ax in range(t.dim()) if t.shape[ax] == batch]
+        cands = [ax for ax in range(t.dim() - 1) if t.shape[ax] == batch]
         if len(cands) == 1:
             t = t.movedim(cands[0], 0)
     # General (B, ..., T, d): collapse everything between batch and (T, d).
@@ -295,12 +297,20 @@ class StateCapture:
     "true_state" when a carry tensor was captured for the final position, else
     "block_output"."""
 
-    def __init__(self, backbone: torch.nn.Module, block_pattern: str):
+    def __init__(self, backbone: torch.nn.Module, block_pattern: str,
+                 prefer_longest: bool = True):
         self._brx = re.compile(block_pattern)
         self._handles = []
         self.matched_blocks: List[str] = []
         self.matched_state: List[str] = []
         self._batch: Optional[int] = None
+        # Block whose per-position sequence we read. With prefer_longest we pick
+        # the DEEPEST block at full sequence resolution — FlowState's last encoder
+        # layer downsamples 266->11 (an output head), so the deepest *full-res*
+        # layer is the genuine per-timestep state trajectory. Set False to always
+        # take the deepest block regardless of resolution (--deepest-block).
+        self.prefer_longest = prefer_longest
+        self._chosen_block: Optional[str] = None
         # execution-order logs
         self._seq_log: List[Tuple[str, torch.Tensor]] = []      # (name, (B,T,d) cpu)
         self._state_log: List[Tuple[str, torch.Tensor]] = []    # (name, (B,dS) cpu)
@@ -356,11 +366,24 @@ class StateCapture:
         self._seq_log = []
         self._state_log = []
 
+    def _select_block(self) -> str:
+        """Name of the block whose sequence we read (cached across batches)."""
+        entries = self._seq_log
+        if self.prefer_longest:
+            max_t = max(s.shape[1] for _, s in entries)
+            cand = [n for (n, s) in entries if s.shape[1] == max_t]
+            return cand[-1]                                    # deepest at full res
+        return entries[-1][0]                                  # deepest overall
+
     def read(self) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], str]]:
         if not self._seq_log:
             return None
-        # final block = last valid firing at the true batch (prefill, most-recent).
-        seq = self._seq_log[-1][1]                             # (B, T, d)
+        name = self._chosen_block
+        if name is None or all(n != name for n, _ in self._seq_log):
+            name = self._select_block()
+            self._chosen_block = name
+        sel = [s for (n, s) in self._seq_log if n == name]
+        seq = sel[-1]                                          # (B, T, d)
         if self._state_log:
             return seq, self._state_log[-1][1], "true_state"
         return seq, seq[:, -1, :], "block_output"
@@ -442,6 +465,7 @@ def collect_state(
     family, base, model_id, contexts: np.ndarray, real_lengths: np.ndarray,
     horizon: int, windows: List[int], batch_size: int, device: str,
     block_pattern: str, progress_desc: Optional[str] = None,
+    prefer_longest: bool = True,
 ) -> Dict[str, object]:
     """Run the WINDOW_GRID sweep once, returning both saturation axes.
 
@@ -455,7 +479,7 @@ def collect_state(
     N = contexts.shape[0]
     grid = np.asarray(sorted(set(bcl.WINDOW_GRID)))
     backbone = _resolve_recurrent_backbone(family, base)
-    cap = StateCapture(backbone, block_pattern)
+    cap = StateCapture(backbone, block_pattern, prefer_longest=prefer_longest)
 
     e_final: Optional[np.ndarray] = None                      # (N, K, d_state)
     d_state: Optional[int] = None
@@ -542,6 +566,7 @@ def collect_state(
         "traj_len": traj_len,                                 # per-series #positions
         "traj_stride": traj_stride,                           # timesteps / position
         "state_source": "+".join(sorted(source_seen)),
+        "chosen_block": cap._chosen_block or "",
         "matched_blocks": cap.matched_blocks,
         "matched_state": cap.matched_state,
     }
@@ -603,6 +628,7 @@ def _write_cell(out_dir, windows, res, meta, title):
         "d_state": int(res["e_final"].shape[2]),
         "T_max": int(res["traj_marginal"].shape[1]),
         "state_source": res["state_source"],
+        "chosen_block": res.get("chosen_block", ""),
         "n_blocks_hooked": len(res["matched_blocks"]),
         "n_state_modules_hooked": len(res["matched_state"]),
         "windows": list(map(int, windows)),
@@ -708,7 +734,8 @@ def run_synthetic(args, family, model_id, display, base, device, windows):
     contexts = contexts[:, -ws[-1]:].astype(np.float32)
     res = collect_state(family, base, model_id, contexts, real_lengths, horizon,
                         ws, args.batch_size, device, args.block_pattern,
-                        progress_desc=f"    synthetic {display}")
+                        progress_desc=f"    synthetic {display}",
+                        prefer_longest=not args.deepest_block)
     meta = {"n_segments": n_segments, "real_lengths": real_lengths,
             "horizon": horizon, "source": "synthetic", "model": display}
     summary = _write_cell(out_dir, ws, res, meta, f"synthetic — {display}")
@@ -766,7 +793,8 @@ def run_gifteval(args, family, model_id, display, base, device, windows,
             res = collect_state(
                 family, base, model_id, contexts, real_lengths, cache.horizon,
                 ws, args.batch_size, device, args.block_pattern,
-                progress_desc=f"    {prog} {display} {dataset_display}/t{term}")
+                progress_desc=f"    {prog} {display} {dataset_display}/t{term}",
+                prefer_longest=not args.deepest_block)
             meta = {"real_lengths": real_lengths, "horizon": cache.horizon,
                     "source": "gifteval", "dataset": dataset_display, "term": term,
                     "model": display}
@@ -962,6 +990,8 @@ def _reconstruct_flags(args, displays):
         f += ["--test-datasets", str(args.test_datasets)]
     if args.probe_beyond:
         f += ["--probe-beyond"]
+    if args.deepest_block:
+        f += ["--deepest-block"]
     if args.force:
         f += ["--force"]
     if args.dump_modules:
@@ -1027,6 +1057,10 @@ def parse_args():
     p.add_argument("--probe-beyond", action="store_true",
                    help="Lift the FLOWSTATE_MAX_CONTEXT / TIREX_MAX_CONTEXT cap to "
                         "study saturation past the trained context.")
+    p.add_argument("--deepest-block", action="store_true",
+                   help="Read the trajectory from the DEEPEST block regardless of "
+                        "resolution (default: deepest FULL-resolution block, so "
+                        "FlowState's 266->11 output-head last layer is skipped).")
     p.add_argument("--out-root", default=OUT_ROOT)
     p.add_argument("--force", action="store_true", help="Recompute cached cells.")
     p.add_argument("--gpus", type=int, default=0, help="0 = all visible GPUs.")
