@@ -137,6 +137,14 @@ def main() -> None:
             df_gr = df_gr[df_gr["model_short"].isin(set(args.models))].reset_index(drop=True)
         write_run_rollup(df_gr, out_dir, plot_strategies=args.plot_strategies,
                          suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
+        print(Fore.GREEN + "Emitted model_strategy_overview_gluonts_real.png "
+              "(scored on mase_gluonts_real)." + Fore.RESET)
+    else:
+        print(Fore.YELLOW + "No real_curve_gluonts_real in "
+              f"{run_dir} — the gluonts-real twin was NOT emitted; only the "
+              "default `mase` overview exists. Re-run the ablation (stage 3) with "
+              "--force 3 so real_curve_gluonts_real is written, then re-run this."
+              + Fore.RESET)
 
     print(Fore.GREEN + f"\nCombined overview written to: {out_dir}" + Fore.RESET)
 
