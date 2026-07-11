@@ -24,17 +24,16 @@ directory only.
 It is pure post-processing: no TSFM inference, no predictor training. It just
 re-reads the cached strategy records the ablation stage already produced.
 
-When the ablation wrote the leaderboard gluonts curves it also emits the
-``_gluonts`` / ``_gluonts_real`` twins of the overview (re-scoring the same
-strategies on those metrics), so ``model_strategy_overview_gluonts_real.png`` is
-produced beside the default-``mase`` one.
+Exactly TWO metrics are emitted, each as its own suffixed set: ``_gluonts_real``
+(gluonts' own evaluate_forecasts machinery — the leaderboard-faithful metric,
+which also drives the wall-clock overview) and ``_gluonts`` (the numpy port).
+The legacy project ``mase`` is not consumed here at all.
 
 Usage (run on the SERVER, where logs/ lives)::
 
     python -m experiments.rollup_all_predictors
     python -m experiments.rollup_all_predictors --models Moirai2-Small TimesFM2.5-200M
-    python -m experiments.rollup_all_predictors --plot-strategies pred pred_cheap best
-    # oracle + both cheap predictors, on the gluonts-real leaderboard MASE:
+    # oracle + both cheap predictors (files: *_gluonts_real.png + *_gluonts.png):
     python -m experiments.rollup_all_predictors --plot-strategies best pred_cheap pred_mamba
 """
 
@@ -105,46 +104,40 @@ def main() -> None:
               "general_v4 absent) — overview will hold only the base predictor."
               + Fore.RESET)
 
-    df = load_strategy_records(run_dir, CACHE_ROOT, dict(DEFAULT_PATCH_SIZES))
-    if args.models:
-        wanted = set(args.models)
-        available = sorted(df["model_short"].unique())
-        df = df[df["model_short"].isin(wanted)].reset_index(drop=True)
-        if df.empty:
-            raise SystemExit(
-                f"No records for {sorted(wanted)} in {run_dir}. Available: {available}")
-
-    write_run_rollup(df, out_dir, plot_strategies=args.plot_strategies)
-    write_run_time_rollup(df, out_dir, plot_strategies=args.plot_strategies)
-
-    # Parallel leaderboard-MASE twins. When the ablation wrote the gluonts curves
-    # (real_curve_gluonts / real_curve_gluonts_real), re-score every strategy —
-    # including the folded-in v3/v4 predictors — on those metrics so the combined
-    # overview is available on `mase_gluonts` and `mase_gluonts_real` too, without
-    # any TSFM re-inference. Mirrors compare_window_strategies_gifteval.main().
-    if run_has_gluonts_curve(run_dir):
-        df_g = load_strategy_records(run_dir, CACHE_ROOT, dict(DEFAULT_PATCH_SIZES),
-                                     mase_metric="mase_gluonts")
+    def _load(metric: str):
+        df = load_strategy_records(run_dir, CACHE_ROOT, dict(DEFAULT_PATCH_SIZES),
+                                   mase_metric=metric)
         if args.models:
-            df_g = df_g[df_g["model_short"].isin(set(args.models))].reset_index(drop=True)
-        write_run_rollup(df_g, out_dir, plot_strategies=args.plot_strategies,
-                         suffix="_gluonts", metric_label="MASE (gluonts)")
+            wanted = set(args.models)
+            available = sorted(df["model_short"].unique())
+            df = df[df["model_short"].isin(wanted)].reset_index(drop=True)
+            if df.empty:
+                raise SystemExit(f"No records for {sorted(wanted)} in {run_dir}. "
+                                 f"Available: {available}")
+        return df
 
-    if run_has_gluonts_real_curve(run_dir):
-        df_gr = load_strategy_records(run_dir, CACHE_ROOT, dict(DEFAULT_PATCH_SIZES),
-                                      mase_metric="mase_gluonts_real")
-        if args.models:
-            df_gr = df_gr[df_gr["model_short"].isin(set(args.models))].reset_index(drop=True)
-        write_run_rollup(df_gr, out_dir, plot_strategies=args.plot_strategies,
-                         suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
-        print(Fore.GREEN + "Emitted model_strategy_overview_gluonts_real.png "
-              "(scored on mase_gluonts_real)." + Fore.RESET)
-    else:
-        print(Fore.YELLOW + "No real_curve_gluonts_real in "
-              f"{run_dir} — the gluonts-real twin was NOT emitted; only the "
-              "default `mase` overview exists. Re-run the ablation (stage 3) with "
-              "--force 3 so real_curve_gluonts_real is written, then re-run this."
-              + Fore.RESET)
+    # Exactly two metrics, both emitted as suffixed sets so nothing ambiguous is
+    # written: `mase_gluonts_real` (gluonts machinery — the leaderboard-faithful
+    # one, also driving the wall-clock overview) and `mase_gluonts` (numpy port).
+    # The legacy project `mase` is gone from this rollup entirely.
+    if not run_has_gluonts_real_curve(run_dir) and not run_has_gluonts_curve(run_dir):
+        raise SystemExit(
+            f"No gluonts curves (real_curve_gluonts[_real]) found in {run_dir} — "
+            "re-run stage 3 (cheap backfill, no TSFM re-inference) first.")
+
+    df_gr = _load("mase_gluonts_real")
+    write_run_rollup(df_gr, out_dir, plot_strategies=args.plot_strategies,
+                     suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
+    write_run_time_rollup(df_gr, out_dir, plot_strategies=args.plot_strategies)
+    if not run_has_gluonts_real_curve(run_dir):
+        print(Fore.YELLOW + "Note: no real_curve_gluonts_real anywhere in the run — "
+              "the _gluonts_real set above was scored on the port stand-in curves. "
+              "Re-run stage 3 (--force 3 for cached cells) to populate the machinery "
+              "values." + Fore.RESET)
+
+    df_g = _load("mase_gluonts")
+    write_run_rollup(df_g, out_dir, plot_strategies=args.plot_strategies,
+                     suffix="_gluonts", metric_label="MASE (gluonts)")
 
     print(Fore.GREEN + f"\nCombined overview written to: {out_dir}" + Fore.RESET)
 
