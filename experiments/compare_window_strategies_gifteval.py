@@ -1241,6 +1241,13 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str,
     rollup_path = os.path.join(out_dir, f"flops_savings_all_models{suffix}.csv")
     rollup.to_csv(rollup_path, index=False, float_format="%.6g")
     print(Fore.GREEN + f"\nSaved run-level FLOPs savings: {rollup_path}" + Fore.RESET)
+
+    # Companion table figure: original (full-window) MASE vs after-technique MASE
+    # per (model, strategy), incl. the TOTAL rows just appended.
+    table_path = plot_mase_change_table(rollup, out_dir, strategies=plot_strategies,
+                                        suffix=suffix, metric_label=metric_label)
+    if table_path:
+        print(Fore.GREEN + f"Saved MASE change table: {table_path}" + Fore.RESET)
     print(Fore.CYAN + "\n--- Grand total FLOPs saved vs full window ---" + Fore.RESET)
     for t in totals:
         print(f"  {t['strategy']:<7}  pooled saved {100*t['pct_flops_saved']:5.1f}%  "
@@ -2492,6 +2499,93 @@ _STRATEGY_STYLE = {
     "period":     ("Period (2×P)",      "#6A1B9A"),
 }
 _MODEL_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "p"]
+
+
+def plot_mase_change_table(rollup: pd.DataFrame, out_dir: str,
+                           strategies: Optional[List[str]] = None,
+                           suffix: str = "", metric_label: str = "MASE") -> str:
+    """Render a table figure of the MASE change per (model, strategy): the
+    original full-window MASE and the MASE after each technique, side by side.
+
+    One row per (model, strategy). Columns: Model, Strategy, ``{metric} full``
+    (original), ``{metric} strategy`` (after), ``Δ`` (strategy − full, <0 = better)
+    and ``Δ%`` (= ``rel_mase_drop_pct``, >0 = better). The Δ% cell is tinted green
+    when the technique lowered the MASE and red when it raised it. The grand TOTAL
+    rows (geomean over all models) are kept and shown in bold at the bottom.
+
+    ``strategies`` optionally restricts which strategies appear (a subset of
+    ``_STRATEGY_STYLE`` keys); ``suffix`` / ``metric_label`` mirror
+    ``write_run_rollup`` so a gluonts / gluonts-real pass writes its own file
+    (``mase_change_table_gluonts_real.png``) without clobbering the default one.
+    """
+    r = rollup.dropna(subset=["geomean_full_mase", "geomean_strategy_mase"]).copy()
+    if strategies:
+        r = r[r["strategy"].isin(strategies)].copy()
+    if r.empty:
+        return ""
+
+    # Stable ordering: models alphabetically with TOTAL last, strategies in the
+    # canonical palette order.
+    strat_rank = {s: i for i, s in enumerate(_STRATEGY_STYLE)}
+    r["__s"] = r["strategy"].map(lambda s: strat_rank.get(s, len(strat_rank)))
+    r["__m"] = r["model_short"].map(lambda m: (m == "TOTAL", m))
+    r = r.sort_values(["__m", "__s"]).reset_index(drop=True)
+
+    def _slabel(s: str) -> str:
+        return _STRATEGY_STYLE.get(s, (s, ""))[0]
+
+    headers = ["Model", "Strategy", f"{metric_label} full\n(original)",
+               f"{metric_label} strategy\n(after)", "Δ", "Δ% vs full\n(>0 better)"]
+    cell_text, cell_colors, is_total = [], [], []
+    for _, row in r.iterrows():
+        tot = row["model_short"] == "TOTAL"
+        is_total.append(tot)
+        rel = row.get("rel_mase_drop_pct", float("nan"))
+        delta = row["geomean_strategy_mase"] - row["geomean_full_mase"]
+        cell_text.append([
+            row["model_short"],
+            _slabel(row["strategy"]),
+            f"{row['geomean_full_mase']:.4f}",
+            f"{row['geomean_strategy_mase']:.4f}",
+            f"{delta:+.4f}",
+            f"{rel:+.2f}%" if pd.notna(rel) else "—",
+        ])
+        # Tint the Δ / Δ% cells by direction (green = improved, red = worse).
+        if pd.notna(rel) and rel > 0:
+            tint = "#E2EFDA"       # green-ish: technique lowered MASE
+        elif pd.notna(rel) and rel < 0:
+            tint = "#FCE4E4"       # red-ish: technique raised MASE
+        else:
+            tint = "#FFFFFF"
+        base = "#F2F2F2" if tot else "#FFFFFF"
+        cell_colors.append([base, base, base, base, tint, tint])
+
+    n_rows = len(cell_text)
+    fig_h = 1.1 + 0.36 * (n_rows + 1)
+    fig, ax = plt.subplots(figsize=(11, fig_h))
+    ax.axis("off")
+    tbl = ax.table(cellText=cell_text, colLabels=headers, cellColours=cell_colors,
+                   loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1.0, 1.5)
+
+    # Header styling + bold TOTAL rows.
+    for (rr, _cc), cell in tbl.get_celld().items():
+        if rr == 0:
+            cell.set_text_props(fontweight="bold", color="white")
+            cell.set_facecolor("#4472C4")
+        elif is_total[rr - 1]:
+            cell.set_text_props(fontweight="bold")
+        cell.set_edgecolor("#BFBFBF")
+
+    ax.set_title(f"MASE change per model × strategy  [{metric_label}]  — "
+                 "full window (original) vs after the technique",
+                 fontsize=12, fontweight="bold", pad=12)
+    plt.tight_layout()
+    path = os.path.join(out_dir, f"mase_change_table{suffix}.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    return path
 
 
 def plot_model_strategy_overview(rollup: pd.DataFrame, out_dir: str,
