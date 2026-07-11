@@ -1132,6 +1132,19 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
         # Unweighted geomean over (dataset, term) rows — matches the bar chart.
         gm_full_mase  = _geomean(sub["full_mase"].values)
         gm_strat_mase = _geomean(sub[mase_col].values)
+        # Leaderboard-style NORMALISED geomean (MASE / seasonal-naive), over the
+        # rows that have a valid baseline. Same row mask for full and strategy so
+        # they stay comparable. NaN when no baseline is present (older runs / the
+        # naive_mase column absent), which drops the norm columns from the table.
+        gm_full_norm = gm_strat_norm = float("nan")
+        n_norm = 0
+        if "naive_mase" in sub.columns:
+            nm = sub["naive_mase"].values.astype(float)
+            valid = np.isfinite(nm) & (nm > 0)
+            if valid.any():
+                gm_full_norm  = _geomean(sub["full_mase"].values[valid] / nm[valid])
+                gm_strat_norm = _geomean(sub[mase_col].values[valid]   / nm[valid])
+                n_norm = int(valid.sum())
         rows.append({
             "strategy":             name,
             "n_rows":               int(len(sub)),
@@ -1147,6 +1160,12 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
             "rel_mase_drop_pct":     (100.0 * (gm_full_mase - gm_strat_mase) / gm_full_mase
                                       if gm_full_mase > 0 else float("nan")),
             "mean_delta_vs_full":    gm_strat_mase - gm_full_mase,  # (strat - full)
+            # leaderboard-normalised twins (÷ seasonal-naive)
+            "n_norm":                     n_norm,
+            "geomean_full_mase_norm":     gm_full_norm,
+            "geomean_strategy_mase_norm": gm_strat_norm,
+            "rel_mase_drop_pct_norm":     (100.0 * (gm_full_norm - gm_strat_norm) / gm_full_norm
+                                           if gm_full_norm > 0 else float("nan")),
         })
     return pd.DataFrame(rows)
 
@@ -1210,6 +1229,20 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str,
         w_rows   = grp["n_rows"].values.astype(float)
         gm_full  = _wgeomean(grp["geomean_full_mase"].values,     w_rows)
         gm_strat = _wgeomean(grp["geomean_strategy_mase"].values, w_rows)
+        # Same cross-model weighted-geomean aggregation for the leaderboard-
+        # normalised twins, over the models that carry a baseline (weighted by the
+        # per-model normalised row count). NaN if none do.
+        gm_full_norm = gm_strat_norm = float("nan")
+        if "geomean_full_mase_norm" in grp.columns:
+            w_norm = grp.get("n_norm", pd.Series(0, index=grp.index)).values.astype(float)
+            mnorm = (np.isfinite(grp["geomean_full_mase_norm"].values)
+                     & np.isfinite(grp["geomean_strategy_mase_norm"].values)
+                     & (w_norm > 0))
+            if mnorm.any():
+                gm_full_norm  = _wgeomean(grp["geomean_full_mase_norm"].values[mnorm],
+                                          w_norm[mnorm])
+                gm_strat_norm = _wgeomean(grp["geomean_strategy_mase_norm"].values[mnorm],
+                                          w_norm[mnorm])
         totals.append({
             "model_short":          "TOTAL",
             "strategy":             name,
@@ -1236,6 +1269,11 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str,
             "rel_mase_drop_pct":     (100.0 * (gm_full - gm_strat) / gm_full
                                       if gm_full > 0 else float("nan")),
             "mean_delta_vs_full":    gm_strat - gm_full,
+            # leaderboard-normalised twins (÷ seasonal-naive)
+            "geomean_full_mase_norm":     gm_full_norm,
+            "geomean_strategy_mase_norm": gm_strat_norm,
+            "rel_mase_drop_pct_norm":     (100.0 * (gm_full_norm - gm_strat_norm) / gm_full_norm
+                                           if gm_full_norm > 0 else float("nan")),
         })
     rollup = pd.concat([rollup, pd.DataFrame(totals)], ignore_index=True)
     rollup_path = os.path.join(out_dir, f"flops_savings_all_models{suffix}.csv")
@@ -2534,35 +2572,59 @@ def plot_mase_change_table(rollup: pd.DataFrame, out_dir: str,
     def _slabel(s: str) -> str:
         return _STRATEGY_STYLE.get(s, (s, ""))[0]
 
+    def _tint(rel: float, tot: bool) -> str:
+        base = "#F2F2F2" if tot else "#FFFFFF"
+        if not pd.notna(rel):
+            return base
+        return "#E2EFDA" if rel > 0 else ("#FCE4E4" if rel < 0 else base)
+
+    # The leaderboard-normalised (÷ seasonal-naive) twin columns are shown only
+    # when a baseline was available (non-NaN norm), so runs without
+    # naive_baselines.json keep the plain absolute-MASE table.
+    has_norm = ("geomean_full_mase_norm" in r.columns
+                and r["geomean_full_mase_norm"].notna().any())
+
     headers = ["Model", "Strategy", f"{metric_label} full\n(original)",
                f"{metric_label} strategy\n(after)", "Δ", "Δ% vs full\n(>0 better)"]
+    if has_norm:
+        headers += [f"{metric_label} full\nNORM (÷naive)",
+                    f"{metric_label} strategy\nNORM (÷naive)", "Δ% NORM\n(>0 better)"]
+
     cell_text, cell_colors, is_total = [], [], []
     for _, row in r.iterrows():
         tot = row["model_short"] == "TOTAL"
         is_total.append(tot)
+        base = "#F2F2F2" if tot else "#FFFFFF"
         rel = row.get("rel_mase_drop_pct", float("nan"))
         delta = row["geomean_strategy_mase"] - row["geomean_full_mase"]
-        cell_text.append([
+        txt = [
             row["model_short"],
             _slabel(row["strategy"]),
             f"{row['geomean_full_mase']:.4f}",
             f"{row['geomean_strategy_mase']:.4f}",
             f"{delta:+.4f}",
             f"{rel:+.2f}%" if pd.notna(rel) else "—",
-        ])
-        # Tint the Δ / Δ% cells by direction (green = improved, red = worse).
-        if pd.notna(rel) and rel > 0:
-            tint = "#E2EFDA"       # green-ish: technique lowered MASE
-        elif pd.notna(rel) and rel < 0:
-            tint = "#FCE4E4"       # red-ish: technique raised MASE
-        else:
-            tint = "#FFFFFF"
-        base = "#F2F2F2" if tot else "#FFFFFF"
-        cell_colors.append([base, base, base, base, tint, tint])
+        ]
+        tint = _tint(rel, tot)
+        cols = [base, base, base, base, tint, tint]
+        if has_norm:
+            fn = row.get("geomean_full_mase_norm", float("nan"))
+            sn = row.get("geomean_strategy_mase_norm", float("nan"))
+            reln = row.get("rel_mase_drop_pct_norm", float("nan"))
+            txt += [
+                f"{fn:.4f}" if pd.notna(fn) else "—",
+                f"{sn:.4f}" if pd.notna(sn) else "—",
+                f"{reln:+.2f}%" if pd.notna(reln) else "—",
+            ]
+            tn = _tint(reln, tot)
+            cols += [base, base, tn]
+        cell_text.append(txt)
+        cell_colors.append(cols)
 
     n_rows = len(cell_text)
     fig_h = 1.1 + 0.36 * (n_rows + 1)
-    fig, ax = plt.subplots(figsize=(11, fig_h))
+    fig_w = 15.5 if has_norm else 11
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.axis("off")
     tbl = ax.table(cellText=cell_text, colLabels=headers, cellColours=cell_colors,
                    loc="center", cellLoc="center")
