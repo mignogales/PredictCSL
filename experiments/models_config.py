@@ -50,7 +50,7 @@ CATALOG: List[ModelSpec] = [
     ModelSpec("Maple728/TimeMoE-200M",           "timemoe",      "TimeMoE-200M",       True),
     # Appended (not inserted) to keep existing --model-idx positions stable.
     ModelSpec("autogluon/chronos-2-synth",       "chronos2",     "Chronos2-Synth",     True),
-    ModelSpec("autogluon/chronos-2-base",        "chronos2",     "Chronos2-Base",      True),
+    ModelSpec("autogluon/chronos-2",             "chronos2",     "Chronos2-Base",      True),
     ModelSpec("amazon/chronos-bolt-base",        "chronos_bolt", "ChronosBolt-Base",   True),
     ModelSpec("Datadog/Toto-2.0-313m",           "toto",         "Toto-2.0-313m",      True),
     ModelSpec("ibm-granite/granite-timeseries-flowstate-r1", "flowstate", "FlowState-R1", True),

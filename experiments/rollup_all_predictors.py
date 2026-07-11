@@ -24,11 +24,18 @@ directory only.
 It is pure post-processing: no TSFM inference, no predictor training. It just
 re-reads the cached strategy records the ablation stage already produced.
 
+When the ablation wrote the leaderboard gluonts curves it also emits the
+``_gluonts`` / ``_gluonts_real`` twins of the overview (re-scoring the same
+strategies on those metrics), so ``model_strategy_overview_gluonts_real.png`` is
+produced beside the default-``mase`` one.
+
 Usage (run on the SERVER, where logs/ lives)::
 
     python -m experiments.rollup_all_predictors
     python -m experiments.rollup_all_predictors --models Moirai2-Small TimesFM2.5-200M
     python -m experiments.rollup_all_predictors --plot-strategies pred pred_cheap best
+    # oracle + both cheap predictors, on the gluonts-real leaderboard MASE:
+    python -m experiments.rollup_all_predictors --plot-strategies best pred_cheap pred_mamba
 """
 
 from __future__ import annotations
@@ -43,6 +50,8 @@ from experiments.compare_window_strategies_gifteval import (
     DEFAULT_PATCH_SIZES,
     discover_pred_variants,
     load_strategy_records,
+    run_has_gluonts_curve,
+    run_has_gluonts_real_curve,
     write_run_rollup,
     write_run_time_rollup,
 )
@@ -107,6 +116,28 @@ def main() -> None:
 
     write_run_rollup(df, out_dir, plot_strategies=args.plot_strategies)
     write_run_time_rollup(df, out_dir, plot_strategies=args.plot_strategies)
+
+    # Parallel leaderboard-MASE twins. When the ablation wrote the gluonts curves
+    # (real_curve_gluonts / real_curve_gluonts_real), re-score every strategy —
+    # including the folded-in v3/v4 predictors — on those metrics so the combined
+    # overview is available on `mase_gluonts` and `mase_gluonts_real` too, without
+    # any TSFM re-inference. Mirrors compare_window_strategies_gifteval.main().
+    if run_has_gluonts_curve(run_dir):
+        df_g = load_strategy_records(run_dir, CACHE_ROOT, dict(DEFAULT_PATCH_SIZES),
+                                     mase_metric="mase_gluonts")
+        if args.models:
+            df_g = df_g[df_g["model_short"].isin(set(args.models))].reset_index(drop=True)
+        write_run_rollup(df_g, out_dir, plot_strategies=args.plot_strategies,
+                         suffix="_gluonts", metric_label="MASE (gluonts)")
+
+    if run_has_gluonts_real_curve(run_dir):
+        df_gr = load_strategy_records(run_dir, CACHE_ROOT, dict(DEFAULT_PATCH_SIZES),
+                                      mase_metric="mase_gluonts_real")
+        if args.models:
+            df_gr = df_gr[df_gr["model_short"].isin(set(args.models))].reset_index(drop=True)
+        write_run_rollup(df_gr, out_dir, plot_strategies=args.plot_strategies,
+                         suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
+
     print(Fore.GREEN + f"\nCombined overview written to: {out_dir}" + Fore.RESET)
 
 
