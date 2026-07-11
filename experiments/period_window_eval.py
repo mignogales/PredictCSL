@@ -66,6 +66,7 @@ from experiments.test_window_ablation_gifteval_v5 import (
     GiftEvalCache,
     ForecastResult,            # noqa: F401  (re-exported for type clarity)
     compute_all_metrics,
+    cell_mase_gluonts_real,
     _forecast_cell,
     _merge_grouped,
     load_chronos_bolt,
@@ -364,7 +365,13 @@ def evaluate_one(
     fr, tgts = _merge_grouped(results, valid_idx.size, horizon, device)
     elapsed = time.perf_counter() - t0
 
-    metrics = compute_all_metrics(fr, tgts, cache.naive_seasonal_mae_train)
+    # Gluonts metrics too: the merged forecast covers valid_idx in row order, so
+    # the per-instance seasonal errors (port) and the start Periods / raw contexts
+    # (machinery) align 1:1. Without these the period strategy would fall out of
+    # the gluonts-scored comparisons (or worse, mix in the custom `mase`).
+    metrics = compute_all_metrics(fr, tgts, cache.naive_seasonal_mae_train,
+                                  seasonal_errors=cache.seasonal_errors_gluonts[valid_idx])
+    metrics["mase_gluonts_real"] = cell_mase_gluonts_real(fr, cache, valid_idx)
     metrics["elapsed_seconds"] = round(elapsed, 3)
     metrics["horizon"] = horizon
 

@@ -120,7 +120,10 @@ CACHE_ROOT_PREDICTOR = "logs/experiments/context_length_predictor"
 # `--force 3` pass instead of silently keeping stale numbers.
 #   v1: initial port      v2: seasonal_error zero-fallback fixed to 1.0 (gluonts),
 #                             was 1e-9 -> exploded MASE on constant/intermittent cells
-MASE_GLUONTS_VER = 2
+#   v3: seasonal errors computed from RAW contexts (NaNs preserved, like the
+#       leaderboard) instead of the NaN->0-filled model-input copy; naive
+#       baseline's mase_gluonts_real now runs the actual gluonts machinery.
+MASE_GLUONTS_VER = 3
 
 
 # ==============================================================================
@@ -167,6 +170,7 @@ class GiftEvalCache:
         self.season: int = _get_seasonality(self.freq)
 
         contexts: List[np.ndarray] = []
+        contexts_raw: List[np.ndarray] = []
         labels: List[np.ndarray] = []
         # Per-instance forecast-start Periods, captured in the SAME (kept) order as
         # contexts/labels so they align 1:1. Feeds the gluonts-machinery
@@ -186,9 +190,18 @@ class GiftEvalCache:
                 )
             if len(label) < self.horizon:
                 continue
-            ctx = np.nan_to_num(np.asarray(target, dtype=np.float32), nan=0.0)
+            # Two copies of the context, and the split matters for leaderboard
+            # exactness: `contexts` is NaN->0 filled and feeds the MODEL wrappers
+            # (unchanged, so every cached forecast stays valid); `contexts_raw`
+            # keeps the NaNs and feeds the METRIC paths (gluonts seasonal errors +
+            # the evaluate_forecasts machinery), which is what the leaderboard
+            # sees. Zero-filling before the seasonal error skewed the MASE
+            # denominator on every config with missing values.
+            raw = np.asarray(target, dtype=np.float32)
+            ctx = np.nan_to_num(raw, nan=0.0)
             lbl = np.asarray(label[: self.horizon], dtype=np.float32)
             contexts.append(ctx)
+            contexts_raw.append(raw)
             labels.append(lbl)
             starts.append(test_label["start"])
 
@@ -199,6 +212,7 @@ class GiftEvalCache:
 
         self.starts: List = starts
         self.contexts: List[np.ndarray] = contexts
+        self.contexts_raw: List[np.ndarray] = contexts_raw
         self.context_lengths: np.ndarray = np.array(
             [len(c) for c in contexts], dtype=np.int64
         )
@@ -214,9 +228,12 @@ class GiftEvalCache:
         # metric, which — unlike `mase` (global MAE / one pooled training-set
         # seasonal-naive MAE) — averages per-instance ratios, matching the HF
         # GiftEval leaderboard. Cheap: one O(context) pass per series.
+        # Computed from the RAW contexts (NaNs preserved, excluded from the mean)
+        # exactly like the leaderboard — the zero-filled copy would understate the
+        # error wherever values are missing.
         self.season_gluonts: int = get_seasonality(self.freq)
         self.seasonal_errors_gluonts: np.ndarray = per_instance_seasonal_errors(
-            self.contexts, self.season_gluonts)
+            self.contexts_raw, self.season_gluonts)
 
     def _compute_naive_mae_train(self) -> float:
         season = self.season
@@ -394,10 +411,19 @@ def compute_naive_seasonal_test_metrics(cache: GiftEvalCache) -> Dict[str, float
     gl_abs = (gl_preds - torch.nan_to_num(tgts, nan=0.0)).abs()
     metrics["mase_gluonts"] = compute_mase_gluonts(
         gl_abs, gl_valid, cache.seasonal_errors_gluonts)
-    # The naive has no stored forecast objects to run the real gluonts machinery,
-    # so stand in with the port (as cached model cells do; they match <1%). Keeps
-    # `--mase-metric mase_gluonts_real` normalisation working (naive denominator).
-    metrics["mase_gluonts_real"] = metrics["mase_gluonts"]
+    # `mase_gluonts_real` for the naive: run the ACTUAL gluonts machinery on the
+    # naive forecast (we hold preds + starts + raw contexts, so nothing stops us).
+    # This is the normalisation denominator for the leaderboard-style aggregate —
+    # a port stand-in here would make every normalised number slightly off. Falls
+    # back to the port only if gluonts is unavailable or the eval fails.
+    try:
+        metrics["mase_gluonts_real"] = gluonts_leaderboard_mase(
+            gl_preds.numpy().astype(np.float64), cache.starts,
+            cache.contexts_raw, cache.labels_np, cache.freq)
+    except Exception as exc:  # noqa: BLE001 - never sink the baseline on this
+        print(Fore.YELLOW + f"  [naive mase_gluonts_real] gluonts eval failed "
+              f"({exc}) -> standing in with the port value." + Fore.RESET)
+        metrics["mase_gluonts_real"] = metrics["mase_gluonts"]
 
     # Cache-version sentinels: `_gluonts_naive_faithful` marks the gluonts-season
     # forecast (vs the old project-season one); `_gluonts_naive_ver` tracks the
@@ -627,7 +653,9 @@ def cell_mase_gluonts_real(fr, cache: "GiftEvalCache", served_indices) -> float:
         samples = (fr.samples.detach().cpu().float().numpy()
                    if fr.samples is not None else None)
         starts = [cache.starts[i] for i in idx]
-        contexts = [cache.contexts[i] for i in idx]
+        # RAW contexts (NaNs preserved): gluonts derives each instance's seasonal
+        # error from these, and the leaderboard sees the missing values as NaN.
+        contexts = [cache.contexts_raw[i] for i in idx]
         labels = cache.labels_np[idx]
         return gluonts_leaderboard_mase(
             median, starts, contexts, labels, cache.freq,
@@ -1893,6 +1921,9 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     if (_missing("mase_gluonts_real") or _stale_ver) \
                             and not _missing("mase_gluonts"):
                         cached["mase_gluonts_real"] = cached["mase_gluonts"]
+                        # Audit marker: this cell's `_real` is the port stand-in,
+                        # not the machinery — `--force 3` recomputes it for real.
+                        cached["_mase_gluonts_real_standin"] = True
                         changed = True
                     if changed:
                         _save_result(dataset_display, model_short, term,
@@ -2015,6 +2046,9 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                               else valid_indices)
                 metrics["mase_gluonts_real"] = cell_mase_gluonts_real(
                     fr, cache, served_idx)
+                metrics["_mase_gluonts_real_standin"] = bool(
+                    np.isnan(metrics["mase_gluonts_real"]))
+                metrics["_mase_gluonts_ver"] = MASE_GLUONTS_VER
                 metrics["elapsed_seconds"] = round(elapsed, 3)
                 metrics["horizon"] = horizon
 

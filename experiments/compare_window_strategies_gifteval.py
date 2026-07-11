@@ -46,20 +46,27 @@ Run-level (at <run_dir>/, one figure for the whole run; via --rollup-only)
                                  (arith & geo means of ratio / %saved / abs saved)
   model_strategy_overview.png    single scatter: every (model × strategy) point,
                                  FLOPs saved (x) vs geomean MASE change (y)
-  model_strategy_overview_gluonts.png  twin scored on the leaderboard `mase_gluonts`
-                                 (emitted whenever the ablation wrote that curve and
-                                 the run isn't already --mase-metric mase_gluonts)
+  model_strategy_overview_gluonts[_real].png  twin scored on the OTHER gluonts
+                                 metric (whichever isn't the primary --mase-metric)
   time_savings_all_models.csv    Stage 6 twin: per-(model,strategy) measured
                                  forward-pass time saved + grand TOTAL row
   model_strategy_overview_time.png  single scatter: every (model × strategy) point,
                                  wall-clock forward-pass time saved (x) vs geomean
                                  MASE change (y)
   bar_aggregate_mase.png      mean & median MASE per strategy (primary metric)
-  bar_aggregate_mase_gluonts.png  same, scored on `mase_gluonts` — emitted
-                              alongside when the leaderboard curve is available
-  bar_aggregate_mase_gluonts_normalized.png  the gluonts MASE divided per cell by
-                              the seasonal-naive baseline (Seasonal Naive = 1.0) —
-                              the leaderboard-faithful aggregation
+  bar_aggregate_mase_normalized.png  the primary MASE divided per cell by the
+                              same-definition seasonal-naive (Seasonal Naive = 1.0)
+                              — the leaderboard-faithful aggregation; with the
+                              default `mase_gluonts_real` this is the figure that
+                              lines up with the HF GiftEval board
+  bar_aggregate_mase_gluonts[_real][_normalized].png  same pair on the other
+                              gluonts metric (suffixed twins)
+
+Exactly TWO MASE metrics exist in this comparison: `mase_gluonts` (numpy port of
+the leaderboard definition) and `mase_gluonts_real` (gluonts' own
+evaluate_forecasts machinery; the default). The legacy project `mase`
+(pooled-training-naive, D->7/W->52 map) is no longer consumed here — cells whose
+npz lacks the gluonts curves are skipped loudly, never silently mixed.
   bar_aggregate_time.png      mean elapsed time per strategy
   scatter_pred_vs_best.png    MASE(pred) vs MASE(best)
   scatter_pred_vs_full.png    MASE(pred) vs MASE(full)
@@ -569,24 +576,11 @@ def _load_naive_baselines(run_dir: str) -> Dict[str, dict]:
         return {}
 
 
-def _resolve_gluonts_df(df_primary: pd.DataFrame,
-                        df_g: Optional[pd.DataFrame],
-                        mase_metric: str) -> Optional[pd.DataFrame]:
-    """The `mase_gluonts`-scored frame for the leaderboard-normalised view: the
-    parallel ``df_g`` when the run's primary metric is something else, or the
-    primary frame itself when it's already scored on `mase_gluonts`."""
-    if df_g is not None and not df_g.empty:
-        return df_g
-    if mase_metric == "mase_gluonts":
-        return df_primary
-    return None
-
-
 def load_strategy_records(
     run_dir: str,
     cache_root: str,
     patch_sizes: Dict[str, int],
-    mase_metric: str = "mase",
+    mase_metric: str = "mase_gluonts_real",
 ) -> pd.DataFrame:
     """
     For each row in compare_summary.csv, load the paired .npz and derive:
@@ -605,14 +599,15 @@ def load_strategy_records(
     if not os.path.isdir(models_root):
         raise FileNotFoundError(f"No models/ dir found in {run_dir}")
 
-    # Seasonal-naive denominators for the leaderboard-style normalised MASE. Which
-    # field to divide by tracks the active metric: the leaderboard normalises the
-    # gluonts MASE by the gluonts Seasonal-Naive, the project `mase` by its own.
+    # Seasonal-naive denominators for the leaderboard-style normalised MASE. The
+    # denominator field tracks the active metric so each MASE is divided by the
+    # SAME-definition Seasonal-Naive (leaderboard convention). Exactly two metrics
+    # exist: the numpy port and the gluonts-machinery one.
+    if mase_metric not in ("mase_gluonts", "mase_gluonts_real"):
+        raise ValueError(f"Unknown mase_metric {mase_metric!r}; expected "
+                         "'mase_gluonts' or 'mase_gluonts_real'.")
     naive_baselines = _load_naive_baselines(run_dir)
-    _naive_field = {
-        "mase_gluonts": "mase_gluonts",
-        "mase_gluonts_real": "mase_gluonts_real",
-    }.get(mase_metric, "mase")
+    _naive_field = mase_metric
 
     # Sibling predictor-variant trees (v3 cheap, v4 Mamba, …) folded in as extra
     # strategies, evaluated on the SAME real curves as the base "pred".
@@ -661,25 +656,36 @@ def load_strategy_records(
                 continue
 
             window_grid: np.ndarray = data["window_grid"]
-            # Which MASE drives the comparison: the project's `mase` (default), the
-            # ported leaderboard `mase_gluonts` (real_curve_gluonts), or the actual
-            # gluonts-machinery `mase_gluonts_real` (real_curve_gluonts_real). All
-            # curves are written by the ablation; fall back to `mase` if an older npz
-            # lacks the requested one (or it's all-NaN).
+            # Which MASE drives the comparison: the ported leaderboard
+            # `mase_gluonts` (real_curve_gluonts) or the gluonts-machinery
+            # `mase_gluonts_real` (real_curve_gluonts_real). NEVER fall back to the
+            # legacy project `real_curve` (custom D->7/W->52 mase) — silently mixing
+            # definitions is exactly what makes numbers stop lining up with the
+            # leaderboard. A `_real` request may stand in with the port curve
+            # (loudly); anything else missing skips the cell (loudly).
             _curve_key = {
                 "mase_gluonts": "real_curve_gluonts",
                 "mase_gluonts_real": "real_curve_gluonts_real",
-            }.get(mase_metric)
-            if _curve_key and _curve_key in data.files \
-                    and np.any(~np.isnan(data[_curve_key])):
-                real_curve = data[_curve_key]                # raw requested MASE per window
+            }[mase_metric]
+
+            def _usable(key: str) -> bool:
+                return key in data.files and bool(np.any(~np.isnan(data[key])))
+
+            if _usable(_curve_key):
+                real_curve = data[_curve_key]                # requested MASE per window
+            elif mase_metric == "mase_gluonts_real" and _usable("real_curve_gluonts"):
+                print(Fore.YELLOW
+                      + f"  {dataset_display} t={term} {model_short}: no "
+                        "real_curve_gluonts_real — standing in with the port curve "
+                        "(re-run stage 3 to populate the machinery one)." + Fore.RESET)
+                real_curve = data["real_curve_gluonts"]
             else:
-                if _curve_key:
-                    print(Fore.YELLOW
-                          + f"  {dataset_display} t={term} {model_short}: no "
-                            f"{_curve_key} — falling back to `mase`. Re-run the "
-                            "ablation to populate it." + Fore.RESET)
-                real_curve = data["real_curve"]              # raw MASE per window
+                print(Fore.YELLOW
+                      + f"  Skip {dataset_display} t={term} {model_short}: no "
+                        f"{_curve_key} in {os.path.basename(npz_path)} — re-run "
+                        "stage 3 (cheap backfill) to write the gluonts curves."
+                      + Fore.RESET)
+                continue
             pred_mean: np.ndarray = data["predicted_mean"]   # z-scored curve for argmin
 
             valid = ~np.isnan(real_curve)
@@ -761,7 +767,12 @@ def load_strategy_records(
             prec = _load_period_record(compare_dir, dataset_display, term, model_short)
             if prec is not None:
                 period_w       = float(prec.get("window_mean", float("nan")))
-                period_mase    = float(prec.get("period_mase", float("nan")))
+                # Score the period strategy on the SAME metric as everything else:
+                # read the active gluonts metric from the sidecar's all_metrics.
+                # Older sidecars (custom-`mase`-only) yield NaN — the period rows
+                # drop out rather than silently mixing metric definitions.
+                _pm = (prec.get("all_metrics") or {}).get(mase_metric)
+                period_mase    = float(_pm) if _pm is not None else float("nan")
                 period_elapsed = float(prec.get("period_elapsed_s", float("nan")))
                 period_w_med   = float(prec.get("window_median", float("nan")))
                 period_n_inst  = int(prec.get("n_instances", n_instances))
@@ -1178,9 +1189,9 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str,
     summary.  Writes ``flops_savings_all_models{suffix}.csv`` and
     ``model_strategy_overview{suffix}.png`` into ``out_dir``.
 
-    ``suffix`` / ``metric_label`` let a second pass on the gluonts-scored df emit a
-    parallel ``model_strategy_overview_gluonts.png`` (and CSV) without clobbering
-    the default-`mase` ones.
+    ``suffix`` / ``metric_label`` let each gluonts metric emit its own file set
+    (e.g. ``model_strategy_overview_gluonts_real.png`` + CSV) without clobbering
+    the other's.
 
     ``plot_strategies`` optionally restricts which strategies appear in the
     overview *figure* (the CSV and console totals always cover all strategies).
@@ -2999,13 +3010,14 @@ def parse_args() -> argparse.Namespace:
                    help="Restrict comparison to these model_short names "
                         "(default: every model present in the run dir).")
     p.add_argument("--mase-metric",
-                   choices=["mase", "mase_gluonts", "mase_gluonts_real"], default="mase",
+                   choices=["mase_gluonts", "mase_gluonts_real"], default="mase_gluonts_real",
                    help="Which MASE drives the strategy comparison + all flops/time "
-                        "savings outputs: the project's `mase` (default), the ported "
-                        "leaderboard `mase_gluonts` (per-instance seasonal error), or "
-                        "`mase_gluonts_real` (the actual gluonts evaluate_forecasts "
-                        "machinery). Use a distinct --output-dir for each to avoid "
-                        "overwriting (e.g. strategy_comparison_gluonts_real/).")
+                        "savings outputs. Exactly two exist: `mase_gluonts` (numpy "
+                        "port of the leaderboard definition) and `mase_gluonts_real` "
+                        "(the actual gluonts evaluate_forecasts machinery — the "
+                        "default and the leaderboard-faithful one). The other metric "
+                        "is always emitted alongside as suffixed twin files. Use a "
+                        "distinct --output-dir per metric to avoid overwriting.")
     p.add_argument("--output-dir", type=str, default=None,
                    help="Override output dir (default: models/<model>/strategy_comparison/). "
                         "Only safe with a single --models entry, else models clobber each other.")
@@ -3075,12 +3087,11 @@ def main() -> None:
                 f"Available: {available}"
             )
 
-    # ---- Parallel gluonts-scored records --------------------------------------
-    # When the primary metric is the project `mase` and the ablation has written
-    # the leaderboard curve, we ALSO score every strategy on `mase_gluonts` (its
-    # own oracle-best window) so the general bar plot can be drawn on the gluonts
-    # MASE and we can emit a second `model_strategy_overview_gluonts.png` beside
-    # the default one. No extra inference — just a second pass over the cached npz.
+    # ---- Twin pass on the OTHER gluonts metric --------------------------------
+    # Exactly two metrics exist (mase_gluonts port / mase_gluonts_real machinery);
+    # whichever isn't the primary is ALSO scored on every strategy (its own
+    # oracle-best window) so its suffixed twin plots/CSVs get emitted beside the
+    # primary ones. No extra inference — a second pass over the cached npz.
     df_g: Optional[pd.DataFrame] = None
     if args.mase_metric != "mase_gluonts" and run_has_gluonts_curve(run_dir):
         df_g = load_strategy_records(run_dir, args.cache_root, patch_sizes,
@@ -3157,27 +3168,24 @@ def main() -> None:
         print(f"  Regret vs oracle:     mean={stats['regret_pred_vs_best']['mean']:.4f}  "
               f"median={stats['regret_pred_vs_best']['median']:.4f}")
 
-        # Three headline aggregations on the FULL-window strategy, side by side:
-        #   (1) the project's original `mase` geomean,
-        #   (2) the absolute leaderboard `mase_gluonts` geomean,
-        #   (3) the seasonal-naive-NORMALISED `mase_gluonts` geomean (the number
-        #       that matches the HF GiftEval leaderboard).
-        # `gl_df` is the gluonts-scored frame: the parallel df_g when the primary
-        # metric is the project `mase`, else df_subset itself (already gluonts).
-        gl_df = _resolve_gluonts_df(df_subset, df_g_subset, args.mase_metric)
-        if gl_df is not None and not gl_df.empty:
-            gstats = compute_summary_stats(gl_df)
-            gfull = gstats.get("full_mase", {})
-            print(Fore.CYAN + "\n--- Aggregate MASE (full window) ---" + Fore.RESET)
-            print(f"  (1) original `mase`         geomean : {stats['full_mase']['geomean']:.4f}")
-            print(f"  (2) mase_gluonts (absolute) geomean : {gfull.get('geomean', float('nan')):.4f}")
-            if "geomean_norm" in gfull:
-                print(f"  (3) mase_gluonts NORMALISED geomean : {gfull['geomean_norm']:.4f}"
-                      f"  <- leaderboard-style (÷ seasonal-naive, n={gfull.get('n_norm', 0)})")
-            else:
-                print(Fore.YELLOW + "  (3) normalised mase_gluonts: no naive baseline "
-                      "found — re-run stage 3 (or --force 3) to write naive_baselines.json"
-                      + Fore.RESET)
+        # Headline aggregations on the FULL-window strategy for the primary
+        # metric, side by side: the absolute geomean and the seasonal-naive-
+        # NORMALISED geomean — the latter is the leaderboard aggregation (each
+        # cell ÷ its Seasonal-Naive MASE of the SAME definition, then geomean),
+        # i.e. the number that lines up with the HF GiftEval board when the
+        # primary metric is `mase_gluonts_real`.
+        full_s = stats.get("full_mase", {})
+        print(Fore.CYAN + f"\n--- Aggregate {args.mase_metric} (full window) ---"
+              + Fore.RESET)
+        print(f"  absolute geomean   : {full_s.get('geomean', float('nan')):.4f}")
+        if "geomean_norm" in full_s:
+            print(f"  NORMALISED geomean : {full_s['geomean_norm']:.4f}"
+                  f"  <- leaderboard aggregation (÷ seasonal-naive, "
+                  f"n={full_s.get('n_norm', 0)})")
+        else:
+            print(Fore.YELLOW + "  NORMALISED geomean: no naive baseline found — "
+                  "re-run stage 3 (or --force 3) to write naive_baselines.json"
+                  + Fore.RESET)
 
         if "speedup_pred_vs_full" in stats:
             sp = stats["speedup_pred_vs_full"]
@@ -3222,37 +3230,53 @@ def main() -> None:
         compute_relative_improvement_tables(df_subset, out_dir)
 
         print(Fore.CYAN + "\n--- Generating plots ---" + Fore.RESET)
-        # Primary MASE bar plot on the run's default metric. When the leaderboard
-        # `mase_gluonts` curve is also present, emit a parallel gluonts-scored bar
-        # plot beside it (separate file) so both metrics are available.
-        bar_mase_path = plot_bar_aggregate_mase(df_subset, out_dir)
-        bar_mase_gluonts_path = ""
+        metric_lbls = {"mase_gluonts": "MASE (gluonts)",
+                       "mase_gluonts_real": "MASE (gluonts-real)"}
+        primary_lbl = metric_lbls[args.mase_metric]
+        # Primary metric: absolute bars + the leaderboard-faithful NORMALISED bars
+        # (each cell ÷ its same-definition Seasonal-Naive; Seasonal Naive = 1.0).
+        # With the default `mase_gluonts_real`, the normalised figure is the one
+        # that lines up with the HF GiftEval board.
+        bar_mase_path = plot_bar_aggregate_mase(df_subset, out_dir,
+                                                metric_label=primary_lbl)
+        bar_mase_norm_path = ""
+        if "naive_mase" in df_subset.columns and df_subset["naive_mase"].notna().any():
+            bar_mase_norm_path = plot_bar_aggregate_mase(
+                df_subset, out_dir,
+                metric_label=f"{primary_lbl}, norm. vs seasonal-naive",
+                fname="bar_aggregate_mase_normalized.png",
+                normalize=True)
+        # Twin files on the OTHER gluonts metric (absolute + normalised), suffixed
+        # so the two metrics never clobber each other.
+        bar_mase_gluonts_path = bar_mase_gluonts_norm_path = ""
         if df_g_subset is not None and not df_g_subset.empty:
             bar_mase_gluonts_path = plot_bar_aggregate_mase(
                 df_g_subset, out_dir, metric_label="MASE (gluonts)",
                 fname="bar_aggregate_mase_gluonts.png")
-        bar_mase_gluonts_real_path = ""
+            if "naive_mase" in df_g_subset.columns and df_g_subset["naive_mase"].notna().any():
+                bar_mase_gluonts_norm_path = plot_bar_aggregate_mase(
+                    df_g_subset, out_dir,
+                    metric_label="MASE (gluonts), norm. vs seasonal-naive",
+                    fname="bar_aggregate_mase_gluonts_normalized.png",
+                    normalize=True)
+        bar_mase_gluonts_real_path = bar_mase_gluonts_real_norm_path = ""
         if df_gr_subset is not None and not df_gr_subset.empty:
             bar_mase_gluonts_real_path = plot_bar_aggregate_mase(
                 df_gr_subset, out_dir, metric_label="MASE (gluonts-real)",
                 fname="bar_aggregate_mase_gluonts_real.png")
-        # Leaderboard-faithful view: the gluonts MASE normalised by the seasonal-
-        # naive baseline per cell (Seasonal Naive = 1.0). This is the number that
-        # lines up with the HF GiftEval board.
-        bar_mase_gluonts_norm_path = ""
-        gl_df_for_norm = _resolve_gluonts_df(df_subset, df_g_subset, args.mase_metric)
-        if gl_df_for_norm is not None and not gl_df_for_norm.empty \
-                and "naive_mase" in gl_df_for_norm.columns:
-            bar_mase_gluonts_norm_path = plot_bar_aggregate_mase(
-                gl_df_for_norm, out_dir,
-                metric_label="MASE (gluonts, norm. vs seasonal-naive)",
-                fname="bar_aggregate_mase_gluonts_normalized.png",
-                normalize=True)
+            if "naive_mase" in df_gr_subset.columns and df_gr_subset["naive_mase"].notna().any():
+                bar_mase_gluonts_real_norm_path = plot_bar_aggregate_mase(
+                    df_gr_subset, out_dir,
+                    metric_label="MASE (gluonts-real), norm. vs seasonal-naive",
+                    fname="bar_aggregate_mase_gluonts_real_normalized.png",
+                    normalize=True)
         single_paths = [
             bar_mase_path,
+            bar_mase_norm_path,
             bar_mase_gluonts_path,
-            bar_mase_gluonts_real_path,
             bar_mase_gluonts_norm_path,
+            bar_mase_gluonts_real_path,
+            bar_mase_gluonts_real_norm_path,
             plot_bar_aggregate_time(df_subset, out_dir),
             plot_scatter(df_subset, "best_mase", "pred_mase",
                          "MASE — Best (oracle)", "MASE — Predictor",
@@ -3280,9 +3304,12 @@ def main() -> None:
     # overview + grand-total CSV from every model in the run dir, then return.
     if getattr(args, "rollup_only", False):
         out = args.output_dir or run_dir
-        write_run_rollup(df, out, plot_strategies=args.plot_strategies)
+        _primary_lbl = {"mase_gluonts": "MASE (gluonts)",
+                        "mase_gluonts_real": "MASE (gluonts-real)"}[args.mase_metric]
+        write_run_rollup(df, out, plot_strategies=args.plot_strategies,
+                         metric_label=_primary_lbl)
         write_run_time_rollup(df, out, plot_strategies=args.plot_strategies)
-        # Parallel gluonts overviews alongside the default-`mase` one.
+        # Twin overview on the other gluonts metric alongside the primary one.
         if df_g is not None:
             write_run_rollup(df_g, out, plot_strategies=args.plot_strategies,
                              suffix="_gluonts", metric_label="MASE (gluonts)")
@@ -3312,7 +3339,10 @@ def main() -> None:
     # invocations so single-model runs don't drop a stray one-point overview.
     if df["model_short"].nunique() > 1:
         out = args.output_dir or run_dir
-        write_run_rollup(df, out, plot_strategies=args.plot_strategies)
+        _primary_lbl = {"mase_gluonts": "MASE (gluonts)",
+                        "mase_gluonts_real": "MASE (gluonts-real)"}[args.mase_metric]
+        write_run_rollup(df, out, plot_strategies=args.plot_strategies,
+                         metric_label=_primary_lbl)
         write_run_time_rollup(df, out, plot_strategies=args.plot_strategies)
         if df_g is not None:
             write_run_rollup(df_g, out, plot_strategies=args.plot_strategies,

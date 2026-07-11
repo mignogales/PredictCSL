@@ -110,54 +110,41 @@ predictor-derived, so no TSFM re-inference):
   then re-runs the comparison with `--use-robust-timing` so the wall-clock figures
   use mean ± std.
 
-**Leaderboard-faithful MASE (`mase_gluonts`), computed alongside `mase`:**
-- **`gifteval_mase.py`** — leaderboard-faithful MASE primitives: gluonts'
-  `DEFAULT_SEASONALITIES` map (`D→1, W→1, H→24, S→3600, T→1440, M→12, Q→4`, with
-  `divmod` for multipliers) + per-instance `seasonal_error` (`mean(|x[m:]−x[:−m]|)`
-  over each series' own context). One auditable place for the definition.
-- **Stage 3** (`test_window_ablation_gifteval_v5.py`) now computes `mase_gluonts`
-  as a **first-class metric column** beside `mase` — it's the average of
-  per-instance ratios `mean_h(|y−ŷ|) / seasonal_error_instance`, vs `mase` =
-  `global_MAE / one pooled training-set seasonal-naive MAE` with the project's
-  custom `D→7, W→52` map. `GiftEvalCache` precomputes the per-instance seasonal
-  errors once; metrics/per-sample/`results.csv`/the ablation summary plots all
-  carry it. Pre-existing cells are **backfilled with no TSFM re-inference**
-  (`_backfill_mase_gluonts` divides the cached per-instance MAE by the
-  data-derived seasonal error), so a plain ablation re-run populates it cheaply.
-  Each `compare_*.npz` carries a parallel `real_curve_gluonts`.
-- **Stage 4** (`compare_window_strategies_gifteval.py`) takes
-  `--mase-metric {mase,mase_gluonts}` (default `mase`); with `mase_gluonts` it
-  drives the whole strategy comparison + **all flops/time-savings outputs** off
-  the gluonts curve. `run_all.py` exposes the same `--mase-metric`, routing its
-  per-model outputs to `strategy_comparison_gluonts/` and the rollup to
-  `general/rollup_gluonts/` so the two metrics never overwrite each other.
-- Even in a **default `mase` run**, when the gluonts curve is present stage 4
-  additionally scores every strategy on `mase_gluonts` (its own oracle-best
-  window) to: draw the general `bar_aggregate_mase.png` on `mase_gluonts`, and
-  emit a parallel `model_strategy_overview_gluonts.png` (+
-  `flops_savings_all_models_gluonts.csv`) beside the default-`mase` overview. No
-  extra inference — a second pass over the cached `compare_*.npz`
-  (`run_has_gluonts_curve` gates it).
-
-**Machinery-faithful MASE (`mase_gluonts_real`) — the third metric:**
-`mase_gluonts` is a *numpy port* of the leaderboard definition; `mase_gluonts_real`
-runs gluonts' **own** `evaluate_forecasts` + `ev.MASE` on real Forecast objects (the
-exact HF-GiftEval path). Validated to match the port to <1% (see
-`compare_mase_variants.py`). Threaded through the pipeline as a **third parallel
-metric**, mirroring `mase_gluonts` at every touchpoint:
-- **`gifteval_mase.py`** — `gluonts_leaderboard_mase(...)` (lazy gluonts import) +
-  `_build_gluonts_forecasts` / `_ListTestData`. Shared by stage 3 and the
-  standalone `compare_mase_variants.py`.
-- **Stage 3** — `GiftEvalCache` also captures per-instance forecast-start Periods
-  (`cache.starts`); on **fresh** inference `cell_mase_gluonts_real` runs the
-  machinery and fills the `mase_gluonts_real` column. **Cached cells** can't re-run
-  it (no stored forecasts) so they **stand in with the port** value (`--force 3`
-  recomputes the true value). Each `compare_*.npz` carries `real_curve_gluonts_real`.
-- **Stage 4 / `run_all.py`** — `--mase-metric` gains `mase_gluonts_real`, routing to
-  `strategy_comparison_gluonts_real/` + `general/rollup_gluonts_real/`. A default
-  `mase` run also emits the `*_gluonts_real` twins (`bar_aggregate_mase_gluonts_real.png`,
-  `model_strategy_overview_gluonts_real.png`, `flops_savings_all_models_gluonts_real.csv`)
-  when `run_has_gluonts_real_curve` finds the curve.
+**MASE metrics — exactly TWO drive everything (leaderboard parity is priority #1):**
+- **`mase_gluonts_real`** (the DEFAULT) — gluonts' **own** `evaluate_forecasts` +
+  `ev.MASE` on real Forecast objects: the exact HF-GiftEval leaderboard path.
+- **`mase_gluonts`** — a validated *numpy port* of the same definition (average of
+  per-instance ratios `mean_h(|y−ŷ|) / seasonal_error_instance`, gluonts season map
+  `D→1, W→1, H→24, …`), backfillable into cached cells with no TSFM re-inference.
+- The legacy project `mase` (pooled training-naive, custom `D→7, W→52` map) is
+  **no longer consumed by stage 4 / the rollups** — cells lacking the gluonts
+  curves are skipped loudly, never silently mixed.
+- **`gifteval_mase.py`** — the one auditable home for both definitions:
+  seasonality map + per-instance `seasonal_error` (port) and
+  `gluonts_leaderboard_mase(...)` / `_build_gluonts_forecasts` (machinery; lazy
+  gluonts import). Shared by stage 3, `period_window_eval.py` and
+  `compare_mase_variants.py`.
+- **Stage 3** (`test_window_ablation_gifteval_v5.py`) — computes both columns per
+  cell. Seasonal errors come from **raw contexts (NaNs preserved)** — `GiftEvalCache`
+  keeps `contexts_raw` for the metric paths and the NaN→0-filled `contexts` only
+  for model input (leaderboard exactness; `MASE_GLUONTS_VER = 3`). On **fresh**
+  inference `cell_mase_gluonts_real` runs the machinery; **cached cells** have no
+  stored forecasts so `_real` **stands in with the port** (marked
+  `_mase_gluonts_real_standin: true`; `--force 3` recomputes truly — needed for
+  exactness only on NaN-label `*_with_missing` cells, elsewhere port == machinery).
+  The naive baseline's `mase_gluonts_real` **runs the actual machinery** (it's the
+  normalisation denominator). Each `compare_*.npz` carries `real_curve_gluonts`
+  and `real_curve_gluonts_real`.
+- **Stage 4 / `run_all.py`** — `--mase-metric {mase_gluonts, mase_gluonts_real}`
+  (default `mase_gluonts_real`). The default **owns the plain**
+  `strategy_comparison/` subdir + `general/` rollup (the timing stage reads the
+  plain `comparison.csv`); `mase_gluonts` routes to `strategy_comparison_gluonts/`
+  + `general/rollup_gluonts/`. Whichever metric is primary, the OTHER is always
+  emitted as suffixed twin files (bars/overview/CSV/table). The headline
+  aggregate is the **leaderboard aggregation**: geomean over cells of
+  `MASE / seasonal-naive MASE` (same definition) —
+  `bar_aggregate_mase_normalized.png`, the `geomean_norm` stat, and the NORM
+  columns in `mase_change_table*.png` / `flops_savings_all_models*.csv`.
 
 **Master orchestrator:**
 - **`master_run_all.py`** — fuses *every* `run_all*` variant into one run while
@@ -202,11 +189,14 @@ python -m experiments.run_all_v4                 # Mamba predictor (needs mamba-
 python -m experiments.run_all_v4 --cheap         # + pin the cheap Mamba corner
 python -m experiments.run_all_5                   # + robust wall-clock timing stage
 python -m experiments.run_all_5 --repeats 10 --warmup 3
-# Leaderboard-faithful MASE (mase_gluonts). Step 1 backfills the metric into the
-# ablation cells WITHOUT TSFM re-inference (cells are cached); step 2 runs the
-# strategy comparison + flops-savings off the gluonts curve into *_gluonts dirs.
-python -m experiments.run_all --skip-stages 1 2 --force 3       # backfill mase_gluonts + default compare
-python -m experiments.run_all --skip-stages 1 2 3 --mase-metric mase_gluonts  # gluonts compare + flops savings
+# Refresh the gluonts metrics into cached ablation cells (cheap backfill of the
+# port + corrected seasonal errors + machinery naive baseline, NO TSFM
+# re-inference), then the default compare runs on mase_gluonts_real:
+python -m experiments.run_all --skip-stages 1 2
+# --force 3 re-infers stage 3, replacing port stand-ins with TRUE machinery
+# values (only matters for exactness on NaN-label *_with_missing cells):
+python -m experiments.run_all --skip-stages 1 2 --force 3
+python -m experiments.run_all --skip-stages 1 2 3 --mase-metric mase_gluonts  # port-scored compare -> *_gluonts dirs
 python -m experiments.master_run_all              # fuse ALL variants, no repeated stages
 python -m experiments.master_run_all --only-variants v1 v5
 ```

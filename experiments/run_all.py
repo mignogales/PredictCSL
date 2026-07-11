@@ -364,9 +364,9 @@ def stage_4_rollup(extra: Sequence[str], out_dir: str = None) -> float:
     """Cross-model final pass: one overview figure + flops_savings_all_models.csv
     spanning every model present in the shared run dir. No --models filter.
 
-    ``out_dir`` defaults to the run dir itself; the gluonts metric routes it to a
-    ``rollup_gluonts/`` subdir so its run-level artefacts never overwrite the
-    default-`mase` ones (which the per-model subdir split already protects)."""
+    ``out_dir`` defaults to the run dir itself (owned by the default
+    `mase_gluonts_real`); a `mase_gluonts` run routes it to ``rollup_gluonts/`` so
+    the two metrics' run-level artefacts never overwrite each other."""
     return _run(
         [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
          "--run-dir", ABLATION_GENERAL,
@@ -482,14 +482,15 @@ def parse_args() -> argparse.Namespace:
               "argument to force every active stage."),
     )
     p.add_argument(
-        "--mase-metric", choices=["mase", "mase_gluonts", "mase_gluonts_real"],
-        default="mase",
-        help=("Which MASE drives stage 4 (compare): the project's `mase` (default), "
-              "the ported leaderboard `mase_gluonts`, or the actual gluonts-machinery "
-              "`mase_gluonts_real`. The non-default metrics read their own curve and "
-              "write to a separate strategy_comparison_gluonts[_real]/ subdir so they "
-              "never collide. The ablation computes ALL columns, so this only affects "
-              "stage 4."),
+        "--mase-metric", choices=["mase_gluonts", "mase_gluonts_real"],
+        default="mase_gluonts_real",
+        help=("Which MASE drives stage 4 (compare). Exactly two exist: the ported "
+              "leaderboard `mase_gluonts` and the gluonts-machinery "
+              "`mase_gluonts_real` (default — the leaderboard-faithful one). Each "
+              "writes to its own strategy_comparison_gluonts[_real]/ subdir so "
+              "they never collide, and stage 4 always emits the other metric's "
+              "twin files alongside. The ablation computes ALL columns, so this "
+              "only affects stage 4."),
     )
     p.add_argument(
         "--short-context-mode", choices=["skip", "pad"], default="skip",
@@ -569,15 +570,17 @@ def main() -> None:
     else:
         ABLATION_GENERAL = os.path.join(ABLATION_ROOT, "general")
 
-    # The gluonts MASEs share the SAME ablation cells (just different metric
-    # columns) but each gets its own strategy-comparison subdir so its flops/time
-    # -savings outputs never overwrite the default-`mase` ones.
-    _MASE_SUBDIR_SUFFIX = {"mase_gluonts": "_gluonts",
-                           "mase_gluonts_real": "_gluonts_real"}
+    # Both metrics share the SAME ablation cells (just different metric columns).
+    # The default `mase_gluonts_real` (leaderboard-faithful) OWNS the plain
+    # strategy_comparison/ subdir — it replaces the legacy custom-`mase` outputs
+    # there, and downstream consumers that hardcode the plain path (the robust
+    # timing stage reads <display>/strategy_comparison/comparison.csv) keep
+    # working. Only the non-default port gets a suffixed subdir.
+    _MASE_SUBDIR_SUFFIX = {"mase_gluonts": "_gluonts"}
     if args.mase_metric in _MASE_SUBDIR_SUFFIX:
         STRATEGY_SUBDIR = STRATEGY_SUBDIR + _MASE_SUBDIR_SUFFIX[args.mase_metric]
-        print(Fore.CYAN + f"MASE metric: {args.mase_metric}  ->  compare subdir {STRATEGY_SUBDIR}"
-              + Fore.RESET)
+    print(Fore.CYAN + f"MASE metric: {args.mase_metric}  ->  compare subdir {STRATEGY_SUBDIR}"
+          + Fore.RESET)
 
     if args.only_stages and args.skip_stages:
         raise SystemExit("Use either --skip-stages or --only-stages, not both.")
@@ -671,8 +674,10 @@ def main() -> None:
         if "4" in active:
             if not _QUIET:
                 _banner("ALL MODELS  —  cross-model overview")
-            _rollup_subdir = {"mase_gluonts": "rollup_gluonts",
-                              "mase_gluonts_real": "rollup_gluonts_real"}
+            # Default `mase_gluonts_real` owns the plain general/ rollup (the
+            # canonical, leaderboard-faithful overview); the port goes to its own
+            # subdir so the two never overwrite each other.
+            _rollup_subdir = {"mase_gluonts": "rollup_gluonts"}
             rollup_dir = (os.path.join(ABLATION_GENERAL, _rollup_subdir[args.mase_metric])
                           if args.mase_metric in _rollup_subdir else ABLATION_GENERAL)
             stage_4_rollup(extras_by_stage["4"], out_dir=rollup_dir)
