@@ -261,16 +261,26 @@ def main() -> None:
         if reason_counts.get(reason):
             print(f"  {reason:<20} {reason_counts[reason]}")
 
-    # cells dropped for EVERY model -> systemic (bad config guess / gift_eval
-    # rejection), vs dropped for some models only -> incomplete stage 3 there.
+    # cells dropped for EVERY model -> systemic. Split intentional exclusions
+    # (run=False in datasets_config, e.g. cells too short for the WINDOW_GRID) from
+    # genuine gaps (bad config guess / gift_eval rejection / incomplete stage 3).
     by_cell: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(list)
     for model_short, disp, term, reason in all_leftover:
         by_cell[(disp, term)].append((model_short, reason))
     systemic = {c: v for c, v in by_cell.items() if len(v) == len(model_dirs)}
-    if systemic:
+    intentional = {c: v for c, v in systemic.items()
+                   if all(r == "disabled_in_config" for _, r in v)}
+    genuine = {c: v for c, v in systemic.items() if c not in intentional}
+    if intentional:
+        print(Fore.CYAN + f"\nCells intentionally excluded for ALL models "
+              "(run=False in datasets_config — expected, not a gap):" + Fore.RESET)
+        for (disp, term) in sorted(intentional):
+            print(f"  {disp:<22} t={term:<7} disabled_in_config")
+    if genuine:
         print(Fore.CYAN + f"\nCells missing for ALL {len(model_dirs)} models "
-              "(systemic — config/gift_eval, not a per-model gap):" + Fore.RESET)
-        for (disp, term), v in sorted(systemic.items()):
+              "(systemic — config/gift_eval/incomplete stage 3, NOT intentional):"
+              + Fore.RESET)
+        for (disp, term), v in sorted(genuine.items()):
             reasons = ", ".join(sorted(set(r for _, r in v)))
             print(f"  {disp:<22} t={term:<7} {reasons}")
 
