@@ -31,6 +31,13 @@ import traceback
 from typing import List, Optional, Tuple
 
 import numpy as np
+from dotenv import load_dotenv
+
+# gift_eval resolves its data dir from a storage env var (GIFT_EVAL / …), read at
+# Dataset construction. Stage 3 loads it from .env at import; mirror that here so
+# the probe doesn't die with "expected str … not NoneType" before it even sees
+# the dataset.
+load_dotenv()
 
 from gift_eval.data import Dataset as GiftEvalDataset
 from experiments import datasets_config
