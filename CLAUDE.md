@@ -156,9 +156,10 @@ predictor-derived, so no TSFM re-inference):
 
 ## Models labeled (the TSFMs under study)
 
-Chronos2-Small, Chronos2-Synth, ChronosBolt-Small, Moirai2-Small,
-TimesFM2.5-200M, PatchTST-FM-R1, Sundial-Base-128M, TimeMoE-200M.
-Each has a `load_*` + `predict_*` wrapper in `build_context_length_dataset.py`.
+Chronos2-Small/Synth/Base, ChronosBolt-Small/Base, Moirai2-Small,
+TimesFM2.5-200M, PatchTST-FM-R1, Sundial-Base-128M, TimeMoE-200M, Toto-2.0-313m,
+FlowState-R1, TiRex. Each has a `load_*` + `predict_*` wrapper in
+`build_context_length_dataset.py` (catalog in `models_config.py`, append-only).
 
 ### Model-specific gotchas baked into the code
 - **PatchTST-FM** has a fixed 8192 context and no mask input → genuine samples are
@@ -170,6 +171,20 @@ Each has a `load_*` + `predict_*` wrapper in `build_context_length_dataset.py`.
   env (`transformers==4.40.1`); the main env's 4.56 breaks them. There's a
   `_patch_dynamic_cache_seen_tokens()` shim restoring removed `DynamicCache` APIs.
 - **Sundial** caps context at 2880; **TimeMoE** caps context+horizon at 4096.
+- **FlowState** is cadence-conditioned: stage 3 / every GiftEval consumer passes a
+  per-dataset `scale_factor` (`flowstate_scale_factor()` in the v5 ablation +
+  `cache.flowstate_scale` — exact port of IBM's leaderboard recipe: 24 /
+  samples-per-cycle, domain decides daily→weekly-vs-yearly, `l2c` gets /7).
+  Stage 1 keeps the neutral 1.0 (synthetic data has no cadence). The median MUST
+  be read from `quantile_outputs` — on current tsfm_public the r1.1 config's
+  `prediction_type='quantile'` is coerced to `'mean'`, making
+  `prediction_outputs` a 3-D quantile-weighted mean (old tsfm_public 4-D
+  quantile output kept as fallback).
+- **TiRex**'s `forecast()` ALWAYS returns CPU tensors → wrappers move the median
+  back to `device`. Internally it truncates AND NaN-left-pads every context to
+  exactly its 2048 train length, so accuracy varies with the window but compute
+  does not: wall-clock is flat across windows and the FLOPs column is a loose
+  upper bound — don't sell context-length compute savings for TiRex.
 
 ## Top-level files (not part of the pipeline)
 - `AR_DIVERSITY_CHANGES.md`, `diagnose_ar_periodicity.md` — design notes on the

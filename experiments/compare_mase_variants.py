@@ -182,7 +182,8 @@ def _forecast_padded(cache, family, handle, model_id, cap, horizon, args):
     results = []
     for L, batches_L, _ax, _ay, idx_L in groups:
         fr_L, tgts_L = _forecast_cell(family, handle, model_id, batches_L, L,
-                                      horizon, args.device, args.batch_size)
+                                      horizon, args.device, args.batch_size,
+                                      flowstate_scale=cache.flowstate_scale)
         results.append((idx_L, fr_L, tgts_L))
     return _merge_grouped(results, cache.n_total, horizon, args.device)
 
@@ -231,7 +232,8 @@ def evaluate_config(display, term, model_id, family, handle, args):
         batches, _ax, _ay, valid_indices = cache.build_batches(
             window, args.batch_size, args.device, pin_memory=(args.device == "cuda"))
         fr, tgts = _forecast_cell(family, handle, model_id, batches, window, horizon,
-                                  args.device, args.batch_size)
+                                  args.device, args.batch_size,
+                                  flowstate_scale=cache.flowstate_scale)
         served_indices = valid_indices
 
     starts_served = [starts[i] for i in served_indices]

@@ -359,7 +359,8 @@ def evaluate_one(
 
         fr_w, tgts_w = _forecast_cell(
             model_family, ensure_handle(), model_id, batches,
-            w, horizon, device, args.batch_size)
+            w, horizon, device, args.batch_size,
+            flowstate_scale=cache.flowstate_scale)
         results.append((grp, fr_w, tgts_w))
 
     fr, tgts = _merge_grouped(results, valid_idx.size, horizon, device)

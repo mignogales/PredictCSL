@@ -103,11 +103,74 @@ TOTO_PATCH_SIZE          = 32    # forecast() context length must be a multiple 
 FLOWSTATE_REVISION            = "r1.1"  # GIFT-Eval checkpoint (mirrors stage-1)
 FLOWSTATE_NUM_QUANTILES       = 9
 FLOWSTATE_MEDIAN_QUANTILE_IDX = 4       # middle of the 9 output quantiles (0.5)
-FLOWSTATE_SCALE_FACTOR        = 1.0     # neutral (treat input cadence as the base)
+FLOWSTATE_SCALE_FACTOR        = 1.0     # fallback only (unknown cadence)
 FLOWSTATE_MAX_CONTEXT         = 4096    # skip wider windows (mirrors stage-1 label cap)
 TIREX_NUM_QUANTILES           = 9       # TiRex quantile head: [0.1..0.9]
 TIREX_MEDIAN_QUANTILE_IDX     = 4       # middle of the 9 quantiles (0.5)
 TIREX_MAX_CONTEXT             = 2048    # TiRex pretraining context (mirrors stage-1 cap)
+
+# ---- FlowState per-dataset scale factor (leaderboard parity) -----------------
+# FlowState is cadence-conditioned: its S5 discretization step and decoder basis
+# are stretched by `scale_factor` = pretraining base seasonality (24) / samples
+# per dominant cycle. IBM's #1 GIFT-Eval submission sets it per dataset
+# (granite-tsfm notebooks/hfdemo/flowstate/gift_wrapper.py + get_fixed_factor in
+# tsfm_public/models/flowstate/utils/utils.py); running everything at 1.0
+# measures a different, handicapped model. Exact port of their recipe:
+#   * frequency -> samples/cycle (sub-daily -> daily cycle, D -> weekly cycle in
+#     human-rhythm domains else yearly, W -> yearly, M -> 12, Q/A -> 4),
+#   * domain decides daily data's cycle: Transport/Healthcare/Sales have weekly
+#     rhythm (their `has_weekly`); the base-name set below is exactly the
+#     gift-eval dataset_properties.json entries in those three domains,
+#   * bizitobs_l2c has no daily cycle -> extra /7 (their `no_daily` special case).
+_FLOWSTATE_BASE_SEASON = 24.0
+_FLOWSTATE_WEEKLY_BASES = {
+    "hospital", "covid_deaths", "us_births",            # Healthcare
+    "car_parts", "restaurant", "hierarchical_sales",    # Sales
+    "loop_seattle", "sz_taxi", "m_dense",               # Transport
+}
+
+
+def flowstate_scale_factor(freq: str, ge_name: str = "") -> float:
+    """IBM's GIFT-Eval `scale_factor` recipe for one dataset (see block comment).
+
+    `freq` is the gluonts/pandas offset string (`"15T"`, `"H"`, `"W-SUN"`, ...);
+    `ge_name` the gift_eval config name (`"LOOP_SEATTLE/D"`), whose base decides
+    the daily-data domain rule. Unknown frequencies warn loudly and fall back to
+    the neutral 1.0 rather than killing a multi-model run."""
+    base_name = ge_name.split("/")[0].lower()
+    if base_name.endswith("_with_missing"):
+        base_name = base_name[: -len("_with_missing")]
+    has_weekly = base_name in _FLOWSTATE_WEEKLY_BASES
+
+    head = freq.split("-")[0].strip()                 # "W-SUN" -> "W"
+    digits = "".join(ch for ch in head if ch.isdigit())
+    n = int(digits) if digits else 1
+    unit = head[len(digits):].upper()
+    # new-style pandas aliases -> the old-style ones the port matches on
+    unit = {"MIN": "T", "ME": "M", "QE": "Q", "YE": "A", "Y": "A"}.get(unit, unit)
+
+    if unit == "S":
+        factor = _FLOWSTATE_BASE_SEASON / (3600.0 / n)          # daily... hourly cycle
+    elif unit == "T":
+        factor = _FLOWSTATE_BASE_SEASON / (24.0 * 60.0 / n)     # daily cycle
+    elif unit == "H":
+        factor = _FLOWSTATE_BASE_SEASON / (24.0 / n)            # daily cycle
+    elif unit == "D":
+        factor = _FLOWSTATE_BASE_SEASON / (7.0 if has_weekly else 365.0)
+        factor *= n
+    elif unit == "W":
+        factor = _FLOWSTATE_BASE_SEASON / (365.0 / 7.0)         # yearly cycle
+    elif unit == "M":
+        factor = _FLOWSTATE_BASE_SEASON / 12.0
+    elif unit in ("Q", "A"):
+        factor = _FLOWSTATE_BASE_SEASON / 4.0   # upstream uses 4 for A too (sic)
+    else:
+        print(Fore.RED + f"  [flowstate] unknown freq {freq!r} -> scale_factor=1.0"
+              + Fore.RESET)
+        return FLOWSTATE_SCALE_FACTOR
+    if "l2c" in base_name:
+        factor /= 7.0                           # weekly-only season (no daily cycle)
+    return factor
 
 N_BEST_WORST = 10
 PLOT_METRICS = ["mae", "mse", "rmse", "mase", "mase_gluonts", "smape", "crps"]
@@ -168,6 +231,9 @@ class GiftEvalCache:
         self.freq: str = ge_dataset.freq
         self.horizon: int = ge_dataset.prediction_length
         self.season: int = _get_seasonality(self.freq)
+        # Cadence conditioning for FlowState (every other family ignores it).
+        self.flowstate_scale: float = flowstate_scale_factor(
+            self.freq, getattr(ge_dataset, "name", ""))
 
         contexts: List[np.ndarray] = []
         contexts_raw: List[np.ndarray] = []
@@ -1033,28 +1099,39 @@ def load_flowstate(model_id, device):
     return model
 
 
-def predict_flowstate(model, batches, horizon, device):
+def predict_flowstate(model, batches, horizon, device,
+                      scale_factor=FLOWSTATE_SCALE_FACTOR):
     """Quantile forecast (FlowState r1.1); return the per-step median (B, horizon).
 
-    Mirrors stage-1's predict_flowstate: ``x`` is (B, W, 1), exactly FlowState's
-    ``batch_first=True`` layout, so it's passed through unreshaped.
-    ``prediction_outputs`` carries the quantile axis: (B, Q=9, H, C); take the
-    median quantile (index 4). A 3-D (B, H, C) point-forecast output is also
-    handled for forward-compatibility with other checkpoints.
+    ``x`` is (B, W, 1), exactly FlowState's ``batch_first=True`` layout, so it's
+    passed through unreshaped. ``scale_factor`` is the per-dataset cadence factor
+    (see ``flowstate_scale_factor``); callers with a GiftEvalCache pass
+    ``cache.flowstate_scale``. The median comes from ``quantile_outputs``
+    (B, Q=9, H, C), index 4 — reading ``prediction_outputs`` instead is a trap on
+    current tsfm_public: the r1.1 config's ``prediction_type='quantile'`` is
+    deprecated there and silently coerced to ``'mean'``, so ``prediction_outputs``
+    is the quantile-weighted MEAN (3-D), not the median every other wrapper
+    contributes. Older tsfm_public (no ``quantile_outputs``) put the quantiles in
+    ``prediction_outputs`` as 4-D (B, Q, H, C) — kept as fallback; a 3-D output
+    there is a true point forecast.
     """
     def step(x, y):
         series = x.to(device, non_blocking=True)               # (B, W, 1)
         out = model(
             series,
-            scale_factor=FLOWSTATE_SCALE_FACTOR,
+            scale_factor=scale_factor,
             prediction_length=horizon,
             batch_first=True,
         )
-        pf = out.prediction_outputs
-        if pf.dim() == 4:                                      # (B, Q, H, C)
-            med = pf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0]
-        else:                                                  # (B, H, C)
-            med = pf[:, :horizon, 0]
+        qf = getattr(out, "quantile_outputs", None)
+        if qf is not None:                                     # (B, Q, H, C)
+            med = qf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0]
+        else:
+            pf = out.prediction_outputs
+            if pf.dim() == 4:                                  # (B, Q, H, C)
+                med = pf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0]
+            else:                                              # (B, H, C)
+                med = pf[:, :horizon, 0]
         return {"median": med.to(torch.float32)}, y[:, :, 0].to(device, non_blocking=True)
     out, all_tgts = _run_batches(batches, "  FlowState", step)
     return ForecastResult(median=out["median"]), all_tgts
@@ -1075,16 +1152,18 @@ def predict_tirex(model, batches, horizon, device):
     """Quantile forecast (TiRex); return the per-step median (B, horizon).
 
     Mirrors stage-1's predict_tirex: forecast() takes a (B, context) tensor and
-    returns (quantiles, mean), where quantiles is (B, horizon, 9) over levels
-    [0.1..0.9]; take the 0.5 row (index 4). NOTE: quantile axis order/levels
-    follow TiRex's docs, not its package source — verify against the installed
-    `tirex` before a full run.
+    returns (quantiles, mean) with quantiles (B, horizon, 9) over levels
+    [0.1..0.9] — verified against the package source (tirex/models/tirex.py
+    computes its own "mean" as the 0.5 column, our index 4). forecast() ALWAYS
+    returns CPU tensors (its _format_output calls .cpu()), so the median must be
+    moved back to `device` — downstream stitching/metrics run there.
     """
     def step(x, y):
         seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
         quantiles, _mean = model.forecast(context=seqs, prediction_length=horizon)
         median = quantiles[:, :horizon, TIREX_MEDIAN_QUANTILE_IDX]
-        return {"median": median.to(torch.float32)}, y[:, :, 0].to(device, non_blocking=True)
+        return ({"median": median.to(device=device, dtype=torch.float32)},
+                y[:, :, 0].to(device, non_blocking=True))
     out, all_tgts = _run_batches(batches, "  TiRex", step)
     return ForecastResult(median=out["median"]), all_tgts
 
@@ -1513,12 +1592,14 @@ def load_handle(model_family: str, model_id: str, device: str):
 
 
 def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
-                   device, batch_size):
+                   device, batch_size, flowstate_scale=FLOWSTATE_SCALE_FACTOR):
     """Run one model family on a uniform-width set of batches.
 
     `width` is the context length these batches share; moirai/timesfm recompile
     against it. `handle` is the loaded base model (None for timesfm — recompiled
-    here — and context_parroting). Returns (ForecastResult, tgts).
+    here — and context_parroting). `flowstate_scale` is FlowState's per-dataset
+    cadence factor (`cache.flowstate_scale`); ignored by every other family.
+    Returns (ForecastResult, tgts).
     """
     if model_family == "chronos_bolt":
         return predict_chronos_bolt(handle, batches, horizon, device)
@@ -1556,14 +1637,15 @@ def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
     if model_family == "toto":
         return predict_toto(handle, batches, horizon, device)
     if model_family == "flowstate":
-        return predict_flowstate(handle, batches, horizon, device)
+        return predict_flowstate(handle, batches, horizon, device,
+                                 scale_factor=flowstate_scale)
     if model_family == "tirex":
         return predict_tirex(handle, batches, horizon, device)
     raise ValueError(f"Unknown model family: {model_family}")
 
 
 def build_forward(model_family, handle, model_id, batches, width, horizon,
-                  device, batch_size):
+                  device, batch_size, flowstate_scale=FLOWSTATE_SCALE_FACTOR):
     """Do all per-window SETUP now (weight load / compile / forecaster build) and
     return a zero-arg ``forward()`` that runs ONLY the forward pass over ``batches``.
 
@@ -1609,7 +1691,8 @@ def build_forward(model_family, handle, model_id, batches, width, horizon,
     # Persistent-handle families (+ context_parroting): _forecast_cell is already a
     # pure forward, so no separate setup is needed.
     return (lambda: _forecast_cell(model_family, handle, model_id, batches,
-                                   width, horizon, device, batch_size)), _noop
+                                   width, horizon, device, batch_size,
+                                   flowstate_scale=flowstate_scale)), _noop
 
 
 def _merge_grouped(results, n_total, horizon, device):
@@ -2003,7 +2086,8 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     for L, batches_L, _ax, _ay, idx_L in groups:
                         fr_L, tgts_L = _forecast_cell(
                             model_family, ensure_handle(), model_id, batches_L,
-                            L, horizon, device, args.batch_size)
+                            L, horizon, device, args.batch_size,
+                            flowstate_scale=cache.flowstate_scale)
                         results.append((idx_L, fr_L, tgts_L))
                     n_valid = cache.n_total
                     fr, tgts = _merge_grouped(results, n_valid, horizon, device)
@@ -2028,7 +2112,8 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     t_start = time.perf_counter()
                     fr, tgts = _forecast_cell(
                         model_family, ensure_handle(), model_id, batches,
-                        window_size, horizon, device, args.batch_size)
+                        window_size, horizon, device, args.batch_size,
+                        flowstate_scale=cache.flowstate_scale)
                     _sync()
                     elapsed = time.perf_counter() - t_start
                     # Skip mode serves only instances with context >= window, in
