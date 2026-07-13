@@ -218,7 +218,7 @@ def _measure_window(cache: GiftEvalCache, model_family: str, ensure_handle,
 
     forward, teardown = build_forward(
         model_family, ensure_handle(), model_id, batches, window_size, horizon,
-        device, batch_size)
+        device, batch_size, flowstate_scale=cache.flowstate_scale)
     try:
         for _ in range(warmup):
             forward()

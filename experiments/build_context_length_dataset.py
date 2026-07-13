@@ -182,7 +182,10 @@ FLOWSTATE_NUM_QUANTILES         = 9
 FLOWSTATE_MEDIAN_QUANTILE_IDX   = 4       # middle of the 9 output quantiles
 # scale_factor relates the data's seasonality to FlowState's pretraining base
 # (24 steps): scale = 24 / seasonality_steps. Synthetic series carry no fixed
-# sampling rate, so 1.0 (treat input cadence as the base) is the neutral choice.
+# sampling rate, so 1.0 (treat input cadence as the base) is the neutral choice
+# HERE ONLY. On real data this must be per-dataset — stage 3 computes it from
+# the GiftEval frequency/domain via flowstate_scale_factor() (IBM's leaderboard
+# recipe); running GiftEval at 1.0 measures a handicapped FlowState.
 FLOWSTATE_SCALE_FACTOR          = 1.0
 # Pretraining context is 4096 (r1.1). FlowState is a *linear-cost* SSM so longer
 # windows won't blow up memory, but fidelity past the trained context is
@@ -814,13 +817,15 @@ def predict_flowstate(model, x: torch.Tensor, horizon: int, device: str) -> torc
     """Quantile forecast; return the per-step median (B, horizon).
 
     ``x`` is (B, W, 1) == (batch, context, channels), which is exactly FlowState's
-    ``batch_first=True`` layout, so it's passed through unreshaped. On the r1.1
-    checkpoint ``prediction_outputs`` carries the quantile axis explicitly:
-    ``(B, Q=9, H, C)`` — see the model card example, which prints
-    ``prediction_outputs.shape == (32, 9, 48, 1)``. We take the median quantile
-    (index 4 of 9) as the point forecast to stay consistent with the other
-    wrappers. A 3-D ``(B, H, C)`` output (point forecast, no quantile axis) is
-    also handled for forward-compatibility with other checkpoints.
+    ``batch_first=True`` layout, so it's passed through unreshaped. The median is
+    read from ``quantile_outputs`` (B, Q=9, H, C), index 4 — NOT from
+    ``prediction_outputs``: on current tsfm_public the r1.1 config's
+    ``prediction_type='quantile'`` is deprecated and coerced to ``'mean'``, so
+    ``prediction_outputs`` is a 3-D quantile-weighted MEAN there, not the median
+    every other wrapper contributes. Older tsfm_public (no ``quantile_outputs``
+    attr) exposed the quantiles as a 4-D ``prediction_outputs`` (the model card's
+    ``(32, 9, 48, 1)``) — kept as the fallback; a 3-D output on that path is a
+    true point forecast.
     """
     series = x.to(device, non_blocking=True)               # (B, W, 1)
     out = model(
@@ -829,11 +834,15 @@ def predict_flowstate(model, x: torch.Tensor, horizon: int, device: str) -> torc
         prediction_length=horizon,
         batch_first=True,
     )
-    pf = out.prediction_outputs
-    if pf.dim() == 4:                                       # (B, Q, H, C)
-        med = pf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0]
-    else:                                                  # (B, H, C)
-        med = pf[:, :horizon, 0]
+    qf = getattr(out, "quantile_outputs", None)
+    if qf is not None:                                     # (B, Q, H, C)
+        med = qf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0]
+    else:
+        pf = out.prediction_outputs
+        if pf.dim() == 4:                                  # (B, Q, H, C)
+            med = pf[:, FLOWSTATE_MEDIAN_QUANTILE_IDX, :horizon, 0]
+        else:                                              # (B, H, C)
+            med = pf[:, :horizon, 0]
     return med.to(torch.float32)                           # (B, horizon)
 
 
@@ -854,15 +863,16 @@ def predict_tirex(model, x: torch.Tensor, horizon: int, device: str) -> torch.Te
     TiRex takes a (batch, context) tensor and returns (quantiles, mean), where
     quantiles is (B, horizon, 9) over levels [0.1..0.9]; we take the 0.5 row
     (index 4) as the point forecast to stay consistent with the other wrappers.
-
-    NOTE: the quantile axis order/levels below follow TiRex's docs, not its
-    package source — verify against the installed `tirex` (quantiles shape and
-    median index) before a full run.
+    Verified against the package source: tirex/models/tirex.py derives its own
+    "mean" as exactly that 0.5 column. forecast() ALWAYS returns CPU tensors
+    (its _format_output calls .cpu() unconditionally), so the median must be
+    moved back to `device` — forecast_window scatters it into a `device`-side
+    output buffer, which raises on a CPU source.
     """
     seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
     quantiles, _mean = model.forecast(context=seqs, prediction_length=horizon)
     median = quantiles[:, :horizon, TIREX_MEDIAN_QUANTILE_IDX]
-    return median.to(torch.float32)                        # (B, horizon)
+    return median.to(device=device, dtype=torch.float32)   # (B, horizon)
 
 
 # ==============================================================================
