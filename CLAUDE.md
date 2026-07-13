@@ -110,6 +110,32 @@ predictor-derived, so no TSFM re-inference):
   then re-runs the comparison with `--use-robust-timing` so the wall-clock figures
   use mean ± std.
 
+**Synthetic single-factor sweeps (standalone, NOT part of run_all\*):**
+- **`synth_param_sweeps.py`** — per-TSFM plots of MAE vs **normalized context**
+  (context/parameter). Twelve experiments, each sweeping ONE generative factor
+  in minimal isolated series (factor + noise only); full designs + hypotheses
+  in **`SYNTH_SWEEPS.md`**. Core seven: `period` (context/T), `seasonality`
+  (composite repeating profile, context/S), `ar_order` (AR(p) with dominant
+  pole matched to a target ACF timescale τ; curves per order, context/τ),
+  `memory` (AR(1), τ = 1/(1−φ), context/τ), `delay` (trigger→response Hann
+  bumps at lag d — patch-wide, not spikes; one response planted in the
+  horizon, context/d), `regime` (fixed regime duration D, last boundary
+  exactly D before forecast time, context/D), `horizon` (fixed signal,
+  context/h). Extension five: `break_age` (ONE change point at age A —
+  deconfounds regime age from duration; error should rise past context/A = 1;
+  the most on-thesis probe), `snr` (fixed T=256, noise σ swept — does the
+  saturation knee shift right ∝ σ²?), `multiscale` (inner T=64 wave with a
+  k-periodic amplitude envelope → knee at context/(k·T) ≈ 1?), `period_drift`
+  (OU log-period with timescale M — frequency staleness, context/M),
+  `missing_gap` (mean-filled gap of length G at [end−1.5G, end−0.5G),
+  context/G; appendix — tests constant spans, not native NaN handling).
+  Contexts sit on a RATIO grid (context = r × parameter, r ∈ 0.25…16) so
+  curves from different parameter values align on the same x-axis. Series are
+  seeded per (experiment, bin) — identical across models. Reuses stage-1
+  loaders/`_forecast_uniform` + context caps; (model, experiment) cell queue
+  across GPUs with done-markers; `--plot-only` regenerates plots. Output:
+  `logs/experiments/synth_param_sweeps/`.
+
 **MASE metrics — exactly TWO drive everything (leaderboard parity is priority #1):**
 - **`mase_gluonts_real`** (the DEFAULT) — gluonts' **own** `evaluate_forecasts` +
   `ev.MASE` on real Forecast objects: the exact HF-GiftEval leaderboard path.
@@ -214,6 +240,9 @@ python -m experiments.run_all --skip-stages 1 2 --force 3
 python -m experiments.run_all --skip-stages 1 2 3 --mase-metric mase_gluonts  # port-scored compare -> *_gluonts dirs
 python -m experiments.master_run_all              # fuse ALL variants, no repeated stages
 python -m experiments.master_run_all --only-variants v1 v5
+python -m experiments.synth_param_sweeps          # single-factor sweeps, run set
+python -m experiments.synth_param_sweeps --models Sundial-Base-128M TimeMoE-200M  # legacy env
+python -m experiments.synth_param_sweeps --experiments period delay --plot-only
 ```
 Stage 1 alone: `python -m experiments.build_context_length_dataset --model-idx <i>`.
 Timing stage alone: `python -m experiments.benchmark_window_timing_gifteval --run-dir logs/experiments/window_ablation_gifteval/general`.
