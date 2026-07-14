@@ -588,7 +588,14 @@ def _backfill_mase_gluonts(dataset_display, model_short, term, window_size,
     if vi.shape[0] != per_mae.shape[0]:
         return None
     se = cache.seasonal_errors_gluonts[vi]
-    return float(np.mean(per_mae / se))
+    # Mirror compute_mase_gluonts' instance masking: an instance with no valid
+    # horizon points (all-NaN labels on *_with_missing-style cells) has NaN
+    # per-instance MAE — drop it instead of letting one NaN poison the cell mean
+    # (which left the whole gluonts curve NaN and the cell out of stage 4).
+    ok = np.isfinite(per_mae) & np.isfinite(se) & (se > 0)
+    if not ok.any():
+        return None
+    return float(np.mean(per_mae[ok] / se[ok]))
 
 
 # ==============================================================================
