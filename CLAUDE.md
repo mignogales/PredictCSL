@@ -169,7 +169,10 @@ predictor-derived, so no TSFM re-inference):
   model, both on the primary metric —
   `bar_aggregate_mase_gluonts.png` (absolute) and
   `bar_aggregate_mase_gluonts_normalized.png` (÷ same-definition Seasonal-Naive,
-  =1.0 line — the leaderboard-faithful headline). Every CSV /
+  =1.0 line — the leaderboard-faithful headline). The minimal bars hold the core
+  full/best/pred trio ONLY: appending period/v3/v4 bars dropna's the rows to that
+  strategy's coverage, silently shrinking n (95→80) — extra-strategy bars exist
+  solely under `--all-figures`. Every CSV /
   `summary_stats.json` still emits. `--all-figures` restores the historical set
   (metric twins — in that mode `_gluonts` in a filename means the PORT —
   scatters, histograms, per-dataset bars, rollup overview/table figures). The
