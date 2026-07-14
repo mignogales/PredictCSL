@@ -165,12 +165,17 @@ predictor-derived, so no TSFM re-inference):
   (default `mase_gluonts_real`). The default **owns the plain**
   `strategy_comparison/` subdir + `general/` rollup (the timing stage reads the
   plain `comparison.csv`); `mase_gluonts` routes to `strategy_comparison_gluonts/`
-  + `general/rollup_gluonts/`. Whichever metric is primary, the OTHER is always
-  emitted as suffixed twin files (bars/overview/CSV/table). The headline
-  aggregate is the **leaderboard aggregation**: geomean over cells of
-  `MASE / seasonal-naive MASE` (same definition) —
-  `bar_aggregate_mase_normalized.png`, the `geomean_norm` stat, and the NORM
-  columns in `mase_change_table*.png` / `flops_savings_all_models*.csv`.
+  + `general/rollup_gluonts/`. **Figures are minimal by default**: exactly two per
+  model, both on the primary metric —
+  `bar_aggregate_mase_gluonts.png` (absolute) and
+  `bar_aggregate_mase_gluonts_normalized.png` (÷ same-definition Seasonal-Naive,
+  =1.0 line — the leaderboard-faithful headline). Every CSV /
+  `summary_stats.json` still emits. `--all-figures` restores the historical set
+  (metric twins — in that mode `_gluonts` in a filename means the PORT —
+  scatters, histograms, per-dataset bars, rollup overview/table figures). The
+  headline aggregate is the **leaderboard aggregation**: geomean over cells of
+  `MASE / seasonal-naive MASE` (same definition) — the normalized bar figure, the
+  `geomean_norm` stat, and the NORM columns in `flops_savings_all_models*.csv`.
 
 **Master orchestrator:**
 - **`master_run_all.py`** — fuses *every* `run_all*` variant into one run while

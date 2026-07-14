@@ -40,6 +40,15 @@ Outputs (written to <run_dir>/models/<model_short>/strategy_comparison/)
   time_savings.csv            total measured forward-pass time saved vs full + geomean
                               MASE drop, per strategy (Stage 6, twin of flops_savings)
 
+FIGURES — by default only TWO are emitted, both on the primary --mase-metric
+(default `mase_gluonts_real`, the leaderboard machinery):
+  bar_aggregate_mase_gluonts.png             absolute MASE bars per strategy
+  bar_aggregate_mase_gluonts_normalized.png  each cell ÷ its same-definition
+                                             Seasonal-Naive, then aggregated — the
+                                             leaderboard-faithful figure (=1.0 line)
+Everything below only appears with --all-figures (note: in that mode the
+`_gluonts` suffix reverts to meaning the PORT twin, plain = primary):
+
 Run-level (at <run_dir>/, one figure for the whole run; via --rollup-only)
 ----------------------------------------------------
   flops_savings_all_models.csv   per-(model,strategy) savings + a grand TOTAL row
@@ -1183,7 +1192,8 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
 
 def write_run_rollup(df: pd.DataFrame, out_dir: str,
                      plot_strategies: Optional[List[str]] = None,
-                     suffix: str = "", metric_label: str = "MASE") -> None:
+                     suffix: str = "", metric_label: str = "MASE",
+                     figures: bool = True) -> None:
     """Cross-model roll-up: per-(model, strategy) FLOPs savings + MASE change, a
     grand TOTAL row per strategy, the single overview figure, and the console
     summary.  Writes ``flops_savings_all_models{suffix}.csv`` and
@@ -1213,12 +1223,14 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str,
     rollup = pd.concat(rollup_rows, ignore_index=True)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Single run-level overview figure: each (model, strategy) point.
-    overview_path = plot_model_strategy_overview(rollup, out_dir,
-                                                 strategies=plot_strategies,
-                                                 suffix=suffix, metric_label=metric_label)
-    if overview_path:
-        print(Fore.GREEN + f"\nSaved run-level overview: {overview_path}" + Fore.RESET)
+    # Single run-level overview figure: each (model, strategy) point. Skipped in
+    # the default minimal-figures mode (the CSV + console totals always emit).
+    if figures:
+        overview_path = plot_model_strategy_overview(rollup, out_dir,
+                                                     strategies=plot_strategies,
+                                                     suffix=suffix, metric_label=metric_label)
+        if overview_path:
+            print(Fore.GREEN + f"\nSaved run-level overview: {overview_path}" + Fore.RESET)
 
     # Grand total per strategy across all models.
     totals = []
@@ -1292,11 +1304,12 @@ def write_run_rollup(df: pd.DataFrame, out_dir: str,
     print(Fore.GREEN + f"\nSaved run-level FLOPs savings: {rollup_path}" + Fore.RESET)
 
     # Companion table figure: original (full-window) MASE vs after-technique MASE
-    # per (model, strategy), incl. the TOTAL rows just appended.
-    table_path = plot_mase_change_table(rollup, out_dir, strategies=plot_strategies,
-                                        suffix=suffix, metric_label=metric_label)
-    if table_path:
-        print(Fore.GREEN + f"Saved MASE change table: {table_path}" + Fore.RESET)
+    # per (model, strategy), incl. the TOTAL rows just appended. Figure-gated too.
+    if figures:
+        table_path = plot_mase_change_table(rollup, out_dir, strategies=plot_strategies,
+                                            suffix=suffix, metric_label=metric_label)
+        if table_path:
+            print(Fore.GREEN + f"Saved MASE change table: {table_path}" + Fore.RESET)
     print(Fore.CYAN + "\n--- Grand total FLOPs saved vs full window ---" + Fore.RESET)
     for t in totals:
         print(f"  {t['strategy']:<7}  pooled saved {100*t['pct_flops_saved']:5.1f}%  "
@@ -1384,7 +1397,8 @@ def compute_time_savings(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def write_run_time_rollup(df: pd.DataFrame, out_dir: str,
-                          plot_strategies: Optional[List[str]] = None) -> None:
+                          plot_strategies: Optional[List[str]] = None,
+                          figures: bool = True) -> None:
     """Cross-model roll-up of measured forward-pass time saved: per-(model,
     strategy) rows, a grand TOTAL per strategy, the overview figure, and the
     console summary.  Writes ``time_savings_all_models.csv`` and
@@ -1407,10 +1421,11 @@ def write_run_time_rollup(df: pd.DataFrame, out_dir: str,
     rollup = pd.concat(rollup_rows, ignore_index=True)
     os.makedirs(out_dir, exist_ok=True)
 
-    overview_path = plot_model_strategy_overview_time(rollup, out_dir,
-                                                      strategies=plot_strategies)
-    if overview_path:
-        print(Fore.GREEN + f"\nSaved run-level time overview: {overview_path}" + Fore.RESET)
+    if figures:
+        overview_path = plot_model_strategy_overview_time(rollup, out_dir,
+                                                          strategies=plot_strategies)
+        if overview_path:
+            print(Fore.GREEN + f"\nSaved run-level time overview: {overview_path}" + Fore.RESET)
 
     totals = []
     for name, grp in rollup.groupby("strategy"):
@@ -1568,6 +1583,7 @@ def infer_domain_from_display(dataset_display: str) -> str:
 def compute_relative_improvement_tables(
     df: pd.DataFrame,
     out_dir: str,
+    figures: bool = True,
 ) -> None:
     """
     Produces four CSV files and prints summaries:
@@ -1775,13 +1791,15 @@ def compute_relative_improvement_tables(
     )
 
     # ------------------------------------------------------------------
-    # Plots
+    # Plots (skipped in the default minimal-figures mode; CSVs above always
+    # written)
     # ------------------------------------------------------------------
-    _plot_rel_impr_by_dataset(ds_agg, out_dir)
-    _plot_rel_impr_by_frequency(freq_agg, out_dir)
-    _plot_rel_impr_by_horizon(hor_agg, out_dir)
-    _plot_rel_impr_by_domain(domain_agg, out_dir)
-    _plot_rel_impr_pred_vs_oracle(ds_agg, out_dir)
+    if figures:
+        _plot_rel_impr_by_dataset(ds_agg, out_dir)
+        _plot_rel_impr_by_frequency(freq_agg, out_dir)
+        _plot_rel_impr_by_horizon(hor_agg, out_dir)
+        _plot_rel_impr_by_domain(domain_agg, out_dir)
+        _plot_rel_impr_pred_vs_oracle(ds_agg, out_dir)
 
 
 def _plot_rel_impr_by_dataset(ds_agg: pd.DataFrame, out_dir: str) -> str:
@@ -3049,6 +3067,13 @@ def parse_args() -> argparse.Namespace:
              "figure + flops_savings_all_models.csv (covering every model in the "
              "run dir). Used for the final aggregation pass after per-model runs.",
     )
+    p.add_argument(
+        "--all-figures", action=argparse.BooleanOptionalAction, default=False,
+        help="Emit the full historical figure set (metric twins, scatters, "
+             "histograms, per-dataset bars, rollup overviews/tables). Default "
+             "emits ONLY bar_aggregate_mase_gluonts[_normalized].png on the "
+             "primary metric; every CSV / summary_stats.json is unaffected.",
+    )
     return p.parse_args()
 
 
@@ -3227,12 +3252,40 @@ def main() -> None:
                       f"({fr['rel_mase_drop_pct']:+.2f}%)")
 
         print(Fore.CYAN + "\n--- Relative improvement tables ---" + Fore.RESET)
-        compute_relative_improvement_tables(df_subset, out_dir)
+        compute_relative_improvement_tables(df_subset, out_dir,
+                                            figures=args.all_figures)
 
         print(Fore.CYAN + "\n--- Generating plots ---" + Fore.RESET)
         metric_lbls = {"mase_gluonts": "MASE (gluonts)",
                        "mase_gluonts_real": "MASE (gluonts-real)"}
         primary_lbl = metric_lbls[args.mase_metric]
+
+        # ---- Minimal figure set (the default) --------------------------------
+        # Exactly TWO figures, both on the PRIMARY metric (default
+        # `mase_gluonts_real` = gluonts' own machinery, the leaderboard
+        # definition): the absolute bars and the leaderboard-faithful
+        # seasonal-naive-NORMALISED bars (each cell ÷ its same-definition
+        # Seasonal-Naive; Seasonal Naive = 1.0). Fixed filenames regardless of
+        # --mase-metric — the figure title carries the exact metric. Everything
+        # else (twins, scatters, histograms, per-dataset bars) is behind
+        # --all-figures; CSVs and summary_stats.json are always written.
+        if not args.all_figures:
+            minimal_paths = [plot_bar_aggregate_mase(
+                df_subset, out_dir, metric_label=primary_lbl,
+                fname="bar_aggregate_mase_gluonts.png")]
+            if "naive_mase" in df_subset.columns and df_subset["naive_mase"].notna().any():
+                minimal_paths.append(plot_bar_aggregate_mase(
+                    df_subset, out_dir,
+                    metric_label=f"{primary_lbl}, norm. vs seasonal-naive",
+                    fname="bar_aggregate_mase_gluonts_normalized.png",
+                    normalize=True))
+            for path in minimal_paths:
+                if path:
+                    print(Fore.GREEN + f"  {path}" + Fore.RESET)
+            print(Fore.GREEN + f"\nDone.  Outputs: {out_dir}" + Fore.RESET)
+            return
+
+        # ---- --all-figures: the full historical set ---------------------------
         # Primary metric: absolute bars + the leaderboard-faithful NORMALISED bars
         # (each cell ÷ its same-definition Seasonal-Naive; Seasonal Naive = 1.0).
         # With the default `mase_gluonts_real`, the normalised figure is the one
@@ -3307,15 +3360,18 @@ def main() -> None:
         _primary_lbl = {"mase_gluonts": "MASE (gluonts)",
                         "mase_gluonts_real": "MASE (gluonts-real)"}[args.mase_metric]
         write_run_rollup(df, out, plot_strategies=args.plot_strategies,
-                         metric_label=_primary_lbl)
-        write_run_time_rollup(df, out, plot_strategies=args.plot_strategies)
+                         metric_label=_primary_lbl, figures=args.all_figures)
+        write_run_time_rollup(df, out, plot_strategies=args.plot_strategies,
+                              figures=args.all_figures)
         # Twin overview on the other gluonts metric alongside the primary one.
         if df_g is not None:
             write_run_rollup(df_g, out, plot_strategies=args.plot_strategies,
-                             suffix="_gluonts", metric_label="MASE (gluonts)")
+                             suffix="_gluonts", metric_label="MASE (gluonts)",
+                             figures=args.all_figures)
         if df_gr is not None:
             write_run_rollup(df_gr, out, plot_strategies=args.plot_strategies,
-                             suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
+                             suffix="_gluonts_real", metric_label="MASE (gluonts-real)",
+                             figures=args.all_figures)
         return
 
     # ---- Per-model outputs --------------------------------------------------
@@ -3342,14 +3398,17 @@ def main() -> None:
         _primary_lbl = {"mase_gluonts": "MASE (gluonts)",
                         "mase_gluonts_real": "MASE (gluonts-real)"}[args.mase_metric]
         write_run_rollup(df, out, plot_strategies=args.plot_strategies,
-                         metric_label=_primary_lbl)
-        write_run_time_rollup(df, out, plot_strategies=args.plot_strategies)
+                         metric_label=_primary_lbl, figures=args.all_figures)
+        write_run_time_rollup(df, out, plot_strategies=args.plot_strategies,
+                              figures=args.all_figures)
         if df_g is not None:
             write_run_rollup(df_g, out, plot_strategies=args.plot_strategies,
-                             suffix="_gluonts", metric_label="MASE (gluonts)")
+                             suffix="_gluonts", metric_label="MASE (gluonts)",
+                             figures=args.all_figures)
         if df_gr is not None:
             write_run_rollup(df_gr, out, plot_strategies=args.plot_strategies,
-                             suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
+                             suffix="_gluonts_real", metric_label="MASE (gluonts-real)",
+                             figures=args.all_figures)
 
 
 if __name__ == "__main__":
