@@ -2131,7 +2131,8 @@ def _plot_rel_impr_pred_vs_oracle(ds_agg: pd.DataFrame, out_dir: str) -> str:
 def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
                             metric_label: str = "MASE",
                             fname: str = "bar_aggregate_mase.png",
-                            normalize: bool = False) -> str:
+                            normalize: bool = False,
+                            extra_strategies: bool = True) -> str:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"]).copy()
     if r.empty:
         return ""
@@ -2161,18 +2162,24 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
     c_median = ["#7BA9D8", "#F0A86A", "#9ED67A"]
     # Append the period-window strategy when sidecars supplied it (restricted to
     # the rows that actually have a period_mase, so bars stay comparable).
-    if "period_mase" in r.columns and r["period_mase"].notna().any():
+    # ``extra_strategies=False`` (the minimal-figures mode) keeps the bar on the
+    # core full/best/pred trio: each extra strategy dropna's `r` to ITS coverage,
+    # so partial period/v3/v4 trees would silently shrink n below the run's true
+    # cell count (e.g. 95 -> 80) — exactly the kind of headline distortion the
+    # minimal figures exist to avoid.
+    if extra_strategies and "period_mase" in r.columns and r["period_mase"].notna().any():
         r = r.dropna(subset=["period_mase"]).copy()
         strategies.append("period_mase")
         labels.append("Period\n(2×Period)")
         c_geom.append("#6A1B9A"); c_median.append("#C39BD3")
     # Append each auto-discovered predictor variant (v3 cheap, v4 Mamba, …),
     # restricted to rows that have its MASE so bars stay comparable.
-    for vkey, vlbl, vclr in present_pred_variants(r):
-        r = r.dropna(subset=[f"{vkey}_mase"]).copy()
-        strategies.append(f"{vkey}_mase")
-        labels.append(vlbl.replace(" ", "\n"))
-        c_geom.append(vclr); c_median.append(vclr)
+    if extra_strategies:
+        for vkey, vlbl, vclr in present_pred_variants(r):
+            r = r.dropna(subset=[f"{vkey}_mase"]).copy()
+            strategies.append(f"{vkey}_mase")
+            labels.append(vlbl.replace(" ", "\n"))
+            c_geom.append(vclr); c_median.append(vclr)
     c_geom   = c_geom[:len(labels)]
     c_median = c_median[:len(labels)]
 
@@ -3270,15 +3277,18 @@ def main() -> None:
         # else (twins, scatters, histograms, per-dataset bars) is behind
         # --all-figures; CSVs and summary_stats.json are always written.
         if not args.all_figures:
+            # extra_strategies=False: core full/best/pred only, so partial
+            # period/v3/v4 coverage can't dropna the bar below the run's true n.
             minimal_paths = [plot_bar_aggregate_mase(
                 df_subset, out_dir, metric_label=primary_lbl,
-                fname="bar_aggregate_mase_gluonts.png")]
+                fname="bar_aggregate_mase_gluonts.png",
+                extra_strategies=False)]
             if "naive_mase" in df_subset.columns and df_subset["naive_mase"].notna().any():
                 minimal_paths.append(plot_bar_aggregate_mase(
                     df_subset, out_dir,
                     metric_label=f"{primary_lbl}, norm. vs seasonal-naive",
                     fname="bar_aggregate_mase_gluonts_normalized.png",
-                    normalize=True))
+                    normalize=True, extra_strategies=False))
             for path in minimal_paths:
                 if path:
                     print(Fore.GREEN + f"  {path}" + Fore.RESET)
