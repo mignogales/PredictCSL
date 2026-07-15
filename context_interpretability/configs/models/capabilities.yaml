@@ -1,0 +1,114 @@
+# Per-family adapter capability declarations (spec §10.1).
+#
+# These are DECLARATIONS, not measurements: patch_length / maximum_context are
+# resolved dynamically from the loaded model config where possible (the yaml
+# value is the fallback + documentation). Any capability set to true that fails
+# at runtime is downgraded with an explicit skip log, never silently ignored.
+#
+# Notes mirror the model-specific gotchas in the repo CLAUDE.md and
+# experiments/context_attention_mask.py:
+#   * attention masking support == context_attention_mask.SUPPORTED_FAMILIES
+#   * integrated gradients need a differentiable single-forward path; families
+#     whose predict wrapper goes through sampling / generate() / a pipeline
+#     no_grad are declared unsupported (checked again at runtime).
+#   * forecast lens uses identity-skip of residual blocks + the frozen head;
+#     declared only where the residual-stream assumption is known to hold.
+#   * timesfm's compiled decode defeats runtime hooks entirely (forecast-only).
+
+families:
+  patchtst_fm:
+    supports_attention_masking: true    # note: head reads every context token —
+                                        # masking curve is "leaky" (see
+                                        # masking_vs_slicing.resolve_models)
+    supports_activation_patching: true
+    supports_forecast_lens: true
+    supports_integrated_gradients: true # direct module forward, no sampling
+    uses_patches: true
+    patch_length: 32                    # d_patch; resolved from config at load
+    maximum_context_length: 8192        # fixed native context (NaN-padded)
+    fixed_native_context: true
+  sundial:
+    supports_attention_masking: true
+    supports_activation_patching: true
+    supports_forecast_lens: true
+    supports_integrated_gradients: false   # generate() + flow sampling
+    uses_patches: true
+    patch_length: 16
+    maximum_context_length: 2880
+  timemoe:
+    supports_attention_masking: true
+    supports_activation_patching: true
+    supports_forecast_lens: true
+    supports_integrated_gradients: false   # autoregressive generate()
+    uses_patches: false                    # pointwise tokens
+    patch_length: 1
+    maximum_context_length: 4096           # context + horizon <= 4096 (cap
+                                           # applied minus horizon at runtime)
+    max_includes_horizon: true
+  chronos2:
+    supports_attention_masking: true
+    supports_activation_patching: true     # context patches lead the sequence;
+                                           # future tokens trail (token offset 0)
+    supports_forecast_lens: false          # forecast read from future tokens
+                                           # via group attention — identity-skip
+                                           # unverified; enable after server check
+    supports_integrated_gradients: false   # pipeline predict runs under no_grad
+    uses_patches: true
+    patch_length: 16
+    maximum_context_length: 8192
+  chronos_bolt:
+    supports_attention_masking: true
+    supports_activation_patching: true     # encoder blocks (T5)
+    supports_forecast_lens: false          # enc-dec: lens on encoder is not
+                                           # "the frozen head applied to layer l"
+    supports_integrated_gradients: false
+    uses_patches: true
+    patch_length: 16
+    maximum_context_length: 2048
+  moirai:
+    supports_attention_masking: true       # experimental (verify on server)
+    supports_activation_patching: true
+    supports_forecast_lens: false
+    supports_integrated_gradients: false
+    uses_patches: true
+    patch_length: 16
+    maximum_context_length: 8192           # max_seq_len(512) x patch(16),
+    max_includes_horizon: true             # context + horizon budget
+  timesfm:
+    supports_attention_masking: false      # compiled decode defeats hooks
+    supports_activation_patching: false
+    supports_forecast_lens: false
+    supports_integrated_gradients: false
+    uses_patches: true
+    patch_length: 32
+    maximum_context_length: 8192
+  toto:
+    supports_attention_masking: true       # experimental (verify on server)
+    supports_activation_patching: true
+    supports_forecast_lens: false
+    supports_integrated_gradients: false
+    uses_patches: true
+    patch_length: 64
+    maximum_context_length: 4096
+  flowstate:
+    supports_attention_masking: false      # SSM — no attention
+    supports_activation_patching: false
+    supports_forecast_lens: false
+    supports_integrated_gradients: false
+    uses_patches: false
+    patch_length: null
+    maximum_context_length: 8192
+  tirex:
+    supports_attention_masking: false      # xLSTM; also NaN-left-pads to 2048
+    supports_activation_patching: false
+    supports_forecast_lens: false
+    supports_integrated_gradients: false
+    uses_patches: true
+    patch_length: 32
+    maximum_context_length: 2048           # internal train length
+
+# Per-display overrides (take precedence over the family entry), e.g.:
+# models:
+#   Chronos2-Small:
+#     supports_forecast_lens: true
+models: {}

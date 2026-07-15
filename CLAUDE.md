@@ -180,6 +180,31 @@ predictor-derived, so no TSFM re-inference):
   `MASE / seasonal-naive MASE` (same definition) — the normalized bar figure, the
   `geomean_norm` stat, and the NORM columns in `flops_savings_all_models*.csv`.
 
+**Interpretability framework (`context_interpretability/`, top-level package):**
+Tests whether observations beyond the sufficient context are causally inert
+(predictive redundancy) vs architecturally unreachable. Six experiments behind
+one config (`configs/experiments.yaml`), one tabular schema (`schema.py`) and
+one figure/hypothesis pipeline (`analysis/`): **exp0** = the EXISTING attention
+masking (`experiments/context_attention_mask.py`, mechanism untouched — only
+rescored into the common schema), **exp1** temporal-block perturbation (the
+principal causal evidence: mean/permute/matched/noise), **exp2** activation
+patching (recovery scores per layer×block), **exp3** frozen-head forecast lens
+(identity-skip of deeper residual blocks), **exp4** synthetic distant-dependency
+controls (MANDATORY; ridge oracles verify lag-d is genuinely predictive before
+any model conclusion), **exp5** integrated gradients (corroborative only).
+Model access goes through `adapters/` (capability flags in
+`configs/models/capabilities.yaml`; unsupported methods are skipped + logged in
+`run_meta.json`, never approximated); the TSFM adapter reuses `setup_model` /
+`_forecast_uniform` / `context_attention_mask` verbatim. Entry point (SERVER):
+`python -m context_interpretability.run_experiment --models <display> \
+[--experiments exp0..exp5] [--source synthetic|gifteval] [--analyze-only]`.
+Output under `logs/experiments/context_interpretability/<model>/`, per-cell
+done-markers (resumable), figures + `hypotheses_report.{json,md}` (H1–H5)
+regenerable offline. Tests run LOCALLY (no TSFM needed — dummy adapter):
+`python -m unittest discover -s context_interpretability/tests -t .`.
+Token-mapping / hook assumptions per family carry "verify on server" notes in
+`adapters/tsfm.py`, mirroring `context_attention_mask.py`'s convention.
+
 **Master orchestrator:**
 - **`master_run_all.py`** — fuses *every* `run_all*` variant into one run while
   running each shared stage **exactly once**: Stage 1 up front, then each variant

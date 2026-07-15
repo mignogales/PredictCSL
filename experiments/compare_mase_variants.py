@@ -97,7 +97,7 @@ LEADERBOARD_CONTEXT_CEILING = 8192
 def model_context_cap(family: str, horizon: int, requested: int) -> int:
     """Clamp a requested context length to what ``family`` actually accepts,
     mirroring the stage-3 ablation's per-model caps (Sundial 2880, TimeMoE
-    ctx+h<=4096, Toto/FlowState 4096, TiRex 2048). Uncapped families keep
+    ctx+h<=4096, Toto/FlowState 4096, TiRex 8192). Uncapped families keep
     ``requested`` (already bounded by the ceiling / instance length)."""
     cap = requested
     hard = {

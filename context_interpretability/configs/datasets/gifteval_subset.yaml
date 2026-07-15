@@ -1,0 +1,10 @@
+# Optional GiftEval dataset subset for the real-data interpretability runs.
+# Referenced by experiments.yaml datasets.gifteval; edit freely — dataset
+# display names must match experiments/datasets_config.py.
+datasets:
+  - ETTh1
+  - ETTh2
+  - us_births/D
+  - m4_hourly
+term: short
+max_instances: 128

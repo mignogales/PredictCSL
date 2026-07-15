@@ -54,7 +54,7 @@ CATALOG: List[ModelSpec] = [
     ModelSpec("amazon/chronos-bolt-base",        "chronos_bolt", "ChronosBolt-Base",   True),
     ModelSpec("Datadog/Toto-2.0-313m",           "toto",         "Toto-2.0-313m",      True),
     ModelSpec("ibm-granite/granite-timeseries-flowstate-r1", "flowstate", "FlowState-R1", True),
-    ModelSpec("NX-AI/TiRex",                     "tirex",        "TiRex",              True),
+    ModelSpec("NX-AI/TiRex-2",                   "tirex",        "TiRex2",             True),
 ]
 
 

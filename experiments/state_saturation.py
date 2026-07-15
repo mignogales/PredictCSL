@@ -78,7 +78,7 @@ Outputs (logs/experiments/state_saturation/)
 Run on the SERVER, e.g.:
   python -m experiments.state_saturation --test                       # smoke run
   python -m experiments.state_saturation                              # full run
-  python -m experiments.state_saturation --sources synthetic --models TiRex
+  python -m experiments.state_saturation --sources synthetic --models TiRex2
   python -m experiments.state_saturation --dump-modules --models FlowState-R1
 """
 
@@ -169,7 +169,7 @@ DEFAULT_BATCH_SIZE = 64
 # at L=4096 the batch drops to 16, at L=32 it stays at batch_size. Tuned for a
 # ~24 GB card — lower it on smaller GPUs, raise / set 0 (off) on bigger ones.
 DEFAULT_MAX_BATCH_TOKENS = 65536
-TEST_MODEL = "TiRex"                                          # small + fast recurrent
+TEST_MODEL = "TiRex2"                                         # small + fast recurrent
 
 
 # ==============================================================================

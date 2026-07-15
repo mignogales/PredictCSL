@@ -1,0 +1,104 @@
+# Unified configuration for the context-saturation interpretability framework.
+# Values here are the spec defaults; run_experiment.py deep-merges CLI overrides
+# and per-model capability files (configs/models/*.yaml) on top.
+
+output_root: logs/experiments/context_interpretability
+seed: 42
+horizon: 64
+batch_size: 16
+max_samples: 256            # per dataset; subsampling is recorded in run_meta
+
+# Primary loss metric — must match the main forecasting evaluation. MASE here is
+# the per-instance gluonts-port definition (experiments.gifteval_mase); on the
+# synthetic pools season_length=1 (naive) unless the dataset declares one.
+primary_metric: mae
+extra_metrics: [mse, smape]
+
+# Requested context lengths (spec §3.2). Before execution each value is
+# (a) dropped if larger than the model-supported context, (b) aligned DOWN to
+# the model patch length; requested + effective are both recorded.
+context_lengths: [32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
+                  1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192]
+
+# Temporal blocks (spec §3.3). model_patch is used whenever the model patches;
+# fixed_length is the fallback (and the forced mode when block_mode says so).
+block_mode: model_patch     # model_patch | fixed_length
+block_length: 32            # used by fixed_length (and by patchless models)
+perturb_partial_patches: false
+max_blocks_per_context: 64  # cap on evaluated blocks per context length; the
+                            # block list is thinned geometrically (recent blocks
+                            # kept dense) and the thinning recorded in run_meta.
+
+experiments:                # which experiments run by default
+  exp0_attention_masking: true
+  exp1_perturbation: true
+  exp2_activation_patching: true
+  exp3_forecast_lens: true
+  exp4_synthetic_controls: true
+  exp5_integrated_gradients: true
+
+perturbation:               # Experiment 1 (spec §4)
+  methods: [block_mean, permutation, matched_block, noise]
+  mean_scope: block         # block | context (context-wide channel mean)
+  noise_scales: [0.1, 0.5, 1.0]
+  noise_std_floor: 1.0e-3
+  n_seeds: 3                # perturbation seeds for stochastic methods
+  matched:                  # preferred matching order (spec §4.2C)
+    same_series_tolerance: 0.25   # relative mean/var match tolerance
+    fallback: other_series        # other_series | seasonal_phase
+
+attention_masking:          # Experiment 0 (spec §9)
+  # visible lengths come from context_lengths (every grid value < the cell's
+  # full context length); nothing else to configure.
+  enabled: true
+
+activation_patching:        # Experiment 2 (spec §5)
+  corruption: permutation   # permutation | matched_block (NEVER noise, §5.4)
+  granularity: [block_token, forecast_token]
+  pilot_samples: 32         # phase 1: all layers on this many samples
+  layers: all               # all | every:<k> | [names] — phase-2 layer set
+  full_layers: every:2      # representative layers for the full subset
+
+forecast_lens:              # Experiment 3 (spec §6)
+  stability_tau: 0.05       # normalized-distance threshold for the
+                            # saturation-layer curve (reported in norm units)
+
+integrated_gradients:       # Experiment 5 (spec §8)
+  steps: 64
+  convergence_steps: [16, 32, 64]
+  internal_batch_size: 8
+  baselines: [context_mean, zero_after_norm, random_sample]
+  n_random_baselines: 3
+  target: mean_forecast     # mean_forecast | horizon_step:<h> | loss
+  supplementary_loss_target: true
+
+synthetic_controls:         # Experiment 4 (spec §7)
+  n_instances: 128
+  series_length: 8192
+  local_order: 8            # r — local dependency length
+  local_kinds: [linear, nonlinear, seasonal]
+  distant_kind: linear      # linear | sin (g in f(local) + strength*g(X_{t-d}))
+  distant_lags: [32, 64, 128, 256]
+  dependency_strengths: [0.0, 0.1, 0.25, 0.5, 1.0]
+  noise_levels: [0.05, 0.1, 0.25]
+  family_c_fraction_distant: 0.5
+  oracle_ridge_alpha: 1.0
+  # experiments to run per control dataset (subject to model capabilities)
+  run_methods: [perturbation, attention_masking, activation_patching,
+                integrated_gradients]
+  sufficient_context_tolerance: 0.05   # err <= (1+tol)*min(err) => sufficient
+
+analysis:
+  bootstrap_samples: 2000
+  alpha: 0.05
+  multiple_comparison: benjamini_hochberg
+  top_k_blocks: 5           # rank-agreement k for the cross-method comparison
+
+datasets:                   # data sources for exp0/1/2/3/5
+  source: synthetic         # synthetic | gifteval
+  synthetic:
+    n_series: 256
+    seed: 42
+  gifteval:                 # used when source == gifteval (server only)
+    datasets: [ETTh1, ETTh2, us_births/D]
+    term: short
