@@ -99,8 +99,8 @@ Outputs (logs/experiments/embedding_saturation/)
 Run on the SERVER, e.g.:
   python -m experiments.embedding_saturation --test          # tiny smoke run
   python -m experiments.embedding_saturation                  # full run
-  python -m experiments.embedding_saturation --sources synthetic --models TiRex
-  python -m experiments.embedding_saturation --dump-modules --models TiRex
+  python -m experiments.embedding_saturation --sources synthetic --models TiRex2
+  python -m experiments.embedding_saturation --dump-modules --models TiRex2
 """
 
 from __future__ import annotations

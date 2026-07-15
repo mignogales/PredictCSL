@@ -74,7 +74,7 @@ independently of the model, so every model sees IDENTICAL series.
 Reuses the stage-1 model machinery verbatim (`setup_model`,
 `_forecast_uniform` — which already handles Toto's patch-multiple padding,
 TimesFM/Moirai per-width rebuilds, PatchTST-FM NaN-padding). Model context
-caps (Sundial 2880, TimeMoE 4096−h, Toto/FlowState 4096, TiRex 2048) skip the
+caps (Sundial 2880, TimeMoE 4096−h, Toto/FlowState 4096, TiRex 8192) skip the
 offending ratio points, leaving NaN. NOTE: TimesFM recompiles per distinct
 context width, so its sweep is slower than the fixed-grid ablation.
 
@@ -86,7 +86,7 @@ separately: `--models Sundial-Base-128M TimeMoE-200M`.
 
 Usage (on the SERVER):
     python -m experiments.synth_param_sweeps                       # run set, all experiments
-    python -m experiments.synth_param_sweeps --models Chronos2-Small TiRex
+    python -m experiments.synth_param_sweeps --models Chronos2-Small TiRex2
     python -m experiments.synth_param_sweeps --experiments period delay
     python -m experiments.synth_param_sweeps --plot-only           # replot from cached npz
     python -m experiments.synth_param_sweeps --test                # tiny smoke run

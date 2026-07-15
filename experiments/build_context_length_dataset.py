@@ -196,9 +196,9 @@ TIREX_NUM_QUANTILES             = 9      # TiRex quantile head: [0.1..0.9]
 TIREX_MEDIAN_QUANTILE_IDX       = 4      # middle of the 9 quantiles (0.5)
 # TiRex is xLSTM (recurrent, LINEAR cost) so long windows won't blow up memory,
 # but fidelity past its trained context is unverified — cap here to keep labels
-# trustworthy (curve flattens past it), like SUNDIAL/FLOWSTATE. 2048 is TiRex's
-# pretraining context length (per the paper, arXiv:2505.23719).
-TIREX_MAX_CONTEXT               = 2048
+# trustworthy (curve flattens past it), like SUNDIAL/FLOWSTATE. TiRex2's
+# pretraining context length is 8192 samples (TiRex-1 was 2048).
+TIREX_MAX_CONTEXT               = 8192
 
 # Output root. Overridable via env so run_all.py --test can redirect the whole
 # smoke run into a throwaway tree (which it deletes afterwards) without ever
@@ -847,32 +847,43 @@ def predict_flowstate(model, x: torch.Tensor, horizon: int, device: str) -> torc
 
 
 def load_tirex(model_id: str, device: str):
-    from tirex import load_model
-    model = load_model(model_id)
-    # tirex.load_model handles device placement internally; .to is a no-op guard.
-    try:
-        model.to(device)
-    except Exception:
-        pass
-    return model
+    # TiRex2 lives in the `tirex2` package (TiRex-1 was `tirex`); load_model takes
+    # the device up front and handles placement internally.
+    from tirex2 import load_model
+    return load_model(model_id, device=device)
 
 
 def predict_tirex(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
-    """Quantile forecast (TiRex); return the per-step median (B, horizon).
+    """Quantile forecast (TiRex2); return the per-step median (B, horizon).
 
-    TiRex takes a (batch, context) tensor and returns (quantiles, mean), where
-    quantiles is (B, horizon, 9) over levels [0.1..0.9]; we take the 0.5 row
-    (index 4) as the point forecast to stay consistent with the other wrappers.
-    Verified against the package source: tirex/models/tirex.py derives its own
-    "mean" as exactly that 0.5 column. forecast() ALWAYS returns CPU tensors
-    (its _format_output calls .cpu() unconditionally), so the median must be
-    moved back to `device` — forecast_window scatters it into a `device`-side
-    output buffer, which raises on a CPU source.
+    TiRex2's API differs from TiRex-1: it takes a LIST of ``TimeseriesType``
+    objects (one per series, ``target`` shaped (n_variates, length)) rather than
+    a batched ``context=`` tensor, and each returned forecast is shaped
+    (n_targets, 9 quantiles, prediction_length) — the quantile axis is the MIDDLE
+    one now (TiRex-1 was (B, horizon, 9)). The 9 levels are still [0.1..0.9], so
+    index 4 (0.5) is the point forecast. ``output_type="numpy"`` is the documented
+    return format; we convert back to a `device` torch tensor because
+    forecast_window scatters the median into a `device`-side buffer.
+
+    NOTE (verify on server): confirmed against the tirex-2 README quick-start
+    (list-of-TimeseriesType input, (n_targets, 9, pred_len) output). Re-check the
+    exact target axis order and whether an ``output_type="torch"`` fast-path
+    exists once the package is installed.
     """
+    from tirex2 import TimeseriesType
+
     seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
-    quantiles, _mean = model.forecast(context=seqs, prediction_length=horizon)
-    median = quantiles[:, :horizon, TIREX_MEDIAN_QUANTILE_IDX]
-    return median.to(device=device, dtype=torch.float32)   # (B, horizon)
+    series = [
+        TimeseriesType(target=row.unsqueeze(0),           # (1, L) univariate
+                       past_covariates=None, future_covariates=None)
+        for row in seqs
+    ]
+    forecasts = model.forecast(series, prediction_length=horizon,
+                               output_type="numpy")         # list of (1, 9, H)
+    medians = np.stack(
+        [f[0, TIREX_MEDIAN_QUANTILE_IDX, :horizon] for f in forecasts], axis=0
+    )                                                       # (B, horizon)
+    return torch.as_tensor(medians, dtype=torch.float32, device=device)
 
 
 # ==============================================================================

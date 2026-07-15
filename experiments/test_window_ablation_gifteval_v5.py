@@ -107,7 +107,7 @@ FLOWSTATE_SCALE_FACTOR        = 1.0     # fallback only (unknown cadence)
 FLOWSTATE_MAX_CONTEXT         = 4096    # skip wider windows (mirrors stage-1 label cap)
 TIREX_NUM_QUANTILES           = 9       # TiRex quantile head: [0.1..0.9]
 TIREX_MEDIAN_QUANTILE_IDX     = 4       # middle of the 9 quantiles (0.5)
-TIREX_MAX_CONTEXT             = 2048    # TiRex pretraining context (mirrors stage-1 cap)
+TIREX_MAX_CONTEXT             = 8192    # TiRex2 pretraining context (mirrors stage-1 cap)
 
 # ---- FlowState per-dataset scale factor (leaderboard parity) -----------------
 # FlowState is cadence-conditioned: its S5 discretization step and decoder basis
@@ -1145,31 +1145,40 @@ def predict_flowstate(model, batches, horizon, device,
 
 
 def load_tirex(model_id, device):
-    from tirex import load_model
-    model = load_model(model_id)
-    # tirex.load_model handles device placement internally; .to is a no-op guard.
-    try:
-        model.to(device)
-    except Exception:
-        pass
-    return model
+    # TiRex2 lives in the `tirex2` package (TiRex-1 was `tirex`); load_model takes
+    # the device up front and handles placement internally.
+    from tirex2 import load_model
+    return load_model(model_id, device=device)
 
 
 def predict_tirex(model, batches, horizon, device):
-    """Quantile forecast (TiRex); return the per-step median (B, horizon).
+    """Quantile forecast (TiRex2); return the per-step median (B, horizon).
 
-    Mirrors stage-1's predict_tirex: forecast() takes a (B, context) tensor and
-    returns (quantiles, mean) with quantiles (B, horizon, 9) over levels
-    [0.1..0.9] — verified against the package source (tirex/models/tirex.py
-    computes its own "mean" as the 0.5 column, our index 4). forecast() ALWAYS
-    returns CPU tensors (its _format_output calls .cpu()), so the median must be
-    moved back to `device` — downstream stitching/metrics run there.
+    Mirrors stage-1's predict_tirex. TiRex2's API differs from TiRex-1: it takes a
+    LIST of ``TimeseriesType`` objects (one per series, ``target`` shaped
+    (n_variates, length)) rather than a batched ``context=`` tensor, and each
+    forecast is shaped (n_targets, 9 quantiles, prediction_length) — the quantile
+    axis is the MIDDLE one now (TiRex-1 was (B, horizon, 9)). The 9 levels are
+    still [0.1..0.9], so index 4 (0.5) is the point forecast. ``output_type=
+    "numpy"`` is the documented return format; convert back to `device` for the
+    downstream stitching/metrics. (Verify on server — see stage-1 note.)
     """
+    from tirex2 import TimeseriesType
+
     def step(x, y):
         seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
-        quantiles, _mean = model.forecast(context=seqs, prediction_length=horizon)
-        median = quantiles[:, :horizon, TIREX_MEDIAN_QUANTILE_IDX]
-        return ({"median": median.to(device=device, dtype=torch.float32)},
+        series = [
+            TimeseriesType(target=row.unsqueeze(0),           # (1, L) univariate
+                           past_covariates=None, future_covariates=None)
+            for row in seqs
+        ]
+        forecasts = model.forecast(series, prediction_length=horizon,
+                                   output_type="numpy")         # list of (1, 9, H)
+        medians = np.stack(
+            [f[0, TIREX_MEDIAN_QUANTILE_IDX, :horizon] for f in forecasts], axis=0
+        )                                                       # (B, horizon)
+        return ({"median": torch.as_tensor(medians, dtype=torch.float32,
+                                           device=device)},
                 y[:, :, 0].to(device, non_blocking=True))
     out, all_tgts = _run_batches(batches, "  TiRex", step)
     return ForecastResult(median=out["median"]), all_tgts

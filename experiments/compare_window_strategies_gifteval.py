@@ -257,11 +257,11 @@ MODEL_ARCH: Dict[str, ModelArch] = {
     # in context — the attention proxy below OVERSTATES it at long windows (keeps
     # a spurious L^2 term), same caveat as FlowState. No external config.json
     # (arch is inside model.ckpt), so d_model/d_ff/patch/layers are ESTIMATES.
-    # max_window = TiRex's 2048 pretraining context (arXiv:2505.23719), mirroring
+    # max_window = TiRex2's 8192 pretraining context (TiRex-1 was 2048), mirroring
     # the TIREX_MAX_CONTEXT label cap. Treat its FLOPs column as a loose upper
     # bound, and re-confirm the arch against the checkpoint.
     "tirex":        ModelArch(d_model=512,  d_ff=2048, patch_size=32, seq_type="unified",
-                              n_enc_layers=12, max_window=2048),
+                              n_enc_layers=12, max_window=8192),
 }
 
 
