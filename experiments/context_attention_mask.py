@@ -23,10 +23,14 @@ saturation effect is purely a matter of what the model attends to.
 
 Only transformer families are supported (there must be an attention matrix to
 mask): PatchTST-FM (encoder), Sundial / TimeMoE (decoder-only, RoPE). FlowState
-(SSM) and TiRex (xLSTM) have no attention and are out of scope. TimesFM 2.5 goes
-through a compiled decode path (``compiled_decode``) that a runtime hook can't
-reliably reach, so it's excluded here too — use Sundial/TimeMoE as the decoder
-representative.
+(SSM) and TiRex (xLSTM) have no attention and are out of scope. TimesFM 2.5 is
+supported ONLY on its eager path: ``compiled_decode`` is (despite the name) an
+eager closure — only ``model.forward`` gets ``torch.compile``d, and only when
+loaded with ``torch_compile=True``. Load with ``torch_compile=False`` (the
+interpretability adapter does) and the ``make_attn_mask`` wrap below is
+reachable; under a compiled forward the wrap may be baked out and masking would
+silently no-op — the ``_warn_if_noop`` guard cannot detect that case, so never
+use the timesfm family here with a compiled model.
 
 Mechanism, by family:
   * **patchtst_fm** — the model already builds an additive attention mask
@@ -396,6 +400,62 @@ def _chronosbolt_mask(handle, last_timesteps: int, full_len: int):
 
 
 # ==============================================================================
+#  TimesFM 2.5 (decoder-only, patch 32) — EAGER path only (torch_compile=False)
+# ==============================================================================
+#  timesfm.torch.transformer.MultiHeadAttention builds its own boolean SDPA mask
+#  via the module-level ``make_attn_mask`` (True = attend): causal AND
+#  ``kv_index >= num_all_masked_kv`` (leading pad patches dropped). We wrap that
+#  function — same technique as PatchTST-FM — and additionally drop the oldest
+#  ``hide`` CONTEXT-patch key columns for the visible query rows (rectangular:
+#  old query rows keep their causal mask so no row is fully masked -> no NaN
+#  softmax). ``hide`` is sized in patch (32) units of the fed window; decode
+#  appends generated patches to the RIGHT, so the leading columns stay the
+#  oldest ones as kv grows. NOTE (server): verify the function lives at
+#  ``timesfm.torch.transformer.make_attn_mask`` and that no caller holds a
+#  from-import rebinding (we patch any module in timesfm.torch that re-exports
+#  it, mirroring the PatchTST-FM dual-binding handling).
+
+TIMESFM_PATCH = 32
+
+
+@contextmanager
+def _timesfm_mask(model, last_timesteps: int, full_len: int):
+    import timesfm.torch.transformer as T
+
+    n_ctx = max(1, -(-int(full_len) // TIMESFM_PATCH))       # ceil div
+    vis = max(1, -(-int(last_timesteps) // TIMESFM_PATCH))
+    hide = max(0, n_ctx - vis)
+    state = {"applied": 0, "saw_none": 0}
+    orig = T.make_attn_mask
+
+    # collect sibling modules that re-bound make_attn_mask via from-import
+    import sys
+    rebound = [m for name, m in list(sys.modules.items())
+               if name.startswith("timesfm") and m is not None
+               and getattr(m, "make_attn_mask", None) is orig and m is not T]
+
+    def wrapped(*args, **kwargs):
+        m = orig(*args, **kwargs)
+        if hide > 0 and torch.is_tensor(m) and m.dtype == torch.bool:
+            m = _rect_hide_bool(m.clone(), min(hide, m.shape[-1] - 1))
+            state["applied"] += 1
+        elif hide > 0:
+            state["saw_none"] += 1
+        return m
+
+    T.make_attn_mask = wrapped
+    for m in rebound:
+        m.make_attn_mask = wrapped
+    try:
+        yield
+    finally:
+        T.make_attn_mask = orig
+        for m in rebound:
+            m.make_attn_mask = orig
+        _warn_if_noop("timesfm", state)
+
+
+# ==============================================================================
 #  Moirai2 (decoder-only, single patch, uni2ts) + Toto (decoder-only, DataDog)
 #  -- EXPERIMENTAL: both use custom attention whose internals we can only
 #  partially see and cannot test locally. Validate on the server (the top-grid
@@ -557,7 +617,7 @@ def _restore_forwards(patched):
 # ==============================================================================
 
 SUPPORTED_FAMILIES = {"patchtst_fm", "sundial", "timemoe", "chronos2",
-                      "chronos_bolt", "moirai", "toto"}
+                      "chronos_bolt", "moirai", "toto", "timesfm"}
 
 
 @contextmanager
@@ -585,6 +645,12 @@ def context_attention_mask(
 
     if family == "chronos2":
         with _chronos2_mask(model, last_timesteps, full_len):
+            yield
+        return
+
+    if family == "timesfm":
+        # EAGER models only (torch_compile=False) — see the module docstring.
+        with _timesfm_mask(model, last_timesteps, full_len):
             yield
         return
 
