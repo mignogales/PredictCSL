@@ -626,6 +626,13 @@ def load_timesfm(model_id: str, window: int, horizon: int, batch_size: int):
 
 
 def predict_timesfm(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
+    """Median forecast (B, horizon).
+
+    NOTE: TimesFM-2.5's ``point_forecast`` IS the 0.5-quantile, not the mean —
+    ``compiled_decode`` returns ``full_forecast[..., 5]`` (``decode_index=5``;
+    columns are ``[mean-head, q0.1..q0.9]``), which is exactly what the GiftEval
+    leaderboard scores as MASE[0.5]. Do NOT "fix" this to the mean head (col 0).
+    """
     PATCH = 32
     bs, ws, _ = x.shape
     x_np = x[:, :, 0].numpy()

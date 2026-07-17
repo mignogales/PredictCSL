@@ -371,7 +371,10 @@ def evaluate_on_dataset(model_name: str, ds_name: str, ds_term: str,
             axis=None,
             mask_invalid_label=True,
             allow_nan_forecast=False,
-            seasonality=get_seasonality(dataset.freq),
+            # str(): gift_eval's Dataset.freq can be a numpy.str_, which the
+            # Cython-compiled pandas to_offset inside get_seasonality rejects
+            # ("expected str, got numpy.str_") on pandas>=2/Cython 3 builds.
+            seasonality=get_seasonality(str(dataset.freq)),
         ).reset_index(drop=True).to_dict(orient="records")
         return res[0]
 
@@ -409,7 +412,7 @@ def evaluate_on_dataset(model_name: str, ds_name: str, ds_term: str,
         axis=None,
         mask_invalid_label=True,
         allow_nan_forecast=False,
-        seasonality=get_seasonality(dataset.freq),
+        seasonality=get_seasonality(str(dataset.freq)),  # str(): see timesfm branch
     ).reset_index(drop=True).to_dict(orient="records")
     return res[0]
 
