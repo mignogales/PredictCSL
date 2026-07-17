@@ -329,21 +329,32 @@ def _get_timesfm(model_name: str):
 def _force_str_freq() -> None:
     """Make gift_eval's ``Dataset.freq`` return a plain ``str``.
 
-    The property returns ``hf_dataset[0]["freq"]``, which arrives as a
+    ``freq`` resolves to ``hf_dataset[0]["freq"]``, which arrives as a
     ``numpy.str_`` under the datasets library's formatting. Cython-3-built
     pandas rejects ``str`` subclasses in typed signatures ("Argument 'freq' has
     incorrect type (expected str, got numpy.str_)"), and the value flows into
     pandas both from OUR calls (get_seasonality) and from gift_eval/gluonts
     internals (``to_offset(self.freq)`` in data.py, period arithmetic in the
     test split) — so wrap it at the source instead of chasing call sites.
-    Idempotent."""
+
+    gift_eval defines ``freq`` as either a ``property`` (``.fget``) or a
+    ``functools.cached_property`` (``.func``) depending on version — handle both,
+    replacing it with a plain recomputing ``property`` (a data descriptor, so it
+    also overrides any value a cached_property already stored on live instances).
+    Idempotent; no-op if ``freq`` isn't a wrappable descriptor."""
     from gift_eval import data as ge_data
 
-    if getattr(ge_data.Dataset, "_freq_str_patched", False):
+    Dataset = ge_data.Dataset
+    if getattr(Dataset, "_freq_str_patched", False):
         return
-    orig_fget = ge_data.Dataset.freq.fget
-    ge_data.Dataset.freq = property(lambda self: str(orig_fget(self)))
-    ge_data.Dataset._freq_str_patched = True
+    descriptor = next(
+        (klass.__dict__["freq"] for klass in Dataset.__mro__
+         if "freq" in klass.__dict__), None)
+    orig = getattr(descriptor, "fget", None) or getattr(descriptor, "func", None)
+    if orig is None:
+        return
+    Dataset.freq = property(lambda self: str(orig(self)))
+    Dataset._freq_str_patched = True
 
 
 def _metrics():
