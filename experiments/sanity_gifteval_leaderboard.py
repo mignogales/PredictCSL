@@ -409,13 +409,36 @@ def _load_timesfm(model_name: str):
     """Official timesfm2p5.ipynb load path:
         tfm = timesfm_2p5_torch.TimesFM_2p5_200M_torch()
         tfm.load_checkpoint()
-    (``load_checkpoint`` pulls the default 200M checkpoint; the model_name is
-    kept only for the cache key / reference lookup.)"""
+    Some installed TimesFM builds changed that method to require an explicit
+    checkpoint path; those fall back to the same HF id used everywhere else in
+    this repo, or to TIMESFM_2P5_CHECKPOINT / TIMESFM_CHECKPOINT if set."""
     if model_name not in _MODEL_HANDLE:
         from timesfm.timesfm_2p5 import timesfm_2p5_torch
 
-        tfm = timesfm_2p5_torch.TimesFM_2p5_200M_torch()
-        tfm.load_checkpoint()
+        cls = timesfm_2p5_torch.TimesFM_2p5_200M_torch
+        tfm = cls()
+        try:
+            tfm.load_checkpoint()
+        except TypeError as exc:
+            msg = str(exc)
+            if "path" not in msg and "required positional argument" not in msg:
+                raise
+            ckpt = os.environ.get("TIMESFM_2P5_CHECKPOINT") \
+                or os.environ.get("TIMESFM_CHECKPOINT")
+            if ckpt:
+                logger.info("TimesFM load_checkpoint() requires a path; using %s",
+                            ckpt)
+                tfm.load_checkpoint(ckpt)
+            elif hasattr(cls, "from_pretrained"):
+                logger.info("TimesFM load_checkpoint() requires a path; using "
+                            "from_pretrained(%s)", model_name)
+                tfm = cls.from_pretrained(model_name)
+            else:
+                raise RuntimeError(
+                    "This TimesFM build requires load_checkpoint(path) and does "
+                    "not expose from_pretrained(). Set TIMESFM_2P5_CHECKPOINT "
+                    "to the local google/timesfm-2.5-200m-pytorch checkpoint."
+                ) from exc
         _MODEL_HANDLE[model_name] = tfm
     return _MODEL_HANDLE[model_name]
 
