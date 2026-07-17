@@ -297,13 +297,15 @@ def build_metrics():
 # ==============================================================================
 class TimesFmPredictor:
     def __init__(self, tfm, prediction_length: int,
-                 max_context_knob: Optional[int] = None):
+                 max_context_knob: Optional[int] = None,
+                 default_batch_size: int = 1024):
         np = _require_numpy("construct the TimesFM predictor")
 
         self.tfm = tfm
         self.prediction_length = prediction_length
         self.quantiles = list(np.arange(1, 10) / 10.0)
         self.max_context_knob = max_context_knob
+        self.default_batch_size = int(default_batch_size)
 
     @staticmethod
     def _model_context(entry_target):
@@ -320,13 +322,15 @@ class TimesFmPredictor:
             return np.zeros_like(arr, dtype=np.float32)
         return arr
 
-    def predict(self, test_data_input, batch_size: int = 1024) -> List:
+    def predict(self, test_data_input, batch_size: Optional[int] = None) -> List:
         np = _require_numpy("run TimesFM forecasts")
 
         from timesfm import configs
         from gluonts.itertools import batcher
         from gluonts.model.forecast import QuantileForecast
 
+        if batch_size is None:
+            batch_size = self.default_batch_size
         test_data_input = list(test_data_input)
         forecast_outputs = []
         for batch in batcher(test_data_input, batch_size=batch_size):
@@ -541,10 +545,12 @@ def evaluate_on_dataset(model_name: str, ds_name: str, ds_term: str,
             tfm=_load_timesfm(model_name),
             prediction_length=dataset.prediction_length,
             max_context_knob=max_context,
+            default_batch_size=1024,
         )
         eval_batch_size = 1024
         while True:
             try:
+                predictor.default_batch_size = eval_batch_size
                 res = evaluate_model(
                     predictor,
                     test_data=dataset.test_data,
