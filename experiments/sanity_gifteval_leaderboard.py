@@ -326,22 +326,61 @@ def _get_timesfm(model_name: str):
 # Per-dataset evaluation — verbatim port of the notebooks' evaluation cells.
 # ------------------------------------------------------------------------------
 
+# pandas >= 2.2 REMOVED the legacy offset aliases the GiftEval HF metadata still
+# stores (``A``/``A-DEC`` year, ``Q``/``Q-DEC`` quarter, ``M`` month, ``H`` hour,
+# ``T`` minute, ``S`` second, ``U`` microsecond). On a strict build ``to_offset``
+# raises on them outright ("'M' is no longer supported ... use 'ME'"), which kills
+# gift_eval's own ``prediction_length`` (it does ``to_offset(self.freq)``) and
+# gluonts' ``get_seasonality`` before either can normalize. This is the exact
+# INVERSE of gift_eval's ``maybe_reconvert_freq`` (new->old): we rewrite the
+# stored old alias to the new one so ``to_offset`` parses, and gift_eval's
+# downstream ``maybe_reconvert_freq`` maps it right back to its old lookup key.
+# Only the leading unit token is touched; multiplier ("15T") and anchor
+# ("A-DEC", "W-SUN") are preserved.
+_OLD_TO_NEW_OFFSET = {
+    "A": "YE", "Y": "YE",
+    "Q": "QE",
+    "M": "ME",
+    "H": "h",
+    "T": "min", "MIN": "min",
+    "S": "s",
+    "U": "us",
+    # W, D, B and any already-new alias pass through unchanged.
+}
+
+
+def _normalize_freq(freq: str) -> str:
+    """Rewrite a legacy pandas offset alias to its pandas>=2.2 spelling,
+    preserving a leading integer multiplier and any ``-ANCHOR`` suffix."""
+    freq = str(freq)
+    head, dash, anchor = freq.partition("-")
+    i = 0
+    while i < len(head) and head[i].isdigit():
+        i += 1
+    mult, unit = head[:i], head[i:]
+    new_unit = _OLD_TO_NEW_OFFSET.get(unit.upper(), unit)
+    return f"{mult}{new_unit}{dash}{anchor}"
+
+
 def _force_str_freq() -> None:
-    """Make gift_eval's ``Dataset.freq`` return a plain ``str``.
+    """Make gift_eval's ``Dataset.freq`` return a plain, pandas-current ``str``.
 
-    ``freq`` resolves to ``hf_dataset[0]["freq"]``, which arrives as a
-    ``numpy.str_`` under the datasets library's formatting. Cython-3-built
-    pandas rejects ``str`` subclasses in typed signatures ("Argument 'freq' has
-    incorrect type (expected str, got numpy.str_)"), and the value flows into
-    pandas both from OUR calls (get_seasonality) and from gift_eval/gluonts
-    internals (``to_offset(self.freq)`` in data.py, period arithmetic in the
-    test split) — so wrap it at the source instead of chasing call sites.
+    Two problems with the raw value (``hf_dataset[0]["freq"]``), fixed together
+    by wrapping the descriptor once at the source rather than chasing call sites:
 
-    gift_eval defines ``freq`` as either a ``property`` (``.fget``) or a
-    ``functools.cached_property`` (``.func``) depending on version — handle both,
-    replacing it with a plain recomputing ``property`` (a data descriptor, so it
-    also overrides any value a cached_property already stored on live instances).
-    Idempotent; no-op if ``freq`` isn't a wrappable descriptor."""
+      1. It arrives as a ``numpy.str_``; Cython-3-built pandas rejects ``str``
+         subclasses in typed signatures ("expected str, got numpy.str_").
+      2. It uses LEGACY offset aliases (``A-DEC``, ``Q-DEC``, ``M``, ...) that
+         pandas>=2.2 no longer parses (see ``_normalize_freq``).
+
+    The value flows into pandas from OUR calls (get_seasonality) AND gift_eval
+    internals (``to_offset`` in ``prediction_length``, test-split Period math), so
+    fixing it here covers every consumer. gift_eval defines ``freq`` as a
+    ``property`` (``.fget``) or ``functools.cached_property`` (``.func``) across
+    versions — handle both, replacing it with a plain recomputing ``property``
+    (a data descriptor, so it also overrides any value a cached_property already
+    cached on live instances). Idempotent; no-op if ``freq`` isn't a wrappable
+    descriptor."""
     from gift_eval import data as ge_data
 
     Dataset = ge_data.Dataset
@@ -353,7 +392,7 @@ def _force_str_freq() -> None:
     orig = getattr(descriptor, "fget", None) or getattr(descriptor, "func", None)
     if orig is None:
         return
-    Dataset.freq = property(lambda self: str(orig(self)))
+    Dataset.freq = property(lambda self: _normalize_freq(orig(self)))
     Dataset._freq_str_patched = True
 
 
