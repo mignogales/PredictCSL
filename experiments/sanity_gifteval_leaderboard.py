@@ -74,7 +74,7 @@ import logging
 import math
 import numbers
 import os
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, TypeVar
 
 try:
     from dotenv import load_dotenv
@@ -85,6 +85,8 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("sanity_gifteval_leaderboard")
+
+T = TypeVar("T")
 
 
 def _require_numpy(purpose: str):
@@ -165,6 +167,23 @@ def _clear_accelerator_cache() -> None:
             mps.empty_cache()
         except Exception:
             pass
+
+
+def _run_with_dynamic_batch(label: str, initial_batch_size: int,
+                            run: Callable[[int], T]) -> Tuple[T, int]:
+    """Run ``run(batch_size)`` and halve the batch size on accelerator OOM."""
+    batch_size = max(1, int(initial_batch_size))
+    while True:
+        try:
+            return run(batch_size), batch_size
+        except RuntimeError as exc:
+            if not _is_oom_error(exc) or batch_size <= 1:
+                raise
+            next_batch_size = max(1, batch_size // 2)
+            logger.warning("%s OOM at batch_size=%d; retrying with %d",
+                           label, batch_size, next_batch_size)
+            _clear_accelerator_cache()
+            batch_size = next_batch_size
 
 
 # ==============================================================================
@@ -450,47 +469,28 @@ class Chronos2Predictor:
         from gluonts.model.forecast import QuantileForecast
 
         pipeline = self.pipeline
-        model_batch_size = self.batch_size
-
-        forecast_outputs = []
         input_data = list(self._pack_model_items(test_data_input))
         is_univariate_data = input_data[0]["target"].ndim == 1
-        while True:
-            try:
-                quantiles, _ = pipeline.predict_quantiles(
-                    inputs=input_data,
-                    prediction_length=self.prediction_length,
-                    batch_size=model_batch_size,
-                    quantile_levels=self.quantile_levels,
-                    predict_batches_jointly=self.predict_batches_jointly,
-                )
-                quantiles = torch.stack(quantiles)
-                # [batch, variates, seq, quantiles] -> [batch, quantiles, seq, variates]
-                quantiles = quantiles.permute(0, 3, 2, 1).cpu().numpy()
-                if is_univariate_data:
-                    quantiles = quantiles.squeeze(-1)
-                assert quantiles.shape[1] == len(self.quantile_levels)
-                assert quantiles.shape[2] == self.prediction_length
-                forecast_outputs.append(quantiles)
-                break
-            except torch.cuda.OutOfMemoryError:
-                if model_batch_size <= 1:
-                    raise
-                next_batch_size = max(1, model_batch_size // 2)
-                logger.warning("Chronos-2 OOM at batch_size=%d; retrying with %d",
-                               model_batch_size, next_batch_size)
-                _clear_accelerator_cache()
-                model_batch_size = next_batch_size
-            except RuntimeError as exc:
-                if not _is_oom_error(exc) or model_batch_size <= 1:
-                    raise
-                next_batch_size = max(1, model_batch_size // 2)
-                logger.warning("Chronos-2 OOM at batch_size=%d; retrying with %d",
-                               model_batch_size, next_batch_size)
-                _clear_accelerator_cache()
-                model_batch_size = next_batch_size
 
-        forecast_outputs = np.concatenate(forecast_outputs, axis=0)
+        def _run(model_batch_size: int):
+            quantiles, _ = pipeline.predict_quantiles(
+                inputs=input_data,
+                prediction_length=self.prediction_length,
+                batch_size=model_batch_size,
+                quantile_levels=self.quantile_levels,
+                predict_batches_jointly=self.predict_batches_jointly,
+            )
+            quantiles = torch.stack(quantiles)
+            # [batch, variates, seq, quantiles] -> [batch, quantiles, seq, variates]
+            quantiles = quantiles.permute(0, 3, 2, 1).cpu().numpy()
+            if is_univariate_data:
+                quantiles = quantiles.squeeze(-1)
+            assert quantiles.shape[1] == len(self.quantile_levels)
+            assert quantiles.shape[2] == self.prediction_length
+            return quantiles
+
+        forecast_outputs, self.batch_size = _run_with_dynamic_batch(
+            "Chronos-2", self.batch_size, _run)
         assert len(forecast_outputs) == len(input_data)
         forecasts = []
         for item, ts in zip(forecast_outputs, test_data_input):
@@ -645,32 +645,49 @@ def evaluate_pipeline_on_dataset(model_id: str, model_family: str,
 
     handle = None if model_family in ("timesfm", "context_parroting") \
         else wab.load_handle(model_family, model_id, device)
-    groups = _pipeline_full_context_batches(
-        cache, cap, batch_size, device, pin_memory=(device == "cuda"))
 
-    results = []
     try:
-        for idx, width, batches in groups:
-            fr, _tgts = wab._forecast_cell(
-                model_family, handle, model_id, batches, width, horizon,
-                device, batch_size, flowstate_scale=cache.flowstate_scale)
-            results.append((idx, fr, _tgts))
-        fr, _tgts = wab._merge_grouped(results, cache.n_total, horizon, device)
-        median = fr.median.detach().cpu().float().numpy()
-        quantiles = (fr.quantiles.detach().cpu().float().numpy()
-                     if fr.quantiles is not None else None)
-        samples = (fr.samples.detach().cpu().float().numpy()
-                   if fr.samples is not None else None)
-        mase = gluonts_leaderboard_mase(
-            median, cache.starts, cache.contexts_raw, cache.labels_np, cache.freq,
-            quantiles=quantiles, quantile_levels=fr.quantile_levels,
-            samples=samples)
-        return {
-            "MASE[0.5]": float(mase),
-            "_recipe": "pipeline_full_context",
-            "_context_cap": int(cap),
-            "_model_family": model_family,
-        }
+        def _run(eval_batch_size: int) -> dict:
+            groups = None
+            results = []
+            try:
+                groups = _pipeline_full_context_batches(
+                    cache, cap, eval_batch_size, device,
+                    pin_memory=(device == "cuda"))
+                for idx, width, batches in groups:
+                    fr, _tgts = wab._forecast_cell(
+                        model_family, handle, model_id, batches, width, horizon,
+                        device, eval_batch_size,
+                        flowstate_scale=cache.flowstate_scale)
+                    results.append((idx, fr, _tgts))
+                fr, _tgts = wab._merge_grouped(
+                    results, cache.n_total, horizon, device)
+                median = fr.median.detach().cpu().float().numpy()
+                quantiles = (fr.quantiles.detach().cpu().float().numpy()
+                             if fr.quantiles is not None else None)
+                samples = (fr.samples.detach().cpu().float().numpy()
+                           if fr.samples is not None else None)
+                mase = gluonts_leaderboard_mase(
+                    median, cache.starts, cache.contexts_raw, cache.labels_np,
+                    cache.freq, quantiles=quantiles,
+                    quantile_levels=fr.quantile_levels, samples=samples)
+                return {
+                    "MASE[0.5]": float(mase),
+                    "_recipe": "pipeline_full_context",
+                    "_context_cap": int(cap),
+                    "_model_family": model_family,
+                    "_batch_size": int(eval_batch_size),
+                }
+            except RuntimeError:
+                del results
+                if groups is not None:
+                    del groups
+                _clear_accelerator_cache()
+                raise
+
+        metrics, _ = _run_with_dynamic_batch(
+            f"{model_family} {ds_name}/{ds_term}", batch_size, _run)
+        return metrics
     finally:
         del handle
         if device == "cuda" and torch.cuda.is_available():
@@ -711,33 +728,24 @@ def evaluate_on_dataset(model_name: str, ds_name: str, ds_term: str,
             max_context_knob=max_context,
             default_batch_size=1024,
         )
-        eval_batch_size = 1024
-        while True:
-            try:
-                predictor.default_batch_size = eval_batch_size
-                res = evaluate_model(
-                    predictor,
-                    test_data=dataset.test_data,
-                    metrics=metrics,
-                    batch_size=eval_batch_size,
-                    axis=None,
-                    mask_invalid_label=True,
-                    allow_nan_forecast=False,
-                    # str(): gift_eval's Dataset.freq can arrive as numpy.str_,
-                    # which the Cython-compiled pandas inside get_seasonality
-                    # rejects. Harmless when it is already a plain str.
-                    seasonality=get_seasonality(str(dataset.freq)),
-                ).reset_index(drop=True).to_dict(orient="records")
-                break
-            except RuntimeError as exc:
-                if not _is_oom_error(exc) or eval_batch_size <= 1:
-                    raise
-                next_batch_size = max(1, eval_batch_size // 2)
-                logger.warning(
-                    "TimesFM OOM on %s/%s at batch_size=%d; retrying with %d",
-                    ds_name, ds_term, eval_batch_size, next_batch_size)
-                _clear_accelerator_cache()
-                eval_batch_size = next_batch_size
+        def _run(eval_batch_size: int):
+            predictor.default_batch_size = eval_batch_size
+            return evaluate_model(
+                predictor,
+                test_data=dataset.test_data,
+                metrics=metrics,
+                batch_size=eval_batch_size,
+                axis=None,
+                mask_invalid_label=True,
+                allow_nan_forecast=False,
+                # str(): gift_eval's Dataset.freq can arrive as numpy.str_,
+                # which the Cython-compiled pandas inside get_seasonality
+                # rejects. Harmless when it is already a plain str.
+                seasonality=get_seasonality(str(dataset.freq)),
+            ).reset_index(drop=True).to_dict(orient="records")
+
+        res, _ = _run_with_dynamic_batch(
+            f"TimesFM {ds_name}/{ds_term}", 1024, _run)
         return res[0]
 
     # ---- chronos-2.ipynb recipe ----
