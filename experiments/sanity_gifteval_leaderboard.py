@@ -305,6 +305,21 @@ class TimesFmPredictor:
         self.quantiles = list(np.arange(1, 10) / 10.0)
         self.max_context_knob = max_context_knob
 
+    @staticmethod
+    def _model_context(entry_target):
+        np = _require_numpy("prepare TimesFM context")
+
+        arr = np.asarray(entry_target, dtype=np.float32)
+        # TimesFM 2.5 interpolates missing values internally, but current builds
+        # crash when a context has no observed value at all after stripping leading
+        # NaNs. Match the rest of this repo's model-input convention: missing
+        # context values become zero, while metrics still see the raw GiftEval data.
+        if arr.size == 0:
+            return np.zeros(1, dtype=np.float32)
+        if np.isnan(arr).all():
+            return np.zeros_like(arr, dtype=np.float32)
+        return arr
+
     def predict(self, test_data_input, batch_size: int = 1024) -> List:
         np = _require_numpy("run TimesFM forecasts")
 
@@ -318,9 +333,10 @@ class TimesFmPredictor:
             context = []
             max_context = 0
             for entry in batch:
-                arr = np.array(entry["target"])
+                arr = self._model_context(entry["target"])
                 if self.max_context_knob is not None:
                     arr = arr[-self.max_context_knob:]
+                    arr = self._model_context(arr)
                 max_context = max(max_context, arr.shape[0])
                 context.append(arr)
             p = self.tfm.model.p
