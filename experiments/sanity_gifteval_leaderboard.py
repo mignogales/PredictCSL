@@ -71,12 +71,10 @@ import argparse
 import itertools
 import json
 import logging
+import math
+import numbers
 import os
 from typing import List, Optional
-
-import numpy as np
-import pandas as pd
-import torch
 
 try:
     from dotenv import load_dotenv
@@ -87,6 +85,58 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("sanity_gifteval_leaderboard")
+
+
+def _require_numpy(purpose: str):
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise ImportError(
+            f"numpy is required to {purpose}. Activate the GiftEval server env "
+            "(predictcsl-main / TSFM_moirai) before running model evaluation."
+        ) from exc
+    return np
+
+
+def _require_pandas(purpose: str):
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise ImportError(
+            f"pandas is required to {purpose}. Activate the GiftEval server env "
+            "(predictcsl-main / TSFM_moirai) before running this step."
+        ) from exc
+    return pd
+
+
+def _require_torch(purpose: str):
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError(
+            f"torch is required to {purpose}. Activate the GiftEval server env "
+            "(predictcsl-main / TSFM_moirai) before running Chronos-2 evaluation."
+        ) from exc
+    return torch
+
+
+def _jsonable_metric_value(v):
+    """Convert numpy/scalar metric values to JSON-safe Python values."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, numbers.Real):
+        return float(v)
+    item = getattr(v, "item", None)
+    if callable(item):
+        try:
+            scalar = item()
+        except Exception:
+            return v
+        if isinstance(scalar, bool):
+            return scalar
+        if isinstance(scalar, numbers.Real):
+            return float(scalar)
+    return v
 
 
 # ==============================================================================
@@ -220,12 +270,16 @@ def build_metrics():
 class TimesFmPredictor:
     def __init__(self, tfm, prediction_length: int,
                  max_context_knob: Optional[int] = None):
+        np = _require_numpy("construct the TimesFM predictor")
+
         self.tfm = tfm
         self.prediction_length = prediction_length
         self.quantiles = list(np.arange(1, 10) / 10.0)
         self.max_context_knob = max_context_knob
 
     def predict(self, test_data_input, batch_size: int = 1024) -> List:
+        np = _require_numpy("run TimesFM forecasts")
+
         from timesfm import configs
         from gluonts.itertools import batcher
         from gluonts.model.forecast import QuantileForecast
@@ -299,6 +353,9 @@ class Chronos2Predictor:
             yield {"target": target}
 
     def predict(self, test_data_input) -> List:
+        np = _require_numpy("run Chronos-2 forecasts")
+        torch = _require_torch("run Chronos-2 forecasts")
+
         from gluonts.model.forecast import QuantileForecast
 
         pipeline = self.pipeline
@@ -462,19 +519,30 @@ def evaluate_on_dataset(model_name: str, ds_name: str, ds_term: str,
 # Comparison against the official leaderboard CSVs
 # ==============================================================================
 def _load_reference_mase(csv_name: str) -> dict:
+    pd = _require_pandas("load leaderboard reference CSVs")
+
     df = pd.read_csv(os.path.join(REF_DIR, csv_name))
     return dict(zip(df["dataset"], df["eval_metrics/MASE[0.5]"]))
 
 
-def _geomean(s: pd.Series) -> float:
+def _geomean(s) -> float:
     s = s.dropna()
-    return float(np.exp(np.log(s).mean())) if len(s) else float("nan")
+    if not len(s):
+        return float("nan")
+    vals = [float(v) for v in s]
+    if any(v < 0.0 for v in vals):
+        return float("nan")
+    if any(v == 0.0 for v in vals):
+        return 0.0
+    return float(math.exp(sum(math.log(v) for v in vals) / len(vals)))
 
 
 def compare_and_report(ours: dict, model_name: str, out_dir: str) -> None:
     """``ours``: {config_key: metrics-dict}. Prints the per-config diff table and
     the normalized-geomean headline vs the official one, and writes
     ``comparison.csv``."""
+    pd = _require_pandas("compare against leaderboard reference CSVs")
+
     sn = _load_reference_mase(SEASONAL_NAIVE_CSV)
     ref_csv = REFERENCE_CSVS.get(model_name)
     ref = _load_reference_mase(ref_csv) if ref_csv else {}
@@ -587,11 +655,14 @@ def main() -> None:
                 predict_batches_jointly=not args.independent,
                 max_context=args.max_context,
             )
+        except ImportError as exc:
+            raise SystemExit(
+                f"{cfg['key']} cannot run because a dependency is missing: {exc}"
+            ) from exc
         except Exception as exc:  # keep going; a hole in the table is loud enough
             logger.error(f"{cfg['key']} FAILED: {exc}", exc_info=True)
             continue
-        m = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
-             for k, v in m.items()}
+        m = {k: _jsonable_metric_value(v) for k, v in m.items()}
         with open(cell_path, "w") as f:
             json.dump(m, f, indent=1)
         ours[cfg["key"]] = m
