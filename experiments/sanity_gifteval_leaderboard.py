@@ -139,6 +139,34 @@ def _jsonable_metric_value(v):
     return v
 
 
+def _is_oom_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    oom_fragments = (
+        "out of memory",
+        "cuda oom",
+        "cublas_status_alloc_failed",
+        "cudnn_status_alloc_failed",
+        "mps backend out of memory",
+        "unable to allocate",
+    )
+    return any(fragment in msg for fragment in oom_fragments)
+
+
+def _clear_accelerator_cache() -> None:
+    try:
+        torch = _require_torch("clear accelerator cache after OOM")
+    except ImportError:
+        return
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    mps = getattr(torch, "mps", None)
+    if mps is not None and hasattr(mps, "empty_cache"):
+        try:
+            mps.empty_cache()
+        except Exception:
+            pass
+
+
 # ==============================================================================
 # Official config universe — verbatim from the submission notebooks.
 # 55 short-only + 21 med/long datasets, x {short, medium, long} where allowed
@@ -307,7 +335,7 @@ class TimesFmPredictor:
                     force_flip_invariance=True,
                     return_backcast=False,
                     normalize_inputs=True,
-                    per_core_batch_size=128,
+                    per_core_batch_size=max(1, min(128, len(context))),
                 ),
             )
             _, full_preds = self.tfm.forecast(
@@ -383,8 +411,21 @@ class Chronos2Predictor:
                 forecast_outputs.append(quantiles)
                 break
             except torch.cuda.OutOfMemoryError:
-                logger.error(f"OOM at batch_size {model_batch_size}, halving")
-                model_batch_size //= 2
+                if model_batch_size <= 1:
+                    raise
+                next_batch_size = max(1, model_batch_size // 2)
+                logger.warning("Chronos-2 OOM at batch_size=%d; retrying with %d",
+                               model_batch_size, next_batch_size)
+                _clear_accelerator_cache()
+                model_batch_size = next_batch_size
+            except RuntimeError as exc:
+                if not _is_oom_error(exc) or model_batch_size <= 1:
+                    raise
+                next_batch_size = max(1, model_batch_size // 2)
+                logger.warning("Chronos-2 OOM at batch_size=%d; retrying with %d",
+                               model_batch_size, next_batch_size)
+                _clear_accelerator_cache()
+                model_batch_size = next_batch_size
 
         forecast_outputs = np.concatenate(forecast_outputs, axis=0)
         assert len(forecast_outputs) == len(input_data)
@@ -485,19 +526,32 @@ def evaluate_on_dataset(model_name: str, ds_name: str, ds_term: str,
             prediction_length=dataset.prediction_length,
             max_context_knob=max_context,
         )
-        res = evaluate_model(
-            predictor,
-            test_data=dataset.test_data,
-            metrics=metrics,
-            batch_size=1024,
-            axis=None,
-            mask_invalid_label=True,
-            allow_nan_forecast=False,
-            # str(): gift_eval's Dataset.freq can arrive as numpy.str_, which the
-            # Cython-compiled pandas inside get_seasonality rejects. Harmless when
-            # it is already a plain str.
-            seasonality=get_seasonality(str(dataset.freq)),
-        ).reset_index(drop=True).to_dict(orient="records")
+        eval_batch_size = 1024
+        while True:
+            try:
+                res = evaluate_model(
+                    predictor,
+                    test_data=dataset.test_data,
+                    metrics=metrics,
+                    batch_size=eval_batch_size,
+                    axis=None,
+                    mask_invalid_label=True,
+                    allow_nan_forecast=False,
+                    # str(): gift_eval's Dataset.freq can arrive as numpy.str_,
+                    # which the Cython-compiled pandas inside get_seasonality
+                    # rejects. Harmless when it is already a plain str.
+                    seasonality=get_seasonality(str(dataset.freq)),
+                ).reset_index(drop=True).to_dict(orient="records")
+                break
+            except RuntimeError as exc:
+                if not _is_oom_error(exc) or eval_batch_size <= 1:
+                    raise
+                next_batch_size = max(1, eval_batch_size // 2)
+                logger.warning(
+                    "TimesFM OOM on %s/%s at batch_size=%d; retrying with %d",
+                    ds_name, ds_term, eval_batch_size, next_batch_size)
+                _clear_accelerator_cache()
+                eval_batch_size = next_batch_size
         return res[0]
 
     # ---- chronos-2.ipynb recipe ----
