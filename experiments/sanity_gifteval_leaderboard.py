@@ -326,6 +326,26 @@ def _get_timesfm(model_name: str):
 # Per-dataset evaluation — verbatim port of the notebooks' evaluation cells.
 # ------------------------------------------------------------------------------
 
+def _force_str_freq() -> None:
+    """Make gift_eval's ``Dataset.freq`` return a plain ``str``.
+
+    The property returns ``hf_dataset[0]["freq"]``, which arrives as a
+    ``numpy.str_`` under the datasets library's formatting. Cython-3-built
+    pandas rejects ``str`` subclasses in typed signatures ("Argument 'freq' has
+    incorrect type (expected str, got numpy.str_)"), and the value flows into
+    pandas both from OUR calls (get_seasonality) and from gift_eval/gluonts
+    internals (``to_offset(self.freq)`` in data.py, period arithmetic in the
+    test split) — so wrap it at the source instead of chasing call sites.
+    Idempotent."""
+    from gift_eval import data as ge_data
+
+    if getattr(ge_data.Dataset, "_freq_str_patched", False):
+        return
+    orig_fget = ge_data.Dataset.freq.fget
+    ge_data.Dataset.freq = property(lambda self: str(orig_fget(self)))
+    ge_data.Dataset._freq_str_patched = True
+
+
 def _metrics():
     from gluonts.ev.metrics import (
         MAE, MAPE, MASE, MSE, MSIS, ND, NRMSE, RMSE, SMAPE,
@@ -350,6 +370,7 @@ def evaluate_on_dataset(model_name: str, ds_name: str, ds_term: str,
 
     from gift_eval.data import Dataset
 
+    _force_str_freq()
     family = _model_family(model_name)
 
     if family == "timesfm":
@@ -543,7 +564,7 @@ def main() -> None:
                 max_context=args.max_context,
             )
         except Exception as exc:  # keep going; a hole in the table is loud enough
-            logger.error(f"{cfg['key']} FAILED: {exc}")
+            logger.error(f"{cfg['key']} FAILED: {exc}", exc_info=True)
             continue
         m = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
              for k, v in m.items()}
