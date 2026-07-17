@@ -924,6 +924,15 @@ def load_timesfm(model_id, window_size, horizon, batch_size):
 
 
 def predict_timesfm(model, batches, horizon, device):
+    """Median + quantile forecast.
+
+    NOTE: TimesFM-2.5's ``point_forecast`` IS the 0.5-quantile, not the mean —
+    ``compiled_decode`` returns ``full_forecast[..., 5]`` (``decode_index=5``;
+    columns are ``[mean-head, q0.1..q0.9]``), which is exactly what the GiftEval
+    leaderboard scores as MASE[0.5]. Do NOT "fix" this to the mean head (col 0).
+    The ``[:, :, 1:]`` slice below keeps the 9 quantiles, mirroring the official
+    notebook's ``full_preds[:, :, 1:]``.
+    """
     PATCH_SIZE = 32
 
     def step(x, y):

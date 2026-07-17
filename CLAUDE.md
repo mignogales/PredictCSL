@@ -223,9 +223,12 @@ Token-mapping / hook assumptions per family carry "verify on server" notes in
   which our pipeline deliberately lacks; knobs (`--univariate`,
   `--independent`, `--max-context 8192`) move the recipe stepwise toward the
   pipeline's to attribute the gap (knobs are part of the output tag).
-  Known pipeline-vs-official TimesFM divergences to attribute: grid cap 8192
-  vs 15360, and stage 3 scores TimesFM's POINT forecast as `median` while the
-  official scores the 0.5-quantile head. Per-config JSON cache under
+  Known pipeline-vs-official TimesFM divergence to attribute: grid cap 8192 vs
+  15360. (NOT a divergence: TimesFM-2.5's returned `point_forecast` IS the
+  0.5-quantile — verified in source, `compiled_decode` returns
+  `full_forecast[..., 5]` / `decode_index=5`, columns `[mean-head, q0.1..q0.9]`
+  — so stage 1/3 scoring `point_forecast` as median is already
+  leaderboard-consistent.) Per-config JSON cache under
   `logs/experiments/sanity_leaderboard/<tag>/`, resumable.
 
 **Master orchestrator:**
