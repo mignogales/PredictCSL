@@ -74,7 +74,7 @@ import logging
 import math
 import numbers
 import os
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -226,10 +226,53 @@ MODEL_ALIASES = {
 
 QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
+# Model ids that should stay on the official notebook recipe by default. Use the
+# display name from experiments.models_config (e.g. TimesFM2.5-200M,
+# Chronos2-Base, Moirai2-Small) to run the repo/pipeline wrapper instead.
+OFFICIAL_RECIPE_IDS = {
+    "google/timesfm-2.5-200m-pytorch",
+    "amazon/chronos-2",
+    "autogluon/chronos-2",
+    "autogluon/chronos-2-synth",
+}
+
 
 def _model_family(model_name: str) -> str:
     """Which official notebook governs this model."""
     return "timesfm" if "timesfm" in model_name.lower() else "chronos2"
+
+
+def _pipeline_model_index() -> dict:
+    from experiments.models_config import CATALOG
+
+    idx = {}
+    for spec in CATALOG:
+        for key in (spec.display, spec.model_id):
+            idx[key.lower()] = (spec.model_id, spec.family, spec.display)
+    return idx
+
+
+def resolve_model(model_arg: str) -> Tuple[str, Optional[str], str, str]:
+    """Return (model_id, pipeline_family, display, recipe).
+
+    recipe is "official" for the two published notebook ports and "pipeline" for
+    models evaluated through this repo's v5 ablation wrappers.
+    """
+    aliased = MODEL_ALIASES.get(model_arg, model_arg)
+    if aliased in OFFICIAL_RECIPE_IDS:
+        return aliased, None, os.path.basename(aliased), "official"
+
+    spec = _pipeline_model_index().get(model_arg.lower()) \
+        or _pipeline_model_index().get(aliased.lower())
+    if spec is not None:
+        model_id, family, display = spec
+        return model_id, family, display, "pipeline"
+
+    # Unknown ids keep the previous behavior: assume an official-style recipe
+    # family based on the model name, but warn that no pipeline family was found.
+    logger.warning("model %r is not in experiments.models_config; using the "
+                   "official-style recipe dispatch", model_arg)
+    return aliased, None, os.path.basename(aliased), "official"
 
 
 # ==============================================================================
@@ -519,6 +562,121 @@ def _load_chronos2(model_name: str, device: str):
     return _MODEL_HANDLE[model_name]
 
 
+def _pipeline_context_cap(family: str, horizon: int, requested: Optional[int],
+                          max_available: int) -> int:
+    import experiments.test_window_ablation_gifteval_v5 as wab
+
+    caps = {
+        "sundial": getattr(wab, "SUNDIAL_MAX_CONTEXT", max_available),
+        "toto": getattr(wab, "TOTO_MAX_CONTEXT", max_available),
+        "flowstate": getattr(wab, "FLOWSTATE_MAX_CONTEXT", max_available),
+        "tirex": getattr(wab, "TIREX_MAX_CONTEXT", max_available),
+    }
+    if family == "timemoe":
+        caps[family] = max(1, getattr(wab, "TIMEMOE_MAX_TOTAL", max_available) - horizon)
+    elif family == "timesfm":
+        caps[family] = 15360
+
+    cap = int(requested) if requested is not None else int(caps.get(family, max_available))
+    return max(1, min(cap, int(max_available)))
+
+
+def _pipeline_full_context_batches(cache, cap: int, batch_size: int,
+                                   device: str, pin_memory: bool):
+    """Exact full-native batches: every instance uses its last min(len, cap)
+    samples, grouped by that effective length so wrappers see rectangular tensors
+    without synthetic left padding."""
+    np = _require_numpy("build pipeline full-context batches")
+    import torch
+
+    lengths = np.maximum(1, np.minimum(cache.context_lengths, int(cap)))
+    groups = []
+    for width in np.unique(lengths):
+        width = int(width)
+        idx = np.flatnonzero(lengths == width)
+        x_np = np.empty((idx.size, width), dtype=np.float32)
+        for j, i in enumerate(idx):
+            ctx = np.asarray(cache.contexts[i], dtype=np.float32)
+            if ctx.size >= width:
+                x_np[j] = ctx[-width:]
+            else:
+                x_np[j] = np.concatenate([
+                    np.zeros(width - ctx.size, dtype=np.float32),
+                    ctx,
+                ])
+        y_np = cache.labels_np[idx]
+
+        all_x = torch.from_numpy(x_np).unsqueeze(-1)
+        all_y = torch.from_numpy(y_np).unsqueeze(-1)
+        if pin_memory and device == "cuda":
+            ax, ay = all_x.pin_memory(), all_y.pin_memory()
+        else:
+            ax, ay = all_x, all_y
+
+        batches = []
+        for start in range(0, idx.size, batch_size):
+            stop = min(start + batch_size, idx.size)
+            batches.append({"x": ax[start:stop], "y": ay[start:stop]})
+        groups.append((idx, width, batches))
+    return groups
+
+
+def evaluate_pipeline_on_dataset(model_id: str, model_family: str,
+                                 ds_name: str, ds_term: str, batch_size: int,
+                                 device: str, max_context: Optional[int]) -> dict:
+    import numpy as np
+    import torch
+
+    import experiments.test_window_ablation_gifteval_v5 as wab
+    from experiments.gifteval_mase import gluonts_leaderboard_mase
+    from gift_eval.data import Dataset
+
+    to_univariate = Dataset(
+        name=ds_name, term=ds_term, to_univariate=False).target_dim > 1
+    dataset = Dataset(name=ds_name, term=ds_term, to_univariate=to_univariate)
+    cache = wab.GiftEvalCache(dataset, ds_name)
+    horizon = cache.horizon
+    cap = _pipeline_context_cap(
+        model_family, horizon, max_context, cache.max_context)
+
+    logger.info("pipeline full-context %s/%s: cap=%d ctx_range=[%d,%d] n=%d",
+                ds_name, ds_term, cap, cache.min_context, cache.max_context,
+                cache.n_total)
+
+    handle = None if model_family in ("timesfm", "context_parroting") \
+        else wab.load_handle(model_family, model_id, device)
+    groups = _pipeline_full_context_batches(
+        cache, cap, batch_size, device, pin_memory=(device == "cuda"))
+
+    results = []
+    try:
+        for idx, width, batches in groups:
+            fr, _tgts = wab._forecast_cell(
+                model_family, handle, model_id, batches, width, horizon,
+                device, batch_size, flowstate_scale=cache.flowstate_scale)
+            results.append((idx, fr, _tgts))
+        fr, _tgts = wab._merge_grouped(results, cache.n_total, horizon, device)
+        median = fr.median.detach().cpu().float().numpy()
+        quantiles = (fr.quantiles.detach().cpu().float().numpy()
+                     if fr.quantiles is not None else None)
+        samples = (fr.samples.detach().cpu().float().numpy()
+                   if fr.samples is not None else None)
+        mase = gluonts_leaderboard_mase(
+            median, cache.starts, cache.contexts_raw, cache.labels_np, cache.freq,
+            quantiles=quantiles, quantile_levels=fr.quantile_levels,
+            samples=samples)
+        return {
+            "MASE[0.5]": float(mase),
+            "_recipe": "pipeline_full_context",
+            "_context_cap": int(cap),
+            "_model_family": model_family,
+        }
+    finally:
+        del handle
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 # ==============================================================================
 # Per-config evaluation — dispatch on family, each branch a notebook port.
 # ==============================================================================
@@ -526,7 +684,13 @@ def evaluate_on_dataset(model_name: str, ds_name: str, ds_term: str,
                         batch_size: int, device: str,
                         use_multivariate_data: bool,
                         predict_batches_jointly: bool,
-                        max_context: Optional[int]) -> dict:
+                        max_context: Optional[int],
+                        pipeline_family: Optional[str] = None) -> dict:
+    if pipeline_family is not None:
+        return evaluate_pipeline_on_dataset(
+            model_name, pipeline_family, ds_name, ds_term, batch_size,
+            device, max_context)
+
     from gluonts.model import evaluate_forecasts, evaluate_model
     from gluonts.time_feature import get_seasonality
 
@@ -692,8 +856,9 @@ def compare_and_report(ours: dict, model_name: str, out_dir: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", default="timesfm-2.5",
-                    help="shorthand (timesfm-2.5, chronos-2, chronos-2-synth) "
-                         "or a full HF id")
+                    help="official shorthand (timesfm-2.5, chronos-2, "
+                         "chronos-2-synth), a models_config display name "
+                         "(Moirai2-Small, PatchTST-FM-R1, ...), or a full HF id")
     ap.add_argument("--batch-size", type=int, default=100,
                     help="chronos-2 official notebook value: 100 (timesfm "
                          "batches internally at 1024)")
@@ -713,12 +878,20 @@ def main() -> None:
                          "8192; the official recipe feeds everything)")
     args = ap.parse_args()
 
-    args.model = MODEL_ALIASES.get(args.model, args.model)
-    if _model_family(args.model) == "timesfm" and (args.univariate or args.independent):
+    model_id, pipeline_family, model_display, recipe = resolve_model(args.model)
+    args.model = model_id
+    if recipe == "official" and _model_family(args.model) == "timesfm" \
+            and (args.univariate or args.independent):
         logger.warning("--univariate/--independent are no-ops for timesfm: its "
                        "official recipe is already univariate and independent")
+    if recipe == "pipeline" and (args.univariate or args.independent):
+        logger.warning("--univariate/--independent only apply to the official "
+                       "Chronos-2 recipe; pipeline models already use the repo's "
+                       "univariate wrappers")
 
-    tag = os.path.basename(args.model)
+    tag = os.path.basename(args.model) if recipe == "official" else model_display
+    if recipe == "pipeline":
+        tag += "_pipeline_full"
     if args.univariate:
         tag += "_univariate"
     if args.independent:
@@ -753,6 +926,7 @@ def main() -> None:
                 use_multivariate_data=not args.univariate,
                 predict_batches_jointly=not args.independent,
                 max_context=args.max_context,
+                pipeline_family=pipeline_family,
             )
         except ImportError as exc:
             raise SystemExit(
