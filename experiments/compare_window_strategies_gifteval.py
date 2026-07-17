@@ -5,7 +5,8 @@ Reads cached ablation results produced by test_window_ablation_gifteval_v5.py
 and compares MASE + wall-clock time + theoretical complexity under three
 context-selection strategies per (model, dataset, term):
 
-  full_window   -- largest valid window in the ablation grid (maximum context)
+  full_window   -- native full-context baseline (wfull_native) when present;
+                   otherwise largest valid window in the ablation grid
   best_window   -- argmin of real MASE curve (oracle; best achievable from grid)
   pred_window   -- argmin of the predictor's mean curve (zero-shot recommendation)
 
@@ -94,7 +95,7 @@ import glob
 import json
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -106,6 +107,8 @@ import matplotlib.pyplot as plt
 from colorama import Fore
 
 CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
+FULL_NATIVE_WINDOW = "full_native"
+WindowKey = Union[int, str]
 
 # ==============================================================================
 #  PREDICTOR VARIANTS
@@ -375,7 +378,7 @@ def _cache_dir(
     dataset_display: str,
     model_short: str,
     term: str,
-    window_size: int,
+    window_size: WindowKey,
 ) -> str:
     return os.path.join(
         cache_root, "datasets", dataset_display, model_short, f"t{term}", f"w{window_size}"
@@ -387,7 +390,7 @@ def _load_elapsed(
     dataset_display: str,
     model_short: str,
     term: str,
-    window_size: int,
+    window_size: WindowKey,
 ) -> float:
     """Return elapsed_seconds from metrics.json, or NaN if unavailable."""
     path = os.path.join(
@@ -417,7 +420,7 @@ def _load_robust_elapsed(
     dataset_display: str,
     model_short: str,
     term: str,
-    window_size: int,
+    window_size: WindowKey,
 ) -> Tuple[float, float]:
     """Return (mean_s, std_s) from the per-cell timing.json, or (NaN, NaN) when
     no robust timing has been recorded for this cell."""
@@ -445,7 +448,7 @@ def _elapsed_and_std(
     dataset_display: str,
     model_short: str,
     term: str,
-    window_size: int,
+    window_size: WindowKey,
 ) -> Tuple[float, float]:
     """Elapsed seconds + std for one cell. Uses the robust timing.json mean/std
     when enabled and present; otherwise the single-shot elapsed_seconds (std NaN).
@@ -456,6 +459,71 @@ def _elapsed_and_std(
         if not math.isnan(mean):
             return mean, std
     return _load_elapsed(cache_root, dataset_display, model_short, term, window_size), float("nan")
+
+
+def _load_metrics(
+    cache_root: str,
+    dataset_display: str,
+    model_short: str,
+    term: str,
+    window_size: WindowKey,
+) -> Optional[dict]:
+    path = os.path.join(
+        _cache_dir(cache_root, dataset_display, model_short, term, window_size),
+        "metrics.json",
+    )
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _mean_theoretical_flops_for_contexts(
+    model_id: str,
+    contexts: np.ndarray,
+    horizon: int,
+    patch_sizes: Dict[str, int],
+) -> float:
+    vals = np.asarray(contexts, dtype=np.int64)
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size == 0:
+        return float("nan")
+    uniq, counts = np.unique(vals, return_counts=True)
+    total = 0.0
+    for ctx, n in zip(uniq, counts):
+        total += theoretical_flops(model_id, int(ctx), horizon, patch_sizes) * int(n)
+    return float(total / vals.size)
+
+
+def _full_native_flops(
+    cache_root: str,
+    dataset_display: str,
+    model_short: str,
+    term: str,
+    model_id: str,
+    horizon: int,
+    patch_sizes: Dict[str, int],
+    metrics: dict,
+) -> float:
+    npz_path = os.path.join(
+        _cache_dir(cache_root, dataset_display, model_short, term, FULL_NATIVE_WINDOW),
+        "per_sample_metrics.npz",
+    )
+    if os.path.isfile(npz_path):
+        try:
+            with np.load(npz_path) as d:
+                if "effective_context" in d.files:
+                    return _mean_theoretical_flops_for_contexts(
+                        model_id, d["effective_context"], horizon, patch_sizes)
+        except Exception:
+            pass
+    cap = metrics.get("_context_cap")
+    if cap is not None:
+        return theoretical_flops(model_id, int(cap), horizon, patch_sizes)
+    return float("nan")
 
 
 # ==============================================================================
@@ -733,6 +801,30 @@ def load_strategy_records(
             full_mase = float(real_curve[full_idx])
             best_mase = float(real_curve[best_idx])
             pred_mase = float(real_curve[pred_idx])
+            full_elapsed_key: WindowKey = full_w
+            full_baseline_source = "grid_largest_valid"
+            full_effective_context_mean = float("nan")
+            full_native_width_groups = float("nan")
+            full_native_metrics = _load_metrics(
+                cache_root, dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+            if full_native_metrics is not None:
+                native_mase = full_native_metrics.get(mase_metric)
+                native_standin = False
+                native_ok = native_mase is not None and np.isfinite(float(native_mase))
+                if not native_ok and mase_metric == "mase_gluonts_real":
+                    native_mase = full_native_metrics.get("mase_gluonts")
+                    native_standin = native_mase is not None
+                if native_mase is not None and np.isfinite(float(native_mase)):
+                    full_mase = float(native_mase)
+                    full_w = int(full_native_metrics.get("_context_cap", full_w))
+                    full_elapsed_key = FULL_NATIVE_WINDOW
+                    full_baseline_source = (
+                        "full_native_standin" if native_standin
+                        else "full_native")
+                    full_effective_context_mean = float(
+                        full_native_metrics.get("_mean_effective_context", float("nan")))
+                    full_native_width_groups = float(
+                        full_native_metrics.get("_n_width_groups", float("nan")))
 
             # Seasonal-naive denominator for this cell (leaderboard-style
             # normalisation: MASE_strategy / MASE_seasonalnaive). NaN when the
@@ -744,7 +836,7 @@ def load_strategy_records(
 
             # --- Elapsed time (robust timing.json mean, else single-shot) --------
             full_elapsed, full_elapsed_std = _elapsed_and_std(
-                cache_root, dataset_display, model_short, term, full_w)
+                cache_root, dataset_display, model_short, term, full_elapsed_key)
             best_elapsed, best_elapsed_std = _elapsed_and_std(
                 cache_root, dataset_display, model_short, term, best_w)
             pred_elapsed, pred_elapsed_std = _elapsed_and_std(
@@ -763,7 +855,14 @@ def load_strategy_records(
             )
 
             # --- Theoretical complexity ------------------------------------------
-            full_flops = theoretical_flops(model, full_w, horizon, patch_sizes)
+            if full_baseline_source.startswith("full_native") and full_native_metrics is not None:
+                full_flops = _full_native_flops(
+                    cache_root, dataset_display, model_short, term,
+                    model, horizon, patch_sizes, full_native_metrics)
+                if not np.isfinite(full_flops):
+                    full_flops = theoretical_flops(model, full_w, horizon, patch_sizes)
+            else:
+                full_flops = theoretical_flops(model, full_w, horizon, patch_sizes)
             best_flops = theoretical_flops(model, best_w, horizon, patch_sizes)
             pred_flops = theoretical_flops(model, pred_w, horizon, patch_sizes)
 
@@ -862,6 +961,9 @@ def load_strategy_records(
             "full_window":     full_w,
             "best_window":     best_w,
             "pred_window":     pred_w,
+            "full_baseline_source": full_baseline_source,
+            "full_effective_context_mean": full_effective_context_mean,
+            "full_native_width_groups": full_native_width_groups,
             "n_windows_valid": int(valid.sum()),
             "pred_clamped":    pred_clamped,   # True when pred window was unavailable
             # MASE values

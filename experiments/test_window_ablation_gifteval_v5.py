@@ -35,7 +35,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -91,6 +91,8 @@ MOIRAI2_MEDIAN_IDX = 4
 MOIRAI_1_1_NUM_SAMPLES = 100
 MOIRAI_1_1_PATCH_SIZE = 32
 TIMESFM_QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+TIMESFM_FULL_CONTEXT = 15360
+FULL_NATIVE_WINDOW = "full_native"
 PATCHTST_FM_QUANTILE_LEVELS = [i / 100.0 for i in range(1, 100)]
 PATCHTST_FM_MEDIAN_QUANTILE_IDX = 49
 SUNDIAL_NUM_SAMPLES = 20
@@ -417,6 +419,57 @@ class GiftEvalCache:
 
         return groups
 
+    def build_batches_full_native(
+        self,
+        context_cap: int,
+        batch_size: int,
+        device: str,
+        pin_memory: bool,
+    ) -> Tuple[
+        List[Tuple[int, List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, np.ndarray]],
+        np.ndarray,
+    ]:
+        """Full-native batching: serve every instance with its available history.
+
+        Each instance contributes ``min(context_cap, context_length)`` genuine
+        samples. Groups are exact effective widths so wrappers that require a
+        rectangular tensor still see only real context, matching the sanity
+        leaderboard path.
+        """
+        lengths = np.maximum(1, np.minimum(self.context_lengths, int(context_cap)))
+
+        groups: List[Tuple[int, List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, np.ndarray]] = []
+        for L in np.unique(lengths):
+            L = int(L)
+            idx = np.flatnonzero(lengths == L)
+            g = idx.size
+            x_np = np.empty((g, L), dtype=np.float32)
+            for j, i in enumerate(idx):
+                ctx = np.asarray(self.contexts[i], dtype=np.float32)
+                if ctx.size >= L:
+                    x_np[j] = ctx[-L:]
+                else:
+                    x_np[j] = np.concatenate([
+                        np.zeros(L - ctx.size, dtype=np.float32),
+                        ctx,
+                    ])
+            y_np = self.labels_np[idx]
+
+            all_x = torch.from_numpy(x_np).unsqueeze(-1)
+            all_y = torch.from_numpy(y_np).unsqueeze(-1)
+            if pin_memory and device == "cuda":
+                ax, ay = all_x.pin_memory(), all_y.pin_memory()
+            else:
+                ax, ay = all_x, all_y
+
+            batches = []
+            for start in range(0, g, batch_size):
+                stop = min(start + batch_size, g)
+                batches.append({"x": ax[start:stop], "y": ay[start:stop]})
+            groups.append((L, batches, all_x, all_y, idx))
+
+        return groups, lengths.astype(np.int32, copy=False)
+
 
 # ==============================================================================
 #  NAIVE BASELINE
@@ -523,7 +576,10 @@ def load_or_compute_naive_baseline(
 #  RESULT CACHE
 # ==============================================================================
 
-def _cache_dir(dataset_display: str, model_short: str, term: str, window_size: int) -> str:
+WindowKey = Union[int, str]
+
+
+def _cache_dir(dataset_display: str, model_short: str, term: str, window_size: WindowKey) -> str:
     return os.path.join(
         CACHE_ROOT, "datasets", dataset_display, model_short, f"t{term}", f"w{window_size}"
     )
@@ -581,7 +637,7 @@ def _backfill_mase_gluonts(dataset_display, model_short, term, window_size,
     # Reproduce the instance set/order stage 3 used for this cell: in skip mode
     # only instances whose context >= window are served (ascending index order);
     # in pad mode every instance is served (full 0..n-1 order).
-    if short_mode == "pad":
+    if window_size == FULL_NATIVE_WINDOW or short_mode == "pad":
         vi = np.arange(cache.n_total)
     else:
         vi = np.flatnonzero(cache.context_lengths >= window_size)
@@ -1752,6 +1808,128 @@ def _merge_grouped(results, n_total, horizon, device):
                           quantiles=quantiles, quantile_levels=qlevels), tgts
 
 
+def _full_native_context_cap(model_family: str, horizon: int, max_available: int) -> int:
+    caps = {
+        "timesfm": TIMESFM_FULL_CONTEXT,
+        "patchtst_fm": 8192,
+        "sundial": SUNDIAL_MAX_CONTEXT,
+        "toto": TOTO_MAX_CONTEXT,
+        "flowstate": FLOWSTATE_MAX_CONTEXT,
+        "tirex": TIREX_MAX_CONTEXT,
+    }
+    if model_family == "timemoe":
+        caps[model_family] = max(1, TIMEMOE_MAX_TOTAL - int(horizon))
+    cap = int(caps.get(model_family, max_available))
+    return max(1, min(cap, int(max_available)))
+
+
+def _missing_metric(metrics: dict, key: str) -> bool:
+    v = metrics.get(key)
+    return v is None or (isinstance(v, float) and np.isnan(v))
+
+
+def _run_full_native_baseline(
+    cache: GiftEvalCache,
+    dataset_display: str,
+    ge_name: str,
+    term: str,
+    model_id: str,
+    model_family: str,
+    model_short: str,
+    batch_size: int,
+    device: str,
+    ensure_handle,
+) -> None:
+    horizon = cache.horizon
+    cap = _full_native_context_cap(model_family, horizon, cache.max_context)
+    tag = (f"{model_short} | {dataset_display} | t={term} | h={horizon} | "
+           f"w={FULL_NATIVE_WINDOW} cap={cap}")
+
+    if _result_cached(dataset_display, model_short, term, FULL_NATIVE_WINDOW):
+        cached = _load_cached_result(dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+        changed = False
+        stale_ver = cached.get("_mase_gluonts_ver", 0) < MASE_GLUONTS_VER
+        if _missing_metric(cached, "mase_gluonts") or stale_ver:
+            mg = _backfill_mase_gluonts(
+                dataset_display, model_short, term, FULL_NATIVE_WINDOW,
+                cache, "pad")
+            if mg is not None:
+                cached["mase_gluonts"] = mg
+                cached["_mase_gluonts_ver"] = MASE_GLUONTS_VER
+                changed = True
+        if (_missing_metric(cached, "mase_gluonts_real") or stale_ver) \
+                and not _missing_metric(cached, "mase_gluonts"):
+            cached["mase_gluonts_real"] = cached["mase_gluonts"]
+            cached["_mase_gluonts_real_standin"] = True
+            changed = True
+        if changed:
+            _save_result(dataset_display, model_short, term,
+                         FULL_NATIVE_WINDOW, cached)
+        print(Fore.WHITE + f"  CACHED  {tag}  -> MAE={cached['mae']:.6f}" + Fore.RESET)
+        return
+
+    print(Fore.YELLOW + f"\n  > {tag}" + Fore.RESET)
+    groups, effective_lengths = cache.build_batches_full_native(
+        cap, batch_size, device, pin_memory=True)
+
+    def _sync():
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+    results = []
+    _sync()
+    t_start = time.perf_counter()
+    for L, batches_L, _ax, _ay, idx_L in groups:
+        fr_L, tgts_L = _forecast_cell(
+            model_family, ensure_handle(), model_id, batches_L,
+            L, horizon, device, batch_size,
+            flowstate_scale=cache.flowstate_scale)
+        results.append((idx_L, fr_L, tgts_L))
+    fr, tgts = _merge_grouped(results, cache.n_total, horizon, device)
+    _sync()
+    elapsed = time.perf_counter() - t_start
+
+    served_idx = np.arange(cache.n_total)
+    se_cell = cache.seasonal_errors_gluonts
+    metrics = compute_all_metrics(fr, tgts, cache.naive_seasonal_mae_train,
+                                  seasonal_errors=se_cell)
+    metrics["mase_gluonts_real"] = cell_mase_gluonts_real(fr, cache, served_idx)
+    if np.isnan(metrics["mase_gluonts_real"]) and not np.isnan(metrics["mase_gluonts"]):
+        metrics["mase_gluonts_real"] = metrics["mase_gluonts"]
+        metrics["_mase_gluonts_real_standin"] = True
+    else:
+        metrics["_mase_gluonts_real_standin"] = False
+    metrics["_mase_gluonts_ver"] = MASE_GLUONTS_VER
+    metrics["elapsed_seconds"] = round(elapsed, 3)
+    metrics["horizon"] = horizon
+    metrics["_full_native_baseline"] = True
+    metrics["_context_cap"] = int(cap)
+    metrics["_min_effective_context"] = int(np.min(effective_lengths))
+    metrics["_mean_effective_context"] = float(np.mean(effective_lengths))
+    metrics["_max_effective_context"] = int(np.max(effective_lengths))
+    metrics["_n_width_groups"] = int(len(groups))
+
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            print(Fore.YELLOW + f"    {k}: {v:.6f}" + Fore.RESET)
+    print(Fore.MAGENTA + f"    TIME  {elapsed:.1f}s" + Fore.RESET)
+    print(f"    Samples: {cache.n_total} ({len(groups)} exact width-groups, full-native)  "
+          f"cap={cap}  H={horizon}")
+
+    per_sample = compute_per_sample_metrics(
+        fr, tgts, cache.naive_seasonal_mae_train, seasonal_errors=se_cell)
+    per_sample["effective_context"] = effective_lengths
+    per_sample["served_index"] = served_idx.astype(np.int32, copy=False)
+    _save_per_sample_metrics(dataset_display, model_short, term,
+                             FULL_NATIVE_WINDOW, per_sample)
+    _save_result(dataset_display, model_short, term, FULL_NATIVE_WINDOW, metrics)
+
+    del fr, tgts, per_sample, results
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Window-size ablation on GiftEval with predictor overlay.")
@@ -1788,6 +1966,9 @@ def parse_args() -> argparse.Namespace:
                         "instance its min(w, context) genuine samples (PatchTST-FM is "
                         "NaN-padded to its native context), so every window averages the "
                         "same full instance set and the curve flattens past available context.")
+    p.add_argument("--no-full-native-baseline", action="store_true",
+                   help="Do not write the extra wfull_native baseline used by stage 4 "
+                        "as the stricter full-context/FLOPs reference.")
     p.add_argument("--num-gpus", type=int, default=0,
                    help="GPUs to shard the ablation across. 0 = auto (all visible, "
                         "respecting CUDA_VISIBLE_DEVICES); >0 caps to min(n, device_count). "
@@ -1925,7 +2106,10 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
     # on disk. Cheap file-stat scan, no dataset loading. The denominator is the
     # full grid, so cells that will be skipped (can't serve / model context
     # limits) are still counted — treat the percentage as a lower bound.
-    n_planned = len(models) * len(datasets) * len(window_sizes)
+    include_full_native = (not args.no_cell_cache
+                           and not args.no_full_native_baseline)
+    n_planned = len(models) * len(datasets) * (
+        len(window_sizes) + (1 if include_full_native else 0))
     n_cached = sum(
         1
         for _, _, model_short in models
@@ -1933,6 +2117,13 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
         for window_size in window_sizes
         if _result_cached(dataset_display, model_short, term, window_size)
     )
+    if include_full_native:
+        n_cached += sum(
+            1
+            for _, _, model_short in models
+            for _, term, dataset_display, _ in datasets
+            if _result_cached(dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+        )
     pct_cached = 100.0 * n_cached / n_planned if n_planned else 100.0
     print(Fore.CYAN
           + f"Resume: {n_cached}/{n_planned} cells cached ({pct_cached:.1f}% complete)"
@@ -1993,6 +2184,12 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
             cache = ge_cache[ds_key]
             naive_bl = naive_baseline_cache[(dataset_display, term)]
             horizon = cache.horizon
+
+            if not args.no_cell_cache and not args.no_full_native_baseline:
+                _run_full_native_baseline(
+                    cache, dataset_display, ge_name, term,
+                    model_id, model_family, model_short,
+                    args.batch_size, device, ensure_handle)
 
             for window_size in window_sizes:
                 tag = f"{model_short} | {dataset_display} | t={term} | h={horizon} | w={window_size}"
