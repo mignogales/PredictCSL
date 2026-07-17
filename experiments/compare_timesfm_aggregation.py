@@ -32,6 +32,22 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 
+def _main_to_sanity_key_map() -> Dict[Tuple[str, str], str]:
+    from experiments import datasets_config
+    from experiments import sanity_gifteval_leaderboard as sanity
+
+    by_ds_term = {
+        (row["ds_name"], row["term"]): row["key"]
+        for row in sanity.official_configs()
+    }
+    out = {}
+    for ge_name, term, display, _to_univariate in datasets_config.catalog():
+        key = by_ds_term.get((ge_name, term))
+        if key is not None:
+            out[(display, term)] = key
+    return out
+
+
 def _finite(x) -> bool:
     try:
         return math.isfinite(float(x))
@@ -135,6 +151,7 @@ def _load_main(run_dir: str, model: str, metric: str, window: str,
     root = os.path.join(run_dir, "datasets")
     if not os.path.isdir(root):
         raise SystemExit(f"No datasets/ under main run dir: {run_dir}")
+    key_map = _main_to_sanity_key_map()
     rows = {}
     for dataset in sorted(os.listdir(root)):
         ddir = os.path.join(root, dataset)
@@ -162,7 +179,7 @@ def _load_main(run_dir: str, model: str, metric: str, window: str,
             # Prefer the actual naive gluonts machinery value if present; fall
             # back to the port so older caches can still be diagnosed.
             sn = ninfo.get("mase_gluonts_real") or ninfo.get("mase_gluonts")
-            key = f"{dataset}/{term}"
+            key = key_map.get((dataset, term), f"{dataset}/{term}")
             rows[key] = {
                 "mase": mase,
                 "sn": sn,
