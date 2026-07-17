@@ -75,10 +75,17 @@ families:
     maximum_context_length: 8192           # max_seq_len(512) x patch(16),
     max_includes_horizon: true             # context + horizon budget
   timesfm:
-    supports_attention_masking: false      # compiled decode defeats hooks
-    supports_activation_patching: false
-    supports_forecast_lens: false
-    supports_integrated_gradients: false
+    # The adapter loads timesfm 2.5 EAGERLY (torch_compile=False): the
+    # "compiled_decode" name is a misnomer — the decode loop is an eager
+    # closure; only model.forward gets torch.compile'd, and only when asked.
+    # Eager => hooks + the make_attn_mask wrap are reachable. Verify on the
+    # server that eager forecasts match the compiled pipeline's, then that the
+    # masked curve at L == full window equals the sliced one.
+    supports_attention_masking: true       # eager path only (see adapter)
+    supports_activation_patching: true     # blocks at stacked_xf.N
+    supports_forecast_lens: true           # residual stack; experimental
+    supports_integrated_gradients: false   # compiled_decode takes numpy lists
+                                           # — gradient path severed at input
     uses_patches: true
     patch_length: 32
     maximum_context_length: 8192

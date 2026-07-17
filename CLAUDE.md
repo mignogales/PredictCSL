@@ -205,6 +205,29 @@ regenerable offline. Tests run LOCALLY (no TSFM needed — dummy adapter):
 Token-mapping / hook assumptions per family carry "verify on server" notes in
 `adapters/tsfm.py`, mirroring `context_attention_mask.py`'s convention.
 
+**Leaderboard sanity check (standalone, NOT part of run_all\*):**
+- **`sanity_gifteval_leaderboard.py`** — clean-room replication of the OFFICIAL
+  GiftEval leaderboard evaluation for one model, a line-for-line port of the
+  official submission notebooks (SalesforceAIResearch/gift-eval
+  `notebooks/timesfm2p5.ipynb` + `notebooks/chronos-2.ipynb`). Runs all 97
+  configs with each model's official recipe, then diffs per config against the
+  leaderboard's published `all_results.csv` and prints the PUBLISHED
+  aggregation (geomean of MASE[0.5] ÷ published seasonal_naive MASE[0.5];
+  reference CSVs in `experiments/leaderboard_reference/`). Targets:
+  **timesfm-2.5 0.7050 (DEFAULT)**, chronos-2 0.6978, chronos-2-synth 0.7203.
+  TimesFM-2.5 is the default replication gate because its official recipe has
+  no extras (univariate flattening, independent series, full context capped
+  15360, per-batch compile, 0.5-quantile head scored) — the cleanest
+  apples-to-apples vs our pipeline. Chronos-2's official recipe DOES use
+  native multivariate + `predict_batches_jointly` in-context cross-learning,
+  which our pipeline deliberately lacks; knobs (`--univariate`,
+  `--independent`, `--max-context 8192`) move the recipe stepwise toward the
+  pipeline's to attribute the gap (knobs are part of the output tag).
+  Known pipeline-vs-official TimesFM divergences to attribute: grid cap 8192
+  vs 15360, and stage 3 scores TimesFM's POINT forecast as `median` while the
+  official scores the 0.5-quantile head. Per-config JSON cache under
+  `logs/experiments/sanity_leaderboard/<tag>/`, resumable.
+
 **Master orchestrator:**
 - **`master_run_all.py`** — fuses *every* `run_all*` variant into one run while
   running each shared stage **exactly once**: Stage 1 up front, then each variant
@@ -230,6 +253,11 @@ FlowState-R1, TiRex. Each has a `load_*` + `predict_*` wrapper in
   env (`transformers==4.40.1`); the main env's 4.56 breaks them. There's a
   `_patch_dynamic_cache_seen_tokens()` shim restoring removed `DynamicCache` APIs.
 - **Sundial** caps context at 2880; **TimeMoE** caps context+horizon at 4096.
+- **FlowState** needs `granite-tsfm>=0.3.6` (also serves PatchTST-FM): a git dev
+  snapshot (0.3.4.dev9) silently random-initialized every `encoder.layers.*.out.*`
+  weight of the r1.1 checkpoint → all-NaN forecasts → stage 3 writes nothing →
+  opaque stage-4 "No records" crash. If FlowState metrics go NaN, check the
+  from_pretrained load warnings first.
 - **FlowState** is cadence-conditioned: stage 3 / every GiftEval consumer passes a
   per-dataset `scale_factor` (`flowstate_scale_factor()` in the v5 ablation +
   `cache.flowstate_scale` — exact port of IBM's leaderboard recipe: 24 /
@@ -276,6 +304,9 @@ python -m experiments.master_run_all --only-variants v1 v5
 python -m experiments.synth_param_sweeps          # single-factor sweeps, run set
 python -m experiments.synth_param_sweeps --models Sundial-Base-128M TimeMoE-200M  # legacy env
 python -m experiments.synth_param_sweeps --experiments period delay --plot-only
+python -m experiments.sanity_gifteval_leaderboard                  # official-recipe TimesFM-2.5, target 0.7050
+python -m experiments.sanity_gifteval_leaderboard --model chronos-2 # target 0.6978 (multivariate+joint recipe)
+python -m experiments.sanity_gifteval_leaderboard --max-context 8192  # pipeline-style context cap
 ```
 Stage 1 alone: `python -m experiments.build_context_length_dataset --model-idx <i>`.
 Timing stage alone: `python -m experiments.benchmark_window_timing_gifteval --run-dir logs/experiments/window_ablation_gifteval/general`.

@@ -62,15 +62,41 @@ class TSFMAdapter(InterpretabilityAdapter):
         self._base = None
         self._backbone = None
         self._layer_names: Optional[List[str]] = None
+        self._timesfm_cfg = None          # (width, horizon) currently compiled
 
     # -- lifecycle -------------------------------------------------------------
 
     def load(self) -> None:
         if self._base is not None:
             return
-        from experiments.build_context_length_dataset import setup_model
-        self._base = setup_model(self.family, self.model_id, self.device)
+        if self.family == "timesfm":
+            # EAGER load — the pipeline's load_timesfm rebuilds a (potentially
+            # torch.compile'd) model per context width, which runtime hooks and
+            # the make_attn_mask wrap can't reliably reach. Loading once with
+            # torch_compile=False keeps every forward eager and hookable;
+            # compile(ForecastConfig) below is just eager-closure setup (the
+            # "compiled_decode" name is a misnomer). Sanity-check on the server
+            # that eager forecasts match the compiled pipeline's.
+            import timesfm
+            self._base = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
+                self.model_id, torch_compile=False)
+            self._timesfm_cfg = None      # (width, horizon) currently compiled
+        else:
+            from experiments.build_context_length_dataset import setup_model
+            self._base = setup_model(self.family, self.model_id, self.device)
         self._refresh_patch_length()
+
+    def _timesfm_ensure_config(self, width: int) -> None:
+        if self._timesfm_cfg == (width, self.horizon):
+            return
+        import timesfm
+        self._base.compile(timesfm.ForecastConfig(
+            max_context=int(width), max_horizon=self.horizon,
+            normalize_inputs=True, use_continuous_quantile_head=True,
+            force_flip_invariance=True, per_core_batch_size=self.batch_size,
+            infer_is_positive=True, fix_quantile_crossing=True,
+        ))
+        self._timesfm_cfg = (int(width), self.horizon)
 
     def close(self) -> None:
         self._base = None
@@ -118,16 +144,32 @@ class TSFMAdapter(InterpretabilityAdapter):
 
     # -- forecasting -------------------------------------------------------------
 
+    def _uniform_forecast(self, x, width: int, batch_size: int):
+        """Median forecast for a uniform-width torch batch (n, W, 1) -> (n, H).
+
+        timesfm routes through the persistent EAGER model (see load()) so hooks
+        and the attention-mask wrap actually fire; every other family uses the
+        pipeline's ``_forecast_uniform`` verbatim."""
+        import torch
+        from experiments import build_context_length_dataset as bcl
+        if self.family == "timesfm":
+            self._timesfm_ensure_config(width)
+            meds = [bcl.predict_timesfm(self._base, x[s:s + batch_size],
+                                        self.horizon, self.device)
+                    for s in range(0, x.shape[0], batch_size)]
+            return torch.cat(meds, dim=0)
+        return bcl._forecast_uniform(self.family, self._base, self.model_id,
+                                     x, width, self.horizon, batch_size,
+                                     self.device)
+
     def forecast(self, contexts: np.ndarray) -> np.ndarray:
         import torch
-        from experiments.build_context_length_dataset import _forecast_uniform
         self.load()
         x = torch.from_numpy(
             np.ascontiguousarray(contexts, dtype=np.float32)).unsqueeze(-1)
         with torch.no_grad():
-            med = _forecast_uniform(self.family, self._base, self.model_id, x,
-                                    int(contexts.shape[1]), self.horizon,
-                                    self.batch_size, self.device)
+            med = self._uniform_forecast(x, int(contexts.shape[1]),
+                                         self.batch_size)
         return med.float().cpu().numpy()
 
     # -- Experiment 0: attention masking ------------------------------------------
@@ -137,7 +179,6 @@ class TSFMAdapter(InterpretabilityAdapter):
         if not self.capabilities.supports_attention_masking:
             raise CapabilityError(f"{self.name}: attention masking unsupported")
         import torch
-        from experiments.build_context_length_dataset import _forecast_uniform
         from experiments.context_attention_mask import context_attention_mask
         self.load()
         W = int(contexts.shape[1])
@@ -145,9 +186,7 @@ class TSFMAdapter(InterpretabilityAdapter):
             np.ascontiguousarray(contexts, dtype=np.float32)).unsqueeze(-1)
         with torch.no_grad(), context_attention_mask(
                 self.family, self._base, int(visible_timesteps), W):
-            med = _forecast_uniform(self.family, self._base, self.model_id, x,
-                                    W, self.horizon, self.batch_size,
-                                    self.device)
+            med = self._uniform_forecast(x, W, self.batch_size)
         return med.float().cpu().numpy()
 
     # -- layer access ---------------------------------------------------------------
@@ -219,12 +258,9 @@ class TSFMAdapter(InterpretabilityAdapter):
     def _forward_chunk(self, x_chunk) -> "object":
         """One uniform forward over a chunk (single internal batch)."""
         import torch
-        from experiments.build_context_length_dataset import _forecast_uniform
         with torch.no_grad():
-            return _forecast_uniform(
-                self.family, self._base, self.model_id, x_chunk,
-                int(x_chunk.shape[1]), self.horizon,
-                int(x_chunk.shape[0]), self.device)
+            return self._uniform_forecast(x_chunk, int(x_chunk.shape[1]),
+                                          int(x_chunk.shape[0]))
 
     # -- Experiment 2: activation capture / patching --------------------------------
 

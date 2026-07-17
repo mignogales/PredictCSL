@@ -68,8 +68,19 @@ from experiments.test_window_ablation_gifteval_v5 import (
 )
 from experiments.compare_window_strategies_gifteval import (
     CACHE_ROOT, DEFAULT_PATCH_SIZES, _MODEL_MARKERS, _geomean,
-    _load_naive_baselines, _npz_filename, theoretical_flops,
+    _load_naive_baselines, _npz_filename, infer_model_family, theoretical_flops,
 )
+
+# Families whose compute does NOT actually vary with the window, so the FLOPs
+# axis is a theoretical upper bound only (never sell compute savings for these):
+#   tirex       — truncates AND NaN-left-pads every context to its 2048 train
+#                 length internally; wall-clock is flat across windows.
+#   patchtst_fm — fixed 8192 native context, no mask input; windows are realised
+#                 by NaN-padding, so every forward pass costs the same.
+# sundial is HALF-flat: it caps context at 2880, so compute varies below the cap
+# but is flat above it (real-curve ties above 2880 make the argmin degenerate and
+# the FLOPs there overstated) — kept solid on the plot, but read its x with care.
+FLAT_COMPUTE_FAMILIES = {"tirex", "patchtst_fm"}
 
 # Per-model predictor run dir layout (mirrors run_all.py's PREDICTOR_ROOT/<display>).
 PREDICTOR_ROOT_DEFAULT = "logs/experiments/context_length_predictor"
@@ -107,13 +118,17 @@ def _trial_cfg(predictor_dir: str, trial_idx: int) -> Optional[dict]:
         return None
 
 
-def select_topk_trials(predictor_dir: str, k: int) -> Tuple[List[int], dict]:
-    """Rank trials by the selection metric and return the K best trial indices
-    (ascending metric = better) that have a durable checkpoint, plus the shared
-    best_config.json (run-global constants: context_length / window_grid / …).
+def select_topk_trials(predictor_dir: str, k: int) -> Tuple[List[dict], dict]:
+    """Rank trials by the selection metric and return the K best as
+    ``[{trial_idx, metric}]`` (ascending metric = better) that have a durable
+    checkpoint, plus the shared best_config.json (run-global constants:
+    context_length / window_grid / …).
 
     Ranking column tracks ``SELECTION_METRIC`` exactly as the training run's
-    ``_select_final`` does (``val_regret`` for the default 'regret').
+    ``_select_final`` does (``val_regret`` for the default 'regret') — so the
+    rank-1 trial here is the SAME trial that was shipped as best_model.pt, which
+    is what makes the per-cell agreement check against the stage-3 npz's
+    ``predicted_mean`` a valid consistency test.
     """
     with open(os.path.join(predictor_dir, "best_config.json")) as f:
         best_cfg = json.load(f)
@@ -134,13 +149,22 @@ def select_topk_trials(predictor_dir: str, k: int) -> Tuple[List[int], dict]:
     df = df[np.isfinite(pd.to_numeric(df[metric_key], errors="coerce"))]
     df = df.sort_values(metric_key, ascending=True)
 
-    chosen: List[int] = []
+    chosen: List[dict] = []
     for _, row in df.iterrows():
         ti = int(row["trial_idx"])
         if os.path.isfile(_trial_best_ckpt(predictor_dir, ti)) and _trial_cfg(predictor_dir, ti):
-            chosen.append(ti)
+            chosen.append({"trial_idx": ti, "metric": float(row[metric_key]),
+                           "metric_key": metric_key})
         if len(chosen) >= k:
             break
+
+    # Sanity: the rank-1 trial should be the one best_config.json shipped. A
+    # mismatch (ties, a search resumed after selection, or a hand-replaced
+    # best_model.pt) makes the npz-agreement check advisory rather than exact.
+    if chosen and "trial_idx" in best_cfg and int(best_cfg["trial_idx"]) != chosen[0]["trial_idx"]:
+        print(Fore.YELLOW + f"  NOTE: rank-1 trial {chosen[0]['trial_idx']} != shipped "
+              f"best_config trial {int(best_cfg['trial_idx'])} — npz agreement check "
+              "will compare different predictors." + Fore.RESET)
     return chosen, best_cfg
 
 
@@ -185,32 +209,46 @@ def score_model(model_short: str, run_dir: str, predictor_dir: str,
                 display_lookup: Dict[str, Tuple[str, bool]],
                 ge_cache: Dict[Tuple[str, str], Optional[GiftEvalCache]],
                 naive_baselines: dict, mase_metric: str, k: int,
-                device: str, batch_size: int) -> List[dict]:
-    """Return one record per (dataset, term) cell for this model, holding the
-    per-predictor chosen-window MASE (``pred_mase_0..k-1``), plus full_mase and
-    the seasonal-naive denominator. GiftEval caches are shared across models via
-    ``ge_cache`` so each (dataset, term) is loaded at most once."""
+                device: str, batch_size: int) -> Tuple[List[dict], List[dict]]:
+    """Return ``(records, trials_meta)``: one record per (dataset, term) cell for
+    this model, holding the per-predictor chosen-window MASE/window/FLOPs
+    (``pred_{mase,window,flops}_0..k-1``), plus full_mase and the seasonal-naive
+    denominator; and the top-K trial metadata (idx + selection metric) for the
+    per-trial breakdown. GiftEval caches are shared across models via
+    ``ge_cache`` so each (dataset, term) is loaded at most once.
+
+    Consistency check: the rank-1 trial is selected by the SAME criterion as the
+    shipped best_model.pt, so its per-cell window choice must agree with the
+    stage-3 npz's stored ``predicted_mean`` argmin — the agreement rate is
+    printed per model, and any systematic disagreement means the checkpoint
+    rebuild/inference path here diverges from stage 3 (a harness bug), whereas
+    ~100% agreement certifies the top-K numbers as genuine predictor spread."""
     compare_dir = os.path.join(run_dir, "models", model_short, "compare_real_vs_predicted")
     summary_path = os.path.join(compare_dir, "compare_summary.csv")
     if not os.path.isfile(summary_path):
         print(Fore.YELLOW + f"  No compare_summary.csv for {model_short}, skipping." + Fore.RESET)
-        return []
+        return [], []
 
-    trial_ids, best_cfg = select_topk_trials(predictor_dir, k)
-    if not trial_ids:
+    trials_meta, best_cfg = select_topk_trials(predictor_dir, k)
+    if not trials_meta:
         print(Fore.RED + f"  {model_short}: no valid trials with checkpoints in "
               f"{predictor_dir}." + Fore.RESET)
-        return []
+        return [], []
+    trial_ids = [t["trial_idx"] for t in trials_meta]
     if len(trial_ids) < k:
         print(Fore.YELLOW + f"  {model_short}: only {len(trial_ids)} trials with "
               f"checkpoints (< k={k}); using those." + Fore.RESET)
     print(Fore.GREEN + f"  {model_short}: top-{len(trial_ids)} trials by "
-          f"{_METRIC_KEY[SELECTION_METRIC]} -> {trial_ids}" + Fore.RESET)
+          f"{_METRIC_KEY[SELECTION_METRIC]} -> "
+          + ", ".join(f"{t['trial_idx']:03d}({t['metric']:.4f})" for t in trials_meta)
+          + Fore.RESET)
 
     pred_ctx_len = int(best_cfg["context_length"])
     horizon_grid = list(best_cfg["horizon_grid"])
     predictors = [load_trial_predictor(predictor_dir, ti, best_cfg, device)
                   for ti in trial_ids]
+
+    n_agree = n_checked = 0  # rank-1 vs shipped-npz argmin agreement
 
     summary = pd.read_csv(summary_path)
     records: List[dict] = []
@@ -267,13 +305,36 @@ def score_model(model_short: str, run_dir: str, predictor_dir: str,
         full_flops = theoretical_flops(
             model_id, int(window_grid[full_idx]), horizon, DEFAULT_PATCH_SIZES)
 
+        # Curve-shape diagnostics: how much a PERFECT window choice could have
+        # won on this cell (oracle headroom), and how flat/degenerate the real
+        # curve is. Flat curves (high tie_frac, low cv) mean there was nothing
+        # to win and the argmin label itself is noise — expected for capped
+        # (Sundial >2880) or fixed-context NaN-padded (PatchTST-FM) models.
+        rc_valid = real_curve[valid_idx].astype(float)
+        best_local = int(np.argmin(rc_valid))
+        best_mase = float(rc_valid[best_local])
+        curve_tie_frac = float(np.mean(rc_valid <= best_mase * 1.01))
+        curve_cv = float(np.std(rc_valid) / (np.mean(rc_valid) + 1e-12))
+
         rec = {
-            "model_short": model_short, "dataset_display": dataset_display,
+            "model_short": model_short, "model_family": infer_model_family(model_id),
+            "dataset_display": dataset_display,
             "term": term, "n_instances": n_instances, "full_mase": full_mase,
-            "full_flops": full_flops,
+            "best_mase": best_mase,
+            "best_window": int(window_grid[valid_idx[best_local]]),
+            "curve_tie_frac": curve_tie_frac, "curve_cv": curve_cv,
+            "n_windows_valid": int(valid_idx.size),
+            "full_window": int(window_grid[full_idx]), "full_flops": full_flops,
             "naive_mase": float(naive_baselines.get(f"{dataset_display}/t{term}", {})
                                 .get(mase_metric, float("nan"))),
         }
+        # The shipped predictor's per-cell choice, straight from the stage-3 npz —
+        # the ground truth the rank-1 trial must reproduce.
+        shipped_idx = None
+        if "predicted_mean" in data.files:
+            shipped_idx = int(np.argmin(data["predicted_mean"]))
+            if np.isnan(real_curve[shipped_idx]):
+                shipped_idx = full_idx
         for k_i, predictor in enumerate(predictors):
             pred_curves = predict_curves_for_dataset(
                 predictor, cache, pred_ctx_len, h_idx, device, batch_size=batch_size)
@@ -282,15 +343,33 @@ def score_model(model_short: str, run_dir: str, predictor_dir: str,
             if np.isnan(real_curve[pred_idx]):  # window unavailable -> full (clamp)
                 pred_idx = full_idx
             rec[f"pred_mase_{k_i}"] = float(real_curve[pred_idx])
+            rec[f"pred_window_{k_i}"] = int(window_grid[pred_idx])
             rec[f"pred_flops_{k_i}"] = theoretical_flops(
                 model_id, int(window_grid[pred_idx]), horizon, DEFAULT_PATCH_SIZES)
+            if k_i == 0 and shipped_idx is not None:
+                agree = (pred_idx == shipped_idx)
+                rec["rank1_agrees_with_shipped"] = bool(agree)
+                n_checked += 1
+                n_agree += int(agree)
         records.append(rec)
+
+    # Consistency verdict: rank-1 trial vs the shipped best_model.pt's choices.
+    if n_checked:
+        rate = 100.0 * n_agree / n_checked
+        color = Fore.GREEN if rate >= 95.0 else Fore.RED
+        print(color + f"  {model_short}: rank-1 vs shipped-npz window agreement "
+              f"{n_agree}/{n_checked} ({rate:.1f}%)"
+              + ("" if rate >= 95.0 else
+                 "  <-- LOW: checkpoint rebuild/inference here diverges from "
+                 "stage 3 (or best_model.pt is not the rank-1 trial) — treat the "
+                 "top-K numbers for this model as suspect.")
+              + Fore.RESET)
 
     # Free predictor VRAM before the next model.
     del predictors
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
-    return records
+    return records, trials_meta
 
 
 # ==============================================================================
@@ -307,49 +386,77 @@ def aggregate(df: pd.DataFrame, k: int) -> pd.DataFrame:
     def _agg(sub: pd.DataFrame, model_short: str) -> dict:
         full_vals = sub["full_mase"].values.astype(float)
         gm_full = _geomean(full_vals)
-        # Per-predictor geomean over cells -> K aggregates -> mean ± std.
-        strat_k = np.array([_geomean(sub[c].values.astype(float)) for c in pred_cols])
-        # Per-predictor relative MASE drop (>0 = better), for the overview y ± std.
-        rel_k = (100.0 * (gm_full - strat_k) / gm_full if gm_full > 0
-                 else np.full(len(strat_k), float("nan")))
-
-        # Per-predictor FLOPs saved vs full, instance-weighted (matches
-        # compute_flops_savings: sum n·flops over cells), for the overview x ± std.
-        w = sub["n_instances"].values.astype(float)
-        full_f = float((sub["full_flops"].values.astype(float) * w).sum())
-        if flops_cols and full_f > 0:
-            fsav_k = np.array([
-                1.0 - float((sub[c].values.astype(float) * w).sum()) / full_f
-                for c in flops_cols])
-        else:
-            fsav_k = np.full(len(pred_cols), float("nan"))
-
-        # Normalised (leaderboard) geomeans over rows with a valid baseline.
+        # Oracle headroom: the ceiling on what ANY window strategy can win here.
+        # A model with ~0 headroom cannot land above the zero line — its top-K
+        # mean being negative is a property of its curves, not of the predictor.
+        gm_best = (_geomean(sub["best_mase"].values.astype(float))
+                   if "best_mase" in sub.columns else float("nan"))
+        oracle_rel = (100.0 * (gm_full - gm_best) / gm_full
+                      if pd.notna(gm_best) and gm_full > 0 else float("nan"))
         nm = sub["naive_mase"].values.astype(float)
         vmask = np.isfinite(nm) & (nm > 0)
+        w = sub["n_instances"].values.astype(float)
+        ff_vals = sub["full_flops"].values.astype(float)
+
+        # Per-predictor aggregates -> K values -> mean ± std. Each predictor is
+        # scored only on the cells it actually has (a model with fewer than K
+        # checkpointed trials leaves NaN in the higher-rank columns; on the TOTAL
+        # row those cells are masked out per column instead of poisoning the
+        # geomean). The paired full-window aggregate uses the SAME mask so every
+        # rel-drop is a like-for-like comparison.
+        strat_k, rel_k, fsav_k, strat_k_norm = [], [], [], []
+        for i, c in enumerate(pred_cols):
+            v = sub[c].values.astype(float)
+            m = np.isfinite(v)
+            if not m.any():
+                continue
+            gm_i = _geomean(v[m])
+            gm_full_i = _geomean(full_vals[m])
+            strat_k.append(gm_i)
+            rel_k.append(100.0 * (gm_full_i - gm_i) / gm_full_i
+                         if gm_full_i > 0 else float("nan"))
+            fc = f"pred_flops_{i}"
+            if fc in sub.columns:
+                fv = sub[fc].values.astype(float)
+                mf = m & np.isfinite(fv) & np.isfinite(ff_vals)
+                ff = float((ff_vals[mf] * w[mf]).sum())
+                fsav_k.append(1.0 - float((fv[mf] * w[mf]).sum()) / ff
+                              if mf.any() and ff > 0 else float("nan"))
+            else:
+                fsav_k.append(float("nan"))
+            mn = m & vmask
+            strat_k_norm.append(_geomean(v[mn] / nm[mn]) if mn.any() else float("nan"))
+        strat_k = np.asarray(strat_k); rel_k = np.asarray(rel_k)
+        fsav_k = np.asarray(fsav_k); strat_k_norm = np.asarray(strat_k_norm)
+
+        # Normalised (leaderboard) full-window geomean over rows with a baseline.
         if vmask.any():
             gm_full_norm = _geomean(full_vals[vmask] / nm[vmask])
-            strat_k_norm = np.array([
-                _geomean(sub[c].values.astype(float)[vmask] / nm[vmask]) for c in pred_cols])
             n_norm = int(vmask.sum())
         else:
             gm_full_norm = float("nan")
-            strat_k_norm = np.full(len(pred_cols), float("nan"))
             n_norm = 0
 
-        strat_mean = float(np.mean(strat_k))
-        strat_std = float(np.std(strat_k))
-        sn_mean = float(np.nanmean(strat_k_norm)) if n_norm else float("nan")
-        sn_std = float(np.nanstd(strat_k_norm)) if n_norm else float("nan")
+        strat_mean = float(np.mean(strat_k)) if strat_k.size else float("nan")
+        strat_std = float(np.std(strat_k)) if strat_k.size else float("nan")
+        has_norm_vals = strat_k_norm.size and np.isfinite(strat_k_norm).any()
+        sn_mean = float(np.nanmean(strat_k_norm)) if has_norm_vals else float("nan")
+        sn_std = float(np.nanstd(strat_k_norm)) if has_norm_vals else float("nan")
         return {
             "model_short": model_short, "n_rows": int(len(sub)),
-            "n_predictors": len(pred_cols),
+            "n_predictors": int(strat_k.size),
             "geomean_full_mase": gm_full,
             "geomean_strategy_mase": strat_mean,
             "geomean_strategy_mase_std": strat_std,
             "mase_drop_vs_full": gm_full - strat_mean,
             "rel_mase_drop_pct": (100.0 * (gm_full - strat_mean) / gm_full
                                   if gm_full > 0 else float("nan")),
+            # Curve-shape diagnostics (why this model can/can't win):
+            "oracle_rel_mase_drop_pct": oracle_rel,
+            "median_curve_tie_frac": (float(sub["curve_tie_frac"].median())
+                                      if "curve_tie_frac" in sub.columns else float("nan")),
+            "median_curve_cv": (float(sub["curve_cv"].median())
+                                if "curve_cv" in sub.columns else float("nan")),
             "geomean_full_mase_norm": gm_full_norm,
             "geomean_strategy_mase_norm": sn_mean,
             "geomean_strategy_mase_norm_std": sn_std,
@@ -359,15 +466,71 @@ def aggregate(df: pd.DataFrame, k: int) -> pd.DataFrame:
             "n_norm": n_norm,
             # Overview coordinates: mean ± std across the K predictors of the
             # per-predictor relative MASE drop (y) and FLOPs saved (x, as a fraction).
-            "rel_mase_drop_pct_mean": float(np.mean(rel_k)),
-            "rel_mase_drop_pct_pstd": float(np.std(rel_k)),
-            "pct_flops_saved_mean":  float(np.nanmean(fsav_k)) if np.isfinite(fsav_k).any() else float("nan"),
-            "pct_flops_saved_pstd":  float(np.nanstd(fsav_k)) if np.isfinite(fsav_k).any() else float("nan"),
+            "rel_mase_drop_pct_mean": (float(np.nanmean(rel_k))
+                                       if rel_k.size and np.isfinite(rel_k).any()
+                                       else float("nan")),
+            "rel_mase_drop_pct_pstd": (float(np.nanstd(rel_k))
+                                       if rel_k.size and np.isfinite(rel_k).any()
+                                       else float("nan")),
+            "pct_flops_saved_mean":  (float(np.nanmean(fsav_k))
+                                      if fsav_k.size and np.isfinite(fsav_k).any()
+                                      else float("nan")),
+            "pct_flops_saved_pstd":  (float(np.nanstd(fsav_k))
+                                      if fsav_k.size and np.isfinite(fsav_k).any()
+                                      else float("nan")),
         }
 
     rows = [_agg(sub.reset_index(drop=True), ms)
             for ms, sub in df.groupby("model_short")]
     rows.append(_agg(df.reset_index(drop=True), "TOTAL"))
+    return pd.DataFrame(rows)
+
+
+def trial_breakdown(df: pd.DataFrame, trials_by_model: Dict[str, List[dict]],
+                    k: int) -> pd.DataFrame:
+    """Per-(model, rank) diagnostic: which of the K trials drags the mean.
+
+    One row per (model_short, rank 0..K-1): the trial's selection metric
+    (val_regret), its geomean MASE over the model's cells, the relative drop vs
+    full, its FLOPs saved, and the distribution of windows it chose. A model
+    whose top-K spans a wide val_regret range (rank-1 far better than rank-5)
+    is a search that found ONE good config, not five — the top-K mean then
+    understates the shipped predictor, which is a finding about selection
+    stability, not a harness bug."""
+    rows = []
+    for model_short, sub in df.groupby("model_short"):
+        sub = sub.reset_index(drop=True)
+        gm_full = _geomean(sub["full_mase"].values.astype(float))
+        w = sub["n_instances"].values.astype(float)
+        full_f = float((sub["full_flops"].values.astype(float) * w).sum())
+        metas = trials_by_model.get(model_short, [])
+        for i in range(k):
+            mc, wc, fc = f"pred_mase_{i}", f"pred_window_{i}", f"pred_flops_{i}"
+            if mc not in sub.columns or sub[mc].isna().all():
+                continue
+            gm_i = _geomean(sub[mc].values.astype(float))
+            meta = metas[i] if i < len(metas) else {}
+            windows = sub[wc].dropna().values if wc in sub.columns else np.array([])
+            fsave = (1.0 - float((sub[fc].values.astype(float) * w).sum()) / full_f
+                     if fc in sub.columns and full_f > 0 else float("nan"))
+            rows.append({
+                "model_short": model_short, "rank": i,
+                "trial_idx": meta.get("trial_idx"),
+                "selection_metric": meta.get("metric"),
+                "geomean_mase": gm_i,
+                "rel_mase_drop_pct": (100.0 * (gm_full - gm_i) / gm_full
+                                      if gm_full > 0 else float("nan")),
+                "pct_flops_saved": fsave,
+                "window_mean": float(windows.mean()) if windows.size else float("nan"),
+                "window_median": float(np.median(windows)) if windows.size else float("nan"),
+                "window_min": int(windows.min()) if windows.size else -1,
+                "window_max": int(windows.max()) if windows.size else -1,
+                "n_cells": int(len(sub)),
+                "rank1_agreement_pct": (
+                    100.0 * sub["rank1_agrees_with_shipped"].mean()
+                    if i == 0 and "rank1_agrees_with_shipped" in sub.columns
+                    and sub["rank1_agrees_with_shipped"].notna().any() else float("nan")),
+            })
     return pd.DataFrame(rows)
 
 
@@ -454,13 +617,19 @@ def plot_topk_table(rollup: pd.DataFrame, out_path: str, k: int,
 
 
 def plot_topk_overview(rollup: pd.DataFrame, out_path: str, k: int,
-                       metric_label: str, variant_label: str = "") -> str:
+                       metric_label: str, variant_label: str = "",
+                       flat_models: Optional[set] = None) -> str:
     """Compute-saved vs accuracy-change overview (twin of
     ``plot_model_strategy_overview``): one point per model for the TOP-K-predictor
     strategy, at (mean FLOPs saved, mean relative MASE drop) across the K
-    predictors, with ± std error bars in both axes. Top-right = cheaper & better."""
+    predictors, with ± std error bars in both axes. Top-right = cheaper & better.
+
+    ``flat_models`` are model_shorts whose compute does not actually vary with
+    the window (TiRex, PatchTST-FM): their x-position is a theoretical proxy
+    only — they get hollow markers + a † in the legend + a footnote."""
     from matplotlib.lines import Line2D
 
+    flat_models = flat_models or set()
     r = rollup[rollup["model_short"] != "TOTAL"].dropna(
         subset=["pct_flops_saved_mean", "rel_mase_drop_pct_mean"]).copy()
     if r.empty:
@@ -491,8 +660,13 @@ def plot_topk_overview(rollup: pd.DataFrame, out_path: str, k: int,
     for xi, yi, xe, ye, m in zip(x, y, xerr, yerr, r["model_short"].values):
         ax.errorbar(xi, yi, xerr=xe, yerr=ye, fmt="none", ecolor=color,
                     elinewidth=1.0, alpha=0.45, capsize=3, zorder=2)
-        ax.scatter(xi, yi, marker=marker_of[m], s=180, c=color,
-                   edgecolors="white", linewidths=0.9, alpha=0.95, zorder=3)
+        if m in flat_models:
+            # Hollow marker: the x-position is a theoretical proxy only.
+            ax.scatter(xi, yi, marker=marker_of[m], s=180, facecolors="none",
+                       edgecolors=color, linewidths=1.6, alpha=0.95, zorder=3)
+        else:
+            ax.scatter(xi, yi, marker=marker_of[m], s=180, c=color,
+                       edgecolors="white", linewidths=0.9, alpha=0.95, zorder=3)
 
     for qx, qy, txt, ha in [
         (0.985, 0.985, "Cheaper & Better",  "right"),
@@ -517,11 +691,20 @@ def plot_topk_overview(rollup: pd.DataFrame, out_path: str, k: int,
 
     model_handles = [
         Line2D([0], [0], marker=marker_of[m], linestyle="none", markersize=9,
-               markerfacecolor="0.35", markeredgecolor="white", label=m)
+               markerfacecolor="none" if m in flat_models else "0.35",
+               markeredgecolor="0.35" if m in flat_models else "white",
+               label=m + (" †" if m in flat_models else ""))
         for m in models
     ]
     ax.legend(handles=model_handles, title="Model", fontsize=8.5, title_fontsize=10,
               loc="center left", bbox_to_anchor=(1.01, 0.5), framealpha=0.9)
+
+    if flat_models & set(models):
+        fig.text(0.01, 0.005,
+                 "† hollow markers: compute does not actually vary with the window "
+                 "(TiRex pads to 2048; PatchTST-FM fixed 8192) — the FLOPs axis is a "
+                 "theoretical proxy only.",
+                 fontsize=8, color="gray", style="italic")
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -572,6 +755,7 @@ def run_one_variant(variant: str, args: argparse.Namespace,
 
     ge_cache: Dict[Tuple[str, str], Optional[GiftEvalCache]] = {}
     all_records: List[dict] = []
+    trials_by_model: Dict[str, List[dict]] = {}
     for model_short in model_shorts:
         predictor_dir = os.path.join(predictor_root, model_short)
         if not os.path.isfile(os.path.join(predictor_dir, "best_config.json")):
@@ -579,12 +763,14 @@ def run_one_variant(variant: str, args: argparse.Namespace,
                   "skipping." + Fore.RESET)
             continue
         print(Fore.CYAN + f"\n=== [{variant}] {model_short} ===" + Fore.RESET)
-        recs = score_model(model_short, run_dir, predictor_dir, display_lookup,
-                           ge_cache, naive_baselines, args.mase_metric, args.k,
-                           args.device, args.predictor_batch_size)
+        recs, trials_meta = score_model(
+            model_short, run_dir, predictor_dir, display_lookup,
+            ge_cache, naive_baselines, args.mase_metric, args.k,
+            args.device, args.predictor_batch_size)
         if args.datasets:
             recs = [r for r in recs if r["dataset_display"] in set(args.datasets)]
         all_records.extend(recs)
+        trials_by_model[model_short] = trials_meta
 
     if not all_records:
         print(Fore.YELLOW + f"  No records for variant {variant} — check the tree / "
@@ -593,20 +779,68 @@ def run_one_variant(variant: str, args: argparse.Namespace,
 
     df = pd.DataFrame(all_records)
     rollup = aggregate(df, args.k)
+    breakdown = trial_breakdown(df, trials_by_model, args.k)
+    flat_models = set(df.loc[df["model_family"].isin(FLAT_COMPUTE_FAMILIES),
+                             "model_short"].unique())
 
     base = f"mase_change_table_topk_{variant}{suffix}"
     csv_path = os.path.join(out_dir, base + ".csv")
     rollup.to_csv(csv_path, index=False)
+    # Diagnostics: raw per-cell records (per-predictor MASE/window/agreement) and
+    # the per-(model, rank) trial breakdown — enough to see which trial drags a
+    # model's mean and whether the rank-1 trial reproduces the shipped predictor.
+    cells_path = os.path.join(out_dir, f"topk_cells_{variant}{suffix}.csv")
+    df.to_csv(cells_path, index=False)
+    breakdown_path = os.path.join(out_dir, f"topk_trial_breakdown_{variant}{suffix}.csv")
+    breakdown.to_csv(breakdown_path, index=False)
+
     png_path = plot_topk_table(rollup, os.path.join(out_dir, base + ".png"),
                                args.k, metric_label, variant_label=vlabel)
     overview_path = plot_topk_overview(
         rollup, os.path.join(out_dir, f"model_strategy_overview_topk_{variant}{suffix}.png"),
-        args.k, metric_label, variant_label=vlabel)
+        args.k, metric_label, variant_label=vlabel, flat_models=flat_models)
+
+    # Console: per-trial breakdown so the offender is visible without opening CSVs.
+    print(Fore.CYAN + f"\n[{variant}] Per-trial breakdown "
+          f"(rank | trial | {_METRIC_KEY[SELECTION_METRIC]} | geomean MASE | Δ% | window med):"
+          + Fore.RESET)
+    for model_short, sub in breakdown.groupby("model_short"):
+        agree = sub.loc[sub["rank"] == 0, "rank1_agreement_pct"]
+        agree_txt = (f"  rank-1 agreement {float(agree.iloc[0]):.0f}%"
+                     if len(agree) and pd.notna(agree.iloc[0]) else "")
+        print(f"  {model_short}{agree_txt}")
+        for _, b in sub.sort_values("rank").iterrows():
+            sm = (f"{b['selection_metric']:.4f}"
+                  if pd.notna(b["selection_metric"]) else "—")
+            print(f"    #{int(b['rank'])}  trial {b['trial_idx']}  "
+                  f"{sm}  ->  {b['geomean_mase']:.4f}  "
+                  f"({b['rel_mase_drop_pct']:+.2f}%)  w_med={b['window_median']:.0f}")
+
+    # "Why can('t) this model win": oracle headroom bounds the y-axis from above;
+    # a flat curve (high tie-frac, low CV) means the argmin labels the predictor
+    # was trained on are themselves noise. Expect the outlier models (capped /
+    # fixed-context / sampling-based) to separate from the pack HERE, not in the
+    # predictor code.
+    print(Fore.CYAN + f"\n[{variant}] Curve-shape diagnostics "
+          "(oracle Δ% = max achievable by ANY window strategy; "
+          "tie-frac = share of windows within 1% of the min; CV = curve spread):"
+          + Fore.RESET)
+    diag = rollup[rollup["model_short"] != "TOTAL"].sort_values("oracle_rel_mase_drop_pct")
+    for _, d in diag.iterrows():
+        won = d["rel_mase_drop_pct_mean"]
+        flag = ("  <-- ~no headroom: predictor could only lose here"
+                if pd.notna(d["oracle_rel_mase_drop_pct"])
+                and d["oracle_rel_mase_drop_pct"] < 1.0 else "")
+        print(f"  {d['model_short']:<22} oracle {d['oracle_rel_mase_drop_pct']:+6.2f}%   "
+              f"top-{args.k} {won:+6.2f}% ± {d['rel_mase_drop_pct_pstd']:.2f}   "
+              f"tie-frac {d['median_curve_tie_frac']:.2f}   "
+              f"CV {d['median_curve_cv']:.3f}{flag}")
 
     tot = rollup[rollup["model_short"] == "TOTAL"].iloc[0]
     print(Fore.GREEN + f"\n[{variant}] Saved: {png_path}"
           + (f"\n              {overview_path}" if overview_path else "")
-          + f"\n              {csv_path}" + Fore.RESET)
+          + f"\n              {csv_path}\n              {breakdown_path}"
+          + f"\n              {cells_path}" + Fore.RESET)
     print(Fore.GREEN + f"[{variant}] TOTAL  full {tot['geomean_full_mase']:.4f} -> "
           f"top-{args.k} {tot['geomean_strategy_mase']:.4f} ± "
           f"{tot['geomean_strategy_mase_std']:.4f}  ({tot['rel_mase_drop_pct']:+.2f}%)"
