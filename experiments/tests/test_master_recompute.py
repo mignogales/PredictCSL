@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -56,6 +57,45 @@ class SoftClassificationLossTest(unittest.TestCase):
             self.assertEqual(float(logits.grad[0, 3]), 0.0)
         finally:
             predictor.TRAINING_OBJECTIVE = old_objective
+
+
+class PatchTSTFMCompatibilityTest(unittest.TestCase):
+    def test_new_past_values_forward_signature(self) -> None:
+        class NewGraniteAPI(torch.nn.Module):
+            config = SimpleNamespace(context_length=8)
+
+            def forward(self, past_values, prediction_length):
+                self.seen = past_values
+                forecast = torch.zeros(
+                    past_values.shape[0], 99, prediction_length, 1,
+                    device=past_values.device,
+                )
+                forecast[:, build.PATCHTST_FM_MEDIAN_QUANTILE_IDX, :, 0] = 2.0
+                return (forecast,)
+
+        model = NewGraniteAPI()
+        result = build.predict_patchtst_fm(
+            model, torch.ones(2, 5, 1), horizon=3, device="cpu")
+
+        self.assertEqual(tuple(model.seen.shape), (2, 8))
+        self.assertEqual(tuple(result.shape), (2, 3))
+        self.assertTrue(torch.equal(result, torch.full((2, 3), 2.0)))
+
+    def test_legacy_inputs_forward_signature(self) -> None:
+        class LegacyAPI(torch.nn.Module):
+            config = SimpleNamespace(context_length=8)
+
+            def forward(self, inputs, prediction_length):
+                forecast = torch.ones(
+                    inputs.shape[0], 1, prediction_length,
+                    device=inputs.device,
+                )
+                return (forecast,)
+
+        result = build.predict_patchtst_fm(
+            LegacyAPI(), torch.ones(1, 8, 1), horizon=2, device="cpu")
+
+        self.assertTrue(torch.equal(result, torch.ones(1, 2)))
 
 
 if __name__ == "__main__":

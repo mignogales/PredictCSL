@@ -1056,7 +1056,9 @@ def predict_patchtst_fm(model, batches, horizon, device):
         # single-shot length (long-term GiftEval). Run under a default-device
         # context so those factory tensors land on `device`.
         with torch.device(device):
-            output = model(inputs=past_values, prediction_length=horizon)
+            # Granite-TSFM renamed the first argument from ``inputs`` to
+            # ``past_values``. Positional dispatch supports both APIs.
+            output = model(past_values, prediction_length=horizon)
         raw = output[0]
         if raw.dim() == 4:
             qf = raw[:, :, :horizon, 0]

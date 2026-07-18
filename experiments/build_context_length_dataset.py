@@ -695,7 +695,9 @@ def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> to
     # the forward under a default-device context so those factory tensors land on
     # `device`; a no-op for tensors that already carry an explicit device.
     with torch.device(device):
-        raw = model(inputs=past_values, prediction_length=horizon)[0]
+        # Granite-TSFM renamed the first forward argument from ``inputs`` to
+        # ``past_values``. Positional dispatch works with both releases.
+        raw = model(past_values, prediction_length=horizon)[0]
     if raw.dim() == 4:                                 # (B, Q, H, 1)
         qf = raw[:, :, :horizon, 0]
         return qf[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :].to(torch.float32)
@@ -1111,12 +1113,13 @@ def gpu_worker(
         shard_id, start, end = spec
         t0 = time.perf_counter()
         try:
-            ctx = np.ascontiguousarray(
-                np.load(contexts_path, mmap_mode="r")[start:end])
-            tgt = np.ascontiguousarray(
-                np.load(targets_path, mmap_mode="r")[start:end])
-            real_len = np.ascontiguousarray(
-                np.load(real_lengths_path, mmap_mode="r")[start:end])  # (B,)
+            # Read-only memmap slices must be copied before torch.from_numpy.
+            ctx = np.array(
+                np.load(contexts_path, mmap_mode="r")[start:end], copy=True)
+            tgt = np.array(
+                np.load(targets_path, mmap_mode="r")[start:end], copy=True)
+            real_len = np.array(
+                np.load(real_lengths_path, mmap_mode="r")[start:end], copy=True)  # (B,)
             tgt_t = torch.from_numpy(tgt).to(device)        # (B, MAX_HORIZON)
 
             cm = np.full((end - start, n_win, n_h), np.nan, dtype=np.float32)
