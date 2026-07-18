@@ -47,7 +47,7 @@ CATALOG: List[ModelSpec] = [
     ModelSpec("thuml/sundial-base-128m",         "sundial",      "Sundial-Base-128M",  True),
     # TimeMoE: autoregressive token-by-token decode is slow at large horizons over
     # the full window grid — keep an eye on stage-1 wall-clock when it's enabled.
-    ModelSpec("Maple728/TimeMoE-200M",           "timemoe",      "TimeMoE-200M",       True),
+    # ModelSpec("Maple728/TimeMoE-200M",           "timemoe",      "TimeMoE-200M",       True),
     # Appended (not inserted) to keep existing --model-idx positions stable.
     ModelSpec("autogluon/chronos-2-synth",       "chronos2",     "Chronos2-Synth",     True),
     ModelSpec("autogluon/chronos-2",             "chronos2",     "Chronos2-Base",      True),
