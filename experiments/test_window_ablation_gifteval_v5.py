@@ -1519,6 +1519,7 @@ def predict_curves_for_dataset(
     context_length: int,
     horizon_idx: int,
     device: str,
+    training_objective: str = "curve",
     batch_size: int = 64,
 ) -> np.ndarray:
     """Per-instance predicted z-scored error curve.
@@ -1540,6 +1541,12 @@ def predict_curves_for_dataset(
                 (xb.shape[0],), horizon_idx, dtype=torch.long, device=device,
             )
             curve_pred, _, _, _ = predictor(xb, horizon_idx=h_idx)
+            if training_objective == "classification":
+                # Downstream strategy code historically chooses argmin of a
+                # predicted cost curve. Convert class logits to negative
+                # sigmoid scores so argmin remains the single decision contract
+                # while preserving the classifier's argmax exactly.
+                curve_pred = -torch.sigmoid(curve_pred)
             preds.append(curve_pred.float().cpu().numpy())
     return np.concatenate(preds, axis=0)
 
@@ -1577,6 +1584,7 @@ def plot_real_vs_predicted_curve(
     horizon_pred: int,
     curve_metric: str,
     save_dir: str,
+    training_objective: str = "curve",
 ) -> str:
     """Overlay z-scored real curve and z-scored predicted curve (mean +/- std).
 
@@ -1606,9 +1614,12 @@ def plot_real_vs_predicted_curve(
         ax.text(0.5, 0.6, "no valid real-curve points",
                 ha="center", va="center", transform=ax.transAxes, color="#999")
 
+    pred_label = (f"Classifier decision score (mean over {n_inst} inst.)"
+                  if training_objective == "classification"
+                  else f"Predicted curve (mean over {n_inst} inst.)")
     ax.plot(ws, pred_mean,
             marker="x", linewidth=2.0, color="#d62728",
-            label=f"Predicted (mean over {n_inst} inst.)")
+            label=pred_label)
     ax.fill_between(ws, pred_mean - pred_std, pred_mean + pred_std,
                     color="#d62728", alpha=0.18,
                     label="Predicted $\\pm$1$\\sigma$")
@@ -1622,7 +1633,10 @@ def plot_real_vs_predicted_curve(
     ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
     ax.tick_params(axis="x", rotation=45)
     ax.set_xlabel("Input Window Size")
-    ax.set_ylabel(f"Z-scored {curve_metric.upper()} along windows")
+    ax.set_ylabel(
+        "Real z-score / classifier score (-probability)"
+        if training_objective == "classification"
+        else f"Z-scored {curve_metric.upper()} along windows")
     ax.set_title(
         f"{dataset_display}  (term={term}, h_real={horizon_real}, "
         f"h_pred={horizon_pred})  --  {model_short}",
@@ -2059,10 +2073,12 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
     horizon_grid: List[int] = list(pred_cfg["horizon_grid"])
     pred_ctx_len: int = int(pred_cfg["context_length"])
     pred_curve_metric: str = pred_cfg.get("curve_metric", "mae")
+    training_objective: str = pred_cfg.get("training_objective", "curve")
     print(Fore.CYAN
           + f"  window_grid ({len(window_grid)}): {window_grid}\n"
           + f"  horizon_grid: {horizon_grid}\n"
           + f"  context_length={pred_ctx_len}  curve_metric={pred_curve_metric}\n"
+          + f"  training_objective={training_objective}\n"
           + f"  label_model={pred_cfg.get('label_model')}"
           + Fore.RESET)
 
@@ -2505,14 +2521,18 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
 
             predicted_curves = predict_curves_for_dataset(
                 predictor, cache, pred_ctx_len, h_idx, device,
+                training_objective=training_objective,
                 batch_size=args.predictor_batch_size,
             )
 
-            plot_path = plot_real_vs_predicted_curve(
-                window_grid, real_curve, predicted_curves,
-                model_short, dataset_display, term,
-                horizon_real, horizon_pred, "mase", compare_dir,
-            )
+            plot_path = ""
+            if not args.no_plots:
+                plot_path = plot_real_vs_predicted_curve(
+                    window_grid, real_curve, predicted_curves,
+                    model_short, dataset_display, term,
+                    horizon_real, horizon_pred, "mase", compare_dir,
+                    training_objective=training_objective,
+                )
 
             # Per-(model,dataset,term) numerical artifact for downstream eval.
             real_z, _ = _zscore_curve(real_curve)
@@ -2536,6 +2556,7 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 predicted_curves=predicted_curves,
                 predicted_mean=pred_mean,
                 predicted_std=pred_std,
+                training_objective=np.asarray(training_objective),
             )
             compare_records.append({
                 "model": model_id, "model_short": model_short,

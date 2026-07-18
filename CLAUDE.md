@@ -43,7 +43,7 @@ swap the **stage-2 predictor** (architecture/search), redirecting it to its own
 the shared `general/` tree (the window grid is dataset-derived, not
 predictor-derived, so no TSFM re-inference):
 - **`run_all_v3.py`** — same PatchTST-Transformer predictor but a *constrained*
-  HP search (low-FLOP corner: big patches, narrow `d_model`, shallow, ~20
+  HP search (low-FLOP corner: big patches, narrow `d_model`, shallow, 30
   trials), so the predictor's own cost is negligible vs the labeled TSFM.
 - **`run_all_v4.py`** — swaps the Transformer encoder for a **bidirectional
   Mamba** (selective state-space) stack — O(N) in the patch-token count instead
@@ -54,10 +54,11 @@ predictor-derived, so no TSFM re-inference):
   server (imported lazily, so the patchtst path needs neither).
 
 1. **`build_context_length_dataset.py`** — *labeling*. Generates ~50k synthetic
-   series (length 8192 + horizon) with injected non-stationarity (1–4 regimes,
+   series (length 15360 + horizon) with injected non-stationarity (1–4 regimes,
    level/variance shifts, per-segment trend/AR/seasonality, wave-type variety,
    spikes, gradual transitions, ~10% short/left-padded series). For each series
-   and each TSFM, forecasts at every window in `WINDOW_GRID` and records the full
+   and each TSFM, forecasts at every model-supported window in `WINDOW_GRID`
+   and records the full
    error-vs-(context, horizon) surface (MAE & MSE). Multi-GPU: one worker per
    CUDA device drains a shard queue; shards resume on re-run. Output:
    `contexts.npy`, `targets.npy`, `curves_{mae,mse}.npy`, etc.
@@ -232,12 +233,14 @@ Token-mapping / hook assumptions per family carry "verify on server" notes in
   `logs/experiments/sanity_leaderboard/<tag>/`, resumable.
 
 **Master orchestrator:**
-- **`master_run_all.py`** — fuses *every* `run_all*` variant into one run while
-  running each shared stage **exactly once**: Stage 1 up front, then each variant
-  as a subprocess with an explicit `--skip-stages` set, then
-  `rollup_all_predictors`. A `VARIANTS` registry is the single source of truth —
-  **add any new `run_all_*` there (with the stages it should skip) so master
-  stays the fuse-everything entry point and never recomputes a shared stage.**
+- **`master_run_all.py`** — clean recomputation entry point. Stage 1 runs once;
+  then cheap PatchTST and Mamba are trained under both curve regression and
+  soft-top-3 classification (30 HP trials each). All four variants reuse one
+  canonical GiftEval cell cache, then `rollup_all_predictors` compares them.
+  The historical full predictor / period / timing-only variants are excluded.
+  Outputs default to the isolated `logs/experiments/master_recompute/` tree;
+  `--test` runs the same matrix with reduced smoke settings and keeps its output
+  for environment/debug inspection.
 
 ## Models labeled (the TSFMs under study)
 
@@ -302,8 +305,9 @@ python -m experiments.run_all --skip-stages 1 2
 # values (only matters for exactness on NaN-label *_with_missing cells):
 python -m experiments.run_all --skip-stages 1 2 --force 3
 python -m experiments.run_all --skip-stages 1 2 3 --mase-metric mase_gluonts  # port-scored compare -> *_gluonts dirs
-python -m experiments.master_run_all              # fuse ALL variants, no repeated stages
-python -m experiments.master_run_all --only-variants v1 v5
+python -m experiments.master_run_all              # requested cheap/Mamba recomputation matrix
+python -m experiments.master_run_all --only-variants cheap mamba
+python -m experiments.master_run_all --test       # reduced end-to-end env/smoke check
 python -m experiments.synth_param_sweeps          # single-factor sweeps, run set
 python -m experiments.synth_param_sweeps --models Sundial-Base-128M TimeMoE-200M  # legacy env
 python -m experiments.synth_param_sweeps --experiments period delay --plot-only

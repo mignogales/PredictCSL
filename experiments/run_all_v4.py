@@ -77,9 +77,9 @@ PREDICTOR_ROOT_V4   = "logs/experiments/context_length_predictor_v4"
 ABLATION_GENERAL_V4 = os.path.join(ra.ABLATION_ROOT, "general_v4")
 STRATEGY_SUBDIR_V4  = "strategy_comparison_v4"
 
-# Match v3's short search: the Mamba predictor is cheap enough that 20 trials are
-# plenty, and it keeps stage-2 wall-clock comparable across the v3/v4 variants.
-N_TRIALS_V4_DEFAULT = 20
+# Match v3's search: 30 trials for both requested predictor architectures, which
+# keeps stage-2 wall-clock directly comparable across the two variants.
+N_TRIALS_V4_DEFAULT = 30
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,6 +102,10 @@ def parse_args() -> argparse.Namespace:
                    help="Also pin the constrained Mamba corner "
                         "(PREDICTCSL_CHEAP_PREDICTOR=1): narrow d_model, shallow, "
                         "larger patches — as v3 does for the Transformer.")
+    p.add_argument("--training-objective", choices=["curve", "classification"],
+                   default="curve",
+                   help="Predict the curve shape (original) or classify the best "
+                        "window with soft top-3 labels.")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Stream subprocess output instead of the quiet tqdm bars.")
     return p.parse_args()
@@ -117,22 +121,36 @@ def main() -> None:
     # ---- Arch + constraint env vars (read at import by predict_context_length) -
     # subprocess.Popen inherits os.environ, so setting these here propagates to
     # the stage-2 child and, in turn, to its spawned per-GPU trial workers.
+    objective_suffix = "" if args.training_objective == "curve" else "_classification"
+    test_mode = os.environ.get("PREDICTCSL_TEST") == "1"
+    master_root = os.environ.get("PREDICTCSL_MASTER_ROOT")
+    if master_root:
+        predictor_base = os.path.join(master_root, "context_length_predictor_v4")
+    else:
+        predictor_base = PREDICTOR_ROOT_V4
+    predictor_root = predictor_base + objective_suffix
+    ablation_general = os.path.join(
+        ra.ABLATION_ROOT, "general_v4" + objective_suffix)
+    strategy_subdir = STRATEGY_SUBDIR_V4 + objective_suffix
+    n_trials = 2 if test_mode else args.n_trials
+
     os.environ["PREDICTCSL_PREDICTOR_ARCH"] = "mamba"
     if args.cheap:
         os.environ["PREDICTCSL_CHEAP_PREDICTOR"] = "1"
-    os.environ["PREDICTCSL_N_TRIALS"] = str(args.n_trials)
+    os.environ["PREDICTCSL_N_TRIALS"] = str(n_trials)
+    os.environ["PREDICTCSL_TRAINING_OBJECTIVE"] = args.training_objective
     # Stage 2 + stage 3 both resolve the predictor root from this env var.
-    os.environ["PREDICTCSL_PREDICTOR_ROOT"] = PREDICTOR_ROOT_V4
+    os.environ["PREDICTCSL_PREDICTOR_ROOT"] = predictor_root
 
     # ---- Redirect roots on the reused run_all machinery ----------------------
     # Stage 1 stays on the shared DATASET_ROOT (reused). Stage 2 -> v4 predictor
     # root; stage 3 -> general_v4 (with linked cells); stage 4 -> *_v4 subdir.
-    ra.PREDICTOR_ROOT   = PREDICTOR_ROOT_V4
-    ra.ABLATION_GENERAL = ABLATION_GENERAL_V4
-    ra.STRATEGY_SUBDIR  = STRATEGY_SUBDIR_V4
+    ra.PREDICTOR_ROOT   = predictor_root
+    ra.ABLATION_GENERAL = ablation_general
+    ra.STRATEGY_SUBDIR  = strategy_subdir
 
     # Reuse the expensive per-cell GiftEval inference (same helper v3 uses).
-    ra_v3._link_shared_cells(ABLATION_GENERAL_V4,
+    ra_v3._link_shared_cells(ablation_general,
                              os.path.join(ra.ABLATION_ROOT, "general"))
 
     active = (set(args.only_stages) if args.only_stages
@@ -156,14 +174,20 @@ def main() -> None:
     # so no extra args are required beyond the short-context mode (skip, to match
     # v3 — short instances are excluded at each window rather than padded).
     extras = {"1": [], "2": [], "3": ["--short-context-mode", "skip"], "4": []}
+    if test_mode:
+        extras["1"] += ["--n-series", str(ra.TEST_N_SERIES)]
+        extras["3"] += ["--no-plots",
+                        "--test-datasets", str(ra.TEST_N_DATASETS),
+                        "--test-datasets-seed", "42"]
 
     print(Fore.CYAN + f"[v4] Models: {[m[2] for m in selected]}" + Fore.RESET)
     print(Fore.CYAN + f"[v4] Active stages: {sorted(active)}" + Fore.RESET)
     print(Fore.CYAN + "[v4] Predictor arch: mamba (bidirectional, O(N))"
           + ("  + cheap corner" if args.cheap else "") + Fore.RESET)
-    print(Fore.CYAN + f"[v4] Trials: {args.n_trials}" + Fore.RESET)
-    print(Fore.CYAN + f"[v4] Predictor root: {PREDICTOR_ROOT_V4}" + Fore.RESET)
-    print(Fore.CYAN + f"[v4] Ablation run dir: {ABLATION_GENERAL_V4}" + Fore.RESET)
+    print(Fore.CYAN + f"[v4] Trials: {n_trials}" + Fore.RESET)
+    print(Fore.CYAN + f"[v4] Training objective: {args.training_objective}" + Fore.RESET)
+    print(Fore.CYAN + f"[v4] Predictor root: {predictor_root}" + Fore.RESET)
+    print(Fore.CYAN + f"[v4] Ablation run dir: {ablation_general}" + Fore.RESET)
     print(Fore.YELLOW + "[v4] Requires mamba-ssm + causal-conv1d on the GPU server."
           + Fore.RESET)
     if forced:
