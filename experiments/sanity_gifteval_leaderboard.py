@@ -150,6 +150,8 @@ def _is_oom_error(exc: BaseException) -> bool:
         "cudnn_status_alloc_failed",
         "mps backend out of memory",
         "unable to allocate",
+        "resource exhausted",
+        "allocation failed",
     )
     return any(fragment in msg for fragment in oom_fragments)
 
@@ -171,12 +173,17 @@ def _clear_accelerator_cache() -> None:
 
 def _run_with_dynamic_batch(label: str, initial_batch_size: int,
                             run: Callable[[int], T]) -> Tuple[T, int]:
-    """Run ``run(batch_size)`` and halve the batch size on accelerator OOM."""
+    """Run ``run(batch_size)`` and halve the batch size on accelerator OOM.
+
+    Some model stacks raise non-``RuntimeError`` exceptions for accelerator
+    allocation failures, so inspect the message instead of keying only on the
+    exception class.
+    """
     batch_size = max(1, int(initial_batch_size))
     while True:
         try:
             return run(batch_size), batch_size
-        except RuntimeError as exc:
+        except Exception as exc:
             if not _is_oom_error(exc) or batch_size <= 1:
                 raise
             next_batch_size = max(1, batch_size // 2)
@@ -566,18 +573,25 @@ def _pipeline_context_cap(family: str, horizon: int, requested: Optional[int],
                           max_available: int) -> int:
     import experiments.test_window_ablation_gifteval_v5 as wab
 
-    caps = {
+    hard_caps = {
+        "chronos2": 8192,
+        "chronos_bolt": 2048,
+        "moirai": max(1, 8192 - int(horizon)),
+        "moirai_1_1": max(1, 8192 - int(horizon)),
+        "timesfm": 15360,
+        "patchtst_fm": 8192,
         "sundial": getattr(wab, "SUNDIAL_MAX_CONTEXT", max_available),
         "toto": getattr(wab, "TOTO_MAX_CONTEXT", max_available),
         "flowstate": getattr(wab, "FLOWSTATE_MAX_CONTEXT", max_available),
         "tirex": getattr(wab, "TIREX_MAX_CONTEXT", max_available),
     }
     if family == "timemoe":
-        caps[family] = max(1, getattr(wab, "TIMEMOE_MAX_TOTAL", max_available) - horizon)
-    elif family == "timesfm":
-        caps[family] = 15360
+        hard_caps[family] = max(
+            1, getattr(wab, "TIMEMOE_MAX_TOTAL", max_available) - int(horizon))
 
-    cap = int(requested) if requested is not None else int(caps.get(family, max_available))
+    cap = int(requested) if requested is not None else int(max_available)
+    if family in hard_caps:
+        cap = min(cap, int(hard_caps[family]))
     return max(1, min(cap, int(max_available)))
 
 
@@ -744,9 +758,11 @@ def evaluate_on_dataset(model_name: str, ds_name: str, ds_term: str,
                 seasonality=get_seasonality(str(dataset.freq)),
             ).reset_index(drop=True).to_dict(orient="records")
 
-        res, _ = _run_with_dynamic_batch(
+        res, effective_batch_size = _run_with_dynamic_batch(
             f"TimesFM {ds_name}/{ds_term}", 1024, _run)
-        return res[0]
+        out = res[0]
+        out["_batch_size"] = int(effective_batch_size)
+        return out
 
     # ---- chronos-2.ipynb recipe ----
     # Native multivariate unless --univariate flattens it.
@@ -783,7 +799,9 @@ def evaluate_on_dataset(model_name: str, ds_name: str, ds_term: str,
         allow_nan_forecast=False,
         seasonality=get_seasonality(str(dataset.freq)),
     ).reset_index(drop=True).to_dict(orient="records")
-    return res[0]
+    out = res[0]
+    out["_batch_size"] = int(predictor.batch_size)
+    return out
 
 
 # ==============================================================================
