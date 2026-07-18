@@ -4,14 +4,14 @@ PredictCSL pipeline orchestrator -- v3 (cheap, severely-constrained predictor).
 Same four stages as ``run_all.py`` (build -> predictor -> ablation -> compare),
 but stage 2 trains a *constrained* predictor: the hyperparameter search is pinned
 to the low-FLOP corner of the space (large patches -> few tokens, narrow
-d_model=128, shallow 2-4 layers) and shortened to 20 trials. The point is a
+d_model=128, shallow 2-4 layers) and shortened to 30 trials. The point is a
 predictor whose own per-series inference cost is negligible against the labeled
 TSFM (worst case ~0.12 GMAC, ~2% of a Moirai2 forward pass), so the
 ``pred_window`` compute savings in stage 4 are honest even without bookkeeping
 the predictor's cost.
 
 The constraint + trial count are passed to stage 2 through environment variables
-(PREDICTCSL_CHEAP_PREDICTOR=1, PREDICTCSL_N_TRIALS=20), resolved at import by
+(PREDICTCSL_CHEAP_PREDICTOR=1, PREDICTCSL_N_TRIALS=30), resolved at import by
 predict_context_length.py so they also reach its spawned per-GPU trial workers.
 
 Cache strategy — repeat as little as possible
@@ -45,7 +45,7 @@ Usage
     python -m experiments.run_all_v3 --models Moirai2-Small
     python -m experiments.run_all_v3 --skip-stages 1      # dataset already built
     python -m experiments.run_all_v3 --force 2            # re-run constrained search
-    python -m experiments.run_all_v3 --n-trials 30        # override the 20-trial default
+    python -m experiments.run_all_v3 --n-trials 40        # override the 30-trial default
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ PREDICTOR_ROOT_V3   = "logs/experiments/context_length_predictor_v3"
 ABLATION_GENERAL_V3 = os.path.join(ra.ABLATION_ROOT, "general_v3")
 STRATEGY_SUBDIR_V3  = "strategy_comparison_v3"
 
-N_TRIALS_V3_DEFAULT = 20
+N_TRIALS_V3_DEFAULT = 30
 
 
 def _link_shared_cells(general_v3: str, shared_general: str) -> None:
@@ -92,12 +92,10 @@ def _link_shared_cells(general_v3: str, shared_general: str) -> None:
                 "as-is; stage 3 will use whatever cells live there."
               + Fore.RESET)
         return
-    if not os.path.isdir(shared_cells):
-        print(Fore.YELLOW
-              + f"[v3] No shared cell cache at {shared_cells} yet — stage 3 will "
-                "build cells fresh under general_v3/ (no reuse possible)."
-              + Fore.RESET)
-        return
+    # The reduced master no longer runs the full/base predictor first. Create
+    # the canonical predictor-independent cell store on demand; the first
+    # variant fills it and every later curve/classification variant reuses it.
+    os.makedirs(shared_cells, exist_ok=True)
 
     # Relative link so the tree stays portable if logs/ is moved/synced.
     rel = os.path.relpath(shared_cells, start=general_v3)
@@ -121,6 +119,10 @@ def parse_args() -> argparse.Namespace:
                         "with no arg to force every active stage.")
     p.add_argument("--n-trials", type=int, default=N_TRIALS_V3_DEFAULT,
                    help=f"Constrained-search trial count (default {N_TRIALS_V3_DEFAULT}).")
+    p.add_argument("--training-objective", choices=["curve", "classification"],
+                   default="curve",
+                   help="Predict the curve shape (original) or classify the best "
+                        "window with soft top-3 labels.")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Stream subprocess output instead of the quiet tqdm bars.")
     return p.parse_args()
@@ -136,20 +138,34 @@ def main() -> None:
     # ---- Constraint env vars (read at import by predict_context_length.py) ---
     # subprocess.Popen inherits os.environ, so setting these here propagates to
     # the stage-2 child and, in turn, to its spawned per-GPU trial workers.
+    objective_suffix = "" if args.training_objective == "curve" else "_classification"
+    test_mode = os.environ.get("PREDICTCSL_TEST") == "1"
+    master_root = os.environ.get("PREDICTCSL_MASTER_ROOT")
+    if master_root:
+        predictor_base = os.path.join(master_root, "context_length_predictor_v3")
+    else:
+        predictor_base = PREDICTOR_ROOT_V3
+    predictor_root = predictor_base + objective_suffix
+    ablation_general = os.path.join(
+        ra.ABLATION_ROOT, "general_v3" + objective_suffix)
+    strategy_subdir = STRATEGY_SUBDIR_V3 + objective_suffix
+    n_trials = 2 if test_mode else args.n_trials
+
     os.environ["PREDICTCSL_CHEAP_PREDICTOR"] = "1"
-    os.environ["PREDICTCSL_N_TRIALS"]        = str(args.n_trials)
+    os.environ["PREDICTCSL_N_TRIALS"]        = str(n_trials)
+    os.environ["PREDICTCSL_TRAINING_OBJECTIVE"] = args.training_objective
     # Stage 2 + stage 3 both resolve the predictor root from this env var.
-    os.environ["PREDICTCSL_PREDICTOR_ROOT"]  = PREDICTOR_ROOT_V3
+    os.environ["PREDICTCSL_PREDICTOR_ROOT"]  = predictor_root
 
     # ---- Redirect roots on the reused run_all machinery ----------------------
     # Stage 1 stays on the shared DATASET_ROOT (reused). Stage 2 -> v3 predictor
     # root; stage 3 -> general_v3 (with linked cells); stage 4 -> *_v3 subdir.
-    ra.PREDICTOR_ROOT   = PREDICTOR_ROOT_V3
-    ra.ABLATION_GENERAL = ABLATION_GENERAL_V3
-    ra.STRATEGY_SUBDIR  = STRATEGY_SUBDIR_V3
+    ra.PREDICTOR_ROOT   = predictor_root
+    ra.ABLATION_GENERAL = ablation_general
+    ra.STRATEGY_SUBDIR  = strategy_subdir
 
     # Reuse the expensive per-cell GiftEval inference.
-    _link_shared_cells(ABLATION_GENERAL_V3, os.path.join(ra.ABLATION_ROOT, "general"))
+    _link_shared_cells(ablation_general, os.path.join(ra.ABLATION_ROOT, "general"))
 
     active = (set(args.only_stages) if args.only_stages
               else set(ra.STAGES) - set(args.skip_stages))
@@ -172,13 +188,19 @@ def main() -> None:
     # stage_3 launcher reads ra.PREDICTOR_ROOT / ra.ABLATION_GENERAL, already
     # redirected above, so no extra args are required). Same for stage 4.
     extras = {"1": [], "2": [], "3": ["--short-context-mode", "skip"], "4": []}
+    if test_mode:
+        extras["1"] += ["--n-series", str(ra.TEST_N_SERIES)]
+        extras["3"] += ["--no-plots",
+                        "--test-datasets", str(ra.TEST_N_DATASETS),
+                        "--test-datasets-seed", "42"]
 
     print(Fore.CYAN + f"[v3] Models: {[m[2] for m in selected]}" + Fore.RESET)
     print(Fore.CYAN + f"[v3] Active stages: {sorted(active)}" + Fore.RESET)
-    print(Fore.CYAN + f"[v3] Constrained search: {args.n_trials} trials, "
+    print(Fore.CYAN + f"[v3] Constrained search: {n_trials} trials, "
           "patch∈{64,128}, d_model=128, layers∈{2,4}" + Fore.RESET)
-    print(Fore.CYAN + f"[v3] Predictor root: {PREDICTOR_ROOT_V3}" + Fore.RESET)
-    print(Fore.CYAN + f"[v3] Ablation run dir: {ABLATION_GENERAL_V3}" + Fore.RESET)
+    print(Fore.CYAN + f"[v3] Training objective: {args.training_objective}" + Fore.RESET)
+    print(Fore.CYAN + f"[v3] Predictor root: {predictor_root}" + Fore.RESET)
+    print(Fore.CYAN + f"[v3] Ablation run dir: {ablation_general}" + Fore.RESET)
     if forced:
         print(Fore.YELLOW + f"[v3] Forced re-runs: {sorted(forced)}" + Fore.RESET)
 

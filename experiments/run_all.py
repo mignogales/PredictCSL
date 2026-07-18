@@ -67,7 +67,10 @@ from tqdm.auto import tqdm
 
 # Authoritative model catalog. --model-idx for stage 1 indexes into THIS list,
 # so we resolve indices from it directly rather than from a hand-copied mirror.
-from experiments.build_context_length_dataset import MODELS as BUILD_MODELS
+from experiments.build_context_length_dataset import (
+    MODELS as BUILD_MODELS,
+    window_grid_for_family,
+)
 from experiments import models_config
 
 
@@ -79,13 +82,17 @@ from experiments import models_config
 # the predictor-overhead summary) picks up the change.
 MODELS_TO_RUN: List[Tuple[str, str, str]] = models_config.models_to_run()
 
-DATASET_ROOT   = "logs/experiments/context_length_dataset"
-PREDICTOR_ROOT = "logs/experiments/context_length_predictor"
-ABLATION_ROOT  = "logs/experiments/window_ablation_gifteval"
+DATASET_ROOT   = os.environ.get(
+    "PREDICTCSL_DATASET_ROOT", "logs/experiments/context_length_dataset")
+PREDICTOR_ROOT = os.environ.get(
+    "PREDICTCSL_PREDICTOR_ROOT", "logs/experiments/context_length_predictor")
+ABLATION_ROOT  = os.environ.get(
+    "PREDICTCSL_ABLATION_ROOT", "logs/experiments/window_ablation_gifteval")
 # Per-stage subprocess output is captured here in quiet mode (the default), so
 # the terminal shows only the top-level tqdm bar. One log per (model, stage);
 # overwritten on each run. Tail is surfaced if a stage fails.
-RUN_LOG_ROOT   = "logs/experiments/run_all_logs"
+RUN_LOG_ROOT   = os.environ.get(
+    "PREDICTCSL_RUN_LOG_ROOT", "logs/experiments/run_all_logs")
 # Shared, cross-model gifteval ablation output (stage 3). One folder for every
 # model — v5 keys its artefacts by (dataset, model_short), so models coexist
 # here without collision and share the dataset cache + naive baselines.
@@ -354,6 +361,7 @@ def stage_4_compare(display: str, family: str, extra: Sequence[str]) -> float:
     return _run(
         [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
          "--run-dir", ABLATION_GENERAL,
+         "--cache-root", ABLATION_ROOT,
          "--models", display,
          "--output-dir", out_dir, *extra],
         stage="4/compare", display=display,
@@ -370,6 +378,7 @@ def stage_4_rollup(extra: Sequence[str], out_dir: str = None) -> float:
     return _run(
         [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
          "--run-dir", ABLATION_GENERAL,
+         "--cache-root", ABLATION_ROOT,
          "--output-dir", out_dir or ABLATION_GENERAL,
          "--rollup-only", *extra],
         stage="4/rollup", display="ALL",
@@ -404,6 +413,10 @@ def _done_stage_1(family: str, display: str = "") -> Tuple[bool, str]:
         return False, "meta.json unreadable"
     done = int(meta.get("shards_done", 0))
     total = int(meta.get("shards_total", 0))
+    expected_grid = window_grid_for_family(family)
+    if meta.get("window_grid") != expected_grid:
+        return False, (
+            f"stale window grid {meta.get('window_grid')} != {expected_grid}")
     pct = 100.0 * done / total if total > 0 else 0.0
     if total > 0 and done >= total:
         return True, f"{done}/{total} shards ({pct:.1f}%)"

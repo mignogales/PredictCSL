@@ -25,7 +25,7 @@ ChronosBolt-Base.
 
 from __future__ import annotations
 
-from typing import List, NamedTuple, Tuple
+from typing import Dict, List, NamedTuple, Tuple
 
 
 class ModelSpec(NamedTuple):
@@ -56,6 +56,43 @@ CATALOG: List[ModelSpec] = [
     ModelSpec("ibm-granite/granite-timeseries-flowstate-r1", "flowstate", "FlowState-R1", True),
     ModelSpec("NX-AI/TiRex-2",                   "tirex",        "TiRex2",             True),
 ]
+
+
+# Maximum context used by the context-length experiments, in raw time steps.
+# These are capability/training limits, not GiftEval-series lengths.  Keeping
+# them here makes stage 1 (synthetic labels), stage 3 (GiftEval ablation), and
+# the strategy/FLOPs comparison agree on the same candidate windows.
+#
+# TimesFM 2.5's checkpoint advertises 16,384 steps.  The official GiftEval
+# recipe caps it at 15,360, which is also the clean-room sanity-check setting;
+# use that value here so our full-window result is directly comparable.
+FAMILY_CONTEXT_LIMIT: Dict[str, int] = {
+    "chronos2": 8192,
+    "chronos_bolt": 2048,
+    "moirai": 8192,
+    "moirai_1_1": 8192,
+    "timesfm": 15360,
+    "patchtst_fm": 8192,
+    "sundial": 2880,
+    # The labeler evaluates all horizons together and TimeMoE requires
+    # context+horizon <= 4096; 3072 is therefore the largest safe grid point
+    # with the 1024-step label horizon.
+    "timemoe": 3072,
+    "toto": 4096,
+    "flowstate": 4096,
+    "tirex": 8192,
+}
+
+
+def context_limit(family: str) -> int:
+    """Return the experiment context cap for a model family."""
+    try:
+        return FAMILY_CONTEXT_LIMIT[family]
+    except KeyError as exc:
+        raise KeyError(
+            f"No context limit registered for family {family!r}. Add it to "
+            "experiments.models_config.FAMILY_CONTEXT_LIMIT."
+        ) from exc
 
 
 def catalog() -> List[Tuple[str, str, str]]:

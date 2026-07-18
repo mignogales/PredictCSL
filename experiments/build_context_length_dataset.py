@@ -80,7 +80,7 @@ from experiments import models_config
 # ==============================================================================
 
 # -- Series geometry ----------------------------------------------------------
-MAX_WINDOW   = 8192          # length of the context pool (largest ablation window)
+MAX_WINDOW   = 15360         # shared pool; TimesFM official GiftEval cap
 PERIOD_MIN   = 16            # seasonal period bounds (samples)
 PERIOD_MAX   = 2048
 
@@ -89,7 +89,7 @@ PERIOD_MAX   = 2048
 # is directly comparable to real GiftEval ablation curves.
 WINDOW_GRID = [
     32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
-    1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192,
+    1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192, 12288, 15360,
 ]
 
 # Smoke-test mode (PREDICTCSL_TEST=1, set by experiments/run_all.py --test):
@@ -97,8 +97,24 @@ WINDOW_GRID = [
 # whole pipeline can be exercised end-to-end in minutes. Resolved from the env
 # at import time on purpose — `mp spawn` workers re-import this module, so a
 # main()-level override would not reach them, but an inherited env var does.
-if os.environ.get("PREDICTCSL_TEST") == "1":
-    WINDOW_GRID = [WINDOW_GRID[0], WINDOW_GRID[-1]]
+TEST_MODE = os.environ.get("PREDICTCSL_TEST") == "1"
+
+
+def window_grid_for_family(family: str) -> List[int]:
+    """Candidate windows supported by ``family``.
+
+    The historical grid is unchanged through 8,192.  Only families whose
+    registered context limit exceeds 8,192 receive the two long-context points
+    (12,288 and the official 15,360 GiftEval cap).  Smaller models therefore do
+    not carry all-NaN output classes that they can never select.
+    """
+    cap = models_config.context_limit(family)
+    grid = [w for w in WINDOW_GRID if w <= cap]
+    if not grid:
+        raise ValueError(f"No WINDOW_GRID point is <= context cap {cap} for {family}.")
+    if TEST_MODE:
+        grid = [grid[0], grid[-1]] if len(grid) > 1 else grid
+    return grid
 
 # -- Horizon grid (forecast lengths labeled per series) -----------------------
 HORIZON_GRID = [16, 32, 64, 128, 512, 1024]
@@ -1165,7 +1181,7 @@ def gpu_worker(
 # ==============================================================================
 
 def merge_shards(
-    model_dir: str, n_series: int
+    model_dir: str, n_series: int, window_indices: List[int]
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """Concatenate completed shard curves into top-level (N, n_win, n_h) arrays.
 
@@ -1186,18 +1202,32 @@ def merge_shards(
                 continue
             with open(dpath) as f:
                 d = json.load(f)
+            if (d.get("window_indices") != window_indices
+                    or d.get("horizon_grid") != HORIZON_GRID):
+                continue
             s, e = d["start"], d["end"]
-            cm[s:e] = np.load(os.path.join(sdir, name, "curves_mae.npy"))
-            cs[s:e] = np.load(os.path.join(sdir, name, "curves_mse.npy"))
+            shard_mae = np.load(os.path.join(sdir, name, "curves_mae.npy"))
+            shard_mse = np.load(os.path.join(sdir, name, "curves_mse.npy"))
+            if shard_mae.shape[1:] != (n_win, n_h):
+                continue
+            cm[s:e] = shard_mae
+            cs[s:e] = shard_mse
             n_done += 1
 
-    np.save(os.path.join(model_dir, "curves_mae.npy"), cm)
-    np.save(os.path.join(model_dir, "curves_mse.npy"), cs)
-    return cm, cs, n_done
+    # Shards use the global union grid so their schema is spawn-stable.  The
+    # public per-model arrays expose only that family's supported grid; this is
+    # what lets smaller-context predictors be genuine smaller classification
+    # problems instead of receiving permanently invalid output positions.
+    cm_model = cm[:, window_indices, :]
+    cs_model = cs[:, window_indices, :]
+    np.save(os.path.join(model_dir, "curves_mae.npy"), cm_model)
+    np.save(os.path.join(model_dir, "curves_mse.npy"), cs_model)
+    return cm_model, cs_model, n_done
 
 
 def _print_data_sanity(
-    curves_mae: np.ndarray, n_segments: np.ndarray, family: str
+    curves_mae: np.ndarray, n_segments: np.ndarray, family: str,
+    window_grid: List[int],
 ) -> None:
     """Report whether the generated data is actually context-sensitive."""
     valid = ~np.isnan(curves_mae).any(axis=(1, 2))
@@ -1206,7 +1236,7 @@ def _print_data_sanity(
         return
     cm_v = curves_mae[valid]                                # (V, n_win, n_h)
     n_win = cm_v.shape[1]
-    win_arr = np.array(WINDOW_GRID)
+    win_arr = np.array(window_grid)
     print(Fore.GREEN + f"  Data sanity [{family}] (MAE curves):" + Fore.RESET)
     print(f"    valid curves: {int(valid.sum())}/{len(curves_mae)}")
     for h_idx, h in enumerate(HORIZON_GRID):
@@ -1260,10 +1290,10 @@ def main() -> None:
             f"--model-idx {args.model_idx} out of range (0-{len(MODELS)-1}).")
 
     devices = resolve_devices(args.device)
-    grid = [w for w in WINDOW_GRID if args.windows is None or w in args.windows]
-    if any(w > MAX_WINDOW for w in grid):
+    requested_grid = [w for w in WINDOW_GRID
+                      if args.windows is None or w in args.windows]
+    if any(w > MAX_WINDOW for w in requested_grid):
         raise ValueError(f"WINDOW_GRID exceeds MAX_WINDOW={MAX_WINDOW}.")
-    win_indices = [WINDOW_GRID.index(w) for w in grid]
 
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
@@ -1274,7 +1304,15 @@ def main() -> None:
     rlen_path     = os.path.join(OUTPUT_ROOT, "real_lengths.npy")
 
     if os.path.isfile(contexts_path):
-        n_series = int(np.load(contexts_path, mmap_mode="r").shape[0])
+        pool_shape = np.load(contexts_path, mmap_mode="r").shape
+        if len(pool_shape) != 2 or pool_shape[1] != MAX_WINDOW:
+            raise RuntimeError(
+                f"Existing synthetic pool has shape {pool_shape}, but this run "
+                f"requires (*, {MAX_WINDOW}) for the long-context grid. Start "
+                "the recomputation in an empty output root (or archive/remove "
+                f"{OUTPUT_ROOT}) so old 8k labels cannot be mixed with the new run."
+            )
+        n_series = int(pool_shape[0])
         n_segments = np.load(nseg_path)
         print(Fore.CYAN + f"Found existing pool: {n_series} series" + Fore.RESET)
     else:
@@ -1319,6 +1357,13 @@ def main() -> None:
           + Fore.RESET)
 
     for model_id, family, display in models_to_run:
+        family_grid = window_grid_for_family(family)
+        grid = [w for w in family_grid if w in requested_grid]
+        if not grid:
+            raise ValueError(
+                f"Requested --windows {args.windows} leaves no supported window "
+                f"for {display} (family grid: {family_grid}).")
+        win_indices = [WINDOW_GRID.index(w) for w in grid]
         model_dir = _model_dir(display)
         os.makedirs(model_dir, exist_ok=True)
         print(Fore.CYAN + f"\n── {display} ({model_id}) ──" + Fore.RESET)
@@ -1328,7 +1373,19 @@ def main() -> None:
         n_completed = 0
         for shard_id, start in enumerate(range(0, n_series, args.shard_size)):
             end = min(start + args.shard_size, n_series)
-            if os.path.isfile(os.path.join(_shard_dir(model_dir, shard_id), "done.json")):
+            done_path = os.path.join(_shard_dir(model_dir, shard_id), "done.json")
+            cached_ok = False
+            if os.path.isfile(done_path):
+                try:
+                    with open(done_path) as f:
+                        done_meta = json.load(f)
+                    cached_ok = (
+                        done_meta.get("window_indices") == win_indices
+                        and done_meta.get("horizon_grid") == HORIZON_GRID
+                    )
+                except (OSError, json.JSONDecodeError):
+                    cached_ok = False
+            if cached_ok:
                 n_completed += 1
             else:
                 pending.append((shard_id, start, end))
@@ -1381,7 +1438,7 @@ def main() -> None:
             print(Fore.MAGENTA + f"   Labeling wall-clock: {time.perf_counter() - t0:.1f}s"
                   + Fore.RESET)
 
-        curves_mae, _, n_done = merge_shards(model_dir, n_series)
+        curves_mae, _, n_done = merge_shards(model_dir, n_series, win_indices)
         total_shards = (n_series + args.shard_size - 1) // args.shard_size
 
         with open(os.path.join(model_dir, "meta.json"), "w") as f:
@@ -1393,11 +1450,15 @@ def main() -> None:
                 "created": datetime.now().isoformat(timespec="seconds"),
                 # Pool-level keys repeated here so predict_context_length.py can
                 # use this subdir as --dataset-dir without reading the parent meta.
-                "max_window": MAX_WINDOW, "max_horizon": MAX_HORIZON,
-                "window_grid": WINDOW_GRID, "horizon_grid": HORIZON_GRID,
+                # Predictor input stays at 8k for <=8k TSFMs and expands to the
+                # long grid only when the labeled TSFM can use it.
+                "max_window": (15360 if max(grid) > 8192 else 8192),
+                "pool_max_window": MAX_WINDOW,
+                "model_context_limit": models_config.context_limit(family),
+                "window_grid": grid, "horizon_grid": HORIZON_GRID,
             }, f, indent=2)
 
-        _print_data_sanity(curves_mae, n_segments, family)
+        _print_data_sanity(curves_mae, n_segments, family, grid)
         idx = MODELS.index((model_id, family, display))
         if n_done == 0:
             # Nothing was labeled at all — almost always a model-load failure in

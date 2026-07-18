@@ -90,9 +90,21 @@ load_dotenv()
 # ==============================================================================
 
 # -- Data ---------------------------------------------------------------------
-CONTEXT_LENGTH = 8192          # must match build_context_length_dataset MAX_WINDOW
+CONTEXT_LENGTH = int(os.environ.get("PREDICTCSL_CONTEXT_LENGTH", "8192"))
 CURVE_METRIC   = "mae"         # which label curve to learn: "mae" or "mse"
 VAL_FRACTION   = 0.1           # held-out fraction of the labeled dataset
+
+# ``curve`` is the original shape-regression task. ``classification`` treats
+# each supported input length as a class. Its multi-label soft target is literal:
+# best=1, second=1/2, third=1/4, every other valid window=0. Binary cross-entropy
+# is used so the best label remains exactly 1 rather than being normalised.
+TRAINING_OBJECTIVE = os.environ.get(
+    "PREDICTCSL_TRAINING_OBJECTIVE", "curve").lower()
+if TRAINING_OBJECTIVE not in ("curve", "classification"):
+    raise ValueError(
+        f"PREDICTCSL_TRAINING_OBJECTIVE={TRAINING_OBJECTIVE!r}; expected "
+        "'curve' or 'classification'.")
+SOFT_TOPK_WEIGHTS = (1.0, 0.5, 0.25)
 
 # -- Random search / training loop --------------------------------------------
 N_TRIALS                = 60
@@ -320,6 +332,13 @@ def load_split_tensors(
               f"({int((~ctx_ok).sum())} non-finite context, "
               f"{int((~surface_ok).sum())} all-NaN curve).")
     contexts = contexts[valid].astype(np.float32, copy=False)
+    if contexts.shape[1] < CONTEXT_LENGTH:
+        raise ValueError(
+            f"contexts.npy width {contexts.shape[1]} is shorter than predictor "
+            f"context_length={CONTEXT_LENGTH}.")
+    # The shared synthetic pool is 15,360 steps, while <=8k TSFMs retain the
+    # historical 8,192-step predictor input. Always keep the most recent tail.
+    contexts = contexts[:, -CONTEXT_LENGTH:]
     curves = curves[valid]
     if contexts.shape[0] == 0:
         raise RuntimeError("No labeled series in dataset.")
@@ -684,16 +703,38 @@ def compute_dual_loss(
     lambda_curve: float,
     lambda_recon: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Combined dual-objective loss.
+    """Combined task + reconstruction loss.
 
-    Curve loss is MSE over the z-scored target curve, masking NaN windows
-    (points the labeler could not serve for this series). Reconstruction loss is
-    MSE over MASKED patches only (visible patches are trivially identity).
+    In curve mode the task loss is MSE over the z-scored curve. In
+    classification mode ``curve_pred`` is interpreted as independent class
+    logits and the target carries literal rank weights 1, 1/2, 1/4 for the best
+    three windows. Reconstruction remains the same masked-patch MSE.
     """
     curve_valid = ~torch.isnan(curve_target)
-    target_safe = torch.nan_to_num(curve_target, nan=0.0)
-    sq = (curve_pred - target_safe).pow(2) * curve_valid.float()
-    curve_mse = sq.sum() / curve_valid.float().sum().clamp_min(1.0)
+    if TRAINING_OBJECTIVE == "classification":
+        valid_rows = curve_valid.any(dim=1)
+        if valid_rows.any():
+            values = curve_target[valid_rows]
+            valid = curve_valid[valid_rows]
+            logits = curve_pred[valid_rows]
+            soft = torch.zeros_like(logits)
+            max_k = min(len(SOFT_TOPK_WEIGHTS), logits.shape[1])
+            ranked = values.masked_fill(~valid, float("inf")).argsort(dim=1)
+            for rank in range(max_k):
+                idx = ranked[:, rank]
+                available = valid.gather(1, idx.unsqueeze(1)).squeeze(1)
+                soft.scatter_add_(
+                    1, idx.unsqueeze(1),
+                    (available.to(logits.dtype) * SOFT_TOPK_WEIGHTS[rank]).unsqueeze(1))
+            bce = F.binary_cross_entropy_with_logits(
+                logits, soft, reduction="none")
+            curve_mse = (bce * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        else:
+            curve_mse = curve_pred.sum() * 0.0
+    else:
+        target_safe = torch.nan_to_num(curve_target, nan=0.0)
+        sq = (curve_pred - target_safe).pow(2) * curve_valid.float()
+        curve_mse = sq.sum() / curve_valid.float().sum().clamp_min(1.0)
 
     if mask.any():
         sq_err = (recon_pred - original_patches).pow(2)
@@ -875,6 +916,7 @@ def _evaluate(
     recon_sum = torch.zeros((), device=device)
     regret_sum = torch.zeros((), device=device)
     acc_sum   = torch.zeros((), device=device)
+    top3_acc_sum = torch.zeros((), device=device)
     n_recon   = 0
 
     generator = torch.Generator(device="cpu").manual_seed(eval_seed)
@@ -907,12 +949,36 @@ def _evaluate(
                 curve_pred, recon_pred, orig, used_mask = model(
                     x, horizon_idx=h_idx_batch, mask=mask)
 
-                # Mask NaN windows (unservable points) in the curve MSE.
-                cvalid = ~torch.isnan(yn)
-                yn_safe = torch.nan_to_num(yn, nan=0.0)
-                curve_sum = curve_sum + (
-                    (curve_pred - yn_safe).pow(2) * cvalid.float()).sum()
-                curve_count = curve_count + cvalid.float().sum()
+                # Classification ranks the raw forecast errors; curve regression
+                # retains the per-series z-scored shape target.
+                task_target = yr if TRAINING_OBJECTIVE == "classification" else yn
+                cvalid = ~torch.isnan(task_target)
+                if TRAINING_OBJECTIVE == "classification":
+                    valid_rows = cvalid.any(dim=1)
+                    if valid_rows.any():
+                        vals = task_target[valid_rows]
+                        valid_cls = cvalid[valid_rows]
+                        logits = curve_pred[valid_rows]
+                        soft = torch.zeros_like(logits)
+                        ranked = vals.masked_fill(
+                            ~valid_cls, float("inf")).argsort(dim=1)
+                        for rank in range(min(len(SOFT_TOPK_WEIGHTS), n_windows)):
+                            ids = ranked[:, rank]
+                            available = valid_cls.gather(
+                                1, ids.unsqueeze(1)).squeeze(1)
+                            soft.scatter_add_(
+                                1, ids.unsqueeze(1),
+                                (available.to(logits.dtype)
+                                 * SOFT_TOPK_WEIGHTS[rank]).unsqueeze(1))
+                        bce = F.binary_cross_entropy_with_logits(
+                            logits, soft, reduction="none")
+                        curve_sum = curve_sum + (bce * valid_cls.float()).sum()
+                        curve_count = curve_count + valid_cls.float().sum()
+                else:
+                    yn_safe = torch.nan_to_num(task_target, nan=0.0)
+                    curve_sum = curve_sum + (
+                        (curve_pred - yn_safe).pow(2) * cvalid.float()).sum()
+                    curve_count = curve_count + cvalid.float().sum()
 
                 if h_idx_val == 0 and used_mask.any():
                     sq_err = (recon_pred - orig).pow(2).mean(dim=-1)
@@ -923,15 +989,25 @@ def _evaluate(
                 # neither the oracle nor the predictor can select them.
                 rvalid = ~torch.isnan(yr)
                 yr_inf = torch.where(rvalid, yr, torch.full_like(yr, float("inf")))
-                pred_inf = torch.where(
-                    rvalid, curve_pred, torch.full_like(curve_pred, float("inf")))
-                pred_arg = pred_inf.argmin(dim=1)
+                if TRAINING_OBJECTIVE == "classification":
+                    pred_score = torch.where(
+                        rvalid, curve_pred,
+                        torch.full_like(curve_pred, float("-inf")))
+                    pred_arg = pred_score.argmax(dim=1)
+                else:
+                    pred_score = torch.where(
+                        rvalid, curve_pred,
+                        torch.full_like(curve_pred, float("inf")))
+                    pred_arg = pred_score.argmin(dim=1)
                 true_arg = yr_inf.argmin(dim=1)
                 best_err   = yr_inf[idx_b, true_arg]
                 chosen_err = yr_inf[idx_b, pred_arg]
                 regret_sum = regret_sum + (
                     (chosen_err - best_err) / best_err.clamp_min(1e-8)).sum()
                 acc_sum = acc_sum + (pred_arg - true_arg).abs().le(1).float().sum()
+                true_top3 = yr_inf.argsort(dim=1)[:, :min(3, n_windows)]
+                top3_acc_sum = top3_acc_sum + (
+                    true_top3 == pred_arg.unsqueeze(1)).any(dim=1).float().sum()
 
     n_arg   = max(n_val * n_horizons, 1)
     curve_mse = (curve_sum / curve_count.clamp_min(1.0)).item()
@@ -943,6 +1019,7 @@ def _evaluate(
         "val_combined":  combined,
         "val_regret":    (regret_sum / n_arg).item(),
         "val_win_acc":   (acc_sum / n_arg).item(),
+        "val_top3_acc":  (top3_acc_sum / n_arg).item(),
     }
 
 
@@ -968,7 +1045,7 @@ def _failed_result(trial_idx: int, device: str, trial: TrialConfig,
         "trial_idx": trial_idx, "device": device,
         "val_curve_mse": float("nan"), "val_recon_mse": float("nan"),
         "val_combined": float("nan"), "val_regret": float("nan"),
-        "val_win_acc": float("nan"),
+        "val_win_acc": float("nan"), "val_top3_acc": float("nan"),
         "history": {}, "best_state_path": None,
         "failed": True, "skip_reason": reason,
         "auto_batch_size": None, "auto_lr": None, "peak_vram_gb": None,
@@ -1017,6 +1094,7 @@ def _run_single_trial(
         "train_total": [], "train_curve": [], "train_recon": [],
         "val_combined": [], "val_curve": [], "val_recon": [],
         "val_regret": [], "val_win_acc": [], "val_epochs": [],
+        "val_top3_acc": [],
     }
 
     try:
@@ -1031,7 +1109,9 @@ def _run_single_trial(
             for step in range(steps_per_epoch):
                 idx = perm[step * bs : (step + 1) * bs]
                 x = x_train.index_select(0, idx)
-                y = y_train.index_select(0, idx)              # (bs, n_w, n_h)
+                task_surface = (y_train_raw if TRAINING_OBJECTIVE == "classification"
+                                else y_train)
+                y = task_surface.index_select(0, idx)         # (bs, n_w, n_h)
 
                 B = x.shape[0]
                 h_idx = torch.randint(
@@ -1066,6 +1146,7 @@ def _run_single_trial(
                 history["val_recon"].append(metrics["val_recon_mse"])
                 history["val_regret"].append(metrics["val_regret"])
                 history["val_win_acc"].append(metrics["val_win_acc"])
+                history["val_top3_acc"].append(metrics["val_top3_acc"])
                 history["val_epochs"].append(epoch)
                 print(Fore.YELLOW
                       + f"  {tag} epoch {epoch:3d}  "
@@ -1074,6 +1155,7 @@ def _run_single_trial(
                       + f"recon={metrics['val_recon_mse']:.4f} "
                       + f"regret={metrics['val_regret']:.4f} "
                       + f"win_acc={metrics['val_win_acc']:.3f}"
+                      + f" top3_acc={metrics['val_top3_acc']:.3f}"
                       + Fore.RESET)
 
                 score = _selection_score(metrics)
@@ -1117,6 +1199,7 @@ def _run_single_trial(
         "val_combined":  best_metrics.get("val_combined",  float("nan")),
         "val_regret":    best_metrics.get("val_regret",    float("nan")),
         "val_win_acc":   best_metrics.get("val_win_acc",   float("nan")),
+        "val_top3_acc":  best_metrics.get("val_top3_acc",  float("nan")),
         "history": history,
         "best_state_path": best_state_path,
         "failed": best_state_path is None,
@@ -1220,7 +1303,9 @@ def _plot_sweep_summary(trials_df: pd.DataFrame, save_path: str,
     df = trials_df.sort_values("trial_idx").reset_index(drop=True)
     panels = [
         ("val_regret",    "val regret (normalized)"),
-        ("val_curve_mse", "val curve MSE (z-scored)"),
+        ("val_curve_mse", ("val soft-label cross-entropy"
+                           if TRAINING_OBJECTIVE == "classification"
+                           else "val curve MSE (z-scored)")),
         ("val_recon_mse", "val reconstruction MSE"),
     ]
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
@@ -1342,6 +1427,7 @@ def _select_final(results: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[s
             "val_combined":  chosen.get("val_combined"),
             "val_regret":    chosen.get("val_regret"),
             "val_win_acc":   chosen.get("val_win_acc"),
+            "val_top3_acc":  chosen.get("val_top3_acc"),
         },
         "n_valid": len(valid), "n_total": len(results),
         "lambda_curve": LAMBDA_CURVE, "lambda_recon": LAMBDA_RECON,
@@ -1360,7 +1446,8 @@ def _persist_artifacts(results: List[Dict[str, Any]], run_label: str) -> None:
         flat = {"trial_idx": r["trial_idx"]}
         flat.update(r.get("cfg", {}))
         for key in ("val_curve_mse", "val_recon_mse", "val_combined",
-                    "val_regret", "val_win_acc", "auto_batch_size", "auto_lr",
+                    "val_regret", "val_win_acc", "val_top3_acc",
+                    "auto_batch_size", "auto_lr",
                     "peak_vram_gb", "device", "elapsed_seconds",
                     "skip_reason", "failed"):
             if key in r:
@@ -1426,10 +1513,16 @@ def main() -> None:
             "build_context_length_dataset.py with the multi-horizon labeler.")
     horizon_grid = meta["horizon_grid"]
     n_horizons = len(horizon_grid)
-    if meta.get("max_window") != CONTEXT_LENGTH:
+    context_length = int(meta.get("max_window", 8192))
+    if context_length not in (8192, 15360):
         raise ValueError(
-            f"Dataset max_window={meta.get('max_window')} != "
-            f"CONTEXT_LENGTH={CONTEXT_LENGTH}.")
+            f"Unsupported predictor context_length={context_length}; expected "
+            "8,192 or 15,360 from the model-aware labeler.")
+    # Spawned GPU workers re-import this module, so publish the dataset-specific
+    # geometry through the environment before creating them.
+    global CONTEXT_LENGTH
+    CONTEXT_LENGTH = context_length
+    os.environ["PREDICTCSL_CONTEXT_LENGTH"] = str(context_length)
 
     # Probe split sizes once (workers reload independently).
     x_tr, y_tr, _, x_va, _, _ = load_split_tensors(dataset_dir, seed=SEED)
@@ -1448,6 +1541,8 @@ def main() -> None:
           + f"windows={window_grid}" + Fore.RESET)
     print(Fore.CYAN + f"arch={ARCH}{'  (cheap corner)' if _CHEAP else ''}"
           + Fore.RESET)
+    print(Fore.CYAN + f"training_objective={TRAINING_OBJECTIVE}  "
+          + f"context_length={CONTEXT_LENGTH}" + Fore.RESET)
     print(Fore.CYAN + f"N_TRIALS={N_TRIALS}  lambda_curve={LAMBDA_CURVE}  "
           + f"lambda_recon={LAMBDA_RECON}  selection={SELECTION_METRIC}"
           + Fore.RESET)
@@ -1557,6 +1652,7 @@ def main() -> None:
                 "val_combined":     chosen.get("val_combined"),
                 "val_regret":       chosen.get("val_regret"),
                 "val_win_acc":      chosen.get("val_win_acc"),
+                "val_top3_acc":     chosen.get("val_top3_acc"),
                 "selection_metric": report["selection_metric"],
                 "auto_batch_size":  chosen.get("auto_batch_size"),
                 "auto_lr":          chosen.get("auto_lr"),
@@ -1566,6 +1662,8 @@ def main() -> None:
                 "n_horizons":       n_horizons,
                 "horizon_grid":     horizon_grid,
                 "curve_metric":     CURVE_METRIC,
+                "training_objective": TRAINING_OBJECTIVE,
+                "soft_topk_weights": list(SOFT_TOPK_WEIGHTS),
                 "lambda_curve":     LAMBDA_CURVE,
                 "lambda_recon":     LAMBDA_RECON,
                 "dataset_dir":      dataset_dir,

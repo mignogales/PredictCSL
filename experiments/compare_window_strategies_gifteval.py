@@ -129,6 +129,10 @@ WindowKey = Union[int, str]
 PRED_VARIANTS: Dict[str, Tuple[str, str, str]] = {
     "_v3": ("pred_cheap", "Predictor (cheap)", "#1F77B4"),
     "_v4": ("pred_mamba", "Predictor Mamba",   "#9C27B0"),
+    "_v3_classification": (
+        "pred_cheap_cls", "Predictor (cheap, cls)", "#17BECF"),
+    "_v4_classification": (
+        "pred_mamba_cls", "Predictor Mamba (cls)", "#E377C2"),
 }
 
 
@@ -148,7 +152,7 @@ def discover_pred_variants(run_dir: str) -> List[Tuple[str, str, str, str]]:
 
     # Recover the stem ("general") by peeling a known variant suffix if present.
     stem = base
-    for suf in PRED_VARIANTS:
+    for suf in sorted(PRED_VARIANTS, key=len, reverse=True):
         if base.endswith(suf):
             stem = base[: -len(suf)]
             break
@@ -224,7 +228,7 @@ MODEL_ARCH: Dict[str, ModelArch] = {
     "chronos2":     ModelArch(d_model=512,  d_ff=2048, patch_size=16, seq_type="enc_dec",
                               n_enc_layers=6,  n_dec_layers=6),
     "chronos_bolt": ModelArch(d_model=512,  d_ff=2048, patch_size=32, seq_type="enc_dec",
-                              n_enc_layers=6,  n_dec_layers=6),
+                              n_enc_layers=6,  n_dec_layers=6, max_window=2048),
     # Encoder over the [context; masked-horizon] sequence
     "moirai":       ModelArch(d_model=384,  d_ff=1024, patch_size=16, seq_type="unified",
                               n_enc_layers=6),
@@ -232,7 +236,7 @@ MODEL_ARCH: Dict[str, ModelArch] = {
                               n_enc_layers=6),
     # Stacked decoder over context patches (intermediate_size == d_model for TimesFM-2.5)
     "timesfm":      ModelArch(d_model=1280, d_ff=1280, patch_size=32, seq_type="unified",
-                              n_enc_layers=20),
+                              n_enc_layers=20, max_window=15360),
     # Encoder over a fixed 8192-ctx patch grid; d_ff not in config -> 4x expansion (estimate)
     "patchtst_fm":  ModelArch(d_model=1024, d_ff=4096, patch_size=16, seq_type="unified",
                               n_enc_layers=20),
@@ -1036,8 +1040,20 @@ def load_strategy_records(
 # ==============================================================================
 
 def _geomean(vals: np.ndarray) -> float:
-    """Geometric mean: exp(mean(log(x))). Clips to 1e-9 to guard against log(0)."""
-    return float(np.exp(np.log(np.clip(vals, 1e-9, None)).mean()))
+    """GiftEval leaderboard geometric mean (same logic as the sanity check).
+
+    Missing values are excluded, any negative value invalidates the aggregate,
+    and a genuine zero makes the geometric mean exactly zero.  In particular we
+    do not epsilon-clip: that would silently produce a different leaderboard
+    number.
+    """
+    arr = np.asarray(vals, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if not arr.size or np.any(arr < 0.0):
+        return float("nan")
+    if np.any(arr == 0.0):
+        return 0.0
+    return float(np.exp(np.log(arr).mean()))
 
 
 def _quadrature(vals: np.ndarray) -> float:
@@ -1056,14 +1072,28 @@ def _wgeomean(vals: np.ndarray, weights: np.ndarray) -> float:
     global weighted geomean exactly (logs are additive), so the run-level rollup
     can aggregate the per-model MASE geomeans without the raw rows.
     """
-    vals = np.clip(np.asarray(vals, dtype=float), 1e-9, None)
+    vals = np.asarray(vals, dtype=float)
     w = np.asarray(weights, dtype=float)
+    valid = np.isfinite(vals) & np.isfinite(w) & (w > 0)
+    vals, w = vals[valid], w[valid]
+    if not vals.size or np.any(vals < 0.0):
+        return float("nan")
+    if np.any(vals == 0.0):
+        return 0.0
     return float(np.exp((w * np.log(vals)).sum() / w.sum()))
 
 
 def compute_summary_stats(df: pd.DataFrame) -> dict:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"])
-    stats: dict = {}
+    stats: dict = {
+        "headline_aggregation": {
+            "formula": "geomean(cell_MASE / cell_seasonal_naive_MASE)",
+            "cell_weighting": "unweighted",
+            "missing_values": "drop",
+            "zero_handling": "exact_zero",
+            "reference": "sanity_gifteval_leaderboard.py",
+        }
+    }
 
     # Seasonal-naive normaliser present? Then also report the leaderboard-style
     # normalised geomean (geomean of MASE_strategy / MASE_seasonalnaive), over the

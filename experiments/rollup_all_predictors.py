@@ -1,25 +1,11 @@
 #!/usr/bin/env python
 """
-Combined cross-predictor overview — every predictor variant on ONE figure.
+Combined cross-predictor overview — every requested predictor on one figure.
 
-The per-variant orchestrators each emit their own ``model_strategy_overview.png``
-rooted at their own ablation tree, so none of them shows the v1 *big* predictor
-and the v3/v4 *small* predictors together:
-
-  * ``run_all.py``    rollup is rooted at ``general/``    -> "pred" = v1 big,
-    and discovers ``general_v3`` / ``general_v4`` as sibling variants. This is
-    already the all-in-one figure, but it WRITES INTO ``general/``.
-  * ``run_all_v3.py`` rollup is rooted at ``general_v3/`` -> "pred" = v3 cheap,
-    the v1 big predictor is never folded in.
-  * ``run_all_v4.py`` rollup is rooted at ``general_v4/`` -> "pred" = v4 Mamba.
-
-This script produces the combined overview WITHOUT touching any of those trees:
-it READS from the base ``general/`` tree (so "pred" is the v1 big predictor and
-``discover_pred_variants`` folds in ``general_v3`` as ``pred_cheap`` and
-``general_v4`` as ``pred_mamba`` against the same real curves), and WRITES every
-artefact into a dedicated ``general_all/`` sink. Nothing is written back into
-``general/``, ``general_v3/`` or ``general_v4/`` — ``general_all`` is an output
-directory only.
+The recomputation master uses ``general_v3`` (cheap curve regression) as the
+base run. Sibling discovery folds in Mamba and both soft-label classification
+trees against the same real GiftEval curves. Outputs go to ``general_all``;
+none of the source trees is modified.
 
 It is pure post-processing: no TSFM inference, no predictor training. It just
 re-reads the cached strategy records the ablation stage already produced.
@@ -55,12 +41,10 @@ from experiments.compare_window_strategies_gifteval import (
     write_run_time_rollup,
 )
 
-# Mirror run_all.py's tree layout. The base run dir MUST keep the bare "general"
-# basename: discover_pred_variants recovers the stem by peeling a known suffix,
-# so only "general" finds the _v3/_v4 siblings (a "general_all" run-dir would
-# look for "general_all_v3" and find nothing). Hence general_all is OUTPUT only.
+# Standalone defaults retain the historical logs root. The master passes its
+# self-contained recomputation paths explicitly.
 ABLATION_ROOT = "logs/experiments/window_ablation_gifteval"
-BASE_RUN_DIR  = os.path.join(ABLATION_ROOT, "general")
+BASE_RUN_DIR  = os.path.join(ABLATION_ROOT, "general_v3")
 OUT_DIR       = os.path.join(ABLATION_ROOT, "general_all")
 
 
@@ -69,8 +53,7 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run-dir", type=str, default=BASE_RUN_DIR,
-                   help=f"Base ablation tree to read (default {BASE_RUN_DIR}). "
-                        "Must be the bare 'general' tree for variant discovery.")
+                   help=f"Base ablation tree to read (default {BASE_RUN_DIR}).")
     p.add_argument("--output-dir", type=str, default=OUT_DIR,
                    help=f"Where to write the combined overview (default {OUT_DIR}). "
                         "A pure output sink — never read back as a run dir.")
@@ -100,12 +83,13 @@ def main() -> None:
               + ", ".join(f"{key} <- {os.path.basename(tree)}"
                           for key, _lbl, _clr, tree in variants) + Fore.RESET)
     else:
-        print(Fore.YELLOW + "No sibling predictor variants found (general_v3 / "
-              "general_v4 absent) — overview will hold only the base predictor."
+        print(Fore.YELLOW + "No sibling predictor variants found — overview "
+              "will hold only the base predictor."
               + Fore.RESET)
 
     def _load(metric: str):
-        df = load_strategy_records(run_dir, CACHE_ROOT, dict(DEFAULT_PATCH_SIZES),
+        cache_root = os.path.dirname(run_dir)
+        df = load_strategy_records(run_dir, cache_root, dict(DEFAULT_PATCH_SIZES),
                                    mase_metric=metric)
         if args.models:
             wanted = set(args.models)

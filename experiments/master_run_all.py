@@ -1,31 +1,21 @@
 """
-PredictCSL master orchestrator -- fuses every ``run_all*`` variant into one run,
-WITHOUT recomputing any shared stage.
+PredictCSL recomputation master: label -> train -> GiftEval -> compare.
 
-Each ``run_all*`` orchestrator re-walks the four base stages (build -> predictor
--> ablation -> compare); many of those stages are *shared* across variants and
-must run exactly once:
+The requested predictor matrix is deliberately small:
 
-  * Stage 1 (synthetic dataset labeling) is common to ALL variants.
-  * The shared stage-2/3/4 on the base ``general/`` tree is common to v1, v2 and
-    run_all_5.
-  * Only v3 / v4 have a genuinely distinct predictor + ablation (their own
-    ``*_v3`` / ``*_v4`` roots), and even there the expensive GiftEval cells are
-    SYMLINKED from ``general/`` — so the TSFM inference itself still happens once.
+  * constrained/cheap PatchTST, curve regression
+  * constrained/cheap PatchTST, soft top-3 window classification
+  * bidirectional Mamba, curve regression
+  * bidirectional Mamba, soft top-3 window classification
 
-This script runs Stage 1 once up front, then invokes each variant as a subprocess
-(needed so import-time env vars like ``PREDICTCSL_PREDICTOR_ARCH=mamba`` stay
-isolated per variant) with an explicit ``--skip-stages`` set covering everything
-an earlier entry already produced. Done-markers remain the safety net.
+Stage 1 runs once. All four predictor variants share one canonical GiftEval cell
+cache, so the expensive TSFM forecasts are also computed once; only predictor
+inference and post-processing repeat. The full/base predictor, period strategy,
+and robust-timing-only v5 pass are not part of this master.
 
-Order (per selected model, shared caches):
-    0. run_all  --only-stages 1            (dataset labeling, once)
-    1. run_all      --skip-stages 1        (v1 predictor + ablation + compare)
-    2. run_all_v2   --skip-stages 1 2 3    (+ period strategy, reuse v1 2/3)
-    3. run_all_v3   --skip-stages 1        (cheap predictor; symlinked cells)
-    4. run_all_v4   --skip-stages 1        (Mamba predictor; symlinked cells)
-    5. run_all_5    --skip-stages 1 2 3 4  (robust timing + compare re-run)
-    6. rollup_all_predictors               (combined cross-predictor overview)
+The default output root is a new self-contained tree
+``logs/experiments/master_recompute`` so incompatible old 8k pools and cached
+checkpoints cannot be mixed into this recomputation.
 
 Cross-env routing
 -----------------
@@ -59,15 +49,15 @@ Usage
 -----
     python -m experiments.master_run_all                       # everything, all models
     python -m experiments.master_run_all --models Chronos2-Small
-    python -m experiments.master_run_all --only-variants v1 v5
-    python -m experiments.master_run_all --skip-variants v3 v4
-    python -m experiments.master_run_all --repeats 10 --warmup 3   # forwarded to v5
-    python -m experiments.master_run_all --test               # smoke-test base pipeline only
+    python -m experiments.master_run_all --only-variants cheap mamba
+    python -m experiments.master_run_all --test               # all selected variants, reduced
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import subprocess
 import sys
 import time
@@ -86,7 +76,6 @@ class Variant:
     module: str                     # python -m target
     skip_stages: List[str]          # base stages already produced upstream
     extra: List[str] = field(default_factory=list)   # variant-specific flags
-    takes_repeats: bool = False     # forward --repeats/--warmup (run_all_5 only)
     needs_mamba: bool = False        # predictor needs mamba-ssm (skip mamba-less envs)
     label: str = ""                 # human description for the banner
 
@@ -94,16 +83,16 @@ class Variant:
 # Authoritative variant registry (see MAINTENANCE RULE in the module docstring).
 # Order matters: each entry's skip set assumes everything above it has run.
 VARIANTS: List[Variant] = [
-    Variant("v1", "experiments.run_all",    ["1"],
-            label="base predictor (build/predictor/ablation/compare)"),
-    Variant("v2", "experiments.run_all_v2", ["1", "2", "3"],
-            label="+ 2×period strategy"),
-    Variant("v3", "experiments.run_all_v3", ["1"],
-            label="cheap constrained PatchTST predictor"),
-    Variant("v4", "experiments.run_all_v4", ["1"], needs_mamba=True,
-            label="Mamba predictor"),
-    Variant("v5", "experiments.run_all_5",  ["1", "2", "3", "4"], takes_repeats=True,
-            label="robust wall-clock timing + compare re-run"),
+    Variant("cheap", "experiments.run_all_v3", ["1"],
+            label="cheap PatchTST · curve regression"),
+    Variant("cheap_cls", "experiments.run_all_v3", ["1"],
+            extra=["--training-objective", "classification"],
+            label="cheap PatchTST · soft top-3 classification"),
+    Variant("mamba", "experiments.run_all_v4", ["1"], needs_mamba=True,
+            label="Mamba · curve regression"),
+    Variant("mamba_cls", "experiments.run_all_v4", ["1"], needs_mamba=True,
+            extra=["--training-objective", "classification"],
+            label="Mamba · soft top-3 classification"),
 ]
 
 
@@ -119,6 +108,11 @@ FAMILY_ENV: Dict[str, str] = {
 }
 # Envs without mamba-ssm -> can't run the Mamba predictor variant (v4).
 ENVS_WITHOUT_MAMBA = {"predictcsl-toto"}
+ENV_ALIASES = {
+    "predictcsl-legacy": ("predictcsl-legacy", "TSFM_sundial_patch"),
+    "predictcsl-toto": ("predictcsl-toto", "TSFM_toto"),
+}
+_CONDA_ENV_NAMES: Optional[set] = None
 
 
 def _banner(text: str) -> None:
@@ -130,6 +124,30 @@ def _env_label(env: Optional[str]) -> str:
     return env or MAIN_ENV
 
 
+def _resolve_conda_env(env: str) -> str:
+    """Resolve canonical env names against the legacy names on the GPU server."""
+    global _CONDA_ENV_NAMES
+    if _CONDA_ENV_NAMES is None:
+        try:
+            raw = subprocess.run(
+                ["conda", "env", "list", "--json"], check=True,
+                capture_output=True, text=True).stdout
+            _CONDA_ENV_NAMES = {
+                os.path.basename(os.path.normpath(p))
+                for p in json.loads(raw).get("envs", [])
+            }
+        except Exception as exc:
+            raise SystemExit(
+                f"Could not inspect conda environments: {exc}. Run the master "
+                "from a shell with conda available.") from exc
+    for candidate in ENV_ALIASES.get(env, (env,)):
+        if candidate in _CONDA_ENV_NAMES:
+            return candidate
+    raise SystemExit(
+        f"Required conda env {env!r} not found. Tried "
+        f"{ENV_ALIASES.get(env, (env,))}; run envs/setup-all.sh first.")
+
+
 def _py(env: Optional[str], *module_and_args: str) -> List[str]:
     """Build a ``python -m <module> [args]`` command, dispatched into ``env``.
 
@@ -139,7 +157,8 @@ def _py(env: Optional[str], *module_and_args: str) -> List[str]:
     """
     if env is None or env == MAIN_ENV:
         return [sys.executable, "-m", *module_and_args]
-    return ["conda", "run", "--no-capture-output", "-n", env,
+    resolved = _resolve_conda_env(env)
+    return ["conda", "run", "--no-capture-output", "-n", resolved,
             "python", "-m", *module_and_args]
 
 
@@ -193,10 +212,6 @@ def parse_args() -> argparse.Namespace:
                    help=f"Run only these variants (default: all of {names}).")
     p.add_argument("--skip-variants", nargs="+", default=[], choices=names,
                    help="Variants to skip.")
-    p.add_argument("--repeats", type=int, default=None,
-                   help="Robust-timing repeats, forwarded to run_all_5.")
-    p.add_argument("--warmup", type=int, default=None,
-                   help="Robust-timing warm-up passes, forwarded to run_all_5.")
     p.add_argument("--force", nargs="*", default=None,
                    metavar="STAGE",
                    help="Forwarded verbatim to every variant (and the stage-1 "
@@ -210,9 +225,13 @@ def parse_args() -> argparse.Namespace:
                         "the re-run cheap (only the new cells compute).")
     p.add_argument("--no-rollup", action="store_true",
                    help="Skip the final cross-predictor rollup_all_predictors pass.")
+    p.add_argument("--output-root", default="logs/experiments/master_recompute",
+                   help="Fresh self-contained root for all datasets, predictors, "
+                        "GiftEval cells, and comparisons (default: "
+                        "logs/experiments/master_recompute).")
     p.add_argument("--test", action="store_true",
-                   help="Smoke-test the BASE pipeline only (run_all --test) and exit; "
-                        "the variant fusion runs on real trees and has no --test.")
+                   help="Smoke-test all selected cheap/Mamba objectives end-to-end "
+                        "in <output-root>/_smoke_test (kept for inspection).")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Pass -v to each variant (stream its subprocess output).")
     return p.parse_args()
@@ -221,14 +240,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # ---- Smoke test: just exercise the base pipeline end-to-end and exit. ----
-    # (Smoke only covers the main group; env-specific families are skipped.)
-    if args.test:
-        cmd = _py(None, "experiments.run_all", "--test")
-        if args.models:
-            cmd += ["--models", *args.models]
-        _run(cmd, "SMOKE TEST — run_all --test (base pipeline, main env)")
-        return
+    run_root = os.path.normpath(args.output_root)
+    os.environ["PREDICTCSL_MASTER_ROOT"] = run_root
+    os.environ["PREDICTCSL_DATASET_ROOT"] = os.path.join(
+        run_root, "context_length_dataset")
+    os.environ["PREDICTCSL_ABLATION_ROOT"] = os.path.join(
+        run_root, "window_ablation_gifteval")
+    os.environ["PREDICTCSL_RUN_LOG_ROOT"] = os.path.join(run_root, "run_all_logs")
 
     wanted = set(args.only_variants) if args.only_variants else {v.name for v in VARIANTS}
     wanted -= set(args.skip_variants)
@@ -254,10 +272,24 @@ def main() -> None:
 
     t_start = time.perf_counter()
 
+    if args.test:
+        smoke_root = os.path.join(run_root, "_smoke_test")
+        os.environ["PREDICTCSL_MASTER_ROOT"] = smoke_root
+        os.environ["PREDICTCSL_TEST"] = "1"
+        os.environ["PREDICTCSL_DATASET_ROOT"] = os.path.join(
+            smoke_root, "context_length_dataset")
+        os.environ["PREDICTCSL_ABLATION_ROOT"] = os.path.join(
+            smoke_root, "window_ablation_gifteval")
+        os.environ["PREDICTCSL_RUN_LOG_ROOT"] = os.path.join(
+            smoke_root, "run_all_logs")
+
     # ---- Stage 1 once, per env group (each labels only its own families). ----
     for env, displays in groups.items():
-        _run(_py(env, "experiments.run_all", "--only-stages", "1",
-                 "--models", *displays, *vflag, *fflag),
+        stage1 = _py(env, "experiments.run_all", "--only-stages", "1",
+                     "--models", *displays, *vflag, *fflag)
+        if args.test:
+            stage1 += ["--build-args", "--n-series", str(200)]
+        _run(stage1,
              f"Stage 1 — labeling [{_env_label(env)}]: {displays}")
 
     # ---- Each variant × env group, with its shared stages skipped. -----------
@@ -272,11 +304,6 @@ def main() -> None:
             if v.skip_stages:
                 cmd += ["--skip-stages", *v.skip_stages]
             cmd += v.extra + ["--models", *displays] + vflag + fflag
-            if v.takes_repeats:
-                if args.repeats is not None:
-                    cmd += ["--repeats", str(args.repeats)]
-                if args.warmup is not None:
-                    cmd += ["--warmup", str(args.warmup)]
             _run(cmd, f"{v.name} [{_env_label(env)}] — {v.label}  "
                       f"(skip stages {v.skip_stages or 'none'})")
 
@@ -284,6 +311,9 @@ def main() -> None:
     # Reads on-disk outputs only (no TSFM load) -> runs once in the main env.
     if not args.no_rollup:
         rollup = _py(None, "experiments.rollup_all_predictors")
+        ablation_root = os.environ["PREDICTCSL_ABLATION_ROOT"]
+        rollup += ["--run-dir", os.path.join(ablation_root, "general_v3"),
+                   "--output-dir", os.path.join(ablation_root, "general_all")]
         if args.models:
             rollup += ["--models", *args.models]
         _run(rollup, "rollup_all_predictors — combined cross-predictor overview")
