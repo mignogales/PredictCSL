@@ -692,7 +692,7 @@ def evaluate_pipeline_on_dataset(model_id: str, model_family: str,
                     "_model_family": model_family,
                     "_batch_size": int(eval_batch_size),
                 }
-            except RuntimeError:
+            except Exception:
                 del results
                 if groups is not None:
                     del groups
