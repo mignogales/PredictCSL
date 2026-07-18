@@ -846,11 +846,12 @@ def _run_batches(batches, desc, step):
     returns ``(dict[str, Tensor], targets)``.
     """
     acc, tgts = {}, []
-    for batch in tqdm(batches, desc=desc, leave=False):
-        outs, tgt = step(batch["x"], batch["y"])
-        for key, val in outs.items():
-            acc.setdefault(key, []).append(val)
-        tgts.append(tgt)
+    with torch.inference_mode():
+        for batch in tqdm(batches, desc=desc, leave=False):
+            outs, tgt = step(batch["x"], batch["y"])
+            for key, val in outs.items():
+                acc.setdefault(key, []).append(val.detach())
+            tgts.append(tgt.detach())
     cat = {key: torch.cat(vals, 0) for key, vals in acc.items()}
     return cat, torch.cat(tgts, 0)
 
