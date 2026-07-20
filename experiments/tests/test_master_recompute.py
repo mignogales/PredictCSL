@@ -35,6 +35,13 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertEqual(master.FAMILY_ENV["tirex"], "predictcsl-tirex")
         self.assertIn("predictcsl-tirex", master.ENVS_WITHOUT_MAMBA)
 
+    def test_toto_uses_dedicated_env(self) -> None:
+        self.assertEqual(master.FAMILY_ENV["toto"], "predictcsl-toto")
+        self.assertEqual(
+            master._resolve_groups(["Toto-2.0-313m"]),
+            {"predictcsl-toto": ["Toto-2.0-313m"]},
+        )
+
     def test_dedicated_envs_use_conda_activation(self) -> None:
         old_names = master._CONDA_ENV_NAMES
         master._CONDA_ENV_NAMES = {"predictcsl-legacy"}
@@ -52,6 +59,47 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertIn("conda activate predictcsl-legacy", cmd[2])
         self.assertIn("exec python -m experiments.run_all", cmd[2])
         self.assertNotIn("conda run", cmd)
+
+    def test_dedicated_variant_args_are_inside_activated_shell(self) -> None:
+        old_names = master._CONDA_ENV_NAMES
+        master._CONDA_ENV_NAMES = {"predictcsl-toto"}
+        try:
+            cmd = master._variant_cmd(
+                "predictcsl-toto",
+                master.VARIANTS[0],
+                ["Toto-2.0-313m"],
+                [],
+                ["--force", "3"],
+            )
+        finally:
+            master._CONDA_ENV_NAMES = old_names
+
+        self.assertEqual(cmd[:2], ["bash", "-lc"])
+        self.assertEqual(len(cmd), 3)
+        self.assertIn("conda activate predictcsl-toto", cmd[2])
+        self.assertIn("experiments.run_all_v3", cmd[2])
+        self.assertIn("--models Toto-2.0-313m", cmd[2])
+        self.assertIn("--force 3", cmd[2])
+
+    def test_dedicated_stage1_args_are_inside_activated_shell(self) -> None:
+        old_names = master._CONDA_ENV_NAMES
+        master._CONDA_ENV_NAMES = {"predictcsl-legacy"}
+        try:
+            cmd = master._stage1_cmd(
+                "predictcsl-legacy",
+                ["Sundial-Base-128M"],
+                ["-v"],
+                [],
+                ["--n-series", "200"],
+            )
+        finally:
+            master._CONDA_ENV_NAMES = old_names
+
+        self.assertEqual(cmd[:2], ["bash", "-lc"])
+        self.assertEqual(len(cmd), 3)
+        self.assertIn("conda activate predictcsl-legacy", cmd[2])
+        self.assertIn("--models Sundial-Base-128M", cmd[2])
+        self.assertIn("--build-args --n-series 200", cmd[2])
 
     def test_master_stage1_build_args(self) -> None:
         args = SimpleNamespace(

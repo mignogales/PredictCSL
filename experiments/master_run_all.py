@@ -271,6 +271,39 @@ def _stage1_build_args(args: argparse.Namespace) -> List[str]:
     return extra
 
 
+def _stage1_cmd(
+    env: Optional[str],
+    displays: List[str],
+    vflag: List[str],
+    fflag: List[str],
+    build_args: List[str],
+) -> List[str]:
+    args = [
+        "experiments.run_all",
+        "--only-stages", "1",
+        "--models", *displays,
+        *vflag,
+        *fflag,
+    ]
+    if build_args:
+        args += ["--build-args", *build_args]
+    return _py(env, *args)
+
+
+def _variant_cmd(
+    env: Optional[str],
+    variant: Variant,
+    displays: List[str],
+    vflag: List[str],
+    fflag: List[str],
+) -> List[str]:
+    args = [variant.module]
+    if variant.skip_stages:
+        args += ["--skip-stages", *variant.skip_stages]
+    args += variant.extra + ["--models", *displays] + vflag + fflag
+    return _py(env, *args)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -320,13 +353,10 @@ def main() -> None:
 
     # ---- Stage 1 once, per env group (each labels only its own families). ----
     for env, displays in groups.items():
-        stage1 = _py(env, "experiments.run_all", "--only-stages", "1",
-                     "--models", *displays, *vflag, *fflag)
         build_args = list(stage1_build_args)
         if args.test:
             build_args += ["--n-series", str(200)]
-        if build_args:
-            stage1 += ["--build-args", *build_args]
+        stage1 = _stage1_cmd(env, displays, vflag, fflag, build_args)
         _run(stage1,
              f"Stage 1 — labeling [{_env_label(env)}]: {displays}")
 
@@ -338,10 +368,7 @@ def main() -> None:
                       + f"  ⤷ skip {v.name} for {displays} "
                         f"({_env_label(env)} has no mamba-ssm)." + Fore.RESET)
                 continue
-            cmd = _py(env, v.module)
-            if v.skip_stages:
-                cmd += ["--skip-stages", *v.skip_stages]
-            cmd += v.extra + ["--models", *displays] + vflag + fflag
+            cmd = _variant_cmd(env, v, displays, vflag, fflag)
             _run(cmd, f"{v.name} [{_env_label(env)}] — {v.label}  "
                       f"(skip stages {v.skip_stages or 'none'})")
 
