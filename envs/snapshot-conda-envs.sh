@@ -27,6 +27,7 @@ CANONICAL_ENVS=(
   predictcsl-tirex
 )
 CONDA_ENV_NAMES_CACHE=""
+RESTORE_TMP_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -232,12 +233,61 @@ restore_envs() {
     exit 1
   fi
 
+  local conda_platform
+  conda_platform="$(conda info --json | python -c '
+import json
+import sys
+print(json.load(sys.stdin).get("platform", ""))
+')"
+  if [[ "$conda_platform" != linux-* ]]; then
+    RESTORE_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/predictcsl-conda-restore.XXXXXX")"
+    trap 'rm -rf "$RESTORE_TMP_DIR"' EXIT
+    echo "Target platform is $conda_platform; filtering Linux/CUDA-only snapshot entries."
+  fi
+
   local canonical
   for canonical in "${CANONICAL_ENVS[@]}"; do
     local yml="$in_dir/$canonical.yml"
+    local portable_requirements=""
     if [[ ! -f "$yml" ]]; then
       echo "Skipping $canonical: missing $yml"
       continue
+    fi
+
+    if [[ -n "$RESTORE_TMP_DIR" ]]; then
+      local portable_yml="$RESTORE_TMP_DIR/$canonical.yml"
+      portable_requirements="$RESTORE_TMP_DIR/$canonical.requirements.txt"
+      awk '
+        # A cross-platform restore only needs Conda to establish the Python
+        # runtime. Native system libraries are resolved for the target host.
+        /^dependencies:$/ { in_deps = 1; print; next }
+        /^  - pip:$/ { exit }
+        in_deps && /^  - / {
+          if ($0 ~ /^  - (python|pip|setuptools|wheel)=/) print
+          next
+        }
+        { print }
+      ' "$yml" > "$portable_yml"
+      awk '
+        /^  - pip:$/ { in_pip = 1; next }
+        !in_pip { next }
+        in_pip && /^      - (nvidia-|cuda-|triton==|causal-conv1d==|mamba-ssm==)/ {
+          next
+        }
+        in_pip && /^      - torch==/ {
+          sub(/\+cu[0-9]+$/, "")
+        }
+        in_pip && /^      - salesforce-gift-eval==0\.0\.0a0$/ {
+          print "git+https://github.com/SalesforceAIResearch/gift-eval.git@d8184bb51079bb5021332f8e5d7486c378a52202"
+          next
+        }
+        in_pip && /^      - granite-tsfm==0\.3\.4\.dev9\+ge4d488689$/ {
+          print "git+https://github.com/ibm-granite/granite-tsfm.git@e4d48868969281f2f4cbc520bd8354c9f9ea3d48"
+          next
+        }
+        { sub(/^      - /, ""); print }
+      ' "$yml" > "$portable_requirements"
+      yml="$portable_yml"
     fi
 
     if env_exists "$canonical"; then
@@ -250,6 +300,11 @@ restore_envs() {
     else
       echo "Creating env $canonical from $yml ..."
       conda env create -n "$canonical" -f "$yml"
+    fi
+
+    if [[ -n "$portable_requirements" ]]; then
+      echo "Installing portable pip snapshot into $canonical ..."
+      conda run -n "$canonical" python -m pip install --no-deps -r "$portable_requirements"
     fi
   done
 
