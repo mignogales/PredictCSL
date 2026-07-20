@@ -25,8 +25,7 @@ cannot collapse them into one:
   Only stage-1 labeling of Sundial (idx 5) + TimeMoE (idx 6).
 - **`predictcsl-toto`** — standalone Python-3.12 env. Only Toto-2.0-313m (idx 10).
 - **`predictcsl-tirex`** — standalone TiRex2 env. The `tirex-2` package imports as
-  `tirex2` and currently requires torch>=2.8 plus numpy 2.x, so it is kept out of
-  `main`.
+  `tirex2` and currently requires torch>=2.8, so it is kept out of `main`.
 
 The per-cell on-disk cache is **shared across all envs**, so each just fills in
 its own families; stages 2/4/5 run in `main` over the merged cache.
