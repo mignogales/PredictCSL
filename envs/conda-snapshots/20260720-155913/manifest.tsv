@@ -1,0 +1,5 @@
+canonical_env	exported_from	file	pip_freeze
+predictcsl-main	predictcsl-main	predictcsl-main.yml	predictcsl-main.pip-freeze.txt
+predictcsl-legacy	predictcsl-legacy	predictcsl-legacy.yml	predictcsl-legacy.pip-freeze.txt
+predictcsl-toto	predictcsl-toto	predictcsl-toto.yml	predictcsl-toto.pip-freeze.txt
+predictcsl-tirex	predictcsl-tirex	predictcsl-tirex.yml	predictcsl-tirex.pip-freeze.txt
