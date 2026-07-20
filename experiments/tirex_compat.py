@@ -18,7 +18,10 @@ VALID_TIREX_BACKENDS = {
 
 def tirex_backend_for_device(device: str) -> str:
     """Return the configured FlashRNN backend for a runtime device."""
-    default = "triton_fused" if str(device).startswith("cuda") else "vanilla"
+    # TiRex2's CUDA extension fails to build on the server, while its Triton
+    # kernel requires more shared memory than the installed GPU exposes. The
+    # vanilla implementation is ordinary torch code and still runs on CUDA.
+    default = "vanilla"
     backend = os.environ.get(TIREX_BACKEND_ENV, default)
     if backend not in VALID_TIREX_BACKENDS:
         choices = ", ".join(sorted(VALID_TIREX_BACKENDS))
@@ -31,7 +34,6 @@ def configure_tirex_backend(device: str) -> str:
     backend = tirex_backend_for_device(device)
 
     # tirex-2 0.1.1 hardcodes device="cuda" to FlashRNN's C++/NVCC backend.
-    # Its Triton backend runs the same sLSTM cell without building that extension.
     from tirex2.model.component import flashrnn_slstm
 
     flashrnn_slstm._flashrnn_backend = lambda _device: backend

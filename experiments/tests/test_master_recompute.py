@@ -184,22 +184,22 @@ class TiRexCompatibilityTest(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("NX-AI/TiRex-2", "cuda", "triton_fused"),
+                ("NX-AI/TiRex-2", "cuda", "vanilla"),
                 ("NX-AI/TiRex-2", "cpu", "vanilla"),
             ],
         )
         self.assertEqual(fake_flashrnn_slstm._flashrnn_backend("cpu"), "vanilla")
 
-    def test_tirex_cuda_uses_triton_backend(self) -> None:
+    def test_tirex_cuda_uses_vanilla_backend(self) -> None:
         from experiments.tirex_compat import tirex_backend_for_device
 
-        self.assertEqual(tirex_backend_for_device("cuda"), "triton_fused")
+        self.assertEqual(tirex_backend_for_device("cuda"), "vanilla")
 
     def test_tirex_backend_can_be_overridden(self) -> None:
         from experiments.tirex_compat import tirex_backend_for_device
 
-        os.environ["PREDICTCSL_TIREX_BACKEND"] = "vanilla"
-        self.assertEqual(tirex_backend_for_device("cuda"), "vanilla")
+        os.environ["PREDICTCSL_TIREX_BACKEND"] = "cuda_fused"
+        self.assertEqual(tirex_backend_for_device("cuda"), "cuda_fused")
 
     def test_tirex_rejects_invalid_backend(self) -> None:
         from experiments.tirex_compat import tirex_backend_for_device

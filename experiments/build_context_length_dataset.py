@@ -879,7 +879,8 @@ def load_tirex(model_id: str, device: str):
     from experiments.tirex_compat import configure_tirex_backend
     from tirex2 import load_model
     tirex_device = "cuda" if _is_cuda(device) else "cpu"
-    configure_tirex_backend(tirex_device)
+    backend = configure_tirex_backend(tirex_device)
+    print(f"  TiRex FlashRNN backend: {backend}", flush=True)
     return load_model(model_id, device=tirex_device)
 
 
