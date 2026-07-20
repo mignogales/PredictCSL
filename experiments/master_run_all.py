@@ -28,7 +28,7 @@ the non-main groups with ``conda run -n <env>``:
     itself launched in; the main group uses the current interpreter).
   * ``predictcsl-legacy`` — Sundial + TimeMoE (transformers==4.40.1).
   * ``predictcsl-toto``   — Toto-2.0-313m (Python 3.12 + toto-2/toto-models).
-  * ``predictcsl-tirex``  — TiRex2 (torch>=2.8 + tirex2).
+  * ``predictcsl-tirex``  — TiRex2 (torch>=2.8 / numpy 2.1 + tirex2).
 
 This is correct because (a) Stage 1 only loads a model when its shards are pending
 and (b) the v5 ablation lazy-imports each TSFM loader only for that model's cells —
@@ -203,8 +203,14 @@ import torch
 print("torch", torch.__version__, "cuda", getattr(torch.version, "cuda", None))
 if not torch.__version__.startswith("2.8.0"):
     raise SystemExit("predictcsl-tirex expects torch==2.8.0 for the pinned TiRex2 stack")
+import numpy as np
+print("numpy", np.__version__)
+if not np.__version__.startswith("2.1.3"):
+    raise SystemExit("predictcsl-tirex expects numpy==2.1.3 for tirex-2")
 from tirex2 import TimeseriesType, load_model
 print("tirex2 import OK")
+from gift_eval.data import Dataset
+print("gift_eval import OK")
 """,
 }
 
