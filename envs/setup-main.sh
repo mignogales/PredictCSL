@@ -3,10 +3,10 @@
 # predictcsl-main — the workhorse env.  (Mirror of the working server env TSFM_moirai,
 # captured from `pip freeze` on 2026-06-24. Python 3.11.14, torch 2.4.1+cu121.)
 #
-# Runs: stage-1 labeling for the modern families (every model EXCEPT Toto idx 9,
-#       Sundial idx 5, TimeMoE idx 6); BOTH stage-2 predictors — PatchTST and the
-#       Mamba variant (run_all_v4), since mamba-ssm lives here; stages 3-5
-#       (GiftEval ablation / compare / timing), period eval, embedding saturation.
+# Runs: stage-1 labeling for the modern families except Toto, Sundial, TimeMoE,
+#       and TiRex2; BOTH stage-2 predictors — PatchTST and the Mamba variant
+#       (run_all_v4), since mamba-ssm lives here; stages 3-5 for the compatible
+#       families, period eval, embedding saturation.
 #
 # Run:  bash envs/setup-main.sh
 #
@@ -38,7 +38,10 @@ pip install \
     accelerate==1.13.0 safetensors==0.7.0 datasets==2.17.1
 
 # 4) TSFM packages from PyPI (these two are fine on PyPI).
-pip install gluonts==0.14.4 uni2ts==2.0.0 "tirex-ts[gluonts,hfdataset]==1.4.0"
+#    TiRex2 is intentionally NOT installed here: tirex-2 requires torch>=2.8 and
+#    numpy 2.x, which conflicts with this env's torch 2.4 / numpy 1.26 stack.
+#    See envs/setup-tirex.sh.
+pip install gluonts==0.14.4 uni2ts==2.0.0
 
 # 5) TSFM packages from GIT at the exact commits running on the server.
 pip install "git+https://github.com/amazon-science/chronos-forecasting.git@f951d9aefa06f5389b2ed6b0e51fd5a1a4cf194b"
@@ -56,4 +59,4 @@ pip install --no-deps \
 echo
 python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())"
 python -c "from mamba_ssm import Mamba; print('mamba-ssm import OK')"
-echo "predictcsl-main ready (Toto NOT included — see envs/README.md)."
+echo "predictcsl-main ready (Toto/TiRex2 NOT included — see envs/README.md)."

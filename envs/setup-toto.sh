@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# predictcsl-toto — Toto-2.0-313m only (catalog idx 9).
+# predictcsl-toto — Toto-2.0-313m only (catalog idx 10).
 #  (Mirror of the working server env TSFM_toto, captured 2026-06-24.)
 #
 # Toto needs its OWN env because toto-models 1.0.0 requires Python >=3.12 (it has
@@ -12,8 +12,8 @@
 #
 # Use (Toto stage-1 labeling, and stage-3 ablation which also needs gift_eval):
 #   conda activate predictcsl-toto
-#   python -m experiments.build_context_length_dataset --model-idx 9   # Toto
-# Stages 2/4/5 run in predictcsl-main off the shared cache.
+#   python -m experiments.build_context_length_dataset --model-idx 10  # Toto
+# The master routes Toto follow-up stages through this env when they need toto2.
 #
 # PINS: Python/torch/toto/gluonts confirmed from TSFM_toto's pip freeze. The
 # generic stack + transformers are best-effort — harden from a full
@@ -47,4 +47,4 @@ pip install "git+https://github.com/SalesforceAIResearch/gift-eval.git@d8184bb51
 echo
 python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())"
 python -c "import toto2; print('toto2 ->', toto2.__file__)"
-echo "predictcsl-toto ready (Toto idx 9)."
+echo "predictcsl-toto ready (Toto idx 10)."
