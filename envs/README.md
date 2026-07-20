@@ -135,3 +135,38 @@ bash envs/setup-tirex.sh      # predictcsl-tirex  (TiRex2 only)
 > best-effort — harden them from a full `pip freeze` of `TSFM_toto` if a resolver
 > conflict shows up. Each script ends with a `torch.cuda.is_available()` + import
 > sanity check.
+
+## Snapshot/export from a working machine
+
+If the envs already exist on another machine and you want to copy their exact
+resolved package state here, use:
+
+```bash
+bash envs/snapshot-conda-envs.sh export
+```
+
+That writes `predictcsl-main.yml`, `predictcsl-legacy.yml`,
+`predictcsl-toto.yml`, and `predictcsl-tirex.yml` under
+`envs/conda-snapshots/<timestamp>/`, plus matching `pip freeze` files for
+debugging. The exporter accepts the old server env aliases (`TSFM_moirai`,
+`TSFM_sundial_patch`, `TSFM_toto`, `predictcsl-test`, `TSFM_tirex2`) and saves
+them under the canonical `predictcsl-*` names used by `master_run_all.py`. It
+also removes machine-specific `prefix:` paths from the exported YAML files.
+
+To restore from a copied snapshot directory:
+
+```bash
+bash envs/snapshot-conda-envs.sh restore envs/conda-snapshots/<timestamp>
+```
+
+If the env names already exist and you want to update them in place:
+
+```bash
+bash envs/snapshot-conda-envs.sh restore --update-existing envs/conda-snapshots/<timestamp>
+```
+
+After restore, run:
+
+```bash
+conda run -n predictcsl-main python -m experiments.master_run_all --test
+```
