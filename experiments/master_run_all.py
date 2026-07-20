@@ -24,10 +24,11 @@ see ``envs/README.md``), so their TSFM-loading work must run in a dedicated cond
 env. Master therefore splits every per-model subprocess by env group and prefixes
 the non-main groups with ``conda run -n <env>``:
 
-  * ``predictcsl-main``   — every family except the two below (the env master is
+  * ``predictcsl-main``   — every family except the dedicated envs below (the env master is
     itself launched in; the main group uses the current interpreter).
   * ``predictcsl-legacy`` — Sundial + TimeMoE (transformers==4.40.1).
   * ``predictcsl-toto``   — Toto-2.0-313m (Python 3.12 + toto-2/toto-models).
+  * ``predictcsl-tirex``  — TiRex2 (torch>=2.8 / numpy 2.x + tirex2).
 
 This is correct because (a) Stage 1 only loads a model when its shards are pending
 and (b) the v5 ablation lazy-imports each TSFM loader only for that model's cells —
@@ -49,6 +50,7 @@ Usage
 -----
     python -m experiments.master_run_all                       # everything, all models
     python -m experiments.master_run_all --models Chronos2-Small
+    python -m experiments.master_run_all --models TiRex2 --stage1-batch-size 8 --stage1-shard-size 50
     python -m experiments.master_run_all --only-variants cheap mamba
     python -m experiments.master_run_all --test               # all selected variants, reduced
 """
@@ -105,12 +107,14 @@ FAMILY_ENV: Dict[str, str] = {
     "sundial": "predictcsl-legacy",   # transformers==4.40.1
     "timemoe": "predictcsl-legacy",
     "toto":    "predictcsl-toto",      # Python 3.12 + toto-2/toto-models
+    "tirex":   "predictcsl-tirex",     # torch>=2.8 + tirex2 package
 }
 # Envs without mamba-ssm -> can't run the Mamba predictor variant (v4).
-ENVS_WITHOUT_MAMBA = {"predictcsl-toto"}
+ENVS_WITHOUT_MAMBA = {"predictcsl-toto", "predictcsl-tirex"}
 ENV_ALIASES = {
     "predictcsl-legacy": ("predictcsl-legacy", "TSFM_sundial_patch"),
     "predictcsl-toto": ("predictcsl-toto", "TSFM_toto"),
+    "predictcsl-tirex": ("predictcsl-tirex", "predictcsl-test", "TSFM_tirex2"),
 }
 _CONDA_ENV_NAMES: Optional[set] = None
 
@@ -225,6 +229,17 @@ def parse_args() -> argparse.Namespace:
                         "the re-run cheap (only the new cells compute).")
     p.add_argument("--no-rollup", action="store_true",
                    help="Skip the final cross-predictor rollup_all_predictors pass.")
+    p.add_argument("--stage1-batch-size", type=int, default=None,
+                   help="Forwarded to build_context_length_dataset --batch-size. "
+                        "Useful for slow/heavy labelers such as TiRex.")
+    p.add_argument("--stage1-shard-size", type=int, default=None,
+                   help="Forwarded to build_context_length_dataset --shard-size "
+                        "so long label jobs checkpoint more frequently.")
+    p.add_argument("--stage1-windows", type=int, nargs="+", default=None,
+                   help="Forwarded to build_context_length_dataset --windows.")
+    p.add_argument("--stage1-n-series", type=int, default=None,
+                   help="Forwarded to build_context_length_dataset --n-series "
+                        "when creating a fresh synthetic pool.")
     p.add_argument("--output-root", default="logs/experiments/master_recompute",
                    help="Fresh self-contained root for all datasets, predictors, "
                         "GiftEval cells, and comparisons (default: "
@@ -235,6 +250,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Pass -v to each variant (stream its subprocess output).")
     return p.parse_args()
+
+
+def _stage1_build_args(args: argparse.Namespace) -> List[str]:
+    extra: List[str] = []
+    if args.stage1_batch_size is not None:
+        extra += ["--batch-size", str(args.stage1_batch_size)]
+    if args.stage1_shard_size is not None:
+        extra += ["--shard-size", str(args.stage1_shard_size)]
+    if args.stage1_windows is not None:
+        extra += ["--windows", *[str(w) for w in args.stage1_windows]]
+    if args.stage1_n_series is not None:
+        extra += ["--n-series", str(args.stage1_n_series)]
+    return extra
 
 
 def main() -> None:
@@ -256,6 +284,7 @@ def main() -> None:
 
     groups = _resolve_groups(args.models)
     vflag = ["-v"] if args.verbose else []
+    stage1_build_args = _stage1_build_args(args)
     # --force forwarding: None -> no flag; [] -> bare --force (all active stages);
     # [...] -> --force <stages>. Passed to every subprocess verbatim; run_all only
     # acts on it for stages that are active (not in that variant's --skip-stages),
@@ -287,8 +316,11 @@ def main() -> None:
     for env, displays in groups.items():
         stage1 = _py(env, "experiments.run_all", "--only-stages", "1",
                      "--models", *displays, *vflag, *fflag)
+        build_args = list(stage1_build_args)
         if args.test:
-            stage1 += ["--build-args", "--n-series", str(200)]
+            build_args += ["--n-series", str(200)]
+        if build_args:
+            stage1 += ["--build-args", *build_args]
         _run(stage1,
              f"Stage 1 — labeling [{_env_label(env)}]: {displays}")
 

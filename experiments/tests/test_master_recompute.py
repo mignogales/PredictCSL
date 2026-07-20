@@ -27,6 +27,28 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertEqual(build.window_grid_for_family("chronos2")[-1], 8192)
         self.assertEqual(build.window_grid_for_family("chronos_bolt")[-1], 2048)
         self.assertEqual(build.window_grid_for_family("sundial")[-1], 2560)
+        self.assertEqual(build.window_grid_for_family("tirex")[-1], 8192)
+
+    def test_tirex2_uses_dedicated_env(self) -> None:
+        self.assertEqual(master.FAMILY_ENV["tirex"], "predictcsl-tirex")
+        self.assertIn("predictcsl-tirex", master.ENVS_WITHOUT_MAMBA)
+
+    def test_master_stage1_build_args(self) -> None:
+        args = SimpleNamespace(
+            stage1_batch_size=8,
+            stage1_shard_size=50,
+            stage1_windows=[32, 64, 128],
+            stage1_n_series=1000,
+        )
+        self.assertEqual(
+            master._stage1_build_args(args),
+            [
+                "--batch-size", "8",
+                "--shard-size", "50",
+                "--windows", "32", "64", "128",
+                "--n-series", "1000",
+            ],
+        )
 
     def test_sanity_check_geomean_rules(self) -> None:
         self.assertAlmostEqual(_geomean(np.array([1.0, 4.0, np.nan])), 2.0)
