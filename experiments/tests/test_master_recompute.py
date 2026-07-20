@@ -33,6 +33,24 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertEqual(master.FAMILY_ENV["tirex"], "predictcsl-tirex")
         self.assertIn("predictcsl-tirex", master.ENVS_WITHOUT_MAMBA)
 
+    def test_dedicated_envs_use_conda_activation(self) -> None:
+        old_names = master._CONDA_ENV_NAMES
+        master._CONDA_ENV_NAMES = {"predictcsl-legacy"}
+        try:
+            cmd = master._py(
+                "predictcsl-legacy",
+                "experiments.run_all",
+                "--models",
+                "Sundial-Base-128M",
+            )
+        finally:
+            master._CONDA_ENV_NAMES = old_names
+
+        self.assertEqual(cmd[:2], ["bash", "-lc"])
+        self.assertIn("conda activate predictcsl-legacy", cmd[2])
+        self.assertIn("exec python -m experiments.run_all", cmd[2])
+        self.assertNotIn("conda run", cmd)
+
     def test_master_stage1_build_args(self) -> None:
         args = SimpleNamespace(
             stage1_batch_size=8,

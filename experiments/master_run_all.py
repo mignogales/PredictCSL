@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -100,7 +101,7 @@ VARIANTS: List[Variant] = [
 
 # ── Cross-env routing (see the docstring + envs/README.md) ───────────────────
 # Master must be launched IN this env; main-group models use the current
-# interpreter, env-specific groups are dispatched via `conda run -n <env>`.
+# interpreter, env-specific groups are dispatched through `conda activate`.
 MAIN_ENV = "predictcsl-main"
 # Model family -> dedicated conda env. Families absent here run in the main group.
 FAMILY_ENV: Dict[str, str] = {
@@ -156,14 +157,19 @@ def _py(env: Optional[str], *module_and_args: str) -> List[str]:
     """Build a ``python -m <module> [args]`` command, dispatched into ``env``.
 
     The main group (``env`` is None or equals MAIN_ENV) runs on the current
-    interpreter; any other env is launched via ``conda run -n <env>`` so its
-    own Python/torch/transformers stack is used.
+    interpreter; any other env is launched through a real ``conda activate`` so
+    compiler/binutils activation scripts match an interactive shell.
     """
     if env is None or env == MAIN_ENV:
         return [sys.executable, "-m", *module_and_args]
     resolved = _resolve_conda_env(env)
-    return ["conda", "run", "--no-capture-output", "-n", resolved,
-            "python", "-m", *module_and_args]
+    py_args = " ".join(shlex.quote(arg) for arg in ("-m", *module_and_args))
+    shell_cmd = (
+        'source "$(conda info --base)/etc/profile.d/conda.sh"; '
+        f"conda activate {shlex.quote(resolved)}; "
+        f"exec python {py_args}"
+    )
+    return ["bash", "-lc", shell_cmd]
 
 
 def _resolve_groups(models: Optional[List[str]]) -> "OrderedDict[Optional[str], List[str]]":
