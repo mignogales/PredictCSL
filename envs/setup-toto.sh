@@ -22,6 +22,8 @@
 set -euo pipefail
 
 ENV=predictcsl-toto
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONSTRAINTS="$SCRIPT_DIR/predictcsl-toto-constraints.txt"
 
 conda create -n "$ENV" python=3.12 -y
 # shellcheck disable=SC1091
@@ -32,17 +34,17 @@ conda activate "$ENV"
 pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 
 # 2) Core scientific stack used by build_context_length_dataset.
-pip install "numpy<2" scipy pandas matplotlib tqdm colorama python-dotenv
+pip install -c "$CONSTRAINTS" "numpy<2" scipy pandas matplotlib tqdm colorama python-dotenv
 
 # 3) Toto model packages (confirmed pins). toto-2 provides `import toto2`.
 #    toto-2 declares gluonts>=0.16, but the working TSFM_toto env runs gluonts
 #    0.15.1 — so install toto first, then force-downgrade gluonts in a SEPARATE
 #    invocation (pip then only warns about the unmet pin instead of erroring).
-pip install toto-2==2.0.0 toto-models==1.0.0
-pip install gluonts==0.15.1
+pip install -c "$CONSTRAINTS" toto-2==2.0.0 toto-models==1.0.0
+pip install -c "$CONSTRAINTS" gluonts==0.15.1
 
 # 4) gift_eval for Toto's stage-3 ablation (same pinned commit as main).
-pip install "git+https://github.com/SalesforceAIResearch/gift-eval.git@d8184bb51079bb5021332f8e5d7486c378a52202"
+pip install -c "$CONSTRAINTS" "git+https://github.com/SalesforceAIResearch/gift-eval.git@d8184bb51079bb5021332f8e5d7486c378a52202"
 
 echo
 python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())"

@@ -172,6 +172,77 @@ def _py(env: Optional[str], *module_and_args: str) -> List[str]:
     return ["bash", "-lc", shell_cmd]
 
 
+def _python_code(env: Optional[str], code: str) -> List[str]:
+    """Build a ``python -c <code>`` command in the selected env."""
+    if env is None or env == MAIN_ENV:
+        return [sys.executable, "-c", code]
+    resolved = _resolve_conda_env(env)
+    shell_cmd = (
+        'source "$(conda info --base)/etc/profile.d/conda.sh"; '
+        f"conda activate {shlex.quote(resolved)}; "
+        f"exec python -c {shlex.quote(code)}"
+    )
+    return ["bash", "-lc", shell_cmd]
+
+
+ENV_PREFLIGHTS: Dict[str, str] = {
+    "predictcsl-toto": r"""
+import sys
+print("python", sys.executable)
+import torch
+print("torch", torch.__version__, "cuda", getattr(torch.version, "cuda", None))
+if not torch.__version__.startswith("2.5.1"):
+    raise SystemExit("predictcsl-toto expects torch==2.5.1 for the pinned Toto stack")
+import toto2
+print("toto2", toto2.__file__)
+""",
+    "predictcsl-tirex": r"""
+import sys
+print("python", sys.executable)
+import torch
+print("torch", torch.__version__, "cuda", getattr(torch.version, "cuda", None))
+if not torch.__version__.startswith("2.8.0"):
+    raise SystemExit("predictcsl-tirex expects torch==2.8.0 for the pinned TiRex2 stack")
+from tirex2 import TimeseriesType, load_model
+print("tirex2 import OK")
+""",
+}
+
+
+def _preflight_env(env: Optional[str]) -> None:
+    """Check dedicated model envs before expensive stage-1 work starts."""
+    label = _env_label(env)
+    probe = ENV_PREFLIGHTS.get(label)
+    if probe is None:
+        return
+    proc = subprocess.run(
+        _python_code(env, probe),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode == 0:
+        print(Fore.GREEN + f"  preflight {label}: OK" + Fore.RESET)
+        return
+
+    details = "\n".join(
+        line for line in (proc.stdout + proc.stderr).strip().splitlines()
+        if line.strip()
+    )
+    repair = {
+        "predictcsl-toto": "bash envs/repair-toto.sh predictcsl-toto",
+        "predictcsl-tirex": "bash envs/repair-tirex.sh predictcsl-tirex",
+    }[label]
+    raise SystemExit(
+        Fore.RED
+        + f"Preflight failed for {label} before launching stage 1.\n"
+        + details
+        + "\n\nRepair this env with:\n"
+        + f"  {repair}"
+        + Fore.RESET
+    )
+
+
 def _resolve_groups(models: Optional[List[str]]) -> "OrderedDict[Optional[str], List[str]]":
     """Group the selected run-set displays by the env they must run in.
 
@@ -337,6 +408,8 @@ def main() -> None:
     print(Fore.CYAN + f"Master run — variants: {[v.name for v in variants]}" + Fore.RESET)
     for env, displays in groups.items():
         print(Fore.CYAN + f"  env {_env_label(env)}: {displays}" + Fore.RESET)
+    for env in groups:
+        _preflight_env(env)
 
     t_start = time.perf_counter()
 

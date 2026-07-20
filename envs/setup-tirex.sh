@@ -11,6 +11,8 @@
 set -euo pipefail
 
 ENV=predictcsl-tirex
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONSTRAINTS="$SCRIPT_DIR/predictcsl-tirex-constraints.txt"
 
 conda create -n "$ENV" python=3.11 -y
 # shellcheck disable=SC1091
@@ -20,12 +22,12 @@ conda activate "$ENV"
 # Match the oldest CUDA-enabled stack published by TiRex2's Pixi config.
 pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
 
-pip install \
+pip install -c "$CONSTRAINTS" \
     numpy==2.1.3 scipy pandas==2.2.3 matplotlib==3.10.3 \
     tqdm==4.67.3 colorama==0.4.6 python-dotenv==1.0.0
 
-pip install "tirex-2[gluonts]==0.1.1"
-pip install "git+https://github.com/SalesforceAIResearch/gift-eval.git@d8184bb51079bb5021332f8e5d7486c378a52202"
+pip install -c "$CONSTRAINTS" "tirex-2[gluonts]==0.1.1"
+pip install -c "$CONSTRAINTS" "git+https://github.com/SalesforceAIResearch/gift-eval.git@d8184bb51079bb5021332f8e5d7486c378a52202"
 
 echo
 python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())"

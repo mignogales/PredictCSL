@@ -1,0 +1,9 @@
+# Keep predictcsl-toto on the stack that is known to load Toto-2.0-313m.
+torch==2.5.1
+numpy==1.26.4
+scipy==1.11.4
+matplotlib==3.9.4
+datasets==2.17.1
+gluonts==0.15.1
+toto-2==2.0.0
+toto-models==1.0.0
