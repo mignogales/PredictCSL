@@ -1217,8 +1217,10 @@ def load_tirex(model_id, device):
     # the device up front and handles placement internally. Its API accepts only
     # bare device types ("cuda"/"cpu"); multi-GPU workers mask themselves to one
     # visible card, so "cuda" still selects the intended GPU.
+    from experiments.tirex_compat import configure_tirex_backend
     from tirex2 import load_model
     tirex_device = "cuda" if str(device).startswith("cuda") else "cpu"
+    configure_tirex_backend(tirex_device)
     return load_model(model_id, device=tirex_device)
 
 
@@ -1232,21 +1234,14 @@ def predict_tirex(model, batches, horizon, device):
     axis is the MIDDLE one now (TiRex-1 was (B, horizon, 9)). The 9 levels are
     still [0.1..0.9], so index 4 (0.5) is the point forecast. ``output_type=
     "numpy"`` is the documented return format; convert back to `device` for the
-    downstream stitching/metrics. (Verify on server — see stage-1 note.)
+    downstream stitching/metrics. Horizons above ``model.future_len`` roll
+    forward in chunks using each preceding median as context.
     """
-    from tirex2 import TimeseriesType
-
     def step(x, y):
         seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
-        series = [
-            TimeseriesType(target=row.unsqueeze(0),           # (1, L) univariate
-                           past_covariates=None, future_covariates=None)
-            for row in seqs
-        ]
-        forecasts = model.forecast(series, prediction_length=horizon,
-                                   output_type="numpy")         # list of (1, 9, H)
-        medians = np.stack(
-            [f[0, TIREX_MEDIAN_QUANTILE_IDX, :horizon] for f in forecasts], axis=0
+        from experiments.tirex_compat import forecast_tirex_medians
+        medians = forecast_tirex_medians(
+            model, seqs, horizon, TIREX_MEDIAN_QUANTILE_IDX
         )                                                       # (B, horizon)
         return ({"median": torch.as_tensor(medians, dtype=torch.float32,
                                            device=device)},

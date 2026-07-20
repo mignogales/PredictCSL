@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -140,30 +141,116 @@ class PatchTSTFMCompatibilityTest(unittest.TestCase):
 
 
 class TiRexCompatibilityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.old_backend = os.environ.pop("PREDICTCSL_TIREX_BACKEND", None)
+
+    def tearDown(self) -> None:
+        if self.old_backend is not None:
+            os.environ["PREDICTCSL_TIREX_BACKEND"] = self.old_backend
+        else:
+            os.environ.pop("PREDICTCSL_TIREX_BACKEND", None)
+
     def test_load_tirex_normalizes_indexed_cuda_device(self) -> None:
         calls = []
         fake_tirex2 = ModuleType("tirex2")
+        fake_tirex2_model = ModuleType("tirex2.model")
+        fake_tirex2_component = ModuleType("tirex2.model.component")
+        fake_flashrnn_slstm = ModuleType("tirex2.model.component.flashrnn_slstm")
 
         def fake_load_model(model_id, device):
-            calls.append((model_id, device))
+            calls.append((model_id, device, fake_flashrnn_slstm._flashrnn_backend(device)))
             return object()
 
         fake_tirex2.load_model = fake_load_model
-        old_tirex2 = sys.modules.get("tirex2")
-        sys.modules["tirex2"] = fake_tirex2
+        module_names = {
+            "tirex2": fake_tirex2,
+            "tirex2.model": fake_tirex2_model,
+            "tirex2.model.component": fake_tirex2_component,
+            "tirex2.model.component.flashrnn_slstm": fake_flashrnn_slstm,
+        }
+        old_modules = {name: sys.modules.get(name) for name in module_names}
+        sys.modules.update(module_names)
+        fake_tirex2_component.flashrnn_slstm = fake_flashrnn_slstm
         try:
             build.load_tirex("NX-AI/TiRex-2", "cuda:0")
             build.load_tirex("NX-AI/TiRex-2", "cpu")
+        finally:
+            for name, old_module in old_modules.items():
+                if old_module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = old_module
+
+        self.assertEqual(
+            calls,
+            [
+                ("NX-AI/TiRex-2", "cuda", "triton_fused"),
+                ("NX-AI/TiRex-2", "cpu", "vanilla"),
+            ],
+        )
+        self.assertEqual(fake_flashrnn_slstm._flashrnn_backend("cpu"), "vanilla")
+
+    def test_tirex_cuda_uses_triton_backend(self) -> None:
+        from experiments.tirex_compat import tirex_backend_for_device
+
+        self.assertEqual(tirex_backend_for_device("cuda"), "triton_fused")
+
+    def test_tirex_backend_can_be_overridden(self) -> None:
+        from experiments.tirex_compat import tirex_backend_for_device
+
+        os.environ["PREDICTCSL_TIREX_BACKEND"] = "vanilla"
+        self.assertEqual(tirex_backend_for_device("cuda"), "vanilla")
+
+    def test_tirex_rejects_invalid_backend(self) -> None:
+        from experiments.tirex_compat import tirex_backend_for_device
+
+        os.environ["PREDICTCSL_TIREX_BACKEND"] = "nope"
+        with self.assertRaisesRegex(ValueError, "PREDICTCSL_TIREX_BACKEND"):
+            tirex_backend_for_device("cuda")
+
+    def test_tirex_long_horizon_is_forecast_in_chunks(self) -> None:
+        from experiments.tirex_compat import forecast_tirex_medians
+
+        fake_tirex2 = ModuleType("tirex2")
+
+        class FakeTimeseries:
+            def __init__(self, target, past_covariates, future_covariates):
+                self.target = target
+
+        class FakeModel:
+            future_len = 3
+            context_len = 5
+
+            def __init__(self):
+                self.context_lengths = []
+
+            def forecast(self, series, prediction_length, output_type):
+                self.context_lengths.append(
+                    ([item.target.shape[-1] for item in series], prediction_length)
+                )
+                value = float(len(self.context_lengths))
+                return [
+                    np.full((1, 9, prediction_length), value, dtype=np.float32)
+                    for _ in series
+                ]
+
+        fake_tirex2.TimeseriesType = FakeTimeseries
+        old_tirex2 = sys.modules.get("tirex2")
+        sys.modules["tirex2"] = fake_tirex2
+        try:
+            model = FakeModel()
+            result = forecast_tirex_medians(model, torch.zeros(2, 4), 7)
         finally:
             if old_tirex2 is None:
                 sys.modules.pop("tirex2", None)
             else:
                 sys.modules["tirex2"] = old_tirex2
 
-        self.assertEqual(
-            calls,
-            [("NX-AI/TiRex-2", "cuda"), ("NX-AI/TiRex-2", "cpu")],
+        np.testing.assert_array_equal(
+            result,
+            np.array([[1, 1, 1, 2, 2, 2, 3], [1, 1, 1, 2, 2, 2, 3]], dtype=np.float32),
         )
+        self.assertEqual(model.context_lengths, [([4, 4], 3), ([5, 5], 3), ([5, 5], 1)])
 
 
 if __name__ == "__main__":

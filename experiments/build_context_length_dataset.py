@@ -876,8 +876,10 @@ def load_tirex(model_id: str, device: str):
     # the device up front and handles placement internally. Its API accepts only
     # bare device types ("cuda"/"cpu"); workers already mask each process to one
     # visible GPU, so "cuda" still selects the intended card.
+    from experiments.tirex_compat import configure_tirex_backend
     from tirex2 import load_model
     tirex_device = "cuda" if _is_cuda(device) else "cpu"
+    configure_tirex_backend(tirex_device)
     return load_model(model_id, device=tirex_device)
 
 
@@ -891,25 +893,15 @@ def predict_tirex(model, x: torch.Tensor, horizon: int, device: str) -> torch.Te
     one now (TiRex-1 was (B, horizon, 9)). The 9 levels are still [0.1..0.9], so
     index 4 (0.5) is the point forecast. ``output_type="numpy"`` is the documented
     return format; we convert back to a `device` torch tensor because
-    forecast_window scatters the median into a `device`-side buffer.
-
-    NOTE (verify on server): confirmed against the tirex-2 README quick-start
-    (list-of-TimeseriesType input, (n_targets, 9, pred_len) output). Re-check the
-    exact target axis order and whether an ``output_type="torch"`` fast-path
-    exists once the package is installed.
+    forecast_window scatters the median into a `device`-side buffer. TiRex2 caps
+    one forecast call at ``model.future_len`` (320 for the current checkpoint),
+    so longer horizons roll forward in chunks using each preceding median as
+    context.
     """
-    from tirex2 import TimeseriesType
-
     seqs = x[:, :, 0].to(device, non_blocking=True)        # (B, L)
-    series = [
-        TimeseriesType(target=row.unsqueeze(0),           # (1, L) univariate
-                       past_covariates=None, future_covariates=None)
-        for row in seqs
-    ]
-    forecasts = model.forecast(series, prediction_length=horizon,
-                               output_type="numpy")         # list of (1, 9, H)
-    medians = np.stack(
-        [f[0, TIREX_MEDIAN_QUANTILE_IDX, :horizon] for f in forecasts], axis=0
+    from experiments.tirex_compat import forecast_tirex_medians
+    medians = forecast_tirex_medians(
+        model, seqs, horizon, TIREX_MEDIAN_QUANTILE_IDX
     )                                                       # (B, horizon)
     return torch.as_tensor(medians, dtype=torch.float32, device=device)
 
