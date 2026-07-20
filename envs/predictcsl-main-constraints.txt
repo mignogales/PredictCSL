@@ -1,0 +1,15 @@
+# Keep the Mamba predictor ABI stable.
+#
+# The prebuilt mamba-ssm / causal-conv1d wheels installed by setup-main.sh are
+# tagged torch2.4. If a later resolver step upgrades torch, selective_scan_cuda
+# fails at import time with an undefined c10/cuda symbol.
+torch==2.4.1
+numpy==1.26.4
+scipy==1.11.4
+pandas==2.1.4
+gluonts==0.14.4
+transformers==4.56.0
+tokenizers==0.22.2
+huggingface_hub==0.36.2
+accelerate==1.13.0
+datasets==2.17.1

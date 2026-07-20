@@ -59,6 +59,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
+import sys
 import time
 
 from colorama import Fore
@@ -80,6 +82,47 @@ STRATEGY_SUBDIR_V4  = "strategy_comparison_v4"
 # Match v3's search: 30 trials for both requested predictor architectures, which
 # keeps stage-2 wall-clock directly comparable across the two variants.
 N_TRIALS_V4_DEFAULT = 30
+
+
+def _preflight_mamba_env() -> None:
+    """Fail before launching trials if Mamba's compiled extensions are mismatched."""
+    probe = r"""
+import sys
+print("python", sys.executable)
+try:
+    import torch
+    print("torch", torch.__version__, "cuda", getattr(torch.version, "cuda", None))
+except Exception as exc:
+    print("torch import failed:", repr(exc))
+    raise
+from mamba_ssm import Mamba
+print("mamba-ssm import OK")
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode == 0:
+        return
+
+    details = "\n".join(
+        line for line in (proc.stdout + proc.stderr).strip().splitlines()
+        if line.strip()
+    )
+    raise SystemExit(
+        Fore.RED
+        + "[v4] Mamba preflight failed before launching predictor trials.\n"
+        + details
+        + "\n\nThis usually means torch was upgraded after installing the "
+        + "torch2.4-tagged mamba-ssm / causal-conv1d wheels. Repair the active "
+        + "server env with:\n"
+        + "  bash envs/repair-main-mamba.sh predictcsl-main\n"
+        + "Then rerun the same run_all_v4 command; failed trials are cached as "
+        + "NaN and will retry automatically."
+        + Fore.RESET
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,6 +235,8 @@ def main() -> None:
           + Fore.RESET)
     if forced:
         print(Fore.YELLOW + f"[v4] Forced re-runs: {sorted(forced)}" + Fore.RESET)
+    if {"2", "3"} & active:
+        _preflight_mamba_env()
 
     def _maybe_run(sid: str, model_id: str, family: str, display: str) -> None:
         name = ra.STAGES[sid][0]
