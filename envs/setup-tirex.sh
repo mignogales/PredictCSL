@@ -23,7 +23,7 @@ conda activate "$ENV"
 pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
 
 pip install -c "$CONSTRAINTS" \
-    numpy==2.1.3 scipy pandas==2.2.3 matplotlib==3.10.3 \
+    numpy==2.1.3 scipy pandas==2.2.3 matplotlib==3.9.4 \
     tqdm==4.67.3 colorama==0.4.6 python-dotenv==1.0.0
 
 pip install -c "$CONSTRAINTS" "tirex-2[gluonts]==0.1.1"
