@@ -203,6 +203,34 @@ class ForecastResult:
     quantile_levels: Optional[List[float]] = None
 
 
+def _as_horizon_matrix(t: torch.Tensor, horizon: int, name: str) -> torch.Tensor:
+    """Return univariate forecast/target tensors as (N, horizon)."""
+    if t.dim() == 3 and t.shape[-1] == 1:
+        t = t.squeeze(-1)
+    elif t.dim() == 3 and t.shape[1] == 1 and t.shape[2] == horizon:
+        t = t.squeeze(1)
+    if t.dim() != 2 or t.shape[1] != horizon:
+        raise ValueError(
+            f"{name} must have shape (N, {horizon}) after univariate squeeze; "
+            f"got {tuple(t.shape)}"
+        )
+    return t
+
+
+def _as_horizon_cube(t: Optional[torch.Tensor], horizon: int, name: str) -> Optional[torch.Tensor]:
+    """Return sample/quantile tensors as (N, S_or_Q, horizon)."""
+    if t is None:
+        return None
+    if t.dim() == 4 and t.shape[-1] == 1:
+        t = t.squeeze(-1)
+    if t.dim() != 3 or t.shape[2] != horizon:
+        raise ValueError(
+            f"{name} must have shape (N, K, {horizon}) after univariate squeeze; "
+            f"got {tuple(t.shape)}"
+        )
+    return t
+
+
 # ==============================================================================
 #  SEASONALITY (frequency-based only)
 # ==============================================================================
@@ -1068,7 +1096,16 @@ def predict_patchtst_fm(model, batches, horizon, device):
                 qf = torch.cat([qf, pad], dim=2)
             preds = qf.to(torch.float32)
         elif raw.dim() == 3:
-            preds = raw[:, :, :horizon].unsqueeze(1) if raw.shape[1] == 1 else raw[:, :, :horizon]
+            if raw.shape[1] == 1:
+                preds = raw[:, :, :horizon]
+            elif raw.shape[2] == 1:
+                preds = raw[:, :horizon, 0].unsqueeze(1)
+            elif raw.shape[1] == len(PATCHTST_FM_QUANTILE_LEVELS):
+                preds = raw[:, :, :horizon]
+            elif raw.shape[2] == len(PATCHTST_FM_QUANTILE_LEVELS):
+                preds = raw[:, :horizon, :].permute(0, 2, 1)
+            else:
+                preds = raw[:, :, :horizon]
             preds = preds.to(torch.float32)
         elif raw.dim() == 2:
             preds = raw[:, :horizon].unsqueeze(1).to(torch.float32)
@@ -1798,27 +1835,32 @@ def _merge_grouped(results, n_total, horizon, device):
     `results` is a list of (indices, ForecastResult, tgts). All groups come from
     the same model, so they share sample count / quantile levels.
     """
-    first = results[0][1]
-    median = torch.empty((n_total, horizon), device=device, dtype=first.median.dtype)
-    tgts = torch.empty((n_total, horizon), device=device, dtype=results[0][2].dtype)
+    first, first_tgts = results[0][1], results[0][2]
+    first_median = _as_horizon_matrix(first.median, horizon, "median")
+    first_tgts = _as_horizon_matrix(first_tgts, horizon, "targets")
+    first_samples = _as_horizon_cube(first.samples, horizon, "samples")
+    first_quantiles = _as_horizon_cube(first.quantiles, horizon, "quantiles")
+
+    median = torch.empty((n_total, horizon), device=device, dtype=first_median.dtype)
+    tgts = torch.empty((n_total, horizon), device=device, dtype=first_tgts.dtype)
 
     samples = quantiles = None
     qlevels = first.quantile_levels
-    if first.samples is not None:
-        S = first.samples.shape[1]
-        samples = torch.empty((n_total, S, horizon), device=device, dtype=first.samples.dtype)
-    if first.quantiles is not None:
-        Q = first.quantiles.shape[1]
-        quantiles = torch.empty((n_total, Q, horizon), device=device, dtype=first.quantiles.dtype)
+    if first_samples is not None:
+        S = first_samples.shape[1]
+        samples = torch.empty((n_total, S, horizon), device=device, dtype=first_samples.dtype)
+    if first_quantiles is not None:
+        Q = first_quantiles.shape[1]
+        quantiles = torch.empty((n_total, Q, horizon), device=device, dtype=first_quantiles.dtype)
 
     for idx, fr, t in results:
         ii = torch.as_tensor(idx, device=device, dtype=torch.long)
-        median[ii] = fr.median
-        tgts[ii] = t
+        median[ii] = _as_horizon_matrix(fr.median, horizon, "median")
+        tgts[ii] = _as_horizon_matrix(t, horizon, "targets")
         if samples is not None:
-            samples[ii] = fr.samples
+            samples[ii] = _as_horizon_cube(fr.samples, horizon, "samples")
         if quantiles is not None:
-            quantiles[ii] = fr.quantiles
+            quantiles[ii] = _as_horizon_cube(fr.quantiles, horizon, "quantiles")
 
     return ForecastResult(median=median, samples=samples,
                           quantiles=quantiles, quantile_levels=qlevels), tgts

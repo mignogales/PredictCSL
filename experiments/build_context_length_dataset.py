@@ -701,9 +701,14 @@ def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> to
     if raw.dim() == 4:                                 # (B, Q, H, 1)
         qf = raw[:, :, :horizon, 0]
         return qf[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :].to(torch.float32)
-    if raw.dim() == 3:                                 # (B, Q, H) or (B, 1, H)
+    if raw.dim() == 3:                                 # (B, Q, H), (B, 1, H), or (B, H, 1)
         if raw.shape[1] == 1:
             return raw[:, 0, :horizon].to(torch.float32)
+        if raw.shape[2] == 1:
+            return raw[:, :horizon, 0].to(torch.float32)
+        if raw.shape[2] == len(PATCHTST_FM_QUANTILE_LEVELS):
+            qf = raw[:, :horizon, :].permute(0, 2, 1)
+            return qf[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :].to(torch.float32)
         return torch.median(raw[:, :, :horizon], dim=1).values.to(torch.float32)
     return raw[:, :horizon].to(torch.float32)          # (B, H)
 
