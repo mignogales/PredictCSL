@@ -873,9 +873,12 @@ def predict_flowstate(model, x: torch.Tensor, horizon: int, device: str) -> torc
 
 def load_tirex(model_id: str, device: str):
     # TiRex2 lives in the `tirex2` package (TiRex-1 was `tirex`); load_model takes
-    # the device up front and handles placement internally.
+    # the device up front and handles placement internally. Its API accepts only
+    # bare device types ("cuda"/"cpu"); workers already mask each process to one
+    # visible GPU, so "cuda" still selects the intended card.
     from tirex2 import load_model
-    return load_model(model_id, device=device)
+    tirex_device = "cuda" if _is_cuda(device) else "cpu"
+    return load_model(model_id, device=tirex_device)
 
 
 def predict_tirex(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:

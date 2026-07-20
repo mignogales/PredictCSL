@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import torch
@@ -136,6 +137,33 @@ class PatchTSTFMCompatibilityTest(unittest.TestCase):
             LegacyAPI(), torch.ones(1, 8, 1), horizon=2, device="cpu")
 
         self.assertTrue(torch.equal(result, torch.ones(1, 2)))
+
+
+class TiRexCompatibilityTest(unittest.TestCase):
+    def test_load_tirex_normalizes_indexed_cuda_device(self) -> None:
+        calls = []
+        fake_tirex2 = ModuleType("tirex2")
+
+        def fake_load_model(model_id, device):
+            calls.append((model_id, device))
+            return object()
+
+        fake_tirex2.load_model = fake_load_model
+        old_tirex2 = sys.modules.get("tirex2")
+        sys.modules["tirex2"] = fake_tirex2
+        try:
+            build.load_tirex("NX-AI/TiRex-2", "cuda:0")
+            build.load_tirex("NX-AI/TiRex-2", "cpu")
+        finally:
+            if old_tirex2 is None:
+                sys.modules.pop("tirex2", None)
+            else:
+                sys.modules["tirex2"] = old_tirex2
+
+        self.assertEqual(
+            calls,
+            [("NX-AI/TiRex-2", "cuda"), ("NX-AI/TiRex-2", "cpu")],
+        )
 
 
 if __name__ == "__main__":

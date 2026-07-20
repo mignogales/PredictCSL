@@ -1214,9 +1214,12 @@ def predict_flowstate(model, batches, horizon, device,
 
 def load_tirex(model_id, device):
     # TiRex2 lives in the `tirex2` package (TiRex-1 was `tirex`); load_model takes
-    # the device up front and handles placement internally.
+    # the device up front and handles placement internally. Its API accepts only
+    # bare device types ("cuda"/"cpu"); multi-GPU workers mask themselves to one
+    # visible card, so "cuda" still selects the intended GPU.
     from tirex2 import load_model
-    return load_model(model_id, device=device)
+    tirex_device = "cuda" if str(device).startswith("cuda") else "cpu"
+    return load_model(model_id, device=tirex_device)
 
 
 def predict_tirex(model, batches, horizon, device):
