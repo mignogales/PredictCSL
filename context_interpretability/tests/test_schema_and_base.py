@@ -3,9 +3,11 @@ import tempfile
 import unittest
 
 import numpy as np
+from torch import nn
 
 from context_interpretability.adapters.base import (
-    align_context_lengths, blocks_for_context, thin_blocks)
+    AdapterCapabilities, align_context_lengths, blocks_for_context, thin_blocks)
+from context_interpretability.adapters.tsfm import TSFMAdapter
 from context_interpretability.schema import (
     ResultsWriter, cell_done, load_results, make_row)
 
@@ -68,6 +70,31 @@ class TestContextAlignment(unittest.TestCase):
         subset2, thinned2 = thin_blocks(blocks[:10], 16)
         self.assertFalse(thinned2)
         self.assertEqual(len(subset2), 10)
+
+
+class _NestedMLPBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mlp = nn.Module()
+        self.mlp.layers = nn.ModuleList([nn.Linear(4, 16), nn.Linear(16, 4)])
+
+
+class _NestedStack(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Module()
+        self.encoder.blocks = nn.ModuleList([_NestedMLPBlock() for _ in range(3)])
+
+
+class TestTSFMLayerDiscovery(unittest.TestCase):
+    def test_selects_residual_stack_not_nested_mlp_layers(self):
+        adapter = TSFMAdapter(
+            "unused", "patchtst_fm", "NestedModel",
+            AdapterCapabilities(supports_forecast_lens=True), horizon=1,
+            device="cpu", batch_size=1)
+        adapter._backbone = _NestedStack()
+        self.assertEqual(adapter.get_layer_names(), [
+            "encoder.blocks.0", "encoder.blocks.1", "encoder.blocks.2"])
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ import os
 from typing import Dict, List, Optional
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from context_interpretability.adapters.base import (
     InterpretabilityAdapter, TemporalBlock)
@@ -161,22 +162,35 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
                 f"w{W}: {len(blocks)} of {W // P} blocks (geometric thinning)")
         writer = ResultsWriter(cell)
 
-        for blk_obj in blocks:
-            blk = blk_obj.input_slice(W)
-            for kind in methods:
-                sevs = noise_scales if kind == "noise" else [np.nan]
-                seeds = range(n_seeds) if kind in _STOCHASTIC else [0]
-                for severity in sevs:
-                    for s in seeds:
-                        pert = apply_perturbation(window, blk, kind,
-                                                  seed + s, severity, pcfg)
-                        assert pert.shape == window.shape  # length preserved
-                        pred = adapter.forecast(pert)
-                        eff = intervention_effects(clean_pred, clean_loss,
-                                                   pred, cache)
-                        _write_block_rows(writer, adapter, data, requested, W,
-                                          blk_obj, kind, severity, seed + s,
-                                          metric, eff)
+        n_forwards = 0
+        for kind in methods:
+            n_sev = len(noise_scales) if kind == "noise" else 1
+            n_seed = n_seeds if kind in _STOCHASTIC else 1
+            n_forwards += len(blocks) * n_sev * n_seed
+        progress = tqdm(total=n_forwards,
+                        desc=f"exp1 {adapter.name} {data.name} W={W}",
+                        unit="forward", dynamic_ncols=True)
+
+        try:
+            for blk_obj in blocks:
+                blk = blk_obj.input_slice(W)
+                for kind in methods:
+                    sevs = noise_scales if kind == "noise" else [np.nan]
+                    seeds = range(n_seeds) if kind in _STOCHASTIC else [0]
+                    for severity in sevs:
+                        for s in seeds:
+                            pert = apply_perturbation(window, blk, kind,
+                                                      seed + s, severity, pcfg)
+                            assert pert.shape == window.shape  # length preserved
+                            pred = adapter.forecast(pert)
+                            progress.update(1)
+                            eff = intervention_effects(clean_pred, clean_loss,
+                                                       pred, cache)
+                            _write_block_rows(
+                                writer, adapter, data, requested, W, blk_obj,
+                                kind, severity, seed + s, metric, eff)
+        finally:
+            progress.close()
         writer.finalize({"context_length": W, "block_length": P,
                          "n_blocks": len(blocks), "thinned": thinned,
                          "methods": methods})

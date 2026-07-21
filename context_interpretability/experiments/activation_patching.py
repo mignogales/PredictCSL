@@ -27,6 +27,7 @@ import os
 from typing import Dict, List, Optional
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from context_interpretability.adapters.base import (
     CapabilityError, InterpretabilityAdapter)
@@ -143,44 +144,58 @@ def _run_cell(adapter, data: ExperimentData, cache: CleanCache, config: dict,
                       f"{adapter.name}: no dedicated forecast token at w{W}")
     writer = ResultsWriter(cell)
 
-    for blk in blocks:
-        corrupted = _corrupt(window, blk.input_slice(W), corruption, seed,
-                             tolerance)
-        corr_pred = adapter.forecast(corrupted)
-        corr_loss = cache.loss(corr_pred)
-        token_idx = adapter.input_block_to_token_indices(
-            blk.lookback_start, blk.lookback_end, W)
-        grans = [("block_token", token_idx)]
-        if "forecast_token" in granularity and fc_tokens is not None:
-            grans.append(("forecast_token", fc_tokens))
+    n_grans = 1 + int("forecast_token" in granularity
+                      and fc_tokens is not None)
+    total = 1 + len(blocks) * (1 + n_grans * len(layers))
+    progress = tqdm(total=total,
+                    desc=f"exp2 {adapter.name} {data.name} {phase} W={W}",
+                    unit="forward", dynamic_ncols=True)
+    progress.update(1)  # clean activation capture above
 
-        for gran_name, tokens in grans:
-            for layer in layers:
-                patched_pred = adapter.run_with_activation_patch(
-                    corrupted, layer, tokens, clean_acts[layer])
-                patched_loss = cache.loss(patched_pred)
-                rec = recovery_score(patched_pred, clean_pred, corr_pred)
-                lrec = loss_recovery(patched_loss, clean_loss, corr_loss)
-                for i, sid in enumerate(data.sample_ids):
-                    writer.add(
-                        model=adapter.name, dataset=data.name, sample_id=sid,
-                        context_length=W, requested_context_length=requested,
-                        horizon=adapter.horizon, block_index=blk.index,
-                        lookback_start=blk.lookback_start,
-                        lookback_end=blk.lookback_end,
-                        method=METHOD,
-                        perturbation_type=f"{corruption}/{gran_name}",
-                        layer=layer, metric=metric, seed=seed,
-                        clean_loss=clean_loss[i],
-                        intervened_loss=patched_loss[i],
-                        loss_delta=corr_loss[i] - clean_loss[i],
-                        prediction_distance=pdist.l1_distance(
-                            patched_pred, clean_pred)[i],
-                        prediction_distance_norm=pdist.normalized_distance(
-                            clean_pred, patched_pred)[i],
-                        recovery_score=rec[i],
-                        loss_recovery=lrec[i],
-                    )
+    try:
+        for blk in blocks:
+            corrupted = _corrupt(window, blk.input_slice(W), corruption, seed,
+                                 tolerance)
+            corr_pred = adapter.forecast(corrupted)
+            progress.update(1)
+            corr_loss = cache.loss(corr_pred)
+            token_idx = adapter.input_block_to_token_indices(
+                blk.lookback_start, blk.lookback_end, W)
+            grans = [("block_token", token_idx)]
+            if "forecast_token" in granularity and fc_tokens is not None:
+                grans.append(("forecast_token", fc_tokens))
+
+            for gran_name, tokens in grans:
+                for layer in layers:
+                    patched_pred = adapter.run_with_activation_patch(
+                        corrupted, layer, tokens, clean_acts[layer])
+                    progress.update(1)
+                    patched_loss = cache.loss(patched_pred)
+                    rec = recovery_score(patched_pred, clean_pred, corr_pred)
+                    lrec = loss_recovery(patched_loss, clean_loss, corr_loss)
+                    for i, sid in enumerate(data.sample_ids):
+                        writer.add(
+                            model=adapter.name, dataset=data.name, sample_id=sid,
+                            context_length=W,
+                            requested_context_length=requested,
+                            horizon=adapter.horizon, block_index=blk.index,
+                            lookback_start=blk.lookback_start,
+                            lookback_end=blk.lookback_end,
+                            method=METHOD,
+                            perturbation_type=f"{corruption}/{gran_name}",
+                            layer=layer, metric=metric, seed=seed,
+                            clean_loss=clean_loss[i],
+                            intervened_loss=patched_loss[i],
+                            loss_delta=corr_loss[i] - clean_loss[i],
+                            prediction_distance=pdist.l1_distance(
+                                patched_pred, clean_pred)[i],
+                            prediction_distance_norm=pdist.normalized_distance(
+                                clean_pred, patched_pred)[i],
+                            recovery_score=rec[i],
+                            loss_recovery=lrec[i],
+                        )
+    finally:
+        progress.close()
     writer.finalize({"context_length": W, "phase": phase, "layers": layers,
                      "corruption": corruption, "granularity": granularity,
                      "n_blocks": len(blocks)})

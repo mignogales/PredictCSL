@@ -218,11 +218,29 @@ class TSFMAdapter(InterpretabilityAdapter):
         if self._layer_names is None:
             rx = re.compile(BLOCK_PATTERN)
             bb = self._resolve_backbone()
-            self._layer_names = [n for n, _ in bb.named_modules() if rx.search(n)]
-            if not self._layer_names:
+            matched = [n for n, _ in bb.named_modules() if rx.search(n)]
+            # A broad naming match can also find nested dimension-changing
+            # stacks. PatchTST has encoder.blocks.N (the residual blocks we
+            # want) and encoder.blocks.N.mlp.layers.K (MLP projections). Group
+            # terminal numeric siblings by exact prefix and choose the largest,
+            # shallowest coherent stack rather than mixing both kinds.
+            groups: Dict[str, List[Tuple[int, str]]] = {}
+            for name in matched:
+                m = re.match(r"(.*?)(\d+)$", name)
+                if m:
+                    groups.setdefault(m.group(1), []).append(
+                        (int(m.group(2)), name))
+            coherent = {p: rows for p, rows in groups.items()
+                        if len(rows) >= 2}
+            if not coherent:
                 raise CapabilityError(
                     f"{self.name}: no repeated-block modules matched "
                     f"{BLOCK_PATTERN!r} — dump modules on the server")
+            _prefix, rows = min(
+                coherent.items(),
+                key=lambda item: (-len(item[1]), item[0].count("."),
+                                  len(item[0]), item[0]))
+            self._layer_names = [name for _idx, name in sorted(rows)]
         return list(self._layer_names)
 
     def _modules_by_name(self, names: Sequence[str]) -> Dict[str, object]:

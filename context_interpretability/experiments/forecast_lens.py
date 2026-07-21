@@ -30,6 +30,7 @@ import os
 from typing import List
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from context_interpretability.adapters.base import (
     CapabilityError, InterpretabilityAdapter)
@@ -74,7 +75,10 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
         writer = ResultsWriter(cell)
         sat_layer = None
 
-        for li, layer in enumerate(layers):
+        progress = tqdm(enumerate(layers), total=len(layers),
+                        desc=f"exp3 {adapter.name} {data.name} W={W}",
+                        unit="layer", dynamic_ncols=True)
+        for li, layer in progress:
             lens_pred = adapter.forecast_from_layer(window, layer)
             lens_loss = cache.loss(lens_pred)
             d_full = pdist.l1_distance(lens_pred, final_full_pred)

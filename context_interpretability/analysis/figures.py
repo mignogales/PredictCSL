@@ -57,6 +57,22 @@ def _heat(ax, piv: pd.DataFrame, xlabel: str, ylabel: str, title: str,
     plt.colorbar(im, ax=ax)
 
 
+def _column_normalize_signed(piv: pd.DataFrame,
+                             signed_log: bool = False) -> pd.DataFrame:
+    """Normalize each context-length column without discarding direction.
+
+    The denominator is the largest absolute effect in that column.  Optional
+    signed-log compression is applied first, so negative improvements remain
+    negative instead of being folded together with harmful perturbations.
+    """
+    vals = piv.to_numpy(dtype=float, copy=True)
+    if signed_log:
+        vals = np.sign(vals) * np.log1p(np.abs(vals))
+    scales = np.nanmax(np.abs(vals), axis=0)
+    scales[~np.isfinite(scales) | (scales == 0)] = 1.0
+    return pd.DataFrame(vals / scales, index=piv.index, columns=piv.columns)
+
+
 # -- 1. context length vs forecasting error --------------------------------------
 
 def fig_error_curve(clean_cache_dir: str, out_dir: str, tag: str) -> None:
@@ -116,16 +132,25 @@ def fig_block_heatmaps(df: pd.DataFrame, out_dir: str) -> None:
         piv = agg.heatmap_matrix(d, value=value)
         if piv.empty:
             continue
+        # Comparing raw columns mostly reveals scale changes with prediction /
+        # context length.  Normalize within each column so the temporal profile
+        # is comparable, using a signed log first to retain beneficial (<0) and
+        # harmful (>0) effects while making small effects visible.
+        piv = _column_normalize_signed(piv, signed_log=True)
         fig, ax = plt.subplots(figsize=(8, 5.5))
         _heat(ax, piv, "context length", "perturbed block lookback (timesteps)",
-              f"{method}: mean {value}", center_zero=center)
+              f"{method}: signed-log effect / column max |effect|",
+              center_zero=True if center else False)
         _save(fig, out_dir, f"{name}.png")
 
 
-def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str) -> None:
+def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str,
+                              dataset: Optional[str] = None) -> None:
     """Per-context line plots: effect vs lookback, one curve per perturbation
     type (spec §4.4)."""
     d = df[df["method"] == "perturbation"]
+    if dataset is not None:
+        d = d[d["dataset"] == dataset]
     if d.empty:
         return
     ctxs = sorted(d["context_length"].unique())
@@ -135,15 +160,23 @@ def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str) -> None:
         g = agg.collapse_seeds(d[d["context_length"] == W])
         for ptype, gg in g.groupby("perturbation_type"):
             prof = gg.groupby("lookback_start")["loss_delta"].mean()
-            ax.plot(prof.index, prof.values, "o-", ms=3, label=str(ptype))
+            xvals = np.maximum(prof.index.to_numpy(dtype=float), 1.0)
+            ax.plot(xvals, prof.values, "o-", ms=3, label=str(ptype))
         ax.axhline(0, color="k", lw=0.5)
-        ax.set_xscale("symlog", base=2, linthresh=32)
+        # Lookback is a non-negative distance.  A plain log axis avoids the
+        # meaningless 2**-k ticks produced by symlog around zero; put the first
+        # block at x=1 solely for plotting and label that tick as zero.
+        ax.set_xscale("log", base=2)
+        ax.set_xlim(left=1)
         ax.set_xlabel("lookback")
         ax.set_title(f"W={W}", fontsize=9)
         ax.grid(True, alpha=0.3)
     axes[0][0].set_ylabel("mean Δ loss")
     axes[0][0].legend(fontsize=6)
-    _save(fig, out_dir, "03c_perturbation_profiles.png")
+    suffix = "" if dataset is None else "_" + "".join(
+        c if c.isalnum() or c in "-_" else "_" for c in str(dataset))
+    title = "03c_perturbation_profiles" + suffix + ".png"
+    _save(fig, out_dir, title)
 
 
 # -- 4. activation-patching heatmap ------------------------------------------------
@@ -325,6 +358,13 @@ def generate_all(run_dir: str, tolerance: float = 0.05) -> None:
         fig_masking_effect(df, out_dir)
         fig_block_heatmaps(df, out_dir)
         fig_perturbation_profiles(df, out_dir)
+        # The pooled plot is useful for the headline result, but can conceal
+        # periodic/AR/trend and real-world differences.  Persist one profile per
+        # dataset as well; synthetic families already encoded as distinct
+        # dataset names are consequently kept separate.
+        for dataset in sorted(df.loc[df["method"] == "perturbation",
+                                     "dataset"].dropna().unique()):
+            fig_perturbation_profiles(df, out_dir, str(dataset))
         fig_patching_heatmaps(df, out_dir)
         fig_lens_heatmaps(df, out_dir)
         fig_cross_method(df, out_dir)

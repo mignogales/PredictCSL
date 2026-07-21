@@ -23,6 +23,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from context_interpretability.adapters.base import (
     CapabilityError, InterpretabilityAdapter)
@@ -186,6 +187,14 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
                            "target": target_kind, "limitations": LIMITATIONS,
                            "completeness": {}, "convergence": {}}
 
+        per_baseline = 1 + sum(s != steps for s in conv_steps)
+        total = len(baselines) * per_baseline
+        total += int(bool(icfg.get("supplementary_loss_target", True)
+                          and baselines))
+        progress = tqdm(total=total,
+                        desc=f"exp5 {adapter.name} {data.name} W={W}",
+                        unit="IG run", dynamic_ncols=True)
+
         for bl_name, bl in baselines.items():
             # convergence sweep on the primary baseline order (spec §8.4)
             conv = {}
@@ -194,11 +203,13 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
                     continue
                 a_s, ce_s = integrated_gradients(
                     adapter, window, bl, s, ibs, target_kind)
+                progress.update(1)
                 conv[str(s)] = {
                     "mean_completeness_err": float(np.nanmean(ce_s)),
                     "mean_abs_attr": float(np.nanmean(np.abs(a_s)))}
             attr, comp_err = integrated_gradients(
                 adapter, window, bl, steps, ibs, target_kind)
+            progress.update(1)
             conv[str(steps)] = {
                 "mean_completeness_err": float(np.nanmean(comp_err)),
                 "mean_abs_attr": float(np.nanmean(np.abs(attr)))}
@@ -230,9 +241,12 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
             bl_name, bl = next(iter(baselines.items()))
             attr_l, _ = integrated_gradients(
                 adapter, window, bl, steps, ibs, "loss", data.targets)
+            progress.update(1)
             np.savez(os.path.join(cell, "attr_loss_target.npz"),
                      attributions=attr_l.astype(np.float32),
                      baseline=bl_name)
+
+        progress.close()
 
         writer.finalize(cell_meta)
         print(f"[exp5][{adapter.name}] {data.name} w{W}: "

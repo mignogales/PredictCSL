@@ -26,6 +26,7 @@ import os
 from typing import Dict, List
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from context_interpretability.adapters.base import (
     CapabilityError, InterpretabilityAdapter)
@@ -84,7 +85,9 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
     run_methods = scfg.get("run_methods", ["perturbation"])
     summary: List[dict] = []
 
-    for spec in _control_specs(scfg):
+    specs = _control_specs(scfg)
+    for spec in tqdm(specs, desc=f"exp4 {adapter.name} controls",
+                     unit="dataset", dynamic_ncols=True):
         ds_dir = os.path.join(out_dir, spec.name)
         os.makedirs(ds_dir, exist_ok=True)
         contexts, targets, gates = generate_control(

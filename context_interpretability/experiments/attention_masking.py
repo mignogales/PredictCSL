@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from typing import List
+from tqdm.auto import tqdm
 
 from context_interpretability.adapters.base import (
     CapabilityError, InterpretabilityAdapter)
@@ -55,7 +56,10 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
 
         # every effective grid length strictly below W is a visible-span level
         visibles = [e for _r, e in pairs if e < W]
-        for L in visibles:
+        progress = tqdm(visibles,
+                        desc=f"exp0 {adapter.name} {data.name} W={W}",
+                        unit="mask", dynamic_ncols=True)
+        for L in progress:
             masked_pred = adapter.forecast_attention_masked(window, L)
             eff = intervention_effects(clean_pred, clean_loss, masked_pred,
                                        cache)
