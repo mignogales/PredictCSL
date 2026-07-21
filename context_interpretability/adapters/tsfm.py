@@ -25,6 +25,7 @@ as context_attention_mask):
 from __future__ import annotations
 
 import math
+import logging
 import re
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -84,6 +85,14 @@ class TSFMAdapter(InterpretabilityAdapter):
         else:
             from experiments.build_context_length_dataset import setup_model
             self._base = setup_model(self.family, self.model_id, self.device)
+        if self.family == "patchtst_fm":
+            # The upstream forward logs context/forecast lengths at INFO on
+            # every batch.  Besides being redundant here, those lines break
+            # tqdm's in-place rendering.  Silence only this module; warnings
+            # and errors, and logging from every other model, remain visible.
+            logging.getLogger(
+                "tsfm_public.models.patchtst_fm.modeling_patchtst_fm"
+            ).setLevel(logging.WARNING)
         self._refresh_patch_length()
 
     def _timesfm_ensure_config(self, width: int) -> None:
