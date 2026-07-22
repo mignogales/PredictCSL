@@ -125,6 +125,8 @@ N_SERIES   = 50_000
 SEED       = 42
 BATCH_SIZE = 32              # TSFM inference batch size
 SHARD_SIZE = 500             # series per shard (parallelism + resume granularity)
+DYNAMIC_BATCH_REFERENCE_CONTEXT = 8192
+DYNAMIC_BATCH_MAX_SIZE = 4096
 
 # -- Short / padded series ----------------------------------------------------
 # A fraction of series mimic real-world short inputs: the genuine signal occupies
@@ -956,12 +958,19 @@ def _forecast_uniform(
     horizon: int,
     batch_size: int,
     device: str,
+    dynamic_batching: bool = False,
+    max_batch_size: Optional[int] = None,
+    tuned_batch_sizes: Optional[dict] = None,
 ) -> torch.Tensor:
     """Forecast a uniform-width batch; return median (n, horizon) on `device`.
 
     moirai/timesfm recompile against `width`, so this is called once per distinct
     context width (see forecast_window's grouping)."""
-    n = x_all.shape[0]
+    n = int(x_all.shape[0])
+    max_batch_size = max(batch_size, int(max_batch_size or batch_size))
+    tuned_batch_sizes = tuned_batch_sizes if tuned_batch_sizes is not None else {}
+    cached_batch = tuned_batch_sizes.get(int(width))
+    current_batch = min(cached_batch or batch_size, max_batch_size, n)
     if family == "moirai":
         runner = _build_moirai(base, horizon, width, device)
     elif family == "timesfm":
@@ -970,31 +979,62 @@ def _forecast_uniform(
         runner = base
 
     medians: List[torch.Tensor] = []
-    for start in range(0, n, batch_size):
-        xb = x_all[start:start + batch_size]
-        if family == "chronos2":
-            m = predict_chronos2(runner, xb, horizon, device)
-        elif family == "chronos_bolt":
-            m = predict_chronos_bolt(runner, xb, horizon, device)
-        elif family == "moirai":
-            m = predict_moirai(runner, xb, horizon, device)
-        elif family == "timesfm":
-            m = predict_timesfm(runner, xb, horizon, device)
-        elif family == "patchtst_fm":
-            m = predict_patchtst_fm(runner, xb, horizon, device)
-        elif family == "sundial":
-            m = predict_sundial(runner, xb, horizon, device)
-        elif family == "timemoe":
-            m = predict_timemoe(runner, xb, horizon, device)
-        elif family == "toto":
-            m = predict_toto(runner, xb, horizon, device)
-        elif family == "flowstate":
-            m = predict_flowstate(runner, xb, horizon, device)
-        elif family == "tirex":
-            m = predict_tirex(runner, xb, horizon, device)
-        else:
-            raise ValueError(f"Unknown model family: {family}")
+    start = 0
+    last_success = 0
+    probing = (dynamic_batching and _is_cuda(device) and family != "timesfm"
+               and cached_batch is None and current_batch < min(max_batch_size, n))
+    while start < n:
+        size = min(current_batch, n - start)
+        xb = x_all[start:start + size]
+        try:
+            if family == "chronos2":
+                m = predict_chronos2(runner, xb, horizon, device)
+            elif family == "chronos_bolt":
+                m = predict_chronos_bolt(runner, xb, horizon, device)
+            elif family == "moirai":
+                m = predict_moirai(runner, xb, horizon, device)
+            elif family == "timesfm":
+                m = predict_timesfm(runner, xb, horizon, device)
+            elif family == "patchtst_fm":
+                m = predict_patchtst_fm(runner, xb, horizon, device)
+            elif family == "sundial":
+                m = predict_sundial(runner, xb, horizon, device)
+            elif family == "timemoe":
+                m = predict_timemoe(runner, xb, horizon, device)
+            elif family == "toto":
+                m = predict_toto(runner, xb, horizon, device)
+            elif family == "flowstate":
+                m = predict_flowstate(runner, xb, horizon, device)
+            elif family == "tirex":
+                m = predict_tirex(runner, xb, horizon, device)
+            else:
+                raise ValueError(f"Unknown model family: {family}")
+        except Exception as exc:
+            if (not dynamic_batching or not _is_cuda_oom(exc) or size <= 1):
+                raise
+            del exc
+            torch.cuda.empty_cache()
+            current_batch = max(1, last_success or size // 2)
+            probing = False
+            tuned_batch_sizes[int(width)] = current_batch
+            print(Fore.YELLOW + f"  dynamic batch [{family}] W={width}: "
+                  + f"OOM at {size}; using {current_batch}" + Fore.RESET,
+                  flush=True)
+            continue
         medians.append(m)
+        start += size
+        if probing and size == current_batch:
+            last_success = current_batch
+            current_batch = min(max_batch_size, n, current_batch * 2)
+            probing = current_batch > last_success
+
+    if dynamic_batching and _is_cuda(device):
+        tuned = max(1, last_success or min(current_batch, n))
+        if cached_batch is None:
+            tuned_batch_sizes[int(width)] = tuned
+            print(Fore.CYAN + f"  dynamic batch [{family}] W={width}: tuned={tuned}, "
+                  + f"search_cap={min(max_batch_size, n)}" + Fore.RESET,
+                  flush=True)
 
     if family in ("moirai", "timesfm"):
         del runner
@@ -1014,6 +1054,10 @@ def forecast_window(
     horizon: int,
     batch_size: int,
     device: str,
+    dynamic_batching: bool = False,
+    batch_reference_context: int = DYNAMIC_BATCH_REFERENCE_CONTEXT,
+    max_batch_size: int = DYNAMIC_BATCH_MAX_SIZE,
+    tuned_batch_sizes: Optional[dict] = None,
 ) -> torch.Tensor:
     """Forecast the horizon for every series using only its *genuine* context.
 
@@ -1041,11 +1085,33 @@ def forecast_window(
         idx = np.flatnonzero(eff_buck == L)
         x_grp = torch.from_numpy(
             np.ascontiguousarray(contexts[idx, -int(L):])).unsqueeze(-1)  # (g, L, 1)
+        effective_batch = batch_size_for_context(
+            batch_size, int(L), len(idx), dynamic_batching,
+            batch_reference_context, max_batch_size)
         med = _forecast_uniform(
-            family, base, model_id, x_grp, int(L), horizon, batch_size, device)
+            family, base, model_id, x_grp, int(L), horizon, effective_batch,
+            device, dynamic_batching, max_batch_size, tuned_batch_sizes)
         out[torch.as_tensor(idx, device=device, dtype=torch.long)] = med
 
     return out                                          # (N, H)
+
+
+def batch_size_for_context(base_batch_size: int, context_length: int,
+                           n_samples: int, dynamic_batching: bool,
+                           reference_context: int,
+                           max_batch_size: int) -> int:
+    """Token-budgeted initial microbatch for a Stage-1 context width."""
+    size = max(1, int(base_batch_size))
+    if dynamic_batching:
+        scale = max(1, int(reference_context) // max(1, int(context_length)))
+        size = min(max(size, int(max_batch_size)), size * scale)
+    return max(1, min(size, int(n_samples)))
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
 # ==============================================================================
@@ -1078,6 +1144,9 @@ def gpu_worker(
     max_horizon: int,
     batch_size: int,
     win_indices: List[int],
+    dynamic_batching: bool,
+    batch_reference_context: int,
+    max_batch_size: int,
 ) -> None:
     """Load the TSFM once, then label series-shards until the queue drains.
 
@@ -1099,6 +1168,7 @@ def gpu_worker(
     n_win = len(WINDOW_GRID)
     n_h = len(HORIZON_GRID)
     tb_shown = False        # print a full traceback only for the first shard failure
+    tuned_batch_sizes = {}  # safe CUDA microbatch cached across shards by width
 
     try:
         base = setup_model(family, model_id, device)
@@ -1145,7 +1215,9 @@ def gpu_worker(
                     continue
                 medians = forecast_window(
                     family, base, model_id, ctx, w, real_len, max_horizon,
-                    batch_size, device)                     # (B, MAX_HORIZON)
+                    batch_size, device, dynamic_batching,
+                    batch_reference_context, max_batch_size,
+                    tuned_batch_sizes)                      # (B, MAX_HORIZON)
                 for h_idx, h in enumerate(HORIZON_GRID):
                     err = medians[:, :h] - tgt_t[:, :h]
                     cm[:, w_idx, h_idx] = err.abs().mean(dim=1).cpu().numpy()
@@ -1273,7 +1345,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-series", type=int, default=N_SERIES,
                    help="Number of synthetic series.")
     p.add_argument("--batch-size", type=int, default=BATCH_SIZE,
-                   help="TSFM inference batch size.")
+                   help="Safe TSFM batch size at --batch-reference-context.")
+    p.add_argument("--no-dynamic-batching", action="store_true",
+                   help="Disable CUDA batch autotuning and use --batch-size exactly.")
+    p.add_argument("--batch-reference-context", type=int,
+                   default=DYNAMIC_BATCH_REFERENCE_CONTEXT,
+                   help="Context width at which --batch-size is the initial batch.")
+    p.add_argument("--max-batch-size", type=int, default=DYNAMIC_BATCH_MAX_SIZE,
+                   help="Upper bound for dynamically tuned microbatches.")
     p.add_argument("--shard-size", type=int, default=SHARD_SIZE,
                    help="Series per shard (parallelism + resume granularity).")
     p.add_argument("--windows", type=int, nargs="+", default=None,
@@ -1420,7 +1499,9 @@ def main() -> None:
                     args=(i, dev, shard_queue, result_queue, model_dir,
                           contexts_path, targets_path, rlen_path,
                           model_id, family,
-                          MAX_HORIZON, args.batch_size, win_indices),
+                          MAX_HORIZON, args.batch_size, win_indices,
+                          not args.no_dynamic_batching,
+                          args.batch_reference_context, args.max_batch_size),
                     name=f"gpu_worker_{i}_{dev.replace(':', '')}",
                 )
                 p.start()
@@ -1457,6 +1538,12 @@ def main() -> None:
                 "window_indices": win_indices,
                 "shards_done": n_done, "shards_total": total_shards,
                 "devices": devices, "shard_size": args.shard_size,
+                "batching": {
+                    "dynamic": not args.no_dynamic_batching,
+                    "base_batch_size": args.batch_size,
+                    "reference_context": args.batch_reference_context,
+                    "max_batch_size": args.max_batch_size,
+                },
                 "created": datetime.now().isoformat(timespec="seconds"),
                 # Pool-level keys repeated here so predict_context_length.py can
                 # use this subdir as --dataset-dir without reading the parent meta.

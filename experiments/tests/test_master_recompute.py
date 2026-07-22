@@ -5,6 +5,7 @@ import os
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -299,6 +300,39 @@ class TiRexCompatibilityTest(unittest.TestCase):
             np.array([[1, 1, 1, 2, 2, 2, 3], [1, 1, 1, 2, 2, 2, 3]], dtype=np.float32),
         )
         self.assertEqual(model.context_lengths, [([4, 4], 3), ([5, 5], 3), ([5, 5], 1)])
+
+    def test_stage1_dynamic_batch_scales_with_context(self) -> None:
+        self.assertEqual(build.batch_size_for_context(
+            8, 8192, 500, True, 8192, 512), 8)
+        self.assertEqual(build.batch_size_for_context(
+            8, 2048, 500, True, 8192, 512), 32)
+        self.assertEqual(build.batch_size_for_context(
+            8, 32, 100, True, 8192, 512), 100)
+        self.assertEqual(build.batch_size_for_context(
+            8, 32, 100, False, 8192, 512), 8)
+
+    def test_stage1_tirex_dynamic_batch_backs_off_after_oom(self) -> None:
+        seen = []
+
+        def fake_predict(_runner, x, horizon, _device):
+            seen.append(len(x))
+            if len(x) > 4:
+                raise RuntimeError("CUDA out of memory")
+            return torch.zeros(len(x), horizon)
+
+        tuned = {}
+        x = torch.zeros(10, 32, 1)
+        with mock.patch.object(build, "_is_cuda", return_value=True), \
+             mock.patch.object(build, "predict_tirex", side_effect=fake_predict), \
+             mock.patch.object(torch.cuda, "empty_cache"):
+            result = build._forecast_uniform(
+                "tirex", object(), "unused", x, 32, 2, 8, "cuda:0",
+                dynamic_batching=True, max_batch_size=16,
+                tuned_batch_sizes=tuned)
+
+        self.assertEqual(tuple(result.shape), (10, 2))
+        self.assertEqual(seen[:2], [8, 4])
+        self.assertEqual(tuned[32], 4)
 
 
 if __name__ == "__main__":
