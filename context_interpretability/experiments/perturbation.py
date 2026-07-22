@@ -19,6 +19,7 @@ Output per cell (``.../exp1_perturbation/<dataset>/w<W>/``):
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -142,6 +143,19 @@ def _interventions(window: np.ndarray, blocks: List[TemporalBlock], W: int,
                     yield blk_obj, kind, severity, seed + s, pert
 
 
+def _next_group(jobs, size: int):
+    """Materialize up to ``size`` interventions for one adapter call."""
+    group = []
+    for _ in range(size):
+        try:
+            group.append(next(jobs))
+        except StopIteration:
+            break
+    if not group:
+        return None
+    return group, np.concatenate([job[4] for job in group], axis=0)
+
+
 # ------------------------------------------------------------------------------
 #  Runner
 # ------------------------------------------------------------------------------
@@ -196,25 +210,30 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
                         desc=f"exp1 {adapter.name} {data.name} W={W}",
                         unit="forward", dynamic_ncols=True)
 
-        jobs = _interventions(window, blocks, W, methods, noise_scales,
-                              n_seeds, seed, pcfg)
+        jobs = iter(_interventions(window, blocks, W, methods, noise_scales,
+                                   n_seeds, seed, pcfg))
+        predictions = []
         try:
-            while True:
-                group = []
-                for _ in range(interventions_per_call):
-                    try:
-                        group.append(next(jobs))
-                    except StopIteration:
-                        break
-                if not group:
-                    break
-                # All variants have identical (N, W) geometry. Concatenating
-                # them preserves predictions exactly and lets the adapter feed
-                # the GPU continuously across intervention boundaries.
-                stacked = np.concatenate([job[4] for job in group], axis=0)
-                stacked_pred = adapter.forecast(stacked)
-                for gi, (blk_obj, kind, severity, job_seed, _pert) in enumerate(
-                        group):
+            # Double-buffer intervention construction: while CUDA consumes the
+            # current group, a CPU worker prepares the next one. Scoring and
+            # row construction are deferred until all GPU work for the cell is
+            # submitted, eliminating those CPU gaps between model calls.
+            with ThreadPoolExecutor(max_workers=1,
+                                    thread_name_prefix="perturb-prefetch") as pool:
+                current = _next_group(jobs, interventions_per_call)
+                while current is not None:
+                    group, stacked = current
+                    future = pool.submit(_next_group, jobs,
+                                         interventions_per_call)
+                    stacked_pred = adapter.forecast(stacked)
+                    metadata = [job[:4] for job in group]  # drop large inputs
+                    predictions.append((metadata, stacked_pred))
+                    progress.update(len(group))
+                    current = future.result()
+
+            for metadata, stacked_pred in predictions:
+                for gi, (blk_obj, kind, severity, job_seed) in enumerate(
+                        metadata):
                     lo, hi = gi * data.n, (gi + 1) * data.n
                     pred = stacked_pred[lo:hi]
                     eff = intervention_effects(clean_pred, clean_loss, pred,
@@ -222,7 +241,6 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
                     _write_block_rows(
                         writer, adapter, data, requested, W, blk_obj, kind,
                         severity, job_seed, metric, eff)
-                progress.update(len(group))
         finally:
             progress.close()
         writer.finalize({"context_length": W, "block_length": P,

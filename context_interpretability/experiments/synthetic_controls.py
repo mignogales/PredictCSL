@@ -45,6 +45,49 @@ METHOD_RUNNERS = {
 }
 
 
+def _load_or_generate_control(spec: ControlSpec, n_inst: int,
+                              canonical_length: int, horizon: int, seed: int,
+                              cache_root: str):
+    """Generate each control pool once and share it across model runs."""
+    os.makedirs(cache_root, exist_ok=True)
+    path = os.path.join(
+        cache_root,
+        f"{spec.name}_n{n_inst}_t{canonical_length}_h{horizon}_s{seed}.npz")
+    if os.path.exists(path):
+        z = np.load(path)
+        gates = z["gates"] if bool(z["has_gates"]) else None
+        return z["contexts"], z["targets"], gates
+    contexts, targets, gates = generate_control(
+        spec, n_inst, canonical_length, horizon, seed)
+    tmp = f"{path}.{os.getpid()}.tmp.npz"
+    np.savez_compressed(
+        tmp, contexts=contexts, targets=targets,
+        gates=np.empty((0,), dtype=np.int8) if gates is None else gates,
+        has_gates=np.asarray(gates is not None))
+    os.replace(tmp, path)
+    return contexts, targets, gates
+
+
+def _load_or_compute_oracle(contexts: np.ndarray, gates, spec: ControlSpec,
+                            alpha: float, seed: int, cache_root: str) -> dict:
+    path = os.path.join(
+        cache_root,
+        f"{spec.name}_oracle_t{contexts.shape[1]}_a{alpha:g}_s{seed}.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    oracle = verify_distant_information(contexts, spec, alpha=alpha,
+                                        seed=seed)
+    if gates is not None:
+        oracle["gate_detect_accuracy"] = gate_detectable(
+            contexts, gates, spec, seed)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(oracle, f, default=_json_default)
+    os.replace(tmp, path)
+    return oracle
+
+
 def sufficient_context(windows: List[int], mean_curve: np.ndarray,
                        tolerance: float) -> int:
     """Smallest window whose error is within (1+tol) of the curve minimum."""
@@ -80,18 +123,25 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
     scfg = config.get("synthetic_controls") or {}
     tol = float(scfg.get("sufficient_context_tolerance", 0.05))
     n_inst = int(scfg.get("n_instances", 128))
-    length = min(int(scfg.get("series_length", 8192)), adapter.max_context())
+    canonical_length = int(scfg.get("series_length", 8192))
+    length = min(canonical_length, adapter.max_context())
     metric = config.get("primary_metric", "mae")
     run_methods = scfg.get("run_methods", ["perturbation"])
     summary: List[dict] = []
+    cache_root = os.path.join(
+        config.get("output_root", os.path.dirname(out_dir)),
+        "_synthetic_control_cache")
 
     specs = _control_specs(scfg)
     for spec in tqdm(specs, desc=f"exp4 {adapter.name} controls",
                      unit="dataset", dynamic_ncols=True):
         ds_dir = os.path.join(out_dir, spec.name)
         os.makedirs(ds_dir, exist_ok=True)
-        contexts, targets, gates = generate_control(
-            spec, n_inst, length, adapter.horizon, seed)
+        contexts, targets, gates = _load_or_generate_control(
+            spec, n_inst, canonical_length, adapter.horizon, seed, cache_root)
+        # All models see the same forecast origin and target. Models with a
+        # smaller context budget consume the aligned suffix of the shared pool.
+        contexts = np.ascontiguousarray(contexts[:, -length:])
         data = ExperimentData(
             name=spec.name, contexts=contexts,
             targets=targets[:, :adapter.horizon],
@@ -100,14 +150,12 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
                       "gates": None if gates is None else gates.tolist()})
 
         # -- 1. oracle verification (always, before any model conclusion) ------
-        oracle = verify_distant_information(
-            contexts, spec, alpha=float(scfg.get("oracle_ridge_alpha", 1.0)),
-            seed=seed)
+        oracle = _load_or_compute_oracle(
+            contexts, gates, spec,
+            alpha=float(scfg.get("oracle_ridge_alpha", 1.0)), seed=seed,
+            cache_root=cache_root)
         broken = (spec.family in ("B", "C") and spec.strength > 0
                   and not oracle["distant_predictive"])
-        if gates is not None:
-            oracle["gate_detect_accuracy"] = gate_detectable(
-                contexts, gates, spec, seed)
 
         # -- 2. context-length error curve + sufficient context ----------------
         cache = CleanCache(adapter, data, metric,
