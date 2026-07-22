@@ -53,6 +53,9 @@ def available_models() -> List[str]:
 
 def build_adapter(display: str, horizon: int, device: str = "cuda:0",
                   batch_size: int = 16,
+                  dynamic_batching: bool = False,
+                  batch_reference_context: int = 1024,
+                  max_batch_size: Optional[int] = None,
                   caps_cfg: Optional[dict] = None) -> TSFMAdapter:
     from experiments.models_config import CATALOG
     match = [m for m in CATALOG if m.display == display]
@@ -62,4 +65,7 @@ def build_adapter(display: str, horizon: int, device: str = "cuda:0",
     spec = match[0]
     caps = capabilities_for(spec.family, spec.display, caps_cfg)
     return TSFMAdapter(spec.model_id, spec.family, spec.display, caps,
-                       horizon=horizon, device=device, batch_size=batch_size)
+                       horizon=horizon, device=device, batch_size=batch_size,
+                       dynamic_batching=dynamic_batching,
+                       batch_reference_context=batch_reference_context,
+                       max_batch_size=max_batch_size)

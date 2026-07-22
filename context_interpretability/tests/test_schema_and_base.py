@@ -71,6 +71,25 @@ class TestContextAlignment(unittest.TestCase):
         self.assertFalse(thinned2)
         self.assertEqual(len(subset2), 10)
 
+    def test_dynamic_batch_size_scales_with_short_contexts(self):
+        from context_interpretability.adapters.base import InterpretabilityAdapter
+        adapter = InterpretabilityAdapter(
+            "test", AdapterCapabilities(), horizon=8, batch_size=8,
+            dynamic_batching=True, batch_reference_context=1024,
+            max_batch_size=128)
+        self.assertEqual(adapter.batch_size_for(1024), 8)
+        self.assertEqual(adapter.batch_size_for(256), 32)
+        self.assertEqual(adapter.batch_size_for(32), 128)  # capped
+        self.assertEqual(adapter.batch_size_for(256, n_samples=10), 10)
+
+    def test_fixed_native_context_disables_width_scaling(self):
+        from context_interpretability.adapters.base import InterpretabilityAdapter
+        adapter = InterpretabilityAdapter(
+            "test", AdapterCapabilities(fixed_native_context=True), horizon=8,
+            batch_size=8, dynamic_batching=True,
+            batch_reference_context=1024, max_batch_size=128)
+        self.assertEqual(adapter.batch_size_for(32), 8)
+
 
 class _NestedMLPBlock(nn.Module):
     def __init__(self):

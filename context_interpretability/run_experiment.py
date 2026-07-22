@@ -120,9 +120,13 @@ def run_model(display: str, exps: List[str], config: dict, device: str,
     _seed_everything(seed)
 
     if not analyze_only:
-        adapter = build_adapter(display, horizon=int(config["horizon"]),
-                                device=device,
-                                batch_size=int(config.get("batch_size", 16)))
+        bcfg = config.get("dynamic_batching") or {}
+        adapter = build_adapter(
+            display, horizon=int(config["horizon"]), device=device,
+            batch_size=int(config.get("batch_size", 16)),
+            dynamic_batching=bool(bcfg.get("enabled", True)),
+            batch_reference_context=int(bcfg.get("reference_context", 1024)),
+            max_batch_size=int(bcfg.get("max_batch_size", 256)))
         meta = RunMeta(run_dir, config, display, device, seed)
         try:
             adapter.load()

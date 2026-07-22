@@ -118,12 +118,39 @@ class InterpretabilityAdapter:
     TSFM zoo) and tests/dummy_adapter.py (a tiny local model for CI)."""
 
     def __init__(self, name: str, capabilities: AdapterCapabilities,
-                 horizon: int, device: str = "cpu", batch_size: int = 16):
+                 horizon: int, device: str = "cpu", batch_size: int = 16,
+                 dynamic_batching: bool = False,
+                 batch_reference_context: int = 1024,
+                 max_batch_size: Optional[int] = None):
         self.name = name
         self.capabilities = capabilities
         self.horizon = int(horizon)
         self.device = device
         self.batch_size = int(batch_size)
+        self.dynamic_batching = bool(dynamic_batching)
+        self.batch_reference_context = max(1, int(batch_reference_context))
+        self.max_batch_size = max(
+            self.batch_size,
+            int(max_batch_size if max_batch_size is not None else batch_size))
+
+    def batch_size_for(self, context_length: int, n_samples: Optional[int] = None
+                       ) -> int:
+        """Choose a token-budgeted microbatch for a context width.
+
+        ``batch_size`` remains the safe size at ``batch_reference_context``
+        and above. Shorter inputs use proportionally more examples, capped by
+        ``max_batch_size`` and by the amount of work available. Models which
+        internally pad every input to their native width cannot benefit from
+        width scaling, so they retain the configured batch size.
+        """
+        size = self.batch_size
+        if self.dynamic_batching and not self.capabilities.fixed_native_context:
+            scale = max(1, self.batch_reference_context // max(
+                1, int(context_length)))
+            size = min(self.max_batch_size, self.batch_size * scale)
+        if n_samples is not None:
+            size = min(size, max(1, int(n_samples)))
+        return max(1, size)
 
     # -- context geometry ------------------------------------------------------
 
@@ -233,5 +260,11 @@ class InterpretabilityAdapter:
             "name": self.name,
             "horizon": self.horizon,
             "device": str(self.device),
+            "batching": {
+                "dynamic": self.dynamic_batching,
+                "base_batch_size": self.batch_size,
+                "reference_context": self.batch_reference_context,
+                "max_batch_size": self.max_batch_size,
+            },
             "capabilities": dataclasses.asdict(self.capabilities),
         }

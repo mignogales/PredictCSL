@@ -6,6 +6,13 @@ output_root: logs/experiments/context_interpretability
 seed: 42
 horizon: 64
 batch_size: 16
+# Keep approximately batch_size * reference_context input timesteps in each
+# GPU microbatch. This raises occupancy for short contexts without increasing
+# the known-safe batch at long contexts. Fixed-native-width models are exempt.
+dynamic_batching:
+  enabled: true
+  reference_context: 1024
+  max_batch_size: 256
 max_samples: 256            # per dataset; subsampling is recorded in run_meta
 
 # Primary loss metric — must match the main forecasting evaluation. MASE here is

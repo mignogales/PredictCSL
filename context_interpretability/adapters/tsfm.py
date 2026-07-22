@@ -56,14 +56,19 @@ class TSFMAdapter(InterpretabilityAdapter):
 
     def __init__(self, model_id: str, family: str, display: str,
                  capabilities: AdapterCapabilities, horizon: int,
-                 device: str = "cuda:0", batch_size: int = 16):
-        super().__init__(display, capabilities, horizon, device, batch_size)
+                 device: str = "cuda:0", batch_size: int = 16,
+                 dynamic_batching: bool = False,
+                 batch_reference_context: int = 1024,
+                 max_batch_size: Optional[int] = None):
+        super().__init__(display, capabilities, horizon, device, batch_size,
+                         dynamic_batching, batch_reference_context,
+                         max_batch_size)
         self.model_id = model_id
         self.family = family
         self._base = None
         self._backbone = None
         self._layer_names: Optional[List[str]] = None
-        self._timesfm_cfg = None          # (width, horizon) currently compiled
+        self._timesfm_cfg = None   # (width, horizon, batch size) active config
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -95,17 +100,17 @@ class TSFMAdapter(InterpretabilityAdapter):
             ).setLevel(logging.WARNING)
         self._refresh_patch_length()
 
-    def _timesfm_ensure_config(self, width: int) -> None:
-        if self._timesfm_cfg == (width, self.horizon):
+    def _timesfm_ensure_config(self, width: int, batch_size: int) -> None:
+        if self._timesfm_cfg == (width, self.horizon, batch_size):
             return
         import timesfm
         self._base.compile(timesfm.ForecastConfig(
             max_context=int(width), max_horizon=self.horizon,
             normalize_inputs=True, use_continuous_quantile_head=True,
-            force_flip_invariance=True, per_core_batch_size=self.batch_size,
+            force_flip_invariance=True, per_core_batch_size=batch_size,
             infer_is_positive=True, fix_quantile_crossing=True,
         ))
-        self._timesfm_cfg = (int(width), self.horizon)
+        self._timesfm_cfg = (int(width), self.horizon, int(batch_size))
 
     def close(self) -> None:
         self._base = None
@@ -162,7 +167,7 @@ class TSFMAdapter(InterpretabilityAdapter):
         import torch
         from experiments import build_context_length_dataset as bcl
         if self.family == "timesfm":
-            self._timesfm_ensure_config(width)
+            self._timesfm_ensure_config(width, batch_size)
             meds = [bcl.predict_timesfm(self._base, x[s:s + batch_size],
                                         self.horizon, self.device)
                     for s in range(0, x.shape[0], batch_size)]
@@ -177,8 +182,9 @@ class TSFMAdapter(InterpretabilityAdapter):
         x = torch.from_numpy(
             np.ascontiguousarray(contexts, dtype=np.float32)).unsqueeze(-1)
         with torch.no_grad():
-            med = self._uniform_forecast(x, int(contexts.shape[1]),
-                                         self.batch_size)
+            width = int(contexts.shape[1])
+            med = self._uniform_forecast(
+                x, width, self.batch_size_for(width, len(contexts)))
         return med.float().cpu().numpy()
 
     # -- Experiment 0: attention masking ------------------------------------------
@@ -195,7 +201,8 @@ class TSFMAdapter(InterpretabilityAdapter):
             np.ascontiguousarray(contexts, dtype=np.float32)).unsqueeze(-1)
         with torch.no_grad(), context_attention_mask(
                 self.family, self._base, int(visible_timesteps), W):
-            med = self._uniform_forecast(x, W, self.batch_size)
+            med = self._uniform_forecast(
+                x, W, self.batch_size_for(W, len(contexts)))
         return med.float().cpu().numpy()
 
     # -- layer access ---------------------------------------------------------------
@@ -285,9 +292,13 @@ class TSFMAdapter(InterpretabilityAdapter):
     def _forward_chunk(self, x_chunk) -> "object":
         """One uniform forward over a chunk (single internal batch)."""
         import torch
+        width = int(x_chunk.shape[1])
         with torch.no_grad():
-            return self._uniform_forecast(x_chunk, int(x_chunk.shape[1]),
-                                          int(x_chunk.shape[0]))
+            # Keep the configured capacity stable for a short final chunk.
+            # TimesFM includes this value in its ForecastConfig, so using the
+            # actual final-chunk length would needlessly rebuild the config.
+            return self._uniform_forecast(
+                x_chunk, width, self.batch_size_for(width))
 
     # -- Experiment 2: activation capture / patching --------------------------------
 
@@ -313,9 +324,10 @@ class TSFMAdapter(InterpretabilityAdapter):
             return hook
 
         with self._hooks([(m, make_hook(n)) for n, m in mods.items()]):
-            for start in range(0, x.shape[0], self.batch_size):
+            batch_size = self.batch_size_for(x.shape[1], x.shape[0])
+            for start in range(0, x.shape[0], batch_size):
                 fired.clear()
-                self._forward_chunk(x[start:start + self.batch_size])
+                self._forward_chunk(x[start:start + batch_size])
         out: Dict[str, object] = {}
         for n in layers:
             if not store[n]:
@@ -364,8 +376,9 @@ class TSFMAdapter(InterpretabilityAdapter):
             return self._replace_hidden(out, new_h)
 
         with self._hooks([(mods[layer_name], hook)]):
-            for start in range(0, x.shape[0], self.batch_size):
-                chunk = x[start:start + self.batch_size]
+            batch_size = self.batch_size_for(x.shape[1], x.shape[0])
+            for start in range(0, x.shape[0], batch_size):
+                chunk = x[start:start + batch_size]
                 state.update(start=start, chunk=int(chunk.shape[0]), fired=False)
                 preds.append(self._forward_chunk(chunk).float().cpu())
         return torch.cat(preds, dim=0).numpy()
@@ -432,10 +445,11 @@ class TSFMAdapter(InterpretabilityAdapter):
             np.ascontiguousarray(contexts, dtype=np.float32)).unsqueeze(-1)
         preds: List[torch.Tensor] = []
         with self._hooks([(mod, identity_hook) for mod in mods.values()]):
-            for start in range(0, x.shape[0], self.batch_size):
+            batch_size = self.batch_size_for(x.shape[1], x.shape[0])
+            for start in range(0, x.shape[0], batch_size):
                 preds.append(
                     self._forward_chunk(
-                        x[start:start + self.batch_size]).float().cpu())
+                        x[start:start + batch_size]).float().cpu())
         return torch.cat(preds, dim=0).numpy()
 
     # -- Experiment 5: integrated gradients -----------------------------------------
