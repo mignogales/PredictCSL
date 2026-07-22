@@ -115,6 +115,41 @@ class TestIntegratedGradientsExp5(unittest.TestCase):
 
 
 class TestSyntheticControlsExp4(unittest.TestCase):
+    def test_compact_design_and_sentinel_selection(self):
+        cfg = make_config("unused")
+        cfg["synthetic_controls"].update({
+            "local_kinds": ["linear", "nonlinear", "seasonal"],
+            "distant_lags": [32, 64, 128, 256],
+            "dependency_strengths": [0.0, 0.5, 1.0],
+            "noise_levels": [0.1],
+            "noise_robustness": {
+                "lag": 128, "strength": 1.0,
+                "extra_noise_levels": [0.05, 0.25],
+            },
+            "run_methods": ["perturbation", "attention_masking"],
+            "sentinel_methods": ["activation_patching",
+                                 "integrated_gradients"],
+            "sentinel_lags": [32, 256],
+            "sentinel_strengths": [0.0, 1.0],
+        })
+        specs = synthetic_controls._control_specs(cfg["synthetic_controls"])
+        self.assertEqual(len(specs), 18)
+        self.assertEqual(sum(role == "core" for _spec, role in specs), 12)
+        self.assertEqual(sum(role == "noise_robustness"
+                             for _spec, role in specs), 2)
+        sentinel = next((spec, role) for spec, role in specs
+                        if spec.family == "B" and spec.distant_lag == 256
+                        and spec.strength == 1.0 and role == "core")
+        methods = synthetic_controls._methods_for_spec(
+            *sentinel, cfg["synthetic_controls"])
+        self.assertIn("integrated_gradients", methods)
+        nonsentinel = next((spec, role) for spec, role in specs
+                           if spec.family == "B" and spec.distant_lag == 64
+                           and spec.strength == 0.5 and role == "core")
+        methods = synthetic_controls._methods_for_spec(
+            *nonsentinel, cfg["synthetic_controls"])
+        self.assertNotIn("integrated_gradients", methods)
+
     def test_summary_and_oracle(self):
         adapter = DummyAdapter()
         with tempfile.TemporaryDirectory() as tmp:

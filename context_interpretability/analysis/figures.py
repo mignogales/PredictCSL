@@ -73,6 +73,16 @@ def _column_normalize_signed(piv: pd.DataFrame,
     return pd.DataFrame(vals / scales, index=piv.index, columns=piv.columns)
 
 
+def _normalize_profile(prof: pd.Series) -> tuple[pd.Series, float]:
+    """Scale a profile by its largest absolute value, preserving its sign."""
+    values = prof.to_numpy(dtype=float)
+    finite = np.isfinite(values)
+    scale = float(np.max(np.abs(values[finite]))) if finite.any() else 0.0
+    if scale == 0.0:
+        return prof.copy(), scale
+    return prof / scale, scale
+
+
 # -- 1. context length vs forecasting error --------------------------------------
 
 def fig_error_curve(clean_cache_dir: str, out_dir: str, tag: str) -> None:
@@ -99,18 +109,59 @@ def fig_error_curve(clean_cache_dir: str, out_dir: str, tag: str) -> None:
 
 # -- 2. attention-masking effect vs lookback --------------------------------------
 
+def _sliced_loss_delta_profiles(df: pd.DataFrame,
+                                masking: pd.DataFrame) -> Dict[int, pd.Series]:
+    """Loss change from actually slicing to L, relative to each full W.
+
+    Clean loss is repeated across intervention rows, so first reduce it to one
+    value per sample and context.  Pairing by sample keeps the sliced baseline
+    comparable to masking's ``masked(L) - clean(W)`` effect and avoids weighting
+    samples by the number of experiment rows they happen to have.
+    """
+    keys = ["model", "dataset", "sample_id", "context_length"]
+    required = set(keys + ["clean_loss"])
+    if masking.empty or not required.issubset(df.columns):
+        return {}
+    clean = (df[keys + ["clean_loss"]]
+             .dropna(subset=["clean_loss"])
+             .groupby(keys, as_index=False, dropna=False)["clean_loss"].mean())
+    profiles: Dict[int, pd.Series] = {}
+    for W, group in masking.groupby("context_length"):
+        full = clean[clean["context_length"] == W].rename(
+            columns={"clean_loss": "full_loss"})
+        points = {}
+        for L in sorted(group["lookback_start"].dropna().unique()):
+            sliced = clean[clean["context_length"] == L].rename(
+                columns={"clean_loss": "sliced_loss"})
+            paired = sliced.merge(
+                full, on=["model", "dataset", "sample_id"], how="inner")
+            if not paired.empty:
+                points[L] = float(
+                    (paired["sliced_loss"] - paired["full_loss"]).mean())
+        if points:
+            profiles[int(W)] = pd.Series(points, dtype=float)
+    return profiles
+
+
 def fig_masking_effect(df: pd.DataFrame, out_dir: str) -> None:
     d = df[df["method"] == "attention_masking"]
     if d.empty:
         return
+    collapsed = agg.collapse_seeds(d)
+    sliced_profiles = _sliced_loss_delta_profiles(df, collapsed)
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    for W, g in agg.collapse_seeds(d).groupby("context_length"):
+    for W, g in collapsed.groupby("context_length"):
         prof = g.groupby("lookback_start")["loss_delta"].mean()
-        ax.plot(prof.index, prof.values, "o-", label=f"W={W}")
+        line, = ax.plot(prof.index, prof.values, "o-",
+                        label=f"W={W} masked")
+        sliced = sliced_profiles.get(int(W))
+        if sliced is not None:
+            ax.plot(sliced.index, sliced.values, "s--", color=line.get_color(),
+                    label=f"W={W} sliced")
     ax.set_xscale("log", base=2)
     ax.set_xlabel("visible span L (timesteps) — everything older is masked")
-    ax.set_ylabel("Δ loss (masked − clean)")
-    ax.set_title("attention masking: effect vs visible span")
+    ax.set_ylabel("Δ loss vs full-W clean input")
+    ax.set_title("attention masking vs input slicing")
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
     _save(fig, out_dir, "02_masking_effect_vs_lookback.png")
@@ -146,8 +197,12 @@ def fig_block_heatmaps(df: pd.DataFrame, out_dir: str) -> None:
 
 def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str,
                               dataset: Optional[str] = None) -> None:
-    """Per-context line plots: effect vs lookback, one curve per perturbation
-    type (spec §4.4)."""
+    """Per-context normalized effect profiles, one per perturbation type.
+
+    Each curve is divided by its own maximum absolute effect so a
+    high-magnitude perturbation cannot hide the shapes of the other curves.
+    The original scale used for normalization is retained in the legend.
+    """
     d = df[df["method"] == "perturbation"]
     if dataset is not None:
         d = d[d["dataset"] == dataset]
@@ -160,8 +215,10 @@ def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str,
         g = agg.collapse_seeds(d[d["context_length"] == W])
         for ptype, gg in g.groupby("perturbation_type"):
             prof = gg.groupby("lookback_start")["loss_delta"].mean()
+            normalized, max_abs = _normalize_profile(prof)
             xvals = np.maximum(prof.index.to_numpy(dtype=float), 1.0)
-            ax.plot(xvals, prof.values, "o-", ms=3, label=str(ptype))
+            ax.plot(xvals, normalized.values, "o-", ms=3,
+                    label=f"{ptype} (max |Δ|={max_abs:.3g})")
         ax.axhline(0, color="k", lw=0.5)
         # Lookback is a non-negative distance.  A plain log axis avoids the
         # meaningless 2**-k ticks produced by symlog around zero; put the first
@@ -170,9 +227,9 @@ def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str,
         ax.set_xlim(left=1)
         ax.set_xlabel("lookback")
         ax.set_title(f"W={W}", fontsize=9)
+        ax.legend(fontsize=6)
         ax.grid(True, alpha=0.3)
-    axes[0][0].set_ylabel("mean Δ loss")
-    axes[0][0].legend(fontsize=6)
+    axes[0][0].set_ylabel("normalized mean Δ loss (per perturbation type)")
     suffix = "" if dataset is None else "_" + "".join(
         c if c.isalnum() or c in "-_" else "_" for c in str(dataset))
     title = "03c_perturbation_profiles" + suffix + ".png"

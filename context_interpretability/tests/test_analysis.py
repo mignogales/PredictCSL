@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 import numpy as np
+import pandas as pd
 
 from context_interpretability.analysis import aggregate as agg
 from context_interpretability.analysis import figures, hypotheses
@@ -58,6 +59,29 @@ class TestAnalysis(unittest.TestCase):
         piv = agg.heatmap_matrix(self.df[self.df["method"] == "perturbation"])
         self.assertEqual(list(piv.columns), [16, 32, 64])
         self.assertIn(0, piv.index)                     # lookback 0 present
+
+    def test_profile_normalization_preserves_sign_and_reports_scale(self):
+        prof = pd.Series([-2.0, 1.0, np.nan])
+        normalized, max_abs = figures._normalize_profile(prof)
+        self.assertEqual(max_abs, 2.0)
+        np.testing.assert_allclose(normalized.iloc[:2], [-1.0, 0.5])
+        self.assertTrue(np.isnan(normalized.iloc[2]))
+
+    def test_sliced_profile_is_paired_against_full_context(self):
+        rows = []
+        for sample, loss16, loss32 in [("a", 3.0, 1.0),
+                                       ("b", 6.0, 2.0)]:
+            for W, loss in [(16, loss16), (32, loss32)]:
+                rows.append({
+                    "model": "m", "dataset": "d", "sample_id": sample,
+                    "context_length": W, "lookback_start": 16,
+                    "clean_loss": loss, "method": "attention_masking",
+                })
+        frame = pd.DataFrame(rows)
+        profiles = figures._sliced_loss_delta_profiles(
+            frame, frame[frame["context_length"] == 32])
+        self.assertEqual(list(profiles[32].index), [16])
+        self.assertAlmostEqual(profiles[32].iloc[0], 3.0)
 
     def test_lens_matrices(self):
         mats = agg.lens_matrices(self.df)

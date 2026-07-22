@@ -20,6 +20,7 @@ limitation (``limitation_flag``), never as adaptive ignoring (spec §7.6).
 
 from __future__ import annotations
 
+import copy
 import itertools
 import json
 import os
@@ -98,24 +99,57 @@ def sufficient_context(windows: List[int], mean_curve: np.ndarray,
     return int(windows[-1])
 
 
-def _control_specs(scfg: dict) -> List[ControlSpec]:
-    specs: List[ControlSpec] = []
+def _control_specs(scfg: dict) -> List[tuple[ControlSpec, str]]:
+    """Return the compact core design plus explicitly labelled anchor cells."""
+    specs: List[tuple[ControlSpec, str]] = []
     r = int(scfg.get("local_order", 8))
     dk = scfg.get("distant_kind", "linear")
     noises = scfg.get("noise_levels", [0.1])
     for kind in scfg.get("local_kinds", ["linear"]):
-        specs.append(ControlSpec("A", kind, r, noise=float(noises[0])))
+        specs.append((ControlSpec("A", kind, r, noise=float(noises[0])),
+                      "local_control"))
     for d, s, nz in itertools.product(scfg.get("distant_lags", [64]),
                                       scfg.get("dependency_strengths", [0.5]),
                                       noises):
-        specs.append(ControlSpec("B", "linear", r, int(d), float(s), dk,
-                                 float(nz)))
+        specs.append((ControlSpec("B", "linear", r, int(d), float(s), dk,
+                                  float(nz)), "core"))
+
+    # Noise is a robustness check at one predeclared anchor, not a fully
+    # crossed factor. Labelling these cells prevents pseudo-replication in H4.
+    robust = scfg.get("noise_robustness") or {}
+    if robust:
+        anchor_d = int(robust.get("lag", scfg.get("distant_lags", [64])[0]))
+        anchor_s = float(robust.get(
+            "strength", max(scfg.get("dependency_strengths", [0.5]))))
+        existing = {(spec.distant_lag, spec.strength, spec.noise)
+                    for spec, _role in specs if spec.family == "B"}
+        for nz in robust.get("extra_noise_levels", []):
+            key = (anchor_d, anchor_s, float(nz))
+            if key not in existing:
+                specs.append((ControlSpec("B", "linear", r, anchor_d,
+                                          anchor_s, dk, float(nz)),
+                              "noise_robustness"))
+                existing.add(key)
     mid = scfg.get("distant_lags", [64])
-    specs.append(ControlSpec("C", "linear", r, int(mid[len(mid) // 2]),
-                             float(max(scfg.get("dependency_strengths",
-                                                [0.5]))),
-                             dk, float(noises[0])))
+    specs.append((ControlSpec("C", "linear", r, int(mid[len(mid) // 2]),
+                              float(max(scfg.get("dependency_strengths",
+                                                 [0.5]))),
+                              dk, float(noises[0])), "conditional_control"))
     return specs
+
+
+def _methods_for_spec(spec: ControlSpec, role: str, scfg: dict) -> List[str]:
+    methods = list(scfg.get("run_methods", ["perturbation"]))
+    sentinel_lags = {int(v) for v in scfg.get("sentinel_lags", [])}
+    sentinel_strengths = {
+        float(v) for v in scfg.get("sentinel_strengths", [])}
+    is_sentinel = (role == "core" and spec.family == "B"
+                   and spec.distant_lag in sentinel_lags
+                   and spec.strength in sentinel_strengths)
+    if is_sentinel:
+        methods.extend(scfg.get("sentinel_methods", []))
+    # Preserve order while tolerating a method listed in both sets.
+    return list(dict.fromkeys(methods))
 
 
 def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
@@ -126,14 +160,17 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
     canonical_length = int(scfg.get("series_length", 8192))
     length = min(canonical_length, adapter.max_context())
     metric = config.get("primary_metric", "mae")
-    run_methods = scfg.get("run_methods", ["perturbation"])
     summary: List[dict] = []
     cache_root = os.path.join(
         config.get("output_root", os.path.dirname(out_dir)),
         "_synthetic_control_cache")
 
     specs = _control_specs(scfg)
-    for spec in tqdm(specs, desc=f"exp4 {adapter.name} controls",
+    exp_config = copy.deepcopy(config)
+    exp_config["context_lengths"] = list(
+        scfg.get("context_lengths", config["context_lengths"]))
+    for spec, design_role in tqdm(specs,
+                     desc=f"exp4 {adapter.name} controls",
                      unit="dataset", dynamic_ncols=True):
         ds_dir = os.path.join(out_dir, spec.name)
         os.makedirs(ds_dir, exist_ok=True)
@@ -160,7 +197,7 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
         # -- 2. context-length error curve + sufficient context ----------------
         cache = CleanCache(adapter, data, metric,
                            cache_dir=os.path.join(ds_dir, "clean_cache"))
-        pairs = adapter.effective_context_lengths(config["context_lengths"])
+        pairs = adapter.effective_context_lengths(exp_config["context_lengths"])
         pairs = [(r_, e) for r_, e in pairs if e <= length]
         eff = [e for _r, e in pairs]
         loss_mat, mean_curve = cache.error_curve(eff)
@@ -171,7 +208,9 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
 
         # -- 3. intervention methods on the control data ------------------------
         methods_run: List[str] = []
-        for m in run_methods:
+        for m in _methods_for_spec(spec, design_role, scfg):
+            if m not in METHOD_RUNNERS:
+                raise ValueError(f"Unknown Exp4 method: {m}")
             mod, cap = METHOD_RUNNERS[m]
             if cap is not None and not adapter.capabilities.supported(cap):
                 if run_meta:
@@ -179,7 +218,7 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
                                   f"{adapter.name}: capability off")
                 continue
             try:
-                mod.run(adapter, data, config,
+                mod.run(adapter, data, exp_config,
                         os.path.join(ds_dir, m), run_meta=run_meta, seed=seed)
                 methods_run.append(m)
             except CapabilityError as exc:
@@ -188,6 +227,7 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
 
         summary.append({
             "spec": dataclass_dict(spec), "dataset": spec.name,
+            "design_role": design_role,
             "oracle": oracle, "config_broken": broken,
             "windows": eff, "mean_error_curve": mean_curve.tolist(),
             "sufficient_context": suff, "methods_run": methods_run,

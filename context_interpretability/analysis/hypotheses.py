@@ -189,7 +189,8 @@ def evaluate_h4(run_dir: str) -> dict:
     with open(path) as f:
         summ = json.load(f)
     rows = [c for c in summ.get("controls", [])
-            if c["spec"]["family"] == "B" and not c.get("config_broken")]
+            if c["spec"]["family"] == "B" and not c.get("config_broken")
+            and c.get("design_role", "core") == "core"]
     strong = [c for c in rows if c["spec"]["strength"] >= 0.5]
     zero = [c for c in rows if c["spec"]["strength"] == 0.0]
     if not strong:

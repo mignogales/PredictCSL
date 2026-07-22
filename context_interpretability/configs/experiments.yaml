@@ -86,18 +86,28 @@ integrated_gradients:       # Experiment 5 (spec §8)
 
 synthetic_controls:         # Experiment 4 (spec §7)
   n_instances: 128
-  series_length: 8192
+  # Exp4 only needs to test whether context reaches the largest planted lag.
+  # Keep a 4x margin beyond d_max without paying for the global 8192 grid.
+  series_length: 1024
+  context_lengths: [16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024]
   local_order: 8            # r — local dependency length
   local_kinds: [linear, nonlinear, seasonal]
   distant_kind: linear      # linear | sin (g in f(local) + strength*g(X_{t-d}))
   distant_lags: [32, 64, 128, 256]
-  dependency_strengths: [0.0, 0.1, 0.25, 0.5, 1.0]
-  noise_levels: [0.05, 0.1, 0.25]
+  dependency_strengths: [0.0, 0.5, 1.0]
+  noise_levels: [0.1]       # core grid; robustness noises are anchor-only below
+  noise_robustness:
+    lag: 128
+    strength: 1.0
+    extra_noise_levels: [0.05, 0.25]
   family_c_fraction_distant: 0.5
   oracle_ridge_alpha: 1.0
-  # experiments to run per control dataset (subject to model capabilities)
-  run_methods: [perturbation, attention_masking, activation_patching,
-                integrated_gradients]
+  # Cheap primary methods run on every control. Expensive methods run only at
+  # the zero/maximum-strength, shortest/longest-lag sentinel cells.
+  run_methods: [perturbation, attention_masking]
+  sentinel_methods: [activation_patching, integrated_gradients]
+  sentinel_lags: [32, 256]
+  sentinel_strengths: [0.0, 1.0]
   sufficient_context_tolerance: 0.05   # err <= (1+tol)*min(err) => sufficient
 
 analysis:

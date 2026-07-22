@@ -190,6 +190,14 @@ CACHE_ROOT_PREDICTOR = "logs/experiments/context_length_predictor"
 #       baseline's mase_gluonts_real now runs the actual gluonts machinery.
 MASE_GLUONTS_VER = 3
 
+# Inference-only dynamic batching. ``--batch-size`` is interpreted as the safe
+# size at this reference width; shorter contexts start proportionally larger.
+# OOM-derived safe sizes are cached per model/width/horizon; accelerator OOMs
+# halve the candidate and retry the complete cell.
+DYNAMIC_BATCH_REFERENCE_CONTEXT = 1024
+DYNAMIC_BATCH_MAX_SIZE = 4096
+_DYNAMIC_BATCH_CACHE: Dict[Tuple[str, str, int, int], int] = {}
+
 
 # ==============================================================================
 #  FORECAST CONTAINER
@@ -882,6 +890,86 @@ def _run_batches(batches, desc, step):
             tgts.append(tgt.detach())
     cat = {key: torch.cat(vals, 0) for key, vals in acc.items()}
     return cat, torch.cat(tgts, 0)
+
+
+def _is_accelerator_oom(exc: BaseException) -> bool:
+    """Recognise allocation failures across CUDA and wrapped model stacks."""
+    message = str(exc).lower()
+    return isinstance(exc, torch.cuda.OutOfMemoryError) or any(fragment in message for fragment in (
+        "out of memory", "cuda oom", "cublas_status_alloc_failed",
+        "cudnn_status_alloc_failed", "mps backend out of memory",
+        "unable to allocate", "resource exhausted", "allocation failed",
+    ))
+
+
+def _clear_accelerator_cache() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    mps = getattr(torch, "mps", None)
+    if mps is not None and hasattr(mps, "empty_cache"):
+        try:
+            mps.empty_cache()
+        except Exception:
+            pass
+    gc.collect()
+
+
+def _rebatch(batches, batch_size: int):
+    """Re-slice a uniform-width CPU batch list without rebuilding the dataset."""
+    if not batches:
+        return []
+    all_x = torch.cat([batch["x"] for batch in batches], dim=0)
+    all_y = torch.cat([batch["y"] for batch in batches], dim=0)
+    return [
+        {"x": all_x[start:start + batch_size],
+         "y": all_y[start:start + batch_size]}
+        for start in range(0, all_x.shape[0], batch_size)
+    ]
+
+
+def _forecast_cell_dynamic(model_family, handle, model_id, batches, width,
+                           horizon, device, base_batch_size,
+                           flowstate_scale=FLOWSTATE_SCALE_FACTOR):
+    """Forecast one width using context-scaled batching with OOM backoff.
+
+    The returned batch size is persisted in cell metadata. Fixed-native-context
+    PatchTST-FM does not scale with the requested window, so it starts at the
+    configured base instead of receiving the short-window multiplier.
+    """
+    n_samples = sum(int(batch["x"].shape[0]) for batch in batches)
+    key = (str(model_id), model_family, int(width), int(horizon))
+    if key in _DYNAMIC_BATCH_CACHE:
+        candidate = min(_DYNAMIC_BATCH_CACHE[key], n_samples)
+    else:
+        scale = (1 if model_family == "patchtst_fm" else
+                 max(1, DYNAMIC_BATCH_REFERENCE_CONTEXT // max(1, int(width))))
+        candidate = min(n_samples, DYNAMIC_BATCH_MAX_SIZE,
+                        max(1, int(base_batch_size)) * scale)
+
+    reduced_after_oom = False
+    while True:
+        trial_batches = _rebatch(batches, candidate)
+        try:
+            result = _forecast_cell(
+                model_family, handle, model_id, trial_batches, width, horizon,
+                device, candidate, flowstate_scale=flowstate_scale)
+            # Do not cache a size merely capped by a tiny dataset: that would
+            # unnecessarily throttle a later, larger dataset at the same width.
+            if reduced_after_oom or key in _DYNAMIC_BATCH_CACHE:
+                _DYNAMIC_BATCH_CACHE[key] = candidate
+            return result[0], result[1], candidate
+        except Exception as exc:
+            if not _is_accelerator_oom(exc) or candidate <= 1:
+                raise
+            next_candidate = max(1, candidate // 2)
+            print(Fore.YELLOW
+                  + f"    dynamic batch {model_family} W={width}: OOM at "
+                    f"{candidate}; retrying with {next_candidate}"
+                  + Fore.RESET)
+            del trial_batches
+            _clear_accelerator_cache()
+            candidate = next_candidate
+            reduced_after_oom = True
 
 
 def load_chronos_bolt(model_id, device):
@@ -1935,14 +2023,16 @@ def _run_full_native_baseline(
             torch.cuda.synchronize()
 
     results = []
+    effective_batch_sizes = []
     _sync()
     t_start = time.perf_counter()
     for L, batches_L, _ax, _ay, idx_L in groups:
-        fr_L, tgts_L = _forecast_cell(
+        fr_L, tgts_L, effective_bs = _forecast_cell_dynamic(
             model_family, ensure_handle(), model_id, batches_L,
             L, horizon, device, batch_size,
             flowstate_scale=cache.flowstate_scale)
         results.append((idx_L, fr_L, tgts_L))
+        effective_batch_sizes.append(effective_bs)
     fr, tgts = _merge_grouped(results, cache.n_total, horizon, device)
     _sync()
     elapsed = time.perf_counter() - t_start
@@ -1966,6 +2056,7 @@ def _run_full_native_baseline(
     metrics["_mean_effective_context"] = float(np.mean(effective_lengths))
     metrics["_max_effective_context"] = int(np.max(effective_lengths))
     metrics["_n_width_groups"] = int(len(groups))
+    metrics["_dynamic_batch_sizes"] = effective_batch_sizes
 
     for k, v in metrics.items():
         if isinstance(v, float):
@@ -2363,14 +2454,16 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     # Run each width-group (its own moirai/timesfm runner), then
                     # stitch back into one instance-ordered result over ALL n_total.
                     results = []
+                    effective_batch_sizes = []
                     _sync()
                     t_start = time.perf_counter()
                     for L, batches_L, _ax, _ay, idx_L in groups:
-                        fr_L, tgts_L = _forecast_cell(
+                        fr_L, tgts_L, effective_bs = _forecast_cell_dynamic(
                             model_family, ensure_handle(), model_id, batches_L,
                             L, horizon, device, args.batch_size,
                             flowstate_scale=cache.flowstate_scale)
                         results.append((idx_L, fr_L, tgts_L))
+                        effective_batch_sizes.append(effective_bs)
                     n_valid = cache.n_total
                     fr, tgts = _merge_grouped(results, n_valid, horizon, device)
                     # Pad mode serves every instance in 0..n-1 order (see
@@ -2392,10 +2485,11 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     print(f"    Samples: {n_valid}  Batches: {len(batches)}  W={window_size}  H={horizon}")
                     _sync()
                     t_start = time.perf_counter()
-                    fr, tgts = _forecast_cell(
+                    fr, tgts, effective_bs = _forecast_cell_dynamic(
                         model_family, ensure_handle(), model_id, batches,
                         window_size, horizon, device, args.batch_size,
                         flowstate_scale=cache.flowstate_scale)
+                    effective_batch_sizes = [effective_bs]
                     _sync()
                     elapsed = time.perf_counter() - t_start
                     # Skip mode serves only instances with context >= window, in
@@ -2418,6 +2512,7 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 metrics["_mase_gluonts_ver"] = MASE_GLUONTS_VER
                 metrics["elapsed_seconds"] = round(elapsed, 3)
                 metrics["horizon"] = horizon
+                metrics["_dynamic_batch_sizes"] = effective_batch_sizes
 
                 for k, v in metrics.items():
                     if isinstance(v, float):
