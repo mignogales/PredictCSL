@@ -69,6 +69,10 @@ class TSFMAdapter(InterpretabilityAdapter):
         self._backbone = None
         self._layer_names: Optional[List[str]] = None
         self._timesfm_cfg = None   # (width, horizon, batch size) active config
+        self._moirai_runner = None
+        self._moirai_cfg = None    # (width, horizon) active forecast wrapper
+        self._tuned_batch_sizes: Dict[int, int] = {}
+        self._batch_search_complete = set()
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -113,6 +117,8 @@ class TSFMAdapter(InterpretabilityAdapter):
         self._timesfm_cfg = (int(width), self.horizon, int(batch_size))
 
     def close(self) -> None:
+        self._moirai_runner = None
+        self._moirai_cfg = None
         self._base = None
         self._backbone = None
         try:
@@ -156,6 +162,15 @@ class TSFMAdapter(InterpretabilityAdapter):
             meta["precision"] = "unknown"
         return meta
 
+    def batch_size_for(self, context_length: int, n_samples: Optional[int] = None
+                       ) -> int:
+        tuned = self._tuned_batch_sizes.get(int(context_length))
+        if tuned is None:
+            return super().batch_size_for(context_length, n_samples)
+        if n_samples is not None:
+            return max(1, min(tuned, int(n_samples)))
+        return tuned
+
     # -- forecasting -------------------------------------------------------------
 
     def _uniform_forecast(self, x, width: int, batch_size: int):
@@ -172,9 +187,104 @@ class TSFMAdapter(InterpretabilityAdapter):
                                         self.horizon, self.device)
                     for s in range(0, x.shape[0], batch_size)]
             return torch.cat(meds, dim=0)
+        if self.family == "moirai":
+            # `_forecast_uniform` constructs a Moirai2Forecast, moves it to
+            # CUDA, deletes it, and calls cuda.empty_cache() on every call.
+            # Interpretability cells call this path hundreds of times at the
+            # same width, so retain the lightweight forecast wrapper and the
+            # allocator cache until the width actually changes.
+            cfg = (int(width), self.horizon)
+            if self._moirai_cfg != cfg:
+                self._moirai_runner = bcl._build_moirai(
+                    self._base, self.horizon, width, self.device)
+                self._moirai_cfg = cfg
+            if self.dynamic_batching and str(self.device).startswith("cuda"):
+                return self._autotuned_forecast(
+                    x, width, batch_size, bcl.predict_moirai,
+                    self._moirai_runner)
+            meds = [bcl.predict_moirai(
+                self._moirai_runner, x[s:s + batch_size], self.horizon,
+                self.device) for s in range(0, x.shape[0], batch_size)]
+            return torch.cat(meds, dim=0)
+        if (self.family == "chronos2" and self.dynamic_batching
+                and str(self.device).startswith("cuda")):
+            return self._autotuned_forecast(
+                x, width, batch_size, bcl.predict_chronos2, self._base)
         return bcl._forecast_uniform(self.family, self._base, self.model_id,
                                      x, width, self.horizon, batch_size,
                                      self.device)
+
+    @staticmethod
+    def _is_cuda_oom(exc: BaseException) -> bool:
+        try:
+            import torch
+            if isinstance(exc, torch.cuda.OutOfMemoryError):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return (isinstance(exc, RuntimeError)
+                and "out of memory" in str(exc).lower())
+
+    def _autotuned_forecast(self, x, width: int, initial_batch: int,
+                            predict_fn, runner):
+        """Grow to the largest observed-safe CUDA batch for this width.
+
+        Successful chunks are never repeated. During the first sufficiently
+        large call the chunk sizes grow geometrically; an OOM retries only the
+        failed chunk at the last successful size. The result is cached for all
+        subsequent experiment calls at the same context width.
+        """
+        import torch
+        n = int(x.shape[0])
+        limit = min(self.max_batch_size, n)
+        cached = self._tuned_batch_sizes.get(int(width))
+        current = min(cached or max(1, initial_batch), limit)
+        probing = (int(width) not in self._batch_search_complete
+                   and current < limit)
+        last_success = 0
+        start = 0
+        medians = []
+        while start < n:
+            size = min(current, n - start)
+            try:
+                med = predict_fn(runner, x[start:start + size], self.horizon,
+                                 self.device)
+            except Exception as exc:  # noqa: BLE001 — selective OOM recovery
+                if not self._is_cuda_oom(exc) or size <= 1:
+                    raise
+                del exc
+                torch.cuda.empty_cache()
+                current = max(1, last_success or size // 2)
+                probing = False
+                self._tuned_batch_sizes[int(width)] = current
+                self._batch_search_complete.add(int(width))
+                print(f"[{self.name}] dynamic batch W={width}: OOM at {size}; "
+                      f"using {current}")
+                continue
+            medians.append(med)
+            start += size
+            if probing and size == current:
+                last_success = current
+                grown = min(limit, current * 2)
+                if grown > current:
+                    current = grown
+                else:
+                    probing = False
+                    self._tuned_batch_sizes[int(width)] = current
+                    self._batch_search_complete.add(int(width))
+            elif not probing:
+                self._tuned_batch_sizes[int(width)] = current
+
+        if int(width) not in self._tuned_batch_sizes:
+            # The call ended before the next probe fit; retain the largest
+            # batch actually exercised rather than an untested candidate.
+            self._tuned_batch_sizes[int(width)] = max(1, last_success or
+                                                       min(initial_batch, n))
+        tuned = self._tuned_batch_sizes[int(width)]
+        if cached is None:
+            print(f"[{self.name}] dynamic batch W={width}: tuned={tuned}, "
+                  f"search_cap={self.max_batch_size}")
+        return torch.cat(medians, dim=0)
 
     def forecast(self, contexts: np.ndarray) -> np.ndarray:
         import torch

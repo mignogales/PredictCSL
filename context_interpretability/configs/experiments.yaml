@@ -12,7 +12,9 @@ batch_size: 32               # safe long-context baseline for the 28 GB runner
 dynamic_batching:
   enabled: true
   reference_context: 8192
-  max_batch_size: 256
+  # Autotuning probes geometrically up to this ceiling and backs off on OOM.
+  # This is a search bound, not an allocation made up front.
+  max_batch_size: 4096
 max_samples: 256            # per dataset; subsampling is recorded in run_meta
 
 # Primary loss metric — must match the main forecasting evaluation. MASE here is
