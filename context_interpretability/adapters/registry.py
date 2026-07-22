@@ -54,7 +54,7 @@ def available_models() -> List[str]:
 def build_adapter(display: str, horizon: int, device: str = "cuda:0",
                   batch_size: int = 16,
                   dynamic_batching: bool = False,
-                  batch_reference_context: int = 1024,
+                  batch_reference_context: int = 8192,
                   max_batch_size: Optional[int] = None,
                   caps_cfg: Optional[dict] = None) -> TSFMAdapter:
     from experiments.models_config import CATALOG

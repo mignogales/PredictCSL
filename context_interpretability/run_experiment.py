@@ -125,7 +125,7 @@ def run_model(display: str, exps: List[str], config: dict, device: str,
             display, horizon=int(config["horizon"]), device=device,
             batch_size=int(config.get("batch_size", 16)),
             dynamic_batching=bool(bcfg.get("enabled", True)),
-            batch_reference_context=int(bcfg.get("reference_context", 1024)),
+            batch_reference_context=int(bcfg.get("reference_context", 8192)),
             max_batch_size=int(bcfg.get("max_batch_size", 256)))
         meta = RunMeta(run_dir, config, display, device, seed)
         try:

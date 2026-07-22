@@ -19,7 +19,7 @@ Output per cell (``.../exp1_perturbation/<dataset>/w<W>/``):
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -123,6 +123,25 @@ def apply_perturbation(window: np.ndarray, blk: slice, kind: str, seed: int,
 _STOCHASTIC = {"permutation", "matched_block", "noise"}
 
 
+def _interventions(window: np.ndarray, blocks: List[TemporalBlock], W: int,
+                   methods: List[str], noise_scales: List[float],
+                   n_seeds: int, seed: int, pcfg: dict
+                   ) -> Iterator[Tuple[TemporalBlock, str, float, int,
+                                       np.ndarray]]:
+    """Yield the intervention grid in the canonical result order."""
+    for blk_obj in blocks:
+        blk = blk_obj.input_slice(W)
+        for kind in methods:
+            sevs = noise_scales if kind == "noise" else [np.nan]
+            seeds = range(n_seeds) if kind in _STOCHASTIC else [0]
+            for severity in sevs:
+                for s in seeds:
+                    pert = apply_perturbation(window, blk, kind, seed + s,
+                                              severity, pcfg)
+                    assert pert.shape == window.shape
+                    yield blk_obj, kind, severity, seed + s, pert
+
+
 # ------------------------------------------------------------------------------
 #  Runner
 # ------------------------------------------------------------------------------
@@ -137,6 +156,12 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
                        ["block_mean", "permutation", "matched_block", "noise"])
     noise_scales = pcfg.get("noise_scales", [0.1, 0.5, 1.0])
     n_seeds = int(pcfg.get("n_seeds", 3))
+    # Keep several logically independent interventions in the adapter's input
+    # queue. The adapter still controls GPU microbatch size, but can now launch
+    # consecutive microbatches without returning to CPU bookkeeping between
+    # every perturbation variant.
+    interventions_per_call = max(1, int(
+        pcfg.get("interventions_per_call", 8)))
     metric = config.get("primary_metric", "mae")
 
     cache = CleanCache(adapter, data, metric,
@@ -171,29 +196,39 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
                         desc=f"exp1 {adapter.name} {data.name} W={W}",
                         unit="forward", dynamic_ncols=True)
 
+        jobs = _interventions(window, blocks, W, methods, noise_scales,
+                              n_seeds, seed, pcfg)
         try:
-            for blk_obj in blocks:
-                blk = blk_obj.input_slice(W)
-                for kind in methods:
-                    sevs = noise_scales if kind == "noise" else [np.nan]
-                    seeds = range(n_seeds) if kind in _STOCHASTIC else [0]
-                    for severity in sevs:
-                        for s in seeds:
-                            pert = apply_perturbation(window, blk, kind,
-                                                      seed + s, severity, pcfg)
-                            assert pert.shape == window.shape  # length preserved
-                            pred = adapter.forecast(pert)
-                            progress.update(1)
-                            eff = intervention_effects(clean_pred, clean_loss,
-                                                       pred, cache)
-                            _write_block_rows(
-                                writer, adapter, data, requested, W, blk_obj,
-                                kind, severity, seed + s, metric, eff)
+            while True:
+                group = []
+                for _ in range(interventions_per_call):
+                    try:
+                        group.append(next(jobs))
+                    except StopIteration:
+                        break
+                if not group:
+                    break
+                # All variants have identical (N, W) geometry. Concatenating
+                # them preserves predictions exactly and lets the adapter feed
+                # the GPU continuously across intervention boundaries.
+                stacked = np.concatenate([job[4] for job in group], axis=0)
+                stacked_pred = adapter.forecast(stacked)
+                for gi, (blk_obj, kind, severity, job_seed, _pert) in enumerate(
+                        group):
+                    lo, hi = gi * data.n, (gi + 1) * data.n
+                    pred = stacked_pred[lo:hi]
+                    eff = intervention_effects(clean_pred, clean_loss, pred,
+                                               cache)
+                    _write_block_rows(
+                        writer, adapter, data, requested, W, blk_obj, kind,
+                        severity, job_seed, metric, eff)
+                progress.update(len(group))
         finally:
             progress.close()
         writer.finalize({"context_length": W, "block_length": P,
                          "n_blocks": len(blocks), "thinned": thinned,
-                         "methods": methods})
+                         "methods": methods,
+                         "interventions_per_call": interventions_per_call})
         print(f"[exp1][{adapter.name}] {data.name} w{W}: "
               f"{len(blocks)} blocks x {len(methods)} methods done")
     return cells

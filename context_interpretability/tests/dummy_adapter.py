@@ -198,6 +198,7 @@ def make_config(tmp_root: str) -> dict:
         "max_blocks_per_context": 64,
         "perturbation": {
             "methods": ["block_mean", "permutation", "matched_block", "noise"],
+            "interventions_per_call": 3,
             "mean_scope": "block",
             "noise_scales": [0.5],
             "noise_std_floor": 1e-3,

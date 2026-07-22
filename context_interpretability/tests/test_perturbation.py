@@ -75,6 +75,29 @@ class TestPerturbationRunner(unittest.TestCase):
             pert.run(adapter, data, cfg, out, seed=0)
             self.assertEqual(len(load_results(out)), n_rows)
 
+    def test_interventions_are_grouped_without_changing_rows(self):
+        class TrackingAdapter(DummyAdapter):
+            def __init__(self):
+                super().__init__()
+                self.forecast_batch_sizes = []
+
+            def forecast(self, contexts):
+                self.forecast_batch_sizes.append(len(contexts))
+                return super().forecast(contexts)
+
+        adapter = TrackingAdapter()
+        data = make_data()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(tmp)  # interventions_per_call == 3
+            out = os.path.join(tmp, "exp1")
+            pert.run(adapter, data, cfg, out, seed=0)
+            # Clean-cache calls contain N samples; grouped intervention calls
+            # contain up to 3*N and still produce the complete expected grid.
+            self.assertIn(3 * data.n, adapter.forecast_batch_sizes)
+            df = load_results(out)
+            jobs = (2 + 4 + 8) * 7  # blocks per W * variants per block
+            self.assertEqual(len(df), jobs * data.n)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -120,7 +120,7 @@ class InterpretabilityAdapter:
     def __init__(self, name: str, capabilities: AdapterCapabilities,
                  horizon: int, device: str = "cpu", batch_size: int = 16,
                  dynamic_batching: bool = False,
-                 batch_reference_context: int = 1024,
+                 batch_reference_context: int = 8192,
                  max_batch_size: Optional[int] = None):
         self.name = name
         self.capabilities = capabilities

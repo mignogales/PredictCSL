@@ -5,13 +5,13 @@
 output_root: logs/experiments/context_interpretability
 seed: 42
 horizon: 64
-batch_size: 16
+batch_size: 32               # safe long-context baseline for the 28 GB runner
 # Keep approximately batch_size * reference_context input timesteps in each
 # GPU microbatch. This raises occupancy for short contexts without increasing
 # the known-safe batch at long contexts. Fixed-native-width models are exempt.
 dynamic_batching:
   enabled: true
-  reference_context: 1024
+  reference_context: 8192
   max_batch_size: 256
 max_samples: 256            # per dataset; subsampling is recorded in run_meta
 
@@ -46,6 +46,9 @@ experiments:                # which experiments run by default
 
 perturbation:               # Experiment 1 (spec §4)
   methods: [block_mean, permutation, matched_block, noise]
+  # Queue several variants per adapter call. This removes CPU/dispatch gaps
+  # between the many short GPU microbatches in exp1 (and exp1 inside exp4).
+  interventions_per_call: 8
   mean_scope: block         # block | context (context-wide channel mean)
   noise_scales: [0.1, 0.5, 1.0]
   noise_std_floor: 1.0e-3
