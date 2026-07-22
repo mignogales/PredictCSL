@@ -176,16 +176,21 @@ class TSFMAdapter(InterpretabilityAdapter):
     def _uniform_forecast(self, x, width: int, batch_size: int):
         """Median forecast for a uniform-width torch batch (n, W, 1) -> (n, H).
 
-        timesfm routes through the persistent EAGER model (see load()) so hooks
-        and the attention-mask wrap actually fire; every other family uses the
-        pipeline's ``_forecast_uniform`` verbatim."""
+        CUDA families route through the common adaptive microbatch loop.
+        TimesFM additionally refreshes its eager ForecastConfig as candidate
+        capacity grows; Moirai retains its per-width forecast wrapper."""
         import torch
         from experiments import build_context_length_dataset as bcl
         if self.family == "timesfm":
+            if self.dynamic_batching and str(self.device).startswith("cuda"):
+                return self._autotuned_forecast(
+                    x, width, batch_size, bcl.predict_timesfm, self._base,
+                    prepare_batch=lambda size: self._timesfm_ensure_config(
+                        width, size))
             self._timesfm_ensure_config(width, batch_size)
-            meds = [bcl.predict_timesfm(self._base, x[s:s + batch_size],
-                                        self.horizon, self.device)
-                    for s in range(0, x.shape[0], batch_size)]
+            meds = [bcl.predict_timesfm(
+                self._base, x[s:s + batch_size], self.horizon, self.device)
+                for s in range(0, x.shape[0], batch_size)]
             return torch.cat(meds, dim=0)
         if self.family == "moirai":
             # `_forecast_uniform` constructs a Moirai2Forecast, moves it to
@@ -206,10 +211,15 @@ class TSFMAdapter(InterpretabilityAdapter):
                 self._moirai_runner, x[s:s + batch_size], self.horizon,
                 self.device) for s in range(0, x.shape[0], batch_size)]
             return torch.cat(meds, dim=0)
-        if (self.family == "chronos2" and self.dynamic_batching
-                and str(self.device).startswith("cuda")):
+        if (self.dynamic_batching and str(self.device).startswith("cuda")):
+            try:
+                predict_fn = getattr(bcl, f"predict_{self.family}")
+            except AttributeError as exc:
+                raise CapabilityError(
+                    f"{self.name}: no forecast function registered for "
+                    f"dynamic batching ({self.family})") from exc
             return self._autotuned_forecast(
-                x, width, batch_size, bcl.predict_chronos2, self._base)
+                x, width, batch_size, predict_fn, self._base)
         return bcl._forecast_uniform(self.family, self._base, self.model_id,
                                      x, width, self.horizon, batch_size,
                                      self.device)
@@ -226,7 +236,7 @@ class TSFMAdapter(InterpretabilityAdapter):
                 and "out of memory" in str(exc).lower())
 
     def _autotuned_forecast(self, x, width: int, initial_batch: int,
-                            predict_fn, runner):
+                            predict_fn, runner, prepare_batch=None):
         """Grow to the largest observed-safe CUDA batch for this width.
 
         Successful chunks are never repeated. During the first sufficiently
@@ -247,6 +257,8 @@ class TSFMAdapter(InterpretabilityAdapter):
         while start < n:
             size = min(current, n - start)
             try:
+                if prepare_batch is not None:
+                    prepare_batch(current)
                 med = predict_fn(runner, x[start:start + size], self.horizon,
                                  self.device)
             except Exception as exc:  # noqa: BLE001 — selective OOM recovery

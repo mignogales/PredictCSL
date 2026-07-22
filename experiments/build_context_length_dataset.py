@@ -582,12 +582,18 @@ def load_chronos2(model_id: str, device: str):
 
 def predict_chronos2(pipeline, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
     context = x.permute(0, 2, 1)                       # (B, 1, W)
-    samples = pipeline.predict(inputs=context, prediction_length=horizon)
+    # Chronos2Pipeline otherwise defaults to an internal batch_size=256,
+    # silently undoing the caller's dynamic microbatch selection. Each call
+    # here already contains exactly one tuned microbatch, so forward its size.
+    samples = pipeline.predict(inputs=context, prediction_length=horizon,
+                               batch_size=int(context.shape[0]))
     if isinstance(samples, list):
         samples = torch.stack(samples, dim=0).squeeze(1)
     if samples.dim() == 4:
         samples = samples.squeeze(2)                   # (B, Q, H)
-    samples = samples.to(device=device, dtype=torch.float32)
+    # Chronos2 deliberately returns predictions on CPU. Keep the tiny median
+    # reduction there instead of copying forecasts GPU -> CPU -> GPU -> CPU.
+    samples = samples.to(dtype=torch.float32)
     return torch.median(samples, dim=1).values         # (B, H)
 
 
