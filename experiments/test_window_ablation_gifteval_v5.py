@@ -949,6 +949,10 @@ def _forecast_cell_dynamic(model_family, handle, model_id, batches, width,
     reduced_after_oom = False
     while True:
         trial_batches = _rebatch(batches, candidate)
+        print(Fore.CYAN
+              + f"    Dynamic batch: samples={n_samples}  effective_bs={candidate}  "
+                f"actual_batches={len(trial_batches)}  W={width}  H={horizon}"
+              + Fore.RESET)
         try:
             result = _forecast_cell(
                 model_family, handle, model_id, trial_batches, width, horizon,
@@ -999,10 +1003,17 @@ def load_chronos2(model_id, device):
     )
 
 
-def predict_chronos2(pipeline, batches, horizon, device):
+def predict_chronos2(pipeline, batches, horizon, device, batch_size):
     def step(x, y):
         context = x.permute(0, 2, 1)
-        samples = pipeline.predict(inputs=context, prediction_length=horizon)
+        # Each outer batch is already the dynamically selected microbatch.
+        # Forward its actual size so Chronos2 cannot silently replace that
+        # decision with its own internal default.
+        samples = pipeline.predict(
+            inputs=context,
+            prediction_length=horizon,
+            batch_size=min(int(batch_size), int(context.shape[0])),
+        )
         samples = (torch.stack(samples, dim=0).squeeze(1)
                    if isinstance(samples, list) else samples)
         if samples.dim() == 4:
@@ -1842,7 +1853,7 @@ def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
     if model_family == "chronos_bolt":
         return predict_chronos_bolt(handle, batches, horizon, device)
     if model_family == "chronos2":
-        return predict_chronos2(handle, batches, horizon, device)
+        return predict_chronos2(handle, batches, horizon, device, batch_size)
     if model_family == "moirai":
         m = build_moirai_forecast(handle, horizon, width, device)
         fr, tgts = predict_moirai(m, batches, horizon, device)
@@ -2312,10 +2323,29 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
         # coordinator's all-cached aggregation pass skip GPU model loads
         # entirely. (timesfm loads per-cell; context_parroting needs nothing.)
         _handle = [None]
+        _handle_loaded = [False]
 
         def ensure_handle():
-            if _handle[0] is None:
+            if not _handle_loaded[0]:
+                has_persistent_handle = model_family not in (
+                    "timesfm", "context_parroting")
+                if has_persistent_handle:
+                    print(Fore.CYAN
+                          + f"    Loading {model_short} model weights on {device} "
+                            "(the following it/s counter is weight loading, not batches)..."
+                          + Fore.RESET)
                 _handle[0] = load_handle(model_family, model_id, device)
+                _handle_loaded[0] = True
+                if has_persistent_handle:
+                    residency = ""
+                    if device == "cuda":
+                        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+                        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                        residency = (f"  CUDA allocated={allocated:.2f} GiB"
+                                     f" reserved={reserved:.2f} GiB")
+                    print(Fore.GREEN
+                          + f"    {model_short} model ready.{residency}"
+                          + Fore.RESET)
             return _handle[0]
 
         for d_idx, (ge_name, term, dataset_display, to_univariate) in enumerate(datasets):
@@ -2458,6 +2488,11 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 except RuntimeError as exc:
                     print(Fore.RED + f"    SKIP: {exc}" + Fore.RESET); continue
 
+                # Lazy model loading is setup, not inference. Do it explicitly
+                # before the synchronized forward timer so the first cell does
+                # not report checkpoint deserialization as GPU inference time.
+                cell_handle = ensure_handle()
+
                 # cuda.synchronize() brackets the timer so it measures completed GPU
                 # work, not just enqueued kernel launches (forecast calls launch
                 # async). No-op on CPU. Syncing right before t_start also drains any
@@ -2475,7 +2510,7 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     t_start = time.perf_counter()
                     for L, batches_L, _ax, _ay, idx_L in groups:
                         fr_L, tgts_L, effective_bs = _forecast_cell_dynamic(
-                            model_family, ensure_handle(), model_id, batches_L,
+                            model_family, cell_handle, model_id, batches_L,
                             L, horizon, device, args.batch_size,
                             flowstate_scale=cache.flowstate_scale)
                         results.append((idx_L, fr_L, tgts_L))
@@ -2498,11 +2533,13 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                           f"W={window_size}  H={horizon}")
                 else:
                     n_valid = all_x_cpu.shape[0]
-                    print(f"    Samples: {n_valid}  Batches: {len(batches)}  W={window_size}  H={horizon}")
+                    print(f"    Samples: {n_valid}  Input chunks: {len(batches)} "
+                          f"(base_bs={args.batch_size}; dynamic rebatch follows)  "
+                          f"W={window_size}  H={horizon}")
                     _sync()
                     t_start = time.perf_counter()
                     fr, tgts, effective_bs = _forecast_cell_dynamic(
-                        model_family, ensure_handle(), model_id, batches,
+                        model_family, cell_handle, model_id, batches,
                         window_size, horizon, device, args.batch_size,
                         flowstate_scale=cache.flowstate_scale)
                     effective_batch_sizes = [effective_bs]
