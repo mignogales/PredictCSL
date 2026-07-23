@@ -125,12 +125,15 @@ def parse_args() -> argparse.Namespace:
                         "window with soft top-3 labels.")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Stream subprocess output instead of the quiet tqdm bars.")
+    p.add_argument("--verbose-ablation", action="store_true",
+                   help="Stream stage 3 output live; keep other stages quiet.")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     ra._QUIET = not args.verbose
+    ra._VERBOSE_ABLATION = args.verbose_ablation
 
     if args.only_stages and args.skip_stages:
         raise SystemExit("Use either --skip-stages or --only-stages, not both.")

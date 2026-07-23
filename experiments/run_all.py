@@ -142,6 +142,9 @@ def _model_idx(model_id: str, display: str) -> int:
 # terminal and every banner / command echo is printed.
 _BAR: "tqdm | None" = None
 _QUIET: bool = True
+# Stream stage 3 only while leaving the other stages on their compact progress
+# bars. Set by --verbose-ablation in run_all and its variant wrappers.
+_VERBOSE_ABLATION: bool = False
 
 
 def _emit(msg: str, level: str = "info") -> None:
@@ -229,7 +232,8 @@ def _run(cmd: Sequence[str], stage: str, display: str,
     label = f"{display} · {stage}"
     t0 = time.perf_counter()
 
-    if not _QUIET:
+    stream_output = not _QUIET or (_VERBOSE_ABLATION and stage == "3/ablation")
+    if stream_output:
         _emit(Fore.MAGENTA + f"  $ {' '.join(cmd)}" + Fore.RESET)
         res = subprocess.run(cmd, check=False)
         dt = time.perf_counter() - t0
@@ -531,6 +535,12 @@ def parse_args() -> argparse.Namespace:
               "behaviour). Default is quiet: only the top-level tqdm bar shows, "
               f"and per-stage output is captured under {RUN_LOG_ROOT}/."),
     )
+    p.add_argument(
+        "--verbose-ablation", action="store_true",
+        help=("Stream stage 3's subprocess output live while keeping all other "
+              "stages on their compact progress bars. Useful for monitoring "
+              "dataset loading, cache hits, GPU inference, and per-cell timing."),
+    )
     # Pass-through extras per stage.
     for sid, (name, _) in STAGES.items():
         p.add_argument(
@@ -543,8 +553,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    global _QUIET
+    global _QUIET, _VERBOSE_ABLATION
     _QUIET = not args.verbose
+    _VERBOSE_ABLATION = args.verbose_ablation
 
     # ---- Smoke-test mode --------------------------------------------------
     # Redirect every stage's output into a throwaway tree and switch the stage

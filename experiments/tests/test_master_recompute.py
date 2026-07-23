@@ -82,6 +82,16 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertIn("--models Toto-2.0-313m", cmd[2])
         self.assertIn("--force 3", cmd[2])
 
+    def test_verbose_ablation_is_forwarded_to_variant(self) -> None:
+        cmd = master._variant_cmd(
+            None,
+            master.VARIANTS[0],
+            ["Chronos2-Small"],
+            ["--verbose-ablation"],
+            [],
+        )
+        self.assertIn("--verbose-ablation", cmd)
+
     def test_dedicated_stage1_args_are_inside_activated_shell(self) -> None:
         old_names = master._CONDA_ENV_NAMES
         master._CONDA_ENV_NAMES = {"predictcsl-legacy"}

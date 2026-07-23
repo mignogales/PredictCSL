@@ -332,6 +332,8 @@ def parse_args() -> argparse.Namespace:
                         "in <output-root>/_smoke_test (kept for inspection).")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Pass -v to each variant (stream its subprocess output).")
+    p.add_argument("--verbose-ablation", action="store_true",
+                   help="Stream only stage 3 output live in each variant.")
     return p.parse_args()
 
 
@@ -400,6 +402,8 @@ def main() -> None:
 
     groups = _resolve_groups(args.models)
     vflag = ["-v"] if args.verbose else []
+    if args.verbose_ablation:
+        vflag.append("--verbose-ablation")
     stage1_build_args = _stage1_build_args(args)
     # --force forwarding: None -> no flag; [] -> bare --force (all active stages);
     # [...] -> --force <stages>. Passed to every subprocess verbatim; run_all only
