@@ -1475,13 +1475,28 @@ def plot_error_distributions(per_sample_metrics, model_short, window_size, horiz
         vals = per_sample_metrics.get(name)
         if vals is None:
             ax.set_title(f"{name.upper()} (no data)"); continue
-        vals = vals[~np.isnan(vals)]
+        # NaNs and infinities cannot produce meaningful histogram limits.
+        vals = np.asarray(vals)
+        vals = vals[np.isfinite(vals)]
         if len(vals) == 0:
             ax.set_title(f"{name.upper()} (no data)"); continue
         clip_val = np.percentile(vals, percentile_clip)
         clipped = vals[vals <= clip_val]
+        # Numerical roundoff in percentile() should not normally make this
+        # empty, but retaining the finite values is safer than passing an empty
+        # array to histogram().
+        if len(clipped) == 0:
+            clipped = vals
         n_bins = min(80, max(20, len(clipped) // 10))
-        ax.hist(clipped, bins=n_bins, density=True, alpha=0.55,
+        try:
+            bin_edges = np.histogram_bin_edges(clipped, bins=n_bins)
+        except ValueError:
+            # At a large offset, a very narrow data range may contain fewer
+            # representable floats than requested bin edges (NumPy raises
+            # "Too many bins for data range"). One bin remains informative for
+            # this effectively degenerate distribution and is always enough.
+            bin_edges = np.histogram_bin_edges(clipped, bins=1)
+        ax.hist(clipped, bins=bin_edges, density=True, alpha=0.55,
                 color=colors[name], edgecolor="white", linewidth=0.5)
         if len(clipped) > 1 and np.std(clipped) > 0:
             try:
@@ -1497,7 +1512,8 @@ def plot_error_distributions(per_sample_metrics, model_short, window_size, horiz
             bv = naive_baseline[name]
             if bv is not None and not np.isnan(bv) and bv <= clip_val:
                 ax.axvline(bv, color="black", linestyle="-.", linewidth=1.5, alpha=0.8, label=f"S.Naive={bv:.4f}")
-        ax.set_xlim(left=0, right=clip_val)
+        if clip_val > 0:
+            ax.set_xlim(left=0, right=clip_val)
         ax.set_title(f"{name.upper()}  (n={len(vals)})", fontsize=11)
         ax.set_xlabel(name.upper()); ax.set_ylabel("Density")
         ax.legend(fontsize=8); ax.grid(True, alpha=0.25)
@@ -2523,22 +2539,28 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                                                         seasonal_errors=se_cell)
                 if not args.no_cell_cache:
                     _save_per_sample_metrics(dataset_display, model_short, term, window_size, per_sample)
+                    # Persist the expensive inference result before generating
+                    # optional diagnostic plots. A plotting failure must never
+                    # force this cell to be inferred again on resume.
+                    _save_result(dataset_display, model_short, term, window_size, metrics)
 
                 if not args.no_plots:
-                    pred_3d = fr.median.detach().cpu().unsqueeze(-1)
-                    tgt_3d = tgts.detach().cpu().unsqueeze(-1)
-                    cell_dir = _cache_dir(dataset_display, model_short, term, window_size)
-                    plot_sample_predictions(all_x_cpu, pred_3d, tgt_3d,
-                                            model_short, window_size, horizon, cell_dir)
-                    best_idx, worst_idx, psm = find_best_worst_samples(pred_3d, tgt_3d, n=N_BEST_WORST)
-                    plot_best_worst_samples(all_x_cpu, pred_3d, tgt_3d,
-                                            best_idx, worst_idx, psm,
-                                            model_short, window_size, horizon, cell_dir)
-                    plot_error_distributions(per_sample, model_short, window_size, horizon,
-                                             cell_dir, naive_baseline=naive_bl)
-
-                if not args.no_cell_cache:
-                    _save_result(dataset_display, model_short, term, window_size, metrics)
+                    try:
+                        pred_3d = fr.median.detach().cpu().unsqueeze(-1)
+                        tgt_3d = tgts.detach().cpu().unsqueeze(-1)
+                        cell_dir = _cache_dir(dataset_display, model_short, term, window_size)
+                        plot_sample_predictions(all_x_cpu, pred_3d, tgt_3d,
+                                                model_short, window_size, horizon, cell_dir)
+                        best_idx, worst_idx, psm = find_best_worst_samples(
+                            pred_3d, tgt_3d, n=N_BEST_WORST)
+                        plot_best_worst_samples(all_x_cpu, pred_3d, tgt_3d,
+                                                best_idx, worst_idx, psm,
+                                                model_short, window_size, horizon, cell_dir)
+                        plot_error_distributions(per_sample, model_short, window_size, horizon,
+                                                 cell_dir, naive_baseline=naive_bl)
+                    except Exception as exc:  # noqa: BLE001
+                        print(Fore.YELLOW + f"    WARNING: plots failed for {tag}: {exc}"
+                              + Fore.RESET)
 
                 all_results.append({
                     "model": model_id, "model_short": model_short, "model_family": model_family,
