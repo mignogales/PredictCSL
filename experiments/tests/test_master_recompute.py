@@ -11,9 +11,12 @@ import numpy as np
 import torch
 
 from experiments import build_context_length_dataset as build
+from experiments import evaluate_instance_windows as instance_eval
 from experiments import master_run_all as master
 from experiments import predict_context_length as predictor
 from experiments.compare_window_strategies_gifteval import _geomean
+from experiments.test_window_ablation_gifteval_v5 import (
+    ForecastResult, compute_per_sample_metrics)
 
 
 class MasterRecomputeConfigTest(unittest.TestCase):
@@ -23,6 +26,15 @@ class MasterRecomputeConfigTest(unittest.TestCase):
             ["cheap", "cheap_cls", "mamba", "mamba_cls"],
         )
         self.assertTrue(all(v.skip_stages == ["1"] for v in master.VARIANTS))
+        self.assertEqual(
+            [v.ablation_tree for v in master.VARIANTS],
+            [
+                "general_v3",
+                "general_v3_classification",
+                "general_v4",
+                "general_v4_classification",
+            ],
+        )
 
     def test_model_aware_window_grids(self) -> None:
         self.assertEqual(build.window_grid_for_family("timesfm")[-2:],
@@ -133,6 +145,59 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertAlmostEqual(_geomean(np.array([1.0, 4.0, np.nan])), 2.0)
         self.assertEqual(_geomean(np.array([0.0, 4.0])), 0.0)
         self.assertTrue(math.isnan(_geomean(np.array([-1.0, 4.0]))))
+
+
+class PerInstanceWindowEvaluationTest(unittest.TestCase):
+    def test_predictor_choice_is_per_row_and_masks_unavailable_windows(self) -> None:
+        windows = np.array([32, 64])
+        errors = np.array([
+            [1.0, 0.5],
+            [2.0, np.nan],
+            [np.nan, np.nan],
+        ])
+        scores = np.array([
+            [0.0, 1.0],  # row 0 chooses 32
+            [9.0, 0.0],  # row 1 wants 64, but it is unavailable
+            [0.0, 1.0],  # no grid window -> full-native
+        ])
+        native = np.array([3.0, 4.0, 5.0])
+
+        selected, selected_w, fallback = instance_eval._choose_scores(
+            scores, errors, windows, native)
+
+        np.testing.assert_allclose(selected, [1.0, 2.0, 5.0])
+        np.testing.assert_array_equal(selected_w, [32, 32, -1])
+        np.testing.assert_array_equal(fallback, [False, False, True])
+
+    def test_fixed_window_is_capped_per_instance(self) -> None:
+        windows = np.array([32, 64, 128])
+        errors = np.array([
+            [3.0, 2.0, 1.0],
+            [4.0, 3.0, np.nan],
+        ])
+        native = np.array([9.0, 9.0])
+
+        selected, selected_w, fallback = instance_eval._choose_capped_fixed(
+            128, errors, windows, native)
+
+        np.testing.assert_allclose(selected, [1.0, 3.0])
+        np.testing.assert_array_equal(selected_w, [128, 64])
+        self.assertFalse(fallback.any())
+
+    def test_per_instance_mase_ignores_missing_horizon_points(self) -> None:
+        forecast = ForecastResult(median=torch.tensor([
+            [1.0, 5.0],
+            [2.0, 3.0],
+        ]))
+        targets = torch.tensor([
+            [3.0, float("nan")],
+            [4.0, 7.0],
+        ])
+        metrics = compute_per_sample_metrics(
+            forecast, targets, seasonal_errors=np.array([2.0, 2.0]))
+
+        np.testing.assert_allclose(metrics["mae"], [2.0, 3.0])
+        np.testing.assert_allclose(metrics["mase_gluonts"], [1.0, 1.5])
 
 
 class SoftClassificationLossTest(unittest.TestCase):

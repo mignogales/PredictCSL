@@ -98,6 +98,11 @@ PATCHTST_FM_MEDIAN_QUANTILE_IDX = 49
 SUNDIAL_NUM_SAMPLES = 20
 SUNDIAL_MAX_CONTEXT = 2880
 TIMEMOE_MAX_TOTAL   = 4096   # context + horizon must not exceed this
+# Moirai2-R-small's checkpoint has max_seq_len=512 and patch_size=16.  Its
+# forecast input contains both context and prediction tokens.
+MOIRAI_MAX_SEQ_LEN  = 512
+MOIRAI_PATCH_SIZE   = 16
+MOIRAI_MAX_TOTAL    = MOIRAI_MAX_SEQ_LEN * MOIRAI_PATCH_SIZE
 TOTO_NUM_QUANTILES       = 9     # Toto 2.0 quantile head: [0.1..0.9]
 TOTO_MEDIAN_QUANTILE_IDX = 4     # middle of the 9 quantiles (0.5)
 TOTO_MAX_CONTEXT         = 4096  # skip wider windows (mirrors stage-1 label cap)
@@ -656,6 +661,35 @@ def _save_per_sample_metrics(dataset_display, model_short, term, window_size, pe
     np.savez_compressed(os.path.join(d, "per_sample_metrics.npz"), **per_sample)
 
 
+def _backfill_served_index(dataset_display, model_short, term, window_size,
+                           cache: "GiftEvalCache", short_mode: str) -> bool:
+    """Add original GiftEval row ids to an older per-sample cache in place.
+
+    Per-instance window selection needs to align the rows produced at different
+    windows.  Older caches only implied this mapping (skip mode kept ascending
+    rows with enough context); make it explicit without rerunning the TSFM.
+    """
+    path = os.path.join(_cache_dir(dataset_display, model_short, term, window_size),
+                        "per_sample_metrics.npz")
+    if not os.path.isfile(path):
+        return False
+    with np.load(path) as data:
+        if "served_index" in data.files:
+            return True
+        payload = {key: np.asarray(data[key]) for key in data.files}
+    if window_size == FULL_NATIVE_WINDOW or short_mode == "pad":
+        served = np.arange(cache.n_total, dtype=np.int32)
+    else:
+        served = np.flatnonzero(
+            cache.context_lengths >= int(window_size)).astype(np.int32)
+    first = next(iter(payload.values()), np.empty(0))
+    if first.shape[0] != served.shape[0]:
+        return False
+    payload["served_index"] = served
+    np.savez_compressed(path, **payload)
+    return True
+
+
 def _backfill_mase_gluonts(dataset_display, model_short, term, window_size,
                            cache: "GiftEvalCache", short_mode: str):
     """Cheaply derive the cell's gluonts MASE from the cached per-instance MAE +
@@ -844,11 +878,20 @@ def compute_per_sample_metrics(
 ) -> dict:
     pred = forecast_result.median
     y = targets
-    abs_err = (pred - y).abs()
-    sq_err = (pred - y) ** 2
+    valid = ~torch.isnan(y)
+    y_safe = torch.where(valid, y, torch.zeros_like(y))
+    pred_safe = torch.where(valid, pred, torch.zeros_like(pred))
+    abs_err = (pred_safe - y_safe).abs()
+    sq_err = (pred_safe - y_safe) ** 2
+    n_valid = valid.sum(dim=1)
+    denom = n_valid.clamp(min=1)
 
-    per_mae = abs_err.mean(dim=1).cpu().numpy()
-    per_mse = sq_err.mean(dim=1).cpu().numpy()
+    per_mae_t = abs_err.sum(dim=1) / denom
+    per_mse_t = sq_err.sum(dim=1) / denom
+    per_mae_t[n_valid == 0] = torch.nan
+    per_mse_t[n_valid == 0] = torch.nan
+    per_mae = per_mae_t.cpu().numpy()
+    per_mse = per_mse_t.cpu().numpy()
     per_rmse = np.sqrt(per_mse)
     per_mase = per_mae / naive_seasonal_mae
     out = {"mae": per_mae, "mse": per_mse, "rmse": per_rmse, "mase": per_mase}
@@ -1013,6 +1056,9 @@ def predict_chronos2(pipeline, batches, horizon, device, batch_size):
             inputs=context,
             prediction_length=horizon,
             batch_size=min(int(batch_size), int(context.shape[0])),
+            # Never share information between series in a batch. Besides avoiding
+            # leakage, this keeps predictions invariant to dynamic batch sizing.
+            cross_learning=False,
         )
         samples = (torch.stack(samples, dim=0).squeeze(1)
                    if isinstance(samples, list) else samples)
@@ -1981,6 +2027,16 @@ def _merge_grouped(results, n_total, horizon, device):
                           quantiles=quantiles, quantile_levels=qlevels), tgts
 
 
+def _moirai_max_context(horizon: int) -> int:
+    """Largest raw context whose padded context+forecast fits Moirai's tokens."""
+    prediction_tokens = (
+        max(0, int(horizon)) + MOIRAI_PATCH_SIZE - 1
+    ) // MOIRAI_PATCH_SIZE
+    return max(
+        0, (MOIRAI_MAX_SEQ_LEN - prediction_tokens) * MOIRAI_PATCH_SIZE
+    )
+
+
 def _full_native_context_cap(model_family: str, horizon: int, max_available: int) -> int:
     caps = {
         "timesfm": TIMESFM_FULL_CONTEXT,
@@ -1992,7 +2048,13 @@ def _full_native_context_cap(model_family: str, horizon: int, max_available: int
     }
     if model_family == "timemoe":
         caps[model_family] = max(1, TIMEMOE_MAX_TOTAL - int(horizon))
+    elif model_family == "moirai":
+        caps[model_family] = _moirai_max_context(horizon)
     cap = int(caps.get(model_family, max_available))
+    if cap < 1:
+        raise ValueError(
+            f"{model_family} cannot serve horizon={horizon} within its input limit"
+        )
     return max(1, min(cap, int(max_available)))
 
 
@@ -2018,8 +2080,17 @@ def _run_full_native_baseline(
     tag = (f"{model_short} | {dataset_display} | t={term} | h={horizon} | "
            f"w={FULL_NATIVE_WINDOW} cap={cap}")
 
-    if _result_cached(dataset_display, model_short, term, FULL_NATIVE_WINDOW):
-        cached = _load_cached_result(dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+    cached = (_load_cached_result(
+        dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+        if _result_cached(
+            dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+        else None)
+    # ``full_native`` does not encode its numeric cap in the cache path.  Ignore
+    # results produced with an older/different cap instead of silently reusing
+    # forecasts that violate the model's current input limit.
+    if cached is not None and int(cached.get("_context_cap", -1)) == cap:
+        _backfill_served_index(
+            dataset_display, model_short, term, FULL_NATIVE_WINDOW, cache, "pad")
         changed = False
         stale_ver = cached.get("_mase_gluonts_ver", 0) < MASE_GLUONTS_VER
         if _missing_metric(cached, "mase_gluonts") or stale_ver:
@@ -2391,8 +2462,20 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
             for window_size in window_sizes:
                 tag = f"{model_short} | {dataset_display} | t={term} | h={horizon} | w={window_size}"
 
+                # Check before the cache lookup too: a cache created before this
+                # limit was enforced must not make an unsupported cell appear
+                # valid in later aggregate results.
+                if model_family == "moirai" and window_size > _moirai_max_context(horizon):
+                    print(Fore.RED + f"  SKIP    {tag}  (Moirai max context for h={horizon} "
+                          f"is {_moirai_max_context(horizon)})"
+                          + Fore.RESET)
+                    continue
+
                 if _result_cached(dataset_display, model_short, term, window_size):
                     cached = _load_cached_result(dataset_display, model_short, term, window_size)
+                    _backfill_served_index(
+                        dataset_display, model_short, term, window_size,
+                        cache, short_mode)
                     # Backfill the gluonts MASE into pre-existing cells WITHOUT
                     # re-inference: per-instance MAE is in the per_sample cache and
                     # the seasonal error comes from the data. Lets a plain re-run of
@@ -2574,6 +2657,8 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
 
                 per_sample = compute_per_sample_metrics(fr, tgts, cache.naive_seasonal_mae_train,
                                                         seasonal_errors=se_cell)
+                per_sample["served_index"] = np.asarray(
+                    served_idx, dtype=np.int32)
                 if not args.no_cell_cache:
                     _save_per_sample_metrics(dataset_display, model_short, term, window_size, per_sample)
                     # Persist the expensive inference result before generating

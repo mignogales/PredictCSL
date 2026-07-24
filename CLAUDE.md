@@ -88,9 +88,12 @@ predictor-derived, so no TSFM re-inference):
    (`--use-robust-timing` / `--no-use-robust-timing`).
 
 **Extras / v2 path:**
-- **`period_window_eval.py`** — a 4th strategy: pick `L_i = max(2×strongest_period,
-  horizon)` per instance (period via FFT+autocorrelation). Evaluated directly
-  (off-grid), written as sidecars that stage 4 folds in as a `period` column.
+- **`period_window_eval.py`** — cadence-constrained strategies: translate the
+  official GiftEval frequency labels to samples at each dataset's sampling
+  rate, split each context into candidate-sized windows, and choose the cadence
+  with maximum adjacent-window correlation. Evaluates both
+  `L_i=max(2×period,horizon)` and `L_i=max(3×period,horizon)` directly (off-grid);
+  stage 4 folds their sidecars into `period` and `period3` columns.
 - **`run_all_v2.py`** — reuses stages 1–3 from `run_all.py`, inserts the period
   stage, re-runs the comparison.
 - **`predict_period.py`** — the original period-regression Patch-Transformer that

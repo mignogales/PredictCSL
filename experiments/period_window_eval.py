@@ -1,17 +1,19 @@
 """
-period_window_eval.py  --  "2x strongest period" context-length heuristic.
+period_window_eval.py  --  GiftEval-cadence period context heuristics.
 
 A fourth context-selection strategy for the PredictCSL pipeline, complementing
 the grid strategies produced by ``test_window_ablation_gifteval_v5.py`` (full /
 best / predictor).  Instead of choosing a window from the predictor's discrete
 grid, this method picks, *per test instance*, the context length
 
-    L_i = max( 2 x strongest_period_i ,  horizon )
+    L_i = max( k x strongest_period_i ,  horizon ),  k in {2, 3}
 
-where ``strongest_period_i`` is detected from that instance's own context via a
-combined FFT + autocorrelation analysis (see ``detect_period``).  The intuition:
-a foundation model needs at least two full cycles of the dominant seasonality as
-context, but never less than the horizon it has to predict.
+where ``strongest_period_i`` is selected only from the sampling cadences used by
+GiftEval (10S, 5T, 10T, 15T, H, D, W, M, Q, A).  Each cadence is translated to
+samples at the dataset's sampling rate.  The context is split into consecutive
+non-overlapping chunks of that size and the candidate with the greatest mean
+correlation between adjacent, per-chunk-normalised windows wins.  We report both
+two-cycle and three-cycle contexts, never shorter than the forecast horizon.
 
 Because each instance gets its OWN window, ``L_i`` is generally NOT one of the
 ablation-grid windows -- so we cannot just read a cached cell.  We evaluate the
@@ -26,8 +28,10 @@ comparison artefacts, so ``compare_window_strategies_gifteval.py`` can pick them
 up and surface ``period`` as a fourth strategy:
 
     <run_dir>/models/<model_short>/compare_real_vs_predicted/
-        period_<dataset>_t<term>_<model_short>.json    aggregate metrics + window stats
-        period_<dataset>_t<term>_<model_short>_win.npz  per-instance windows + periods
+        period_<dataset>_t<term>_<model_short>.json      2-cycle strategy
+        period_<dataset>_t<term>_<model_short>_win.npz
+        period3_<dataset>_t<term>_<model_short>.json     3-cycle strategy
+        period3_<dataset>_t<term>_<model_short>_win.npz
 
 Re-running is safe: a (model, dataset, term) whose sidecar JSON already exists is
 skipped unless --force is given.
@@ -55,6 +59,7 @@ import torch
 from colorama import Fore
 
 from gift_eval.data import Dataset as GiftEvalDataset
+from experiments.period_detection import GIFT_EVAL_PERIOD_LABELS, detect_period
 
 # Reuse v5's catalog + machinery verbatim so this method evaluates models exactly
 # the way the grid ablation does (same loaders, same forward passes, same metric
@@ -66,6 +71,7 @@ from experiments.test_window_ablation_gifteval_v5 import (
     GiftEvalCache,
     ForecastResult,            # noqa: F401  (re-exported for type clarity)
     compute_all_metrics,
+    compute_per_sample_metrics,
     cell_mase_gluonts_real,
     _forecast_cell,
     _merge_grouped,
@@ -82,105 +88,6 @@ from experiments.test_window_ablation_gifteval_v5 import (
     SUNDIAL_MAX_CONTEXT,
     TIMEMOE_MAX_TOTAL,
 )
-
-
-# ==============================================================================
-#  PERIOD DETECTION  (per-series "strongest period")
-# ==============================================================================
-
-def _fft_period(x: np.ndarray, min_period: int, max_period: int) -> Tuple[Optional[float], float]:
-    """Dominant period via the periodogram peak within [min_period, max_period].
-
-    Returns (period, salience) where salience = peak_power / median_power (>1
-    means the peak stands above the spectral floor). period is None if no
-    in-range frequency exists.
-    """
-    n = x.size
-    if n < 2 * min_period + 1:
-        return None, 0.0
-    power = np.abs(np.fft.rfft(x)) ** 2
-    freqs = np.fft.rfftfreq(n)
-    with np.errstate(divide="ignore"):
-        periods = np.where(freqs > 0, 1.0 / freqs, np.inf)
-    mask = (periods >= min_period) & (periods <= max_period)
-    if not mask.any():
-        return None, 0.0
-    cand = np.flatnonzero(mask)
-    best = cand[int(np.argmax(power[cand]))]
-    floor = float(np.median(power[1:])) if n > 2 else 0.0
-    salience = float(power[best] / floor) if floor > 0 else float("inf")
-    return float(periods[best]), salience
-
-
-def _acf_period(x: np.ndarray, min_period: int, max_period: int) -> Tuple[Optional[float], float]:
-    """Dominant period via the first strong autocorrelation peak in range.
-
-    Returns (period, strength) where strength is the ACF value at the peak lag
-    (normalised so lag-0 = 1). period is None if no positive in-range peak.
-    """
-    n = x.size
-    if n < 2 * min_period + 1:
-        return None, 0.0
-    # Biased ACF via FFT (fast); normalise so r[0] == 1.
-    f = np.fft.rfft(x, n=2 * n)
-    acf = np.fft.irfft(f * np.conj(f))[:n]
-    if acf[0] <= 0:
-        return None, 0.0
-    acf = acf / acf[0]
-    hi = min(max_period, n - 1)
-    if hi < min_period:
-        return None, 0.0
-    seg = acf[min_period:hi + 1]
-    if seg.size == 0:
-        return None, 0.0
-    # Prefer a local maximum; fall back to the arg-max of the segment.
-    lag = int(np.argmax(seg)) + min_period
-    return float(lag), float(acf[lag])
-
-
-def detect_period(
-    x: np.ndarray,
-    min_period: int,
-    max_period: int,
-    season_fallback: int,
-    fft_salience_min: float = 3.0,
-    fft_strong_salience_min: float = 40.0,
-    acf_strength_min: float = 0.2,
-) -> Tuple[float, str]:
-    """Estimate a single series' strongest period.
-
-    Strategy: linearly detrend, then take the FFT periodogram peak and the ACF
-    peak.  Prefer the FFT peak when it is salient AND the ACF agrees it is a real
-    correlation; otherwise fall back to the ACF peak, then to the frequency-based
-    seasonality (``season_fallback``).  Returns (period, method).
-    """
-    x = np.asarray(x, dtype=np.float64)
-    x = x[np.isfinite(x)]
-    n = x.size
-    if n < 2 * min_period + 1:
-        return float(max(season_fallback, min_period)), "fallback_short"
-
-    # Linear detrend + de-mean so trend/level don't dominate the low-freq bins.
-    t = np.arange(n, dtype=np.float64)
-    slope, intercept = np.polyfit(t, x, 1)
-    x = x - (slope * t + intercept)
-    if not np.any(np.abs(x) > 1e-12):
-        return float(max(season_fallback, min_period)), "fallback_flat"
-
-    fft_p, fft_sal = _fft_period(x, min_period, max_period)
-    acf_p, acf_str = _acf_period(x, min_period, max_period)
-
-    # FFT peak, confirmed by a non-trivial ACF at a compatible lag.
-    if fft_p is not None and fft_sal >= fft_salience_min and acf_str >= acf_strength_min:
-        return fft_p, "fft"
-    if acf_p is not None and acf_str >= acf_strength_min:
-        return acf_p, "acf"
-    # ACF-unconfirmed FFT peak: accept ONLY when the spectral peak is very strong
-    # (a clean periodic series sits >100x the spectral floor; white noise peaks
-    # stay below ~20x), otherwise fall back to the frequency-based seasonality.
-    if fft_p is not None and fft_sal >= fft_strong_salience_min:
-        return fft_p, "fft_strong"
-    return float(max(season_fallback, min_period)), "fallback_season"
 
 
 # ==============================================================================
@@ -233,9 +140,16 @@ def _compare_dir(run_dir: str, model_short: str) -> str:
     return os.path.join(run_dir, "models", model_short, "compare_real_vs_predicted")
 
 
-def _sidecar_paths(run_dir: str, dataset_display: str, term: str, model_short: str) -> Tuple[str, str]:
+def _sidecar_paths(
+    run_dir: str,
+    dataset_display: str,
+    term: str,
+    model_short: str,
+    period_multiple: int = 2,
+) -> Tuple[str, str]:
     cdir = _compare_dir(run_dir, model_short)
-    base = f"period_{dataset_display}_t{term}_{model_short}"
+    prefix = "period" if period_multiple == 2 else f"period{period_multiple}"
+    base = f"{prefix}_{dataset_display}_t{term}_{model_short}"
     return os.path.join(cdir, base + ".json"), os.path.join(cdir, base + "_win.npz")
 
 
@@ -279,12 +193,13 @@ def evaluate_one(
     args,
     device: str,
     full_window: Optional[int] = None,
-) -> Tuple[dict, np.ndarray, np.ndarray]:
+) -> Tuple[dict, np.ndarray, np.ndarray, dict]:
     """Run the period-window strategy for one (model, dataset, term).
 
-    Returns (metrics_dict, per_instance_windows, per_instance_periods). Instances
-    the family cannot serve at any length (e.g. TimeMoE when horizon alone
-    exhausts its budget) are dropped from the aggregate.
+    Returns (metrics_dict, per_instance_windows, per_instance_periods,
+    per_instance_metrics). Instances the family cannot serve at any length
+    (e.g. TimeMoE when horizon alone exhausts its budget) are dropped from the
+    aggregate.
 
     ``full_window`` (when given) is the largest valid ablation-grid window; the
     per-series period window is never allowed to exceed it, because the model is
@@ -294,23 +209,21 @@ def evaluate_one(
     n_total = cache.n_total
     cap = _family_cap(model_family, horizon)
 
-    max_period_cap = max(args.min_period, int(args.max_period_frac * cache.max_context))
-
     periods = np.empty(n_total, dtype=np.float64)
     methods: List[str] = []
+    similarities = np.full(n_total, np.nan, dtype=np.float64)
     raw_L = np.empty(n_total, dtype=np.int64)
     for i in range(n_total):
-        ctx = cache.contexts[i]
-        real_len = int(cache.context_lengths[i])
-        p, method = detect_period(
-            ctx,
-            min_period=args.min_period,
-            max_period=min(max_period_cap, max(args.min_period, real_len // 2)),
+        p, method, scores = detect_period(
+            cache.contexts_raw[i],
+            sampling_freq=cache.freq,
             season_fallback=cache.season,
         )
         periods[i] = p
         methods.append(method)
-        raw_L[i] = max(int(round(2.0 * p)), horizon)
+        if method in scores and np.isfinite(scores[method]):
+            similarities[i] = scores[method]
+        raw_L[i] = max(int(round(args.period_multiple * p)), horizon)
 
     # Clamp to each instance's genuine context and the family's serving cap.
     eff_L = np.minimum(raw_L, cache.context_lengths.astype(np.int64))
@@ -375,6 +288,10 @@ def evaluate_one(
     metrics["mase_gluonts_real"] = cell_mase_gluonts_real(fr, cache, valid_idx)
     metrics["elapsed_seconds"] = round(elapsed, 3)
     metrics["horizon"] = horizon
+    per_sample = compute_per_sample_metrics(
+        fr, tgts, cache.naive_seasonal_mae_train,
+        seasonal_errors=cache.seasonal_errors_gluonts[valid_idx])
+    per_sample["served_index"] = valid_idx.astype(np.int32, copy=False)
 
     # Window stats are over the actually-served (quantized) widths.
     win_full = np.full(n_total, -1, dtype=np.int64)
@@ -390,6 +307,9 @@ def evaluate_one(
         "model": model_id,
         "model_family": model_family,
         "horizon": horizon,
+        "sampling_frequency": cache.freq,
+        "period_multiple": int(args.period_multiple),
+        "period_candidates": list(GIFT_EVAL_PERIOD_LABELS),
         "n_total": int(n_total),
         "n_instances": int(valid_idx.size),
         "full_window_cap": (int(full_window) if full_window else None),
@@ -403,11 +323,17 @@ def evaluate_one(
         "n_distinct_windows": int(np.unique(W).size),
         "period_mean": float(periods[valid_idx].mean()),
         "period_median": float(np.median(periods[valid_idx])),
-        "method_counts": method_counts,
+        "cadence_counts": method_counts,
+        "similarity_mean": (
+            float(np.nanmean(similarities[valid_idx]))
+            if np.isfinite(similarities[valid_idx]).any() else float("nan")
+        ),
         "all_metrics": {k: (float(v) if isinstance(v, (int, float)) else v)
                         for k, v in metrics.items()},
     }
-    return summary, win_full, periods
+    per_sample["period_labels"] = np.asarray(methods)
+    per_sample["period_similarity"] = similarities
+    return summary, win_full, periods, per_sample
 
 
 # ==============================================================================
@@ -453,6 +379,7 @@ def run(args, device: str) -> None:
     print(Fore.CYAN
           + f"Period-window eval  |  device={device}  |  quantize={args.quantize}"
           + (f" (n_buckets={args.n_buckets})" if args.quantize != "none" else "")
+          + f"  |  multiples={args.period_multiples}"
           + f"  |  models={[m[2] for m in models]}"
           + Fore.RESET)
 
@@ -464,11 +391,34 @@ def run(args, device: str) -> None:
         ensure_handle, handle = _make_ensure_handle(model_id, model_family, device)
 
         for ge_name, term, dataset_display, to_univariate in datasets:
-            json_path, npz_path = _sidecar_paths(args.run_dir, dataset_display, term, model_short)
-            if os.path.isfile(json_path) and not args.force:
-                print(Fore.WHITE
-                      + f"  CACHED  {model_short} | {dataset_display} | t={term}  -> skip"
-                      + Fore.RESET)
+            pending: List[Tuple[int, str, str]] = []
+            for multiple in args.period_multiples:
+                json_path, npz_path = _sidecar_paths(
+                    args.run_dir, dataset_display, term, model_short, multiple)
+                per_instance_cached = False
+                if os.path.isfile(json_path) and os.path.isfile(npz_path):
+                    try:
+                        with np.load(npz_path) as cached:
+                            per_instance_cached = {
+                                "windows", "periods", "period_labels",
+                                "period_similarity", "mase_gluonts", "served_index",
+                            }.issubset(cached.files)
+                    except (OSError, ValueError):
+                        per_instance_cached = False
+                if per_instance_cached and not args.force:
+                    print(Fore.WHITE
+                          + f"  CACHED  {model_short} | {dataset_display} | "
+                            f"t={term} | {multiple}xP  -> skip"
+                          + Fore.RESET)
+                    continue
+                if os.path.isfile(json_path) and not args.force:
+                    print(Fore.YELLOW
+                          + f"  STALE   {model_short} | {dataset_display} | t={term} | "
+                            f"{multiple}xP: sidecar uses the old detector or lacks "
+                            "aligned per-instance MASE; recomputing."
+                          + Fore.RESET)
+                pending.append((multiple, json_path, npz_path))
+            if not pending:
                 continue
 
             ds_key = (ge_name, term)
@@ -482,35 +432,45 @@ def run(args, device: str) -> None:
             # period never feeds the model more context than the full strategy.
             full_w = _full_window_cap(args.run_dir, dataset_display, term, model_short)
             if full_w is None:
+                if args.require_comparison:
+                    print(Fore.WHITE
+                          + f"  SKIP  {model_short} | {dataset_display} | t={term}: "
+                            "no matching v5 comparison cell." + Fore.RESET)
+                    continue
                 print(Fore.YELLOW
                       + f"    WARN: no v5 npz for {dataset_display} t={term}; "
                         "period window left uncapped by full window."
                       + Fore.RESET)
 
-            tag = f"{model_short} | {dataset_display} | t={term} | h={cache.horizon}"
-            print(Fore.YELLOW + f"\n  > {tag}  (n={cache.n_total}"
-                  + (f", full_cap={full_w}" if full_w else "") + ")" + Fore.RESET)
-            try:
-                summary, windows, periods = evaluate_one(
-                    cache, model_id, model_family, model_short,
-                    ensure_handle, args, device, full_window=full_w)
-            except RuntimeError as exc:
-                print(Fore.RED + f"    SKIP: {exc}" + Fore.RESET)
-                continue
+            for multiple, json_path, npz_path in pending:
+                args.period_multiple = multiple
+                tag = (f"{model_short} | {dataset_display} | t={term} | "
+                       f"h={cache.horizon} | {multiple}xP")
+                print(Fore.YELLOW + f"\n  > {tag}  (n={cache.n_total}"
+                      + (f", full_cap={full_w}" if full_w else "") + ")" + Fore.RESET)
+                try:
+                    summary, windows, periods, per_sample = evaluate_one(
+                        cache, model_id, model_family, model_short,
+                        ensure_handle, args, device, full_window=full_w)
+                except RuntimeError as exc:
+                    print(Fore.RED + f"    SKIP: {exc}" + Fore.RESET)
+                    continue
 
-            summary["term"] = term
-            print(Fore.GREEN
-                  + f"    period_mase={summary['period_mase']:.6f}  "
-                  + f"window: mean={summary['window_mean']:.0f} "
-                  + f"median={summary['window_median']:.0f} "
-                  + f"[{summary['window_min']},{summary['window_max']}]  "
-                  + f"({summary['n_distinct_windows']} widths, {summary['period_elapsed_s']:.1f}s)"
-                  + Fore.RESET)
+                summary["term"] = term
+                print(Fore.GREEN
+                      + f"    {multiple}xP_mase={summary['period_mase']:.6f}  "
+                      + f"window: mean={summary['window_mean']:.0f} "
+                      + f"median={summary['window_median']:.0f} "
+                      + f"[{summary['window_min']},{summary['window_max']}]  "
+                      + f"({summary['n_distinct_windows']} widths, "
+                        f"{summary['period_elapsed_s']:.1f}s)"
+                      + Fore.RESET)
 
-            os.makedirs(os.path.dirname(json_path), exist_ok=True)
-            with open(json_path, "w") as f:
-                json.dump(summary, f, indent=2)
-            np.savez_compressed(npz_path, windows=windows, periods=periods)
+                os.makedirs(os.path.dirname(json_path), exist_ok=True)
+                with open(json_path, "w") as f:
+                    json.dump(summary, f, indent=2)
+                np.savez_compressed(
+                    npz_path, windows=windows, periods=periods, **per_sample)
 
             if device == "cuda":
                 torch.cuda.empty_cache()
@@ -526,7 +486,7 @@ def run(args, device: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Per-series 2x-strongest-period context-length strategy.")
+        description="Per-series GiftEval-cadence 2x/3x-period context strategies.")
     p.add_argument("--models", type=str, nargs="+", default=None,
                    help="Restrict to these model_short names (default: all in v5's MODELS).")
     p.add_argument("--datasets", type=str, nargs="+", default=None,
@@ -538,18 +498,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--force", action="store_true",
                    help="Recompute even when a sidecar JSON already exists.")
-    # Period detection knobs.
-    p.add_argument("--min-period", type=int, default=2,
-                   help="Smallest detectable period (samples).")
-    p.add_argument("--max-period-frac", type=float, default=0.5,
-                   help="Largest detectable period as a fraction of a dataset's max context.")
+    p.add_argument("--require-comparison", action="store_true",
+                   help="Skip dataset cells without a matching v5 comparison NPZ. "
+                        "Used by the master so smoke/partial runs stay in scope.")
+    p.add_argument("--period-multiples", type=int, nargs="+", default=[2, 3],
+                   help="Numbers of detected cycles to use as context (default: 2 3).")
     # Window quantization (bounds distinct forward-pass widths -> moirai/timesfm recompiles).
-    p.add_argument("--quantize", choices=["log", "none"], default="log",
+    p.add_argument("--quantize", choices=["log", "none"], default="none",
                    help="'log': snap per-series windows down onto n_buckets log-spaced widths "
-                        "(default; bounds recompiles). 'none': exact per-series widths.")
+                        "(bounds recompiles). 'none': exact 2x/3x cadence widths (default).")
     p.add_argument("--n-buckets", type=int, default=48,
                    help="Number of log-spaced window buckets when --quantize log.")
-    return p.parse_args()
+    args = p.parse_args()
+    if any(k < 1 for k in args.period_multiples):
+        p.error("--period-multiples values must be positive integers")
+    args.period_multiples = list(dict.fromkeys(args.period_multiples))
+    return args
 
 
 def main() -> None:

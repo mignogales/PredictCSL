@@ -587,8 +587,15 @@ def predict_chronos2(pipeline, x: torch.Tensor, horizon: int, device: str) -> to
     # Chronos2Pipeline otherwise defaults to an internal batch_size=256,
     # silently undoing the caller's dynamic microbatch selection. Each call
     # here already contains exactly one tuned microbatch, so forward its size.
-    samples = pipeline.predict(inputs=context, prediction_length=horizon,
-                               batch_size=int(context.shape[0]))
+    samples = pipeline.predict(
+        inputs=context,
+        prediction_length=horizon,
+        batch_size=int(context.shape[0]),
+        # Keep every time series independent. Chronos2 calls this cross-learning;
+        # enabling it would share information across series in the same batch and
+        # make forecasts depend on batch composition.
+        cross_learning=False,
+    )
     if isinstance(samples, list):
         samples = torch.stack(samples, dim=0).squeeze(1)
     if samples.dim() == 4:

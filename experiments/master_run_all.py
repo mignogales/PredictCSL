@@ -1,5 +1,6 @@
 """
-PredictCSL recomputation master: label -> train -> GiftEval -> compare.
+PredictCSL recomputation master: label -> train -> GiftEval -> compare ->
+per-instance window evaluation.
 
 The requested predictor matrix is deliberately small:
 
@@ -10,8 +11,13 @@ The requested predictor matrix is deliberately small:
 
 Stage 1 runs once. All four predictor variants share one canonical GiftEval cell
 cache, so the expensive TSFM forecasts are also computed once; only predictor
-inference and post-processing repeat. The full/base predictor, period strategy,
-and robust-timing-only v5 pass are not part of this master.
+inference and post-processing repeat. The full/base predictor and
+robust-timing-only v5 pass are not part of this master.
+
+Stage 5 evaluates every predictor both ways: the historical dataset-shared
+choice and a genuine per-instance W_i choice. It retrieves each selected
+instance's cached leaderboard MASE and compares against full-native context,
+fixed windows, heuristics, and dataset/per-instance oracles.
 
 The default output root is a new self-contained tree
 ``logs/experiments/master_recompute`` so incompatible old 8k pools and cached
@@ -81,21 +87,26 @@ class Variant:
     extra: List[str] = field(default_factory=list)   # variant-specific flags
     needs_mamba: bool = False        # predictor needs mamba-ssm (skip mamba-less envs)
     label: str = ""                 # human description for the banner
+    ablation_tree: str = ""         # subdir under PREDICTCSL_ABLATION_ROOT
 
 
 # Authoritative variant registry (see MAINTENANCE RULE in the module docstring).
 # Order matters: each entry's skip set assumes everything above it has run.
 VARIANTS: List[Variant] = [
     Variant("cheap", "experiments.run_all_v3", ["1"],
-            label="cheap PatchTST · curve regression"),
+            label="cheap PatchTST · curve regression",
+            ablation_tree="general_v3"),
     Variant("cheap_cls", "experiments.run_all_v3", ["1"],
             extra=["--training-objective", "classification"],
-            label="cheap PatchTST · soft top-3 classification"),
+            label="cheap PatchTST · soft top-3 classification",
+            ablation_tree="general_v3_classification"),
     Variant("mamba", "experiments.run_all_v4", ["1"], needs_mamba=True,
-            label="Mamba · curve regression"),
+            label="Mamba · curve regression",
+            ablation_tree="general_v4"),
     Variant("mamba_cls", "experiments.run_all_v4", ["1"], needs_mamba=True,
             extra=["--training-objective", "classification"],
-            label="Mamba · soft top-3 classification"),
+            label="Mamba · soft top-3 classification",
+            ablation_tree="general_v4_classification"),
 ]
 
 
@@ -303,7 +314,8 @@ def parse_args() -> argparse.Namespace:
                    metavar="STAGE",
                    help="Forwarded verbatim to every variant (and the stage-1 "
                         "pre-run) as run_all's --force: pass stage numbers "
-                        "(e.g. --force 3 4) to re-run those stages even when their "
+                        "(e.g. --force 3 4 or --force 5 for instance evaluation) "
+                        "to re-run those stages even when their "
                         "done-marker is present, or --force with no argument to "
                         "force all active stages. Needed after adding datasets/"
                         "models to a catalog, since the stage-level done-markers "
@@ -312,6 +324,12 @@ def parse_args() -> argparse.Namespace:
                         "the re-run cheap (only the new cells compute).")
     p.add_argument("--no-rollup", action="store_true",
                    help="Skip the final cross-predictor rollup_all_predictors pass.")
+    p.add_argument("--no-instance-eval", action="store_true",
+                   help="Skip Stage 5 (period heuristic + genuine per-instance "
+                        "window evaluation).")
+    p.add_argument("--no-period-heuristic", action="store_true",
+                   help="In Stage 5, evaluate cached grid methods but do not run "
+                        "the additional per-series 2x-period TSFM forecasts.")
     p.add_argument("--stage1-batch-size", type=int, default=None,
                    help="Forwarded to build_context_length_dataset --batch-size. "
                         "Useful for slow/heavy labelers such as TiRex.")
@@ -409,12 +427,16 @@ def main() -> None:
     # [...] -> --force <stages>. Passed to every subprocess verbatim; run_all only
     # acts on it for stages that are active (not in that variant's --skip-stages),
     # so forcing e.g. stage 3 is a no-op on variants that reuse it.
+    force_instance = args.force == [] or (
+        args.force is not None and "5" in args.force)
     if args.force is None:
         fflag: List[str] = []
     elif args.force == []:
         fflag = ["--force"]
     else:
-        fflag = ["--force", *args.force]
+        base_forced = [
+            stage for stage in args.force if stage in {"1", "2", "3", "4"}]
+        fflag = ["--force", *base_forced] if base_forced else []
     print(Fore.CYAN + f"Master run — variants: {[v.name for v in variants]}" + Fore.RESET)
     for env, displays in groups.items():
         print(Fore.CYAN + f"  env {_env_label(env)}: {displays}" + Fore.RESET)
@@ -454,6 +476,45 @@ def main() -> None:
             cmd = _variant_cmd(env, v, displays, vflag, fflag)
             _run(cmd, f"{v.name} [{_env_label(env)}] — {v.label}  "
                       f"(skip stages {v.skip_stages or 'none'})")
+
+    # ---- Stage 5: genuine per-instance context choice. -----------------------
+    # The period heuristic performs additional TSFM inference and therefore uses
+    # the same per-family conda routing. The final evaluator only reads caches.
+    if not args.no_instance_eval:
+        ablation_root = os.environ["PREDICTCSL_ABLATION_ROOT"]
+        period_run_dir = os.path.join(ablation_root, variants[0].ablation_tree)
+        if not args.no_period_heuristic:
+            for env, displays in groups.items():
+                period_cmd = _py(
+                    env, "experiments.period_window_eval",
+                    "--models", *displays,
+                    "--run-dir", period_run_dir,
+                    "--require-comparison",
+                )
+                if force_instance:
+                    period_cmd.append("--force")
+                _run(
+                    period_cmd,
+                    f"Stage 5a — per-instance period heuristic "
+                    f"[{_env_label(env)}]: {displays}",
+                )
+
+        instance_out = os.path.join(
+            os.environ["PREDICTCSL_MASTER_ROOT"],
+            "instance_window_evaluation")
+        instance_cmd = _py(
+            None, "experiments.evaluate_instance_windows",
+            "--ablation-root", ablation_root,
+            "--output-dir", instance_out,
+        )
+        if not args.no_period_heuristic:
+            instance_cmd += ["--period-run-dir", period_run_dir]
+        if args.models:
+            instance_cmd += ["--models", *args.models]
+        _run(
+            instance_cmd,
+            "Stage 5b — per-instance W_i evaluation (all predictor variants)",
+        )
 
     # ---- Final combined cross-predictor overview (pure post-processing). -----
     # Reads on-disk outputs only (no TSFM load) -> runs once in the main env.

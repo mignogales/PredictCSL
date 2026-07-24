@@ -585,7 +585,11 @@ def run_has_gluonts_real_curve(run_dir: str) -> bool:
 
 
 def _load_period_record(
-    compare_dir: str, dataset_display: str, term: str, model_short: str
+    compare_dir: str,
+    dataset_display: str,
+    term: str,
+    model_short: str,
+    period_multiple: int = 2,
 ) -> Optional[dict]:
     """Load the period_window_eval.py sidecar for this (dataset, term, model), if any.
 
@@ -593,9 +597,9 @@ def _load_period_record(
     period-window strategy was not evaluated -- in which case the period_* columns
     stay NaN and the comparison degrades gracefully to the original 3 strategies.
     """
+    prefix = "period" if period_multiple == 2 else f"period{period_multiple}"
     path = os.path.join(
-        compare_dir, f"period_{dataset_display}_t{term}_{model_short}.json"
-    )
+        compare_dir, f"{prefix}_{dataset_display}_t{term}_{model_short}.json")
     if not os.path.isfile(path):
         return None
     try:
@@ -873,34 +877,35 @@ def load_strategy_records(
             complexity_ratio_pred = pred_flops / full_flops
             complexity_ratio_best = best_flops / full_flops
 
-            # --- Period-window strategy (per-series 2x-period; off-grid) ----------
-            # Loaded from the period_window_eval.py sidecar; NaN-filled when absent
-            # so the comparison still runs with just full/best/pred.
-            prec = _load_period_record(compare_dir, dataset_display, term, model_short)
-            if prec is not None:
-                period_w       = float(prec.get("window_mean", float("nan")))
-                # Score the period strategy on the SAME metric as everything else:
-                # read the active gluonts metric from the sidecar's all_metrics.
-                # Older sidecars (custom-`mase`-only) yield NaN — the period rows
-                # drop out rather than silently mixing metric definitions.
-                _pm = (prec.get("all_metrics") or {}).get(mase_metric)
-                period_mase    = float(_pm) if _pm is not None else float("nan")
-                period_elapsed = float(prec.get("period_elapsed_s", float("nan")))
-                period_w_med   = float(prec.get("window_median", float("nan")))
-                period_n_inst  = int(prec.get("n_instances", n_instances))
-                period_flops   = theoretical_flops(
-                    model, max(1, int(round(period_w))), horizon, patch_sizes)
-                speedup_period = (
-                    full_elapsed / period_elapsed
-                    if period_elapsed > 0 and not math.isnan(period_elapsed)
-                    and not math.isnan(full_elapsed)
+            # --- GiftEval-cadence period strategies (2xP and 3xP; off-grid) ------
+            # Each multiplier has its own sidecar. Missing sidecars are NaN-filled
+            # so old/partial runs still compare full/best/pred normally.
+            def _period_values(period_multiple: int):
+                prec = _load_period_record(
+                    compare_dir, dataset_display, term, model_short,
+                    period_multiple=period_multiple)
+                if prec is None:
+                    return (float("nan"), float("nan"), float("nan"),
+                            float("nan"), 0, float("nan"), float("nan"))
+                pw = float(prec.get("window_mean", float("nan")))
+                pm_raw = (prec.get("all_metrics") or {}).get(mase_metric)
+                pm = float(pm_raw) if pm_raw is not None else float("nan")
+                pe = float(prec.get("period_elapsed_s", float("nan")))
+                pwm = float(prec.get("window_median", float("nan")))
+                pni = int(prec.get("n_instances", n_instances))
+                pf = theoretical_flops(
+                    model, max(1, int(round(pw))), horizon, patch_sizes)
+                ps = (
+                    full_elapsed / pe
+                    if pe > 0 and not math.isnan(pe) and not math.isnan(full_elapsed)
                     else float("nan")
                 )
-            else:
-                period_w = period_mase = period_elapsed = period_w_med = float("nan")
-                period_n_inst = 0
-                period_flops = float("nan")
-                speedup_period = float("nan")
+                return pw, pm, pe, pwm, pni, pf, ps
+
+            (period_w, period_mase, period_elapsed, period_w_med,
+             period_n_inst, period_flops, speedup_period) = _period_values(2)
+            (period3_w, period3_mase, period3_elapsed, period3_w_med,
+             period3_n_inst, period3_flops, speedup_period3) = _period_values(3)
 
             # --- Predictor-variant strategies (v3 cheap, v4 Mamba, …) ------------
             # Each variant's curve picks a window; we score it on the SAME base
@@ -1017,6 +1022,24 @@ def load_strategy_records(
             "period_flops":    period_flops,
             "complexity_ratio_period_vs_full": (
                 period_flops / full_flops if full_flops > 0 else float("nan")
+            ),
+            # Same detected GiftEval cadence, but retain three complete cycles.
+            "period3_window": period3_w,
+            "period3_window_median": period3_w_med,
+            "period3_n_instances": period3_n_inst,
+            "period3_mase": period3_mase,
+            "delta_period3_vs_full": period3_mase - full_mase,
+            "delta_period3_vs_best": period3_mase - best_mase,
+            "delta_period3_vs_pred": period3_mase - pred_mase,
+            "rel_gain_period3_over_full": (
+                (full_mase - period3_mase) / (abs(full_mase) + 1e-12)
+            ),
+            "period3_elapsed_s": period3_elapsed,
+            "period3_elapsed_std_s": float("nan"),
+            "speedup_period3_vs_full": speedup_period3,
+            "period3_flops": period3_flops,
+            "complexity_ratio_period3_vs_full": (
+                period3_flops / full_flops if full_flops > 0 else float("nan")
             ),
             # predictor-variant strategies (v3 cheap, v4 Mamba, …); empty when none
             **variant_cols,
@@ -1189,6 +1212,42 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
                     "median": float(np.median(crp)),
                 }
             stats["mean_period_window"] = float(rp["period_window"].dropna().mean())
+
+    if "period3_mase" in df.columns:
+        rp3 = df.dropna(subset=["full_mase", "best_mase", "period3_mase"])
+        if not rp3.empty:
+            vals = rp3["period3_mase"].values
+            stats["period3_mase"] = {
+                "mean": float(vals.mean()),
+                "geomean": _geomean(vals),
+                "median": float(np.median(vals)),
+                "std": float(vals.std()),
+                "n": int(len(vals)),
+            }
+            beats = int((rp3["period3_mase"] < rp3["full_mase"]).sum())
+            stats["period3_beats_full_count"] = beats
+            stats["period3_beats_full_rate"] = beats / max(len(rp3), 1)
+            stats["period3_beats_pred_count"] = int(
+                (rp3["period3_mase"] < rp3["pred_mase"]).sum())
+            gain = rp3["rel_gain_period3_over_full"].values
+            stats["rel_gain_period3_over_full"] = {
+                "mean": float(gain.mean()),
+                "median": float(np.median(gain)),
+                "pct_positive": float((gain > 0).mean()),
+            }
+            regret = rp3["delta_period3_vs_best"].values
+            stats["regret_period3_vs_best"] = {
+                "mean": float(regret.mean()),
+                "median": float(np.median(regret)),
+            }
+            crp = df["complexity_ratio_period3_vs_full"].dropna().values
+            if crp.size:
+                stats["complexity_ratio_period3_vs_full"] = {
+                    "mean": float(crp.mean()),
+                    "median": float(np.median(crp)),
+                }
+            stats["mean_period3_window"] = float(
+                rp3["period3_window"].dropna().mean())
 
     # ---- Predictor-variant strategies (v3 cheap, v4 Mamba, …) -----------------
     # Same sub-block the primary predictor / period strategies get, per variant.
@@ -3299,6 +3358,8 @@ def main() -> None:
                      ("pred_mase", "Predictor    ")]
         if "period_mase" in stats:
             mase_keys.append(("period_mase", "Period (2xP) "))
+        if "period3_mase" in stats:
+            mase_keys.append(("period3_mase", "Period (3xP) "))
         # Auto-discovered predictor variants (v3 cheap, v4 Mamba, …).
         for vkey, vlbl, _vclr in present_pred_variants(df_subset):
             if f"{vkey}_mase" in stats:
@@ -3312,6 +3373,13 @@ def main() -> None:
                   f"({100*stats['period_beats_full_rate']:.1f}%)  |  "
                   f"regret vs oracle: mean={stats['regret_period_vs_best']['mean']:.4f}  "
                   f"mean window={stats.get('mean_period_window', float('nan')):.0f}")
+        if "period3_mase" in stats:
+            print(f"  Period 3x beats full: "
+                  f"{stats['period3_beats_full_count']}/{stats['total_rows']} "
+                  f"({100*stats['period3_beats_full_rate']:.1f}%)  |  "
+                  f"regret vs oracle: mean="
+                  f"{stats['regret_period3_vs_best']['mean']:.4f}  "
+                  f"mean window={stats.get('mean_period3_window', float('nan')):.0f}")
         print(f"  Pred beats full: {stats['pred_beats_full_count']}/{stats['total_rows']} "
               f"({100*stats['pred_beats_full_rate']:.1f}%)")
         for vkey, vlbl, _vclr in present_pred_variants(df_subset):

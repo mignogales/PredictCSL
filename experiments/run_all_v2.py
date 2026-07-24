@@ -1,17 +1,16 @@
 """
-PredictCSL pipeline orchestrator -- v2 (adds the "2x strongest period" method).
+PredictCSL pipeline orchestrator -- v2 (adds cadence-similarity period methods).
 
 Same four stages as ``run_all.py`` (build -> predictor -> ablation -> compare),
 but with a fifth stage inserted before the comparison that evaluates an
 alternative, off-grid context-length strategy:
 
     Stage 5 (period) -- experiments.period_window_eval
-        For every test instance, pick context  L_i = max(2 x strongest_period_i,
-        horizon)  (period detected per series via FFT + autocorrelation), run the
-        model at that per-series length, and aggregate one MASE per
-        (model, dataset, term).  Because L_i is generally NOT on the ablation
-        grid, the metric is COMPUTED here rather than read from a cached cell.
-        Results are dropped as sidecars next to the v5 comparison artefacts.
+        For every test instance, translate the official GiftEval cadences to
+        sample counts, choose the cadence whose adjacent non-overlapping chunks
+        are most similar, then evaluate max(2P, horizon) and max(3P, horizon).
+        Because these lengths are generally NOT on the ablation grid, their
+        metrics are computed here rather than read from cached cells.
 
     Stage 4 (compare) is then re-run so compare_window_strategies_gifteval.py
         surfaces the period strategy as a fourth column alongside
@@ -80,7 +79,7 @@ def parse_args() -> argparse.Namespace:
                         "--force with no arg to force all of 1/2/3.")
     p.add_argument("--force-period", action="store_true",
                    help="Recompute period sidecars even when they already exist.")
-    p.add_argument("--quantize", choices=["log", "none"], default="log",
+    p.add_argument("--quantize", choices=["log", "none"], default="none",
                    help="Window quantization for the period stage (see period_window_eval).")
     p.add_argument("--n-buckets", type=int, default=48,
                    help="Log-spaced window buckets when --quantize log.")
