@@ -67,6 +67,24 @@ class TestAnalysis(unittest.TestCase):
         np.testing.assert_allclose(normalized.iloc[:2], [-1.0, 0.5])
         self.assertTrue(np.isnan(normalized.iloc[2]))
 
+    def test_perturbation_grid_uses_4x4_for_16_or_more(self):
+        contexts = [32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
+                    1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192]
+        selected, nrows, ncols = figures._perturbation_grid_layout(contexts)
+        self.assertEqual((nrows, ncols), (4, 4))
+        self.assertEqual(len(selected), 16)
+        self.assertNotIn(32, selected)
+        self.assertNotIn(48, selected)
+        self.assertEqual(selected[0], 64)
+        self.assertEqual(selected[-1], 8192)
+
+    def test_perturbation_grid_uses_largest_12_for_3x4(self):
+        contexts = [32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
+                    1024, 1536, 2048]
+        selected, nrows, ncols = figures._perturbation_grid_layout(contexts)
+        self.assertEqual((nrows, ncols), (3, 4))
+        self.assertEqual(selected, contexts[1:])
+
     def test_sliced_profile_is_paired_against_full_context(self):
         rows = []
         for sample, loss16, loss32 in [("a", 3.0, 1.0),

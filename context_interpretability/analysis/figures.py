@@ -234,25 +234,22 @@ def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str,
 
     Each curve is divided by its own maximum absolute effect so a
     high-magnitude perturbation cannot hide the shapes of the other curves.
-    The original scale used for normalization is retained in the legend.  The
-    smallest context is omitted: it has virtually no temporal profile to
-    interpret and removing it leaves the requested 12-panel (3x4) comparison.
-    ``log_y`` uses a symmetric log because loss deltas can legitimately be
-    negative.
+    The original scale used for normalization is retained in the legend.
+    Context grids of 13--15 retain the largest 12 panels in a 3x4 comparison;
+    grids of 16 or more retain the largest 16 in a 4x4 comparison. ``log_y``
+    uses a symmetric log because loss deltas can legitimately be negative.
     """
     d = df[df["method"] == "perturbation"]
     if dataset is not None:
         d = d[d["dataset"] == dataset]
     if d.empty:
         return
-    ctxs = sorted(d["context_length"].unique())[1:]
+    ctxs, nrows, ncols = _perturbation_grid_layout(
+        d["context_length"].unique())
     if not ctxs:
         return
-    if len(ctxs) > 12:
-        raise ValueError(
-            "Perturbation profile has more than 12 contexts after omitting "
-            f"the smallest one: {ctxs}")
-    fig, axes = plt.subplots(3, 4, figsize=(16, 10.8), squeeze=False)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(4 * ncols, 3.6 * nrows), squeeze=False)
     for ax, W in zip(axes.flat, ctxs):
         g = agg.collapse_seeds(d[d["context_length"] == W])
         for ptype, gg in g.groupby("perturbation_type"):
@@ -286,6 +283,21 @@ def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str,
     scale_suffix = "_log_y" if log_y else ""
     title = "03c_perturbation_profiles" + suffix + scale_suffix + ".png"
     _save(fig, out_dir, title)
+
+
+def _perturbation_grid_layout(contexts) -> tuple[List[int], int, int]:
+    """Choose a 3x4 or 4x4 grid, discarding only the smallest contexts.
+
+    Up to 15 available contexts use the requested 3x4 layout and retain the
+    largest 12.  Sixteen or more use a 4x4 layout and retain the largest 16.
+    Smaller test/model grids keep all their contexts in a 3x4 canvas.
+    """
+    available = [int(w) for w in sorted(set(contexts))]
+    if len(available) >= 16:
+        return available[-16:], 4, 4
+    if len(available) > 12:
+        return available[-12:], 3, 4
+    return available, 3, 4
 
 
 # -- 4. activation-patching heatmap ------------------------------------------------
