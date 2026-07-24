@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 
@@ -27,10 +28,11 @@ from context_interpretability.schema import load_results
 DPI = 130
 
 
-def _save(fig, out_dir: str, name: str) -> str:
+def _save(fig, out_dir: str, name: str,
+          tight_rect=None) -> str:
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
-    fig.tight_layout()
+    fig.tight_layout(rect=tight_rect)
     fig.savefig(path, dpi=DPI)
     plt.close(fig)
     print(f"[figures] wrote {path}")
@@ -144,26 +146,65 @@ def _sliced_loss_delta_profiles(df: pd.DataFrame,
     return profiles
 
 
-def _plot_masking_effect(ax, df: pd.DataFrame, title: str) -> bool:
+def _masking_colors(contexts) -> Dict[int, object]:
+    """Stable, non-repeating color map for full-context lengths W."""
+    windows = [int(w) for w in sorted(set(contexts))]
+    cmap = plt.get_cmap("turbo", max(1, len(windows)))
+    return {w: cmap(i) for i, w in enumerate(windows)}
+
+
+def _masking_legend_handles(colors: Dict[int, object]):
+    """Independent legend handles for color (W) and shape (intervention)."""
+    color_handles = [
+        Line2D([0], [0], color=color, lw=2.2, label=f"W={W}")
+        for W, color in colors.items()
+    ]
+    shape_handles = [
+        Line2D([0], [0], color="black", marker="o", linestyle="-",
+               label="attention masked"),
+        Line2D([0], [0], color="black", marker="s", linestyle="--",
+               label="input sliced"),
+    ]
+    return color_handles, shape_handles
+
+
+def _add_masking_legends(ax, colors: Dict[int, object]) -> None:
+    color_handles, shape_handles = _masking_legend_handles(colors)
+    color_legend = ax.legend(
+        handles=color_handles, title="full context W (color)",
+        fontsize=7, title_fontsize=8, ncol=2, loc="upper left",
+        bbox_to_anchor=(1.01, 1.0), borderaxespad=0)
+    ax.add_artist(color_legend)
+    ax.legend(
+        handles=shape_handles, title="intervention (shape / line)",
+        fontsize=7, title_fontsize=8, loc="lower left",
+        bbox_to_anchor=(1.01, 0.0), borderaxespad=0)
+
+
+def _plot_masking_effect(ax, df: pd.DataFrame, title: str,
+                         colors: Optional[Dict[int, object]] = None,
+                         add_legends: bool = True) -> bool:
     """Draw masking and paired slicing curves on ``ax``."""
     d = df[df["method"] == "attention_masking"]
     if d.empty:
         return False
     collapsed = agg.collapse_seeds(d)
     sliced_profiles = _sliced_loss_delta_profiles(df, collapsed)
+    if colors is None:
+        colors = _masking_colors(collapsed["context_length"].unique())
     for W, g in collapsed.groupby("context_length"):
+        color = colors[int(W)]
         prof = g.groupby("lookback_start")["loss_delta"].mean()
-        line, = ax.plot(prof.index, prof.values, "o-",
-                        label=f"W={W} masked")
+        ax.plot(prof.index, prof.values, "o-", color=color)
         sliced = sliced_profiles.get(int(W))
         if sliced is not None:
-            ax.plot(sliced.index, sliced.values, "s--", color=line.get_color(),
-                    label=f"W={W} sliced")
+            ax.plot(sliced.index, sliced.values, "s--", color=color)
     ax.set_xscale("log", base=2)
     ax.set_xlabel("visible span L (timesteps) — everything older is masked")
     ax.set_ylabel("Δ loss vs full-W clean input")
     ax.set_title(title)
-    ax.legend(fontsize=7)
+    if add_legends:
+        _add_masking_legends(ax, colors)
     ax.grid(True, alpha=0.3)
     return True
 
@@ -187,16 +228,38 @@ def fig_masking_effect_all_models(model_frames: Dict[str, pd.DataFrame],
     }
     if not frames:
         return
+    all_windows = sorted({
+        int(W)
+        for frame in frames.values()
+        for W in frame.loc[
+            frame["method"] == "attention_masking",
+            "context_length"].dropna().unique()
+    })
+    colors = _masking_colors(all_windows)
     ncols = min(3, len(frames))
     nrows = math.ceil(len(frames) / ncols)
     fig, axes = plt.subplots(
         nrows, ncols, figsize=(7 * ncols, 4.8 * nrows), squeeze=False)
     for ax, (model, frame) in zip(axes.flat, frames.items()):
-        _plot_masking_effect(ax, frame, model)
+        _plot_masking_effect(
+            ax, frame, model, colors=colors, add_legends=False)
     for ax in axes.flat[len(frames):]:
         ax.set_visible(False)
-    fig.suptitle("attention masking vs input slicing — all models", fontsize=14)
-    _save(fig, out_dir, "02_masking_effect_vs_lookback_all_models.png")
+    color_handles, shape_handles = _masking_legend_handles(colors)
+    fig.legend(
+        handles=color_handles, title="full context W (color)",
+        ncol=min(8, len(color_handles)), loc="upper center",
+        bbox_to_anchor=(0.5, 0.96), fontsize=7, title_fontsize=8)
+    fig.legend(
+        handles=shape_handles, title="intervention (shape / line)",
+        ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.89),
+        fontsize=7, title_fontsize=8)
+    fig.suptitle(
+        "attention masking vs input slicing — all models",
+        fontsize=14, y=0.995)
+    _save(
+        fig, out_dir, "02_masking_effect_vs_lookback_all_models.png",
+        tight_rect=(0, 0, 1, 0.84))
 
 
 # -- 3+6. block-effect heatmaps (perturbation Δloss / pred-distance / IG) ---------

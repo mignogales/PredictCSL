@@ -101,6 +101,16 @@ class TestAnalysis(unittest.TestCase):
         self.assertEqual(list(profiles[32].index), [16])
         self.assertAlmostEqual(profiles[32].iloc[0], 3.0)
 
+    def test_masking_legends_separate_color_from_shape(self):
+        colors = figures._masking_colors([48, 64, 96])
+        color_handles, shape_handles = figures._masking_legend_handles(colors)
+        self.assertEqual(
+            [h.get_label() for h in color_handles],
+            ["W=48", "W=64", "W=96"])
+        self.assertEqual(
+            [h.get_label() for h in shape_handles],
+            ["attention masked", "input sliced"])
+
     def test_lens_matrices(self):
         mats = agg.lens_matrices(self.df)
         self.assertEqual(set(mats),
