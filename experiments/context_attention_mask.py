@@ -359,11 +359,70 @@ def _config_int(inner, names):
 #  columns in every ``T5Attention`` whose key dim is the context length therefore
 #  (a) keeps visible encoder reps from mixing in old context (self-attn) and (b)
 #  stops the decoder query from reading old context (cross-attn). Decoder
-#  self-attention has key dim 1 → hide resolves to 0, auto-skipped.
+#  self-attention has key dim 1 rather than the context-token layout and is
+#  therefore skipped.
+
+def _chronosbolt_patch_geometry(handle, last_timesteps: int, full_len: int):
+    """Return the exact Chronos-Bolt context-token geometry.
+
+    Chronos-Bolt's key sequence is ``[context patches..., REG?]``.  The REG
+    token is not a timestep-bearing patch and must never consume one of the
+    requested visible-patch slots.  Derive the patch count from the model
+    config and mirror upstream's ``Patch.forward`` padding/unfold operation.
+
+    Returns ``(n_context_patches, n_visible_patches, n_reg_tokens)``.
+    """
+    inner = _chronos2_inner_module(handle)
+    cfg = getattr(inner, "config", None)
+    cc = getattr(cfg, "chronos_config", None)
+
+    def _get(name, default=None):
+        if isinstance(cc, dict):
+            return cc.get(name, default)
+        return getattr(cc, name, default) if cc is not None else default
+
+    patch_size = int(_get("input_patch_size", 0) or 0)
+    patch_stride = int(_get("input_patch_stride", 0) or 0)
+    if patch_size <= 0 or patch_stride <= 0:
+        raise AttributeError(
+            "Could not infer Chronos-Bolt input_patch_size/input_patch_stride "
+            "from model.config.chronos_config.")
+    if patch_stride != patch_size:
+        raise ValueError(
+            "Chronos-Bolt attention masking currently requires non-overlapping "
+            "patches (input_patch_stride == input_patch_size); overlapping "
+            "patches need an explicit suffix-to-patch overlap policy.")
+
+    def _n_patches(length: int) -> int:
+        length = max(1, int(length))
+        padded = length + (-length % patch_size)
+        return max(1, 1 + (padded - patch_size) // patch_stride)
+
+    n_context = _n_patches(full_len)
+    # We retain every tail patch that intersects the requested visible suffix.
+    # Official Chronos-Bolt models use non-overlapping patches
+    # (input_patch_stride == input_patch_size), for which this is exactly
+    # ceil(last_timesteps / patch_size).
+    n_visible = min(n_context, _n_patches(last_timesteps))
+    n_reg = 1 if bool(_get("use_reg_token", False)) else 0
+    return n_context, n_visible, n_reg
+
 
 def _chronosbolt_mask(handle, last_timesteps: int, full_len: int):
     inner = _chronos2_inner_module(handle)
-    state = {"applied": 0, "saw_none": 0}
+    n_context, n_visible, n_reg = _chronosbolt_patch_geometry(
+        handle, last_timesteps, full_len)
+    expected_kv = n_context + n_reg
+    hide = max(0, n_context - n_visible)
+    state = {
+        "applied": 0,
+        "saw_none": 0,
+        "n_context_patches": n_context,
+        "n_visible_patches": n_visible,
+        "n_reg_tokens": n_reg,
+        "expected_kv": expected_kv,
+        "hide_count": hide,
+    }
 
     def make_wrapper(orig):
         def wrapper(*args, **kwargs):
@@ -372,18 +431,25 @@ def _chronosbolt_mask(handle, last_timesteps: int, full_len: int):
             m = kwargs.get("mask", None)
             if m is None and len(args) >= 2:
                 m = args[1]
-            if torch.is_tensor(m) and m.is_floating_point() and m.shape[-1] > 1:
-                kv = m.shape[-1]
-                visible = max(1, round(int(last_timesteps) * kv / int(full_len)))
-                hide = max(0, kv - visible)
-                if hide > 0:
-                    m = m.clone()
-                    m[..., :hide] = torch.finfo(m.dtype).min  # key-padding: all q rows
-                    if from_kwargs:
-                        kwargs = {**kwargs, "mask": m}
-                    else:
-                        args = tuple(m if i == 1 else a for i, a in enumerate(args))
-                    state["applied"] += 1
+            # Encoder self-attention and decoder cross-attention both have
+            # ``n_context_patches + n_reg_tokens`` keys. Decoder self-attention
+            # has a different key length (normally 1) and must remain untouched.
+            if (torch.is_tensor(m) and m.is_floating_point()
+                    and m.shape[-1] == expected_kv and hide > 0):
+                m = m.clone()
+                # Context patches lead and REG, when present, is last. Hiding
+                # only the leading context columns preserves REG explicitly.
+                m[..., :hide] = torch.finfo(m.dtype).min
+                if from_kwargs:
+                    kwargs = {**kwargs, "mask": m}
+                else:
+                    args = tuple(m if i == 1 else a for i, a in enumerate(args))
+                state["applied"] += 1
+            elif (torch.is_tensor(m) and m.is_floating_point()
+                  and m.shape[-1] > 1 and m.shape[-1] != expected_kv):
+                # If upstream changes its token layout, fail loud through the
+                # existing no-op warning instead of silently masking nothing.
+                state["saw_none"] += 1
             return orig(*args, **kwargs)
         return wrapper
 
