@@ -247,6 +247,12 @@ def main() -> None:
         for name, err in failed:
             print(f"  {name}: {err}")
 
+    # Cross-model figures are pure post-processing and therefore work both
+    # after a fresh run and with --analyze-only.
+    from context_interpretability.analysis import figures
+    figures.generate_all_models(
+        config.get("output_root", RESULTS_ROOT), args.models)
+
 
 if __name__ == "__main__":
     main()

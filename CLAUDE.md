@@ -202,6 +202,10 @@ Model access goes through `adapters/` (capability flags in
 `_forecast_uniform` / `context_attention_mask` verbatim. Entry point (SERVER):
 `python -m context_interpretability.run_experiment --models <display> \
 [--experiments exp0..exp5] [--source synthetic|gifteval] [--analyze-only]`.
+Cross-environment entry point (SERVER, launch from `predictcsl-main`):
+`python -m context_interpretability.master_run`; it partitions the run-set by
+the main/legacy/Toto/TiRex env mapping, fills the shared resumable output tree,
+then performs one analysis-only pass for the all-model figures.
 Output under `logs/experiments/context_interpretability/<model>/`, per-cell
 done-markers (resumable), figures + `hypotheses_report.{json,md}` (H1–H5)
 regenerable offline. Tests run LOCALLY (no TSFM needed — dummy adapter):

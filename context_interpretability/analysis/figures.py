@@ -10,6 +10,7 @@ exist, into ``<run_dir>/figures/``.
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Dict, List, Optional
 
@@ -143,13 +144,13 @@ def _sliced_loss_delta_profiles(df: pd.DataFrame,
     return profiles
 
 
-def fig_masking_effect(df: pd.DataFrame, out_dir: str) -> None:
+def _plot_masking_effect(ax, df: pd.DataFrame, title: str) -> bool:
+    """Draw masking and paired slicing curves on ``ax``."""
     d = df[df["method"] == "attention_masking"]
     if d.empty:
-        return
+        return False
     collapsed = agg.collapse_seeds(d)
     sliced_profiles = _sliced_loss_delta_profiles(df, collapsed)
-    fig, ax = plt.subplots(figsize=(7, 4.5))
     for W, g in collapsed.groupby("context_length"):
         prof = g.groupby("lookback_start")["loss_delta"].mean()
         line, = ax.plot(prof.index, prof.values, "o-",
@@ -161,10 +162,41 @@ def fig_masking_effect(df: pd.DataFrame, out_dir: str) -> None:
     ax.set_xscale("log", base=2)
     ax.set_xlabel("visible span L (timesteps) — everything older is masked")
     ax.set_ylabel("Δ loss vs full-W clean input")
-    ax.set_title("attention masking vs input slicing")
+    ax.set_title(title)
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
+    return True
+
+
+def fig_masking_effect(df: pd.DataFrame, out_dir: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    if not _plot_masking_effect(
+            ax, df, "attention masking vs input slicing"):
+        plt.close(fig)
+        return
     _save(fig, out_dir, "02_masking_effect_vs_lookback.png")
+
+
+def fig_masking_effect_all_models(model_frames: Dict[str, pd.DataFrame],
+                                  out_dir: str) -> None:
+    """One attention-masking/slicing overview containing every model."""
+    frames = {
+        model: frame for model, frame in model_frames.items()
+        if not frame.empty
+        and (frame["method"] == "attention_masking").any()
+    }
+    if not frames:
+        return
+    ncols = min(3, len(frames))
+    nrows = math.ceil(len(frames) / ncols)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(7 * ncols, 4.8 * nrows), squeeze=False)
+    for ax, (model, frame) in zip(axes.flat, frames.items()):
+        _plot_masking_effect(ax, frame, model)
+    for ax in axes.flat[len(frames):]:
+        ax.set_visible(False)
+    fig.suptitle("attention masking vs input slicing — all models", fontsize=14)
+    _save(fig, out_dir, "02_masking_effect_vs_lookback_all_models.png")
 
 
 # -- 3+6. block-effect heatmaps (perturbation Δloss / pred-distance / IG) ---------
@@ -196,22 +228,32 @@ def fig_block_heatmaps(df: pd.DataFrame, out_dir: str) -> None:
 
 
 def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str,
-                              dataset: Optional[str] = None) -> None:
+                              dataset: Optional[str] = None,
+                              log_y: bool = False) -> None:
     """Per-context normalized effect profiles, one per perturbation type.
 
     Each curve is divided by its own maximum absolute effect so a
     high-magnitude perturbation cannot hide the shapes of the other curves.
-    The original scale used for normalization is retained in the legend.
+    The original scale used for normalization is retained in the legend.  The
+    smallest context is omitted: it has virtually no temporal profile to
+    interpret and removing it leaves the requested 12-panel (3x4) comparison.
+    ``log_y`` uses a symmetric log because loss deltas can legitimately be
+    negative.
     """
     d = df[df["method"] == "perturbation"]
     if dataset is not None:
         d = d[d["dataset"] == dataset]
     if d.empty:
         return
-    ctxs = sorted(d["context_length"].unique())
-    k = len(ctxs)
-    fig, axes = plt.subplots(1, k, figsize=(4 * k, 3.6), squeeze=False)
-    for ax, W in zip(axes[0], ctxs):
+    ctxs = sorted(d["context_length"].unique())[1:]
+    if not ctxs:
+        return
+    if len(ctxs) > 12:
+        raise ValueError(
+            "Perturbation profile has more than 12 contexts after omitting "
+            f"the smallest one: {ctxs}")
+    fig, axes = plt.subplots(3, 4, figsize=(16, 10.8), squeeze=False)
+    for ax, W in zip(axes.flat, ctxs):
         g = agg.collapse_seeds(d[d["context_length"] == W])
         for ptype, gg in g.groupby("perturbation_type"):
             prof = gg.groupby("lookback_start")["loss_delta"].mean()
@@ -225,14 +267,24 @@ def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str,
         # block at x=1 solely for plotting and label that tick as zero.
         ax.set_xscale("log", base=2)
         ax.set_xlim(left=1)
+        if log_y:
+            ax.set_yscale("symlog", base=10, linthresh=1e-2)
         ax.set_xlabel("lookback")
         ax.set_title(f"W={W}", fontsize=9)
         ax.legend(fontsize=6)
         ax.grid(True, alpha=0.3)
-    axes[0][0].set_ylabel("normalized mean Δ loss (per perturbation type)")
+    for ax in axes.flat[len(ctxs):]:
+        ax.set_visible(False)
+    ylabel = "normalized mean Δ loss (per perturbation type)"
+    if log_y:
+        ylabel += " — symlog"
+    for ax in axes[:, 0]:
+        if ax.get_visible():
+            ax.set_ylabel(ylabel)
     suffix = "" if dataset is None else "_" + "".join(
         c if c.isalnum() or c in "-_" else "_" for c in str(dataset))
-    title = "03c_perturbation_profiles" + suffix + ".png"
+    scale_suffix = "_log_y" if log_y else ""
+    title = "03c_perturbation_profiles" + suffix + scale_suffix + ".png"
     _save(fig, out_dir, title)
 
 
@@ -415,6 +467,7 @@ def generate_all(run_dir: str, tolerance: float = 0.05) -> None:
         fig_masking_effect(df, out_dir)
         fig_block_heatmaps(df, out_dir)
         fig_perturbation_profiles(df, out_dir)
+        fig_perturbation_profiles(df, out_dir, log_y=True)
         # The pooled plot is useful for the headline result, but can conceal
         # periodic/AR/trend and real-world differences.  Persist one profile per
         # dataset as well; synthetic families already encoded as distinct
@@ -422,6 +475,8 @@ def generate_all(run_dir: str, tolerance: float = 0.05) -> None:
         for dataset in sorted(df.loc[df["method"] == "perturbation",
                                      "dataset"].dropna().unique()):
             fig_perturbation_profiles(df, out_dir, str(dataset))
+            fig_perturbation_profiles(
+                df, out_dir, str(dataset), log_y=True)
         fig_patching_heatmaps(df, out_dir)
         fig_lens_heatmaps(df, out_dir)
         fig_cross_method(df, out_dir)
@@ -436,3 +491,14 @@ def generate_all(run_dir: str, tolerance: float = 0.05) -> None:
     ctrl = os.path.join(run_dir, "exp4_synthetic_controls",
                         "controls_summary.json")
     fig_control_sweeps(ctrl, out_dir)
+
+
+def generate_all_models(output_root: str, models: List[str]) -> None:
+    """Generate figures whose comparison spans multiple model run trees."""
+    frames = {
+        model: load_results(os.path.join(output_root, model))
+        for model in models
+        if os.path.isdir(os.path.join(output_root, model))
+    }
+    fig_masking_effect_all_models(
+        frames, os.path.join(output_root, "figures"))

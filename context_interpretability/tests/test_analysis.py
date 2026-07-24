@@ -108,9 +108,17 @@ class TestAnalysis(unittest.TestCase):
         names = os.listdir(figdir)
         self.assertTrue(any(n.startswith("02_masking") for n in names))
         self.assertTrue(any(n.startswith("03a_perturbation") for n in names))
+        self.assertIn("03c_perturbation_profiles_log_y.png", names)
         self.assertTrue(any(n.startswith("05_lens") for n in names))
         self.assertTrue(any(n.startswith("06_ig") for n in names))
         self.assertTrue(any(n.startswith("09_cross_method") for n in names))
+
+    def test_cross_model_masking_figure(self):
+        root = os.path.dirname(self.run_dir)
+        figures.generate_all_models(root, ["DummyModel"])
+        self.assertTrue(os.path.exists(os.path.join(
+            root, "figures",
+            "02_masking_effect_vs_lookback_all_models.png")))
 
     def test_hypotheses_report(self):
         report = hypotheses.evaluate(self.run_dir)
