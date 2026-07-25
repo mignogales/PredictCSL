@@ -85,6 +85,22 @@ class TestAnalysis(unittest.TestCase):
         self.assertEqual((nrows, ncols), (3, 4))
         self.assertEqual(selected, contexts[1:])
 
+    def test_perturbation_profiles_omit_noise(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            original_plot = figures.plt.Axes.plot
+            labels = []
+
+            def record_plot(ax, *args, **kwargs):
+                labels.append(kwargs.get("label", ""))
+                return original_plot(ax, *args, **kwargs)
+
+            from unittest.mock import patch
+            with patch.object(figures.plt.Axes, "plot", record_plot):
+                figures.fig_perturbation_profiles(self.df, out_dir)
+
+            self.assertTrue(any("block_mean" in label for label in labels))
+            self.assertFalse(any("noise" in label for label in labels))
+
     def test_sliced_profile_is_paired_against_full_context(self):
         rows = []
         for sample, loss16, loss32 in [("a", 3.0, 1.0),
@@ -100,6 +116,22 @@ class TestAnalysis(unittest.TestCase):
             frame, frame[frame["context_length"] == 32])
         self.assertEqual(list(profiles[32].index), [16])
         self.assertAlmostEqual(profiles[32].iloc[0], 3.0)
+
+    def test_absolute_sliced_profile_uses_loss_at_visible_length(self):
+        rows = []
+        for sample, loss16, loss32 in [("a", 3.0, 1.0),
+                                       ("b", 6.0, 2.0)]:
+            for W, loss in [(16, loss16), (32, loss32)]:
+                rows.append({
+                    "model": "m", "dataset": "d", "sample_id": sample,
+                    "context_length": W, "lookback_start": 16,
+                    "clean_loss": loss, "method": "attention_masking",
+                })
+        frame = pd.DataFrame(rows)
+        profiles = figures._sliced_loss_profiles(
+            frame, frame[frame["context_length"] == 32])
+        self.assertEqual(list(profiles[32].index), [16])
+        self.assertAlmostEqual(profiles[32].iloc[0], 4.5)
 
     def test_masking_legends_separate_color_from_shape(self):
         colors = figures._masking_colors([48, 64, 96])
@@ -135,6 +167,7 @@ class TestAnalysis(unittest.TestCase):
         figdir = os.path.join(self.run_dir, "figures")
         names = os.listdir(figdir)
         self.assertTrue(any(n.startswith("02_masking") for n in names))
+        self.assertIn("02b_masking_loss_vs_lookback.png", names)
         self.assertTrue(any(n.startswith("03a_perturbation") for n in names))
         self.assertIn("03c_perturbation_profiles_log_y.png", names)
         self.assertTrue(any(n.startswith("05_lens") for n in names))
@@ -147,6 +180,9 @@ class TestAnalysis(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(
             root, "figures",
             "02_masking_effect_vs_lookback_all_models.png")))
+        self.assertTrue(os.path.exists(os.path.join(
+            root, "figures",
+            "02b_masking_loss_vs_lookback_all_models.png")))
 
     def test_hypotheses_report(self):
         report = hypotheses.evaluate(self.run_dir)

@@ -146,6 +146,34 @@ def _sliced_loss_delta_profiles(df: pd.DataFrame,
     return profiles
 
 
+def _sliced_loss_profiles(df: pd.DataFrame,
+                          masking: pd.DataFrame) -> Dict[int, pd.Series]:
+    """Absolute loss from actual input slicing, paired to each full-W cohort."""
+    keys = ["model", "dataset", "sample_id", "context_length"]
+    required = set(keys + ["clean_loss"])
+    if masking.empty or not required.issubset(df.columns):
+        return {}
+    clean = (df[keys + ["clean_loss"]]
+             .dropna(subset=["clean_loss"])
+             .groupby(keys, as_index=False, dropna=False)["clean_loss"].mean())
+    profiles: Dict[int, pd.Series] = {}
+    for W, group in masking.groupby("context_length"):
+        cohort = (clean[clean["context_length"] == W]
+                  [["model", "dataset", "sample_id"]]
+                  .drop_duplicates())
+        points = {}
+        for L in sorted(group["lookback_start"].dropna().unique()):
+            sliced = clean[clean["context_length"] == L].rename(
+                columns={"clean_loss": "sliced_loss"})
+            paired = sliced.merge(
+                cohort, on=["model", "dataset", "sample_id"], how="inner")
+            if not paired.empty:
+                points[L] = float(paired["sliced_loss"].mean())
+        if points:
+            profiles[int(W)] = pd.Series(points, dtype=float)
+    return profiles
+
+
 def _masking_colors(contexts) -> Dict[int, object]:
     """Stable, non-repeating color map for full-context lengths W."""
     windows = [int(w) for w in sorted(set(contexts))]
@@ -183,25 +211,31 @@ def _add_masking_legends(ax, colors: Dict[int, object]) -> None:
 
 def _plot_masking_effect(ax, df: pd.DataFrame, title: str,
                          colors: Optional[Dict[int, object]] = None,
-                         add_legends: bool = True) -> bool:
+                         add_legends: bool = True,
+                         absolute_loss: bool = False) -> bool:
     """Draw masking and paired slicing curves on ``ax``."""
     d = df[df["method"] == "attention_masking"]
     if d.empty:
         return False
     collapsed = agg.collapse_seeds(d)
-    sliced_profiles = _sliced_loss_delta_profiles(df, collapsed)
+    sliced_profiles = (
+        _sliced_loss_profiles(df, collapsed) if absolute_loss
+        else _sliced_loss_delta_profiles(df, collapsed)
+    )
+    masked_value = "intervened_loss" if absolute_loss else "loss_delta"
     if colors is None:
         colors = _masking_colors(collapsed["context_length"].unique())
     for W, g in collapsed.groupby("context_length"):
         color = colors[int(W)]
-        prof = g.groupby("lookback_start")["loss_delta"].mean()
+        prof = g.groupby("lookback_start")[masked_value].mean()
         ax.plot(prof.index, prof.values, "o-", color=color)
         sliced = sliced_profiles.get(int(W))
         if sliced is not None:
             ax.plot(sliced.index, sliced.values, "s--", color=color)
     ax.set_xscale("log", base=2)
     ax.set_xlabel("visible span L (timesteps) — everything older is masked")
-    ax.set_ylabel("Δ loss vs full-W clean input")
+    ax.set_ylabel(
+        "mean loss" if absolute_loss else "Δ loss vs full-W clean input")
     ax.set_title(title)
     if add_legends:
         _add_masking_legends(ax, colors)
@@ -218,8 +252,20 @@ def fig_masking_effect(df: pd.DataFrame, out_dir: str) -> None:
     _save(fig, out_dir, "02_masking_effect_vs_lookback.png")
 
 
+def fig_masking_loss(df: pd.DataFrame, out_dir: str) -> None:
+    """Absolute-loss companion to the delta-loss masking comparison."""
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    if not _plot_masking_effect(
+            ax, df, "attention masking vs input slicing — absolute loss",
+            absolute_loss=True):
+        plt.close(fig)
+        return
+    _save(fig, out_dir, "02b_masking_loss_vs_lookback.png")
+
+
 def fig_masking_effect_all_models(model_frames: Dict[str, pd.DataFrame],
-                                  out_dir: str) -> None:
+                                  out_dir: str,
+                                  absolute_loss: bool = False) -> None:
     """One attention-masking/slicing overview containing every model."""
     frames = {
         model: frame for model, frame in model_frames.items()
@@ -242,7 +288,8 @@ def fig_masking_effect_all_models(model_frames: Dict[str, pd.DataFrame],
         nrows, ncols, figsize=(7 * ncols, 4.8 * nrows), squeeze=False)
     for ax, (model, frame) in zip(axes.flat, frames.items()):
         _plot_masking_effect(
-            ax, frame, model, colors=colors, add_legends=False)
+            ax, frame, model, colors=colors, add_legends=False,
+            absolute_loss=absolute_loss)
     for ax in axes.flat[len(frames):]:
         ax.set_visible(False)
     color_handles, shape_handles = _masking_legend_handles(colors)
@@ -254,11 +301,17 @@ def fig_masking_effect_all_models(model_frames: Dict[str, pd.DataFrame],
         handles=shape_handles, title="intervention (shape / line)",
         ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.89),
         fontsize=7, title_fontsize=8)
+    comparison = "absolute loss" if absolute_loss else "Δ loss"
     fig.suptitle(
-        "attention masking vs input slicing — all models",
+        f"attention masking vs input slicing — all models ({comparison})",
         fontsize=14, y=0.995)
+    filename = (
+        "02b_masking_loss_vs_lookback_all_models.png"
+        if absolute_loss
+        else "02_masking_effect_vs_lookback_all_models.png"
+    )
     _save(
-        fig, out_dir, "02_masking_effect_vs_lookback_all_models.png",
+        fig, out_dir, filename,
         tight_rect=(0, 0, 1, 0.84))
 
 
@@ -293,16 +346,21 @@ def fig_block_heatmaps(df: pd.DataFrame, out_dir: str) -> None:
 def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str,
                               dataset: Optional[str] = None,
                               log_y: bool = False) -> None:
-    """Per-context normalized effect profiles, one per perturbation type.
+    """Per-context normalized effect profiles for informative perturbations.
 
     Each curve is divided by its own maximum absolute effect so a
     high-magnitude perturbation cannot hide the shapes of the other curves.
+    Additive-noise controls are intentionally omitted from these profile
+    figures; their rows remain available in the saved results for analysis.
     The original scale used for normalization is retained in the legend.
     Context grids of 13--15 retain the largest 12 panels in a 3x4 comparison;
     grids of 16 or more retain the largest 16 in a 4x4 comparison. ``log_y``
     uses a symmetric log because loss deltas can legitimately be negative.
     """
-    d = df[df["method"] == "perturbation"]
+    d = df[
+        (df["method"] == "perturbation")
+        & (df["perturbation_type"] != "noise")
+    ]
     if dataset is not None:
         d = d[d["dataset"] == dataset]
     if d.empty:
@@ -540,6 +598,7 @@ def generate_all(run_dir: str, tolerance: float = 0.05) -> None:
     df = load_results(run_dir)
     if not df.empty:
         fig_masking_effect(df, out_dir)
+        fig_masking_loss(df, out_dir)
         fig_block_heatmaps(df, out_dir)
         fig_perturbation_profiles(df, out_dir)
         fig_perturbation_profiles(df, out_dir, log_y=True)
@@ -577,3 +636,5 @@ def generate_all_models(output_root: str, models: List[str]) -> None:
     }
     fig_masking_effect_all_models(
         frames, os.path.join(output_root, "figures"))
+    fig_masking_effect_all_models(
+        frames, os.path.join(output_root, "figures"), absolute_loss=True)
