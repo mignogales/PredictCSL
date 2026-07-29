@@ -108,6 +108,7 @@ from colorama import Fore
 from experiments.gifteval_reference import (
     NORMALIZATION_REFERENCE, published_naive_by_display,
 )
+from experiments.timesfm_gifteval import TIMESFM_GIFTEVAL_RECIPE
 
 CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
 FULL_NATIVE_WINDOW = "full_native"
@@ -815,6 +816,15 @@ def load_strategy_records(
             full_native_metrics = _load_metrics(
                 cache_root, dataset_display, model_short, term, FULL_NATIVE_WINDOW)
             if full_native_metrics is not None:
+                if ("timesfm" in model.lower()
+                        and full_native_metrics.get("_timesfm_gifteval_recipe")
+                        != TIMESFM_GIFTEVAL_RECIPE):
+                    raise RuntimeError(
+                        "Stale TimesFM full-native cache for "
+                        f"{dataset_display}/t{term}: rerun stage 3 before stage 4. "
+                        "The old cache used compiled_decode/zero-filled contexts "
+                        "instead of the official GiftEval forecast recipe."
+                    )
                 native_mase = full_native_metrics.get(mase_metric)
                 native_standin = False
                 native_ok = native_mase is not None and np.isfinite(float(native_mase))
@@ -1114,6 +1124,12 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
             "reference": NORMALIZATION_REFERENCE,
         }
     }
+    if ("model" in df.columns
+            and df["model"].astype(str).str.contains(
+                "timesfm", case=False, regex=False).any()):
+        stats["inference_recipes"] = {
+            "timesfm": TIMESFM_GIFTEVAL_RECIPE,
+        }
 
     # Seasonal-naive normaliser present? Then also report the leaderboard-style
     # normalised geomean (geomean of MASE_strategy / MASE_seasonalnaive), over the

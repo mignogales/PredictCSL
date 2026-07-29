@@ -178,7 +178,8 @@ def _forecast_padded(cache, family, handle, model_id, cap, horizon, args):
     grid = sorted(set(WINDOW_GRID) | {int(cap)})
     groups = cache.build_batches_padded(
         cap, args.batch_size, args.device,
-        pin_memory=(args.device == "cuda"), window_grid=grid)
+        pin_memory=(args.device == "cuda"), window_grid=grid,
+        preserve_missing=(family == "timesfm"))
     results = []
     for L, batches_L, _ax, _ay, idx_L in groups:
         fr_L, tgts_L = _forecast_cell(family, handle, model_id, batches_L, L,
@@ -230,7 +231,9 @@ def evaluate_config(display, term, model_id, family, handle, args):
                   else (args.window or min(cache.max_context, 1024)))
         window = min(window, cache.max_context)
         batches, _ax, _ay, valid_indices = cache.build_batches(
-            window, args.batch_size, args.device, pin_memory=(args.device == "cuda"))
+            window, args.batch_size, args.device,
+            pin_memory=(args.device == "cuda"),
+            preserve_missing=(family == "timesfm"))
         fr, tgts = _forecast_cell(family, handle, model_id, batches, window, horizon,
                                   args.device, args.batch_size,
                                   flowstate_scale=cache.flowstate_scale)

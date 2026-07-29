@@ -379,61 +379,25 @@ class TimesFmPredictor:
 
     @staticmethod
     def _model_context(entry_target):
-        np = _require_numpy("prepare TimesFM context")
-
-        arr = np.asarray(entry_target, dtype=np.float32)
-        # TimesFM 2.5 interpolates missing values internally, but current builds
-        # crash when a context has no observed value at all after stripping leading
-        # NaNs. Match the rest of this repo's model-input convention: missing
-        # context values become zero, while metrics still see the raw GiftEval data.
-        if arr.size == 0:
-            return np.zeros(1, dtype=np.float32)
-        if np.isnan(arr).all():
-            return np.zeros_like(arr, dtype=np.float32)
-        return arr
+        from experiments.timesfm_gifteval import model_context
+        return model_context(entry_target)
 
     def predict(self, test_data_input, batch_size: Optional[int] = None) -> List:
         np = _require_numpy("run TimesFM forecasts")
 
-        from timesfm import configs
-        from gluonts.itertools import batcher
         from gluonts.model.forecast import QuantileForecast
+        from experiments.timesfm_gifteval import forecast_quantiles
 
         if batch_size is None:
             batch_size = self.default_batch_size
         test_data_input = list(test_data_input)
-        forecast_outputs = []
-        for batch in batcher(test_data_input, batch_size=batch_size):
-            context = []
-            max_context = 0
-            for entry in batch:
-                arr = self._model_context(entry["target"])
-                if self.max_context_knob is not None:
-                    arr = arr[-self.max_context_knob:]
-                    arr = self._model_context(arr)
-                max_context = max(max_context, arr.shape[0])
-                context.append(arr)
-            p = self.tfm.model.p
-            max_context = ((max_context + p - 1) // p) * p
-            self.tfm.compile(
-                forecast_config=configs.ForecastConfig(
-                    max_context=min(15360, max_context),
-                    max_horizon=1024,
-                    infer_is_positive=True,
-                    use_continuous_quantile_head=True,
-                    fix_quantile_crossing=True,
-                    force_flip_invariance=True,
-                    return_backcast=False,
-                    normalize_inputs=True,
-                    per_core_batch_size=max(1, min(128, len(context))),
-                ),
-            )
-            _, full_preds = self.tfm.forecast(
-                horizon=self.prediction_length, inputs=context)
-            # Columns: [mean-head, q0.1 .. q0.9]; keep the 9 quantile columns.
-            full_preds = full_preds[:, 0:self.prediction_length, 1:]
-            forecast_outputs.append(full_preds.transpose((0, 2, 1)))
-        forecast_outputs = np.concatenate(forecast_outputs)
+        forecast_outputs = forecast_quantiles(
+            self.tfm,
+            [entry["target"] for entry in test_data_input],
+            self.prediction_length,
+            batch_size=batch_size,
+            max_context_knob=self.max_context_knob,
+        )
 
         forecasts = []
         for item, ts in zip(forecast_outputs, test_data_input):
@@ -524,34 +488,10 @@ def _load_timesfm(model_name: str):
     Some installed TimesFM builds changed that method to require an explicit
     checkpoint path; those fall back to the same HF id used everywhere else in
     this repo, or to TIMESFM_2P5_CHECKPOINT / TIMESFM_CHECKPOINT if set."""
-    if model_name not in _MODEL_HANDLE:
-        from timesfm.timesfm_2p5 import timesfm_2p5_torch
+    from experiments.timesfm_gifteval import load_model
 
-        cls = timesfm_2p5_torch.TimesFM_2p5_200M_torch
-        tfm = cls()
-        try:
-            tfm.load_checkpoint()
-        except TypeError as exc:
-            msg = str(exc)
-            if "path" not in msg and "required positional argument" not in msg:
-                raise
-            ckpt = os.environ.get("TIMESFM_2P5_CHECKPOINT") \
-                or os.environ.get("TIMESFM_CHECKPOINT")
-            if ckpt:
-                logger.info("TimesFM load_checkpoint() requires a path; using %s",
-                            ckpt)
-                tfm.load_checkpoint(ckpt)
-            elif hasattr(cls, "from_pretrained"):
-                logger.info("TimesFM load_checkpoint() requires a path; using "
-                            "from_pretrained(%s)", model_name)
-                tfm = cls.from_pretrained(model_name)
-            else:
-                raise RuntimeError(
-                    "This TimesFM build requires load_checkpoint(path) and does "
-                    "not expose from_pretrained(). Set TIMESFM_2P5_CHECKPOINT "
-                    "to the local google/timesfm-2.5-200m-pytorch checkpoint."
-                ) from exc
-        _MODEL_HANDLE[model_name] = tfm
+    if model_name not in _MODEL_HANDLE:
+        _MODEL_HANDLE[model_name] = load_model(model_name)
     return _MODEL_HANDLE[model_name]
 
 

@@ -207,14 +207,14 @@ def _measure_window(cache: GiftEvalCache, model_family: str, ensure_handle,
     """Time ``repeats`` PURE forward passes (after ``warmup`` discarded ones) for
     one window, each GPU-synced.
 
-    All per-window setup is paid ONCE outside the timed loop: batch building plus,
-    via ``build_forward``, the weight load + compile (timesfm) or forecaster build
-    (moirai) that ``_forecast_cell`` would otherwise re-run on every call. The
-    timed unit is therefore the inference itself, not the reload/compile — which is
-    the cost the strategy comparison's FLOPs axis represents. The model built for
-    this window is freed afterwards via the teardown to avoid GPU accumulation."""
+    Batch building, weight loading, and persistent-wrapper construction happen
+    outside the timed loop. TimesFM is the exception: its official GiftEval
+    ``forecast()`` recipe recompiles from each outer batch's maximum context, so
+    that required dispatch remains inside its timed call. The model built for a
+    window is freed afterwards via the teardown to avoid GPU accumulation."""
     batches, _ax, _ay, _idx = cache.build_batches(
-        window_size, batch_size, device, pin_memory=True)
+        window_size, batch_size, device, pin_memory=True,
+        preserve_missing=(model_family == "timesfm"))
 
     forward, teardown = build_forward(
         model_family, ensure_handle(), model_id, batches, window_size, horizon,

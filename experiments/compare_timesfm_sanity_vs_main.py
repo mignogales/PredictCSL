@@ -4,7 +4,7 @@ This is a diagnostic script, not part of the production pipeline. It runs one
 GiftEval config through:
 
   1. the official-style sanity wrapper (TimesFmPredictor / tfm.forecast), and
-  2. the main v5 ablation wrapper (load_timesfm / compiled_decode),
+  2. the main v5 ablation wrapper (the shared official ``tfm.forecast`` recipe),
 
 then reports where they differ: data selection, effective contexts, model inputs,
 forecasts, and leaderboard-style MASE.
@@ -177,7 +177,7 @@ def _effective_contexts_main(cache, indices, cap: int) -> List[np.ndarray]:
 
     contexts = []
     for i in indices:
-        ctx = np.asarray(cache.contexts[int(i)], dtype=np.float32)
+        ctx = np.asarray(cache.contexts_raw[int(i)], dtype=np.float32)
         width = max(1, min(int(cap), int(cache.context_lengths[int(i)])))
         if ctx.size >= width:
             contexts.append(ctx[-width:])
@@ -235,7 +235,7 @@ def _make_main_batches(cache, positions, original_indices, width: int,
 
     x_np = np.empty((len(original_indices), width), dtype=np.float32)
     for j, i in enumerate(original_indices):
-        ctx = np.asarray(cache.contexts[int(i)], dtype=np.float32)
+        ctx = np.asarray(cache.contexts_raw[int(i)], dtype=np.float32)
         if ctx.size >= width:
             x_np[j] = ctx[-width:]
         else:
@@ -274,14 +274,17 @@ def _main_forecast(cache, indices, horizon: int, cap: int, batch_size: int,
         groups = [(np.arange(served.size, dtype=np.int64), int(window_size), served)]
         mode = f"window_{int(window_size)}_skip"
     else:
-        local_positions = np.arange(len(selected), dtype=np.int64)
         used_indices = selected
-        widths = np.maximum(1, np.minimum(cache.context_lengths[selected], int(cap)))
-        groups = []
-        for width in np.unique(widths):
-            pos = local_positions[widths == width]
-            groups.append((pos, int(width), selected[pos]))
-        mode = f"native_cap_{int(cap)}"
+        contexts = [
+            np.asarray(cache.contexts_raw[int(i)], dtype=np.float32)[-int(cap):]
+            for i in selected
+        ]
+        model = wab.load_timesfm(
+            TIMESFM_MODEL_ID, int(cap), horizon, batch_size)
+        fr, _tgts = wab.predict_timesfm_contexts(
+            model, contexts, cache.labels_np[selected], horizon, device,
+            batch_size=batch_size)
+        return f"native_cap_{int(cap)}", fr, used_indices
 
     results = []
     compile_h = 1024 if compile_horizon == "1024" else horizon
@@ -320,8 +323,8 @@ def parse_args():
                         "If omitted, compare native full-context grouping.")
     p.add_argument("--main-compile-horizon", choices=["horizon", "1024"],
                    default="horizon",
-                   help="Main wrapper compile max_horizon. 'horizon' matches current "
-                        "main code; '1024' tests official-like compile config.")
+                   help="Deprecated compatibility option; both paths now use the "
+                        "official max_horizon=1024 recipe.")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--device", default=None, choices=["cuda", "cpu"])
     p.add_argument("--out", default=None,

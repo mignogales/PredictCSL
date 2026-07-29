@@ -60,6 +60,11 @@ from experiments.gifteval_mase import (
     get_seasonality, per_instance_seasonal_errors, gluonts_leaderboard_mase,
 )
 from experiments.gifteval_reference import published_naive_record
+from experiments.timesfm_gifteval import (
+    TIMESFM_GIFTEVAL_RECIPE,
+    forecast_quantiles as forecast_timesfm_quantiles,
+    load_model as load_timesfm_official,
+)
 
 try:
     from tsfm_public import PatchTSTFMForPrediction
@@ -301,12 +306,10 @@ class GiftEvalCache:
             if len(label) < self.horizon:
                 continue
             # Two copies of the context, and the split matters for leaderboard
-            # exactness: `contexts` is NaN->0 filled and feeds the MODEL wrappers
-            # (unchanged, so every cached forecast stays valid); `contexts_raw`
-            # keeps the NaNs and feeds the METRIC paths (gluonts seasonal errors +
-            # the evaluate_forecasts machinery), which is what the leaderboard
-            # sees. Zero-filling before the seasonal error skewed the MASE
-            # denominator on every config with missing values.
+            # exactness: most model wrappers use the NaN->0 ``contexts`` copy;
+            # TimesFM and all metric paths use ``contexts_raw`` because the
+            # official TimesFM wrapper interpolates partial missing values
+            # internally and GluonTS excludes them from seasonal errors.
             raw = np.asarray(target, dtype=np.float32)
             ctx = np.nan_to_num(raw, nan=0.0)
             lbl = np.asarray(label[: self.horizon], dtype=np.float32)
@@ -372,6 +375,7 @@ class GiftEvalCache:
         batch_size: int,
         device: str,
         pin_memory: bool,
+        preserve_missing: bool = False,
     ) -> Tuple[List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, np.ndarray]:
         valid_mask = self.context_lengths >= window_size
         valid_indices = np.flatnonzero(valid_mask)
@@ -383,8 +387,9 @@ class GiftEvalCache:
 
         n = valid_indices.size
         x_np = np.empty((n, window_size), dtype=np.float32)
+        source_contexts = self.contexts_raw if preserve_missing else self.contexts
         for j, i in enumerate(valid_indices):
-            x_np[j] = self.contexts[i][-window_size:]
+            x_np[j] = source_contexts[i][-window_size:]
 
         y_np = self.labels_np[valid_indices]
 
@@ -414,6 +419,7 @@ class GiftEvalCache:
         device: str,
         pin_memory: bool,
         window_grid: List[int],
+        preserve_missing: bool = False,
     ) -> List[Tuple[int, List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, np.ndarray]]:
         """Pad-mode batching: NO instance is skipped.
 
@@ -437,13 +443,14 @@ class GiftEvalCache:
         )
 
         groups: List[Tuple[int, List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, np.ndarray]] = []
+        source_contexts = self.contexts_raw if preserve_missing else self.contexts
         for L in np.unique(eff_buck):
             L = int(L)
             idx = np.flatnonzero(eff_buck == L)
             g = idx.size
             x_np = np.empty((g, L), dtype=np.float32)
             for j, i in enumerate(idx):
-                x_np[j] = self.contexts[i][-L:]
+                x_np[j] = source_contexts[i][-L:]
             y_np = self.labels_np[idx]
 
             all_x = torch.from_numpy(x_np).unsqueeze(-1)
@@ -467,6 +474,7 @@ class GiftEvalCache:
         batch_size: int,
         device: str,
         pin_memory: bool,
+        preserve_missing: bool = False,
     ) -> Tuple[
         List[Tuple[int, List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, np.ndarray]],
         np.ndarray,
@@ -481,13 +489,14 @@ class GiftEvalCache:
         lengths = np.maximum(1, np.minimum(self.context_lengths, int(context_cap)))
 
         groups: List[Tuple[int, List[Dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, np.ndarray]] = []
+        source_contexts = self.contexts_raw if preserve_missing else self.contexts
         for L in np.unique(lengths):
             L = int(L)
             idx = np.flatnonzero(lengths == L)
             g = idx.size
             x_np = np.empty((g, L), dtype=np.float32)
             for j, i in enumerate(idx):
-                ctx = np.asarray(self.contexts[i], dtype=np.float32)
+                ctx = np.asarray(source_contexts[i], dtype=np.float32)
                 if ctx.size >= L:
                     x_np[j] = ctx[-L:]
                 else:
@@ -555,6 +564,18 @@ def _load_cached_result(dataset_display, model_short, term, window_size) -> dict
     path = os.path.join(_cache_dir(dataset_display, model_short, term, window_size), "metrics.json")
     with open(path, "r") as f:
         return json.load(f)
+
+
+def _result_cached_for_family(
+    dataset_display, model_short, term, window_size, model_family
+) -> bool:
+    """Like ``_result_cached``, also rejecting stale model-recipe caches."""
+    if not _result_cached(dataset_display, model_short, term, window_size):
+        return False
+    return _inference_recipe_current(
+        _load_cached_result(dataset_display, model_short, term, window_size),
+        model_family,
+    )
 
 
 def _save_result(dataset_display, model_short, term, window_size, metrics: dict) -> None:
@@ -1049,60 +1070,57 @@ def predict_moirai_1_1(model, batches, horizon, device):
 
 
 def load_timesfm(model_id, window_size, horizon, batch_size):
-    import timesfm
-    model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(model_id)
-    model.compile(
-        timesfm.ForecastConfig(
-            max_context=window_size, max_horizon=horizon,
-            normalize_inputs=True, use_continuous_quantile_head=True,
-            force_flip_invariance=True, per_core_batch_size=batch_size,
-            infer_is_positive=True, fix_quantile_crossing=True,
-        )
-    )
-    return model
+    """Compatibility wrapper returning the shared official TimesFM handle.
 
-
-def predict_timesfm(model, batches, horizon, device):
-    """Median + quantile forecast.
-
-    NOTE: TimesFM-2.5's ``point_forecast`` IS the 0.5-quantile, not the mean —
-    ``compiled_decode`` returns ``full_forecast[..., 5]`` (``decode_index=5``;
-    columns are ``[mean-head, q0.1..q0.9]``), which is exactly what the GiftEval
-    leaderboard scores as MASE[0.5]. Do NOT "fix" this to the mean head (col 0).
-    The ``[:, :, 1:]`` slice below keeps the 9 quantiles, mirroring the official
-    notebook's ``full_preds[:, :, 1:]``.
+    Compilation is intentionally deferred to ``forecast_timesfm_quantiles``:
+    the official recipe compiles once per outer batch from that batch's maximum
+    variable context length.
     """
-    PATCH_SIZE = 32
+    del window_size, horizon, batch_size
+    return load_timesfm_official(model_id)
 
-    def step(x, y):
-        bs, ws, _ = x.shape
-        x_np = x[:, :, 0].numpy()
-        remainder = ws % PATCH_SIZE
-        pad_len = (PATCH_SIZE - remainder) % PATCH_SIZE
-        if pad_len > 0:
-            padding = np.zeros((bs, pad_len), dtype=np.float32)
-            padded = np.concatenate([padding, x_np], axis=1)
-            mask_pad = np.ones((bs, pad_len), dtype=bool)
-            mask_valid = np.zeros((bs, ws), dtype=bool)
-            masks_np = np.concatenate([mask_pad, mask_valid], axis=1)
-        else:
-            padded = x_np
-            masks_np = np.zeros((bs, ws), dtype=bool)
 
-        values = [padded[i] for i in range(bs)]
-        masks = [masks_np[i] for i in range(bs)]
-        point_forecast, quantile_forecast = model.compiled_decode(horizon, values, masks)
-        pf = torch.as_tensor(point_forecast[:, :horizon], dtype=torch.float32, device=device)
-        qf = torch.as_tensor(
-            quantile_forecast[:, :horizon, 1:], dtype=torch.float32, device=device
-        ).permute(0, 2, 1)
-        return ({"median": pf, "quantiles": qf},
-                y[:, :, 0].to(device, non_blocking=True))
-    out, all_tgts = _run_batches(batches, "  TimesFM", step)
+def predict_timesfm(model, batches, horizon, device, batch_size=None):
+    """Run the same public ``tfm.forecast`` path as the sanity leaderboard."""
+    contexts = [
+        np.asarray(row, dtype=np.float32)
+        for batch in batches
+        for row in batch["x"][:, :, 0].cpu().numpy()
+    ]
+    all_targets = torch.cat(
+        [batch["y"][:, :, 0] for batch in batches], dim=0
+    ).to(device, non_blocking=True)
+    if batch_size is None:
+        batch_size = max(int(batch["x"].shape[0]) for batch in batches)
+    quantiles_np = forecast_timesfm_quantiles(
+        model, contexts, horizon, batch_size=int(batch_size))
+    all_quantiles = torch.as_tensor(
+        quantiles_np, dtype=torch.float32, device=device)
     return ForecastResult(
-        median=out["median"], quantiles=out["quantiles"],
+        median=all_quantiles[:, 4, :], quantiles=all_quantiles,
         quantile_levels=TIMESFM_QUANTILE_LEVELS,
-    ), all_tgts
+    ), all_targets
+
+
+def predict_timesfm_contexts(
+    model,
+    contexts,
+    targets,
+    horizon,
+    device,
+    batch_size=1024,
+):
+    """Official variable-length TimesFM path used by the native-full baseline."""
+    quantiles_np = forecast_timesfm_quantiles(
+        model, contexts, horizon, batch_size=int(batch_size))
+    all_quantiles = torch.as_tensor(
+        quantiles_np, dtype=torch.float32, device=device)
+    all_targets = torch.as_tensor(
+        np.asarray(targets, dtype=np.float32), dtype=torch.float32, device=device)
+    return ForecastResult(
+        median=all_quantiles[:, 4, :], quantiles=all_quantiles,
+        quantile_levels=TIMESFM_QUANTILE_LEVELS,
+    ), all_targets
 
 
 def load_patchtst_fm(model_id, device):
@@ -1767,9 +1785,11 @@ def plot_real_vs_predicted_curve(
 # ==============================================================================
 
 def load_handle(model_family: str, model_id: str, device: str):
-    """Load the base model for a family, or None for families that need no
-    persistent handle (timesfm recompiles per-cell; context_parroting is
-    parameter-free). Single source of truth for the per-family load dispatch,
+    """Load the base model for a family, or None for parameter-free families.
+
+    TimesFM now keeps one official checkpoint handle and recompiles that handle
+    per forecast batch, matching its GiftEval wrapper. Single source of truth
+    for the per-family load dispatch,
     shared by the ablation's lazy `ensure_handle` and the robust-timing stage."""
     if model_family == "chronos_bolt":
         return load_chronos_bolt(model_id, device)
@@ -1779,6 +1799,8 @@ def load_handle(model_family: str, model_id: str, device: str):
         return load_moirai_module(model_id)
     if model_family == "moirai_1_1":
         return load_moirai_1_1_module(model_id)
+    if model_family == "timesfm":
+        return load_timesfm_official(model_id)
     if model_family == "patchtst_fm":
         return load_patchtst_fm(model_id, device)
     if model_family == "sundial":
@@ -1791,7 +1813,7 @@ def load_handle(model_family: str, model_id: str, device: str):
         return load_flowstate(model_id, device)
     if model_family == "tirex":
         return load_tirex(model_id, device)
-    # timesfm (recompiled per-cell in _forecast_cell) + context_parroting need none.
+    # context_parroting is parameter-free.
     return None
 
 
@@ -1800,8 +1822,8 @@ def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
     """Run one model family on a uniform-width set of batches.
 
     `width` is the context length these batches share; moirai/timesfm recompile
-    against it. `handle` is the loaded base model (None for timesfm — recompiled
-    here — and context_parroting). `flowstate_scale` is FlowState's per-dataset
+    against it. `handle` is the loaded base model (None only for
+    context_parroting). `flowstate_scale` is FlowState's per-dataset
     cadence factor (`cache.flowstate_scale`); ignored by every other family.
     Returns (ForecastResult, tgts).
     """
@@ -1824,12 +1846,9 @@ def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
             torch.cuda.empty_cache()
         return fr, tgts
     if model_family == "timesfm":
-        tfm = load_timesfm(model_id, width, horizon, batch_size)
-        fr, tgts = predict_timesfm(tfm, batches, horizon, device)
-        del tfm
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        return fr, tgts
+        tfm = handle if handle is not None else load_timesfm_official(model_id)
+        return predict_timesfm(
+            tfm, batches, horizon, device, batch_size=batch_size)
     if model_family == "context_parroting":
         return predict_context_parroting(batches, horizon, device)
     if model_family == "patchtst_fm":
@@ -1850,12 +1869,13 @@ def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
 
 def build_forward(model_family, handle, model_id, batches, width, horizon,
                   device, batch_size, flowstate_scale=FLOWSTATE_SCALE_FACTOR):
-    """Do all per-window SETUP now (weight load / compile / forecaster build) and
+    """Do persistent per-window setup now (weight load / forecaster build) and
     return a zero-arg ``forward()`` that runs ONLY the forward pass over ``batches``.
 
     Separating setup from the forward lets a benchmark time the inference itself
-    rather than re-paying timesfm's reload+compile or moirai's wrapper build on
-    every repeat. For families whose ``_forecast_cell`` is already a pure forward
+    rather than re-paying model reload or Moirai's wrapper build on every repeat.
+    TimesFM's official ``forecast()`` call still performs its required per-batch
+    compile. For families whose ``_forecast_cell`` is already a pure forward
     over a persistent handle, ``forward()`` is just that call. Returns
     ``(forward, teardown)``; call ``teardown()`` once after the repeats to free any
     model built here (no-op for persistent-handle families)."""
@@ -1883,14 +1903,12 @@ def build_forward(model_family, handle, model_id, batches, width, horizon,
         return (lambda: predict_moirai_1_1(m, batches, horizon, device)), _td
 
     if model_family == "timesfm":
-        tfm = load_timesfm(model_id, width, horizon, batch_size)
-
-        def _td():
-            nonlocal tfm
-            del tfm
-            if device == "cuda":
-                torch.cuda.empty_cache()
-        return (lambda: predict_timesfm(tfm, batches, horizon, device)), _td
+        tfm = handle if handle is not None else load_timesfm_official(model_id)
+        return (
+            lambda: predict_timesfm(
+                tfm, batches, horizon, device, batch_size=batch_size),
+            _noop,
+        )
 
     # Persistent-handle families (+ context_parroting): _forecast_cell is already a
     # pure forward, so no separate setup is needed.
@@ -1972,6 +1990,13 @@ def _missing_metric(metrics: dict, key: str) -> bool:
     return v is None or (isinstance(v, float) and np.isnan(v))
 
 
+def _inference_recipe_current(metrics: dict, model_family: str) -> bool:
+    """Whether a cached forecast was produced by the active model recipe."""
+    if model_family == "timesfm":
+        return metrics.get("_timesfm_gifteval_recipe") == TIMESFM_GIFTEVAL_RECIPE
+    return True
+
+
 def _run_full_native_baseline(
     cache: GiftEvalCache,
     dataset_display: str,
@@ -1997,7 +2022,9 @@ def _run_full_native_baseline(
     # ``full_native`` does not encode its numeric cap in the cache path.  Ignore
     # results produced with an older/different cap instead of silently reusing
     # forecasts that violate the model's current input limit.
-    if cached is not None and int(cached.get("_context_cap", -1)) == cap:
+    if (cached is not None
+            and int(cached.get("_context_cap", -1)) == cap
+            and _inference_recipe_current(cached, model_family)):
         _backfill_served_index(
             dataset_display, model_short, term, FULL_NATIVE_WINDOW, cache, "pad")
         changed = False
@@ -2022,27 +2049,58 @@ def _run_full_native_baseline(
         return
 
     print(Fore.YELLOW + f"\n  > {tag}" + Fore.RESET)
-    groups, effective_lengths = cache.build_batches_full_native(
-        cap, batch_size, device, pin_memory=True)
-
     def _sync():
         if device == "cuda":
             torch.cuda.synchronize()
 
     results = []
     effective_batch_sizes = []
-    _sync()
-    t_start = time.perf_counter()
-    for L, batches_L, _ax, _ay, idx_L in groups:
-        fr_L, tgts_L, effective_bs = _forecast_cell_dynamic(
-            model_family, ensure_handle(), model_id, batches_L,
-            L, horizon, device, batch_size,
-            flowstate_scale=cache.flowstate_scale)
-        results.append((idx_L, fr_L, tgts_L))
-        effective_batch_sizes.append(effective_bs)
-    fr, tgts = _merge_grouped(results, cache.n_total, horizon, device)
-    _sync()
-    elapsed = time.perf_counter() - t_start
+    if model_family == "timesfm":
+        # The leaderboard wrapper sends the variable-length contexts in original
+        # dataset order through tfm.forecast() with an outer batch of 1024.  Do
+        # not exact-width-group or zero-fill here: both change TimesFM's compile /
+        # preprocessing path and were the source of the 0.744 vs 0.705 gap.
+        effective_lengths = np.maximum(
+            1, np.minimum(cache.context_lengths, int(cap))).astype(np.int32)
+        candidate = min(1024, cache.n_total)
+        while True:
+            try:
+                _sync()
+                t_start = time.perf_counter()
+                fr, tgts = predict_timesfm_contexts(
+                    ensure_handle(), cache.contexts_raw, cache.labels_np,
+                    horizon, device, batch_size=candidate)
+                _sync()
+                elapsed = time.perf_counter() - t_start
+                effective_batch_sizes = [candidate]
+                break
+            except Exception as exc:
+                if not _is_accelerator_oom(exc) or candidate <= 1:
+                    raise
+                next_candidate = max(1, candidate // 2)
+                print(Fore.YELLOW
+                      + f"    TimesFM official full-native: OOM at {candidate}; "
+                        f"retrying with {next_candidate}"
+                      + Fore.RESET)
+                _clear_accelerator_cache()
+                candidate = next_candidate
+        n_width_groups = 1
+    else:
+        groups, effective_lengths = cache.build_batches_full_native(
+            cap, batch_size, device, pin_memory=True)
+        _sync()
+        t_start = time.perf_counter()
+        for L, batches_L, _ax, _ay, idx_L in groups:
+            fr_L, tgts_L, effective_bs = _forecast_cell_dynamic(
+                model_family, ensure_handle(), model_id, batches_L,
+                L, horizon, device, batch_size,
+                flowstate_scale=cache.flowstate_scale)
+            results.append((idx_L, fr_L, tgts_L))
+            effective_batch_sizes.append(effective_bs)
+        fr, tgts = _merge_grouped(results, cache.n_total, horizon, device)
+        _sync()
+        elapsed = time.perf_counter() - t_start
+        n_width_groups = len(groups)
 
     served_idx = np.arange(cache.n_total)
     se_cell = cache.seasonal_errors_gluonts
@@ -2058,19 +2116,25 @@ def _run_full_native_baseline(
     metrics["elapsed_seconds"] = round(elapsed, 3)
     metrics["horizon"] = horizon
     metrics["_full_native_baseline"] = True
+    if model_family == "timesfm":
+        metrics["_timesfm_gifteval_recipe"] = TIMESFM_GIFTEVAL_RECIPE
     metrics["_context_cap"] = int(cap)
     metrics["_min_effective_context"] = int(np.min(effective_lengths))
     metrics["_mean_effective_context"] = float(np.mean(effective_lengths))
     metrics["_max_effective_context"] = int(np.max(effective_lengths))
-    metrics["_n_width_groups"] = int(len(groups))
+    metrics["_n_width_groups"] = int(n_width_groups)
     metrics["_dynamic_batch_sizes"] = effective_batch_sizes
 
     for k, v in metrics.items():
         if isinstance(v, float):
             print(Fore.YELLOW + f"    {k}: {v:.6f}" + Fore.RESET)
     print(Fore.MAGENTA + f"    TIME  {elapsed:.1f}s" + Fore.RESET)
-    print(f"    Samples: {cache.n_total} ({len(groups)} exact width-groups, full-native)  "
-          f"cap={cap}  H={horizon}")
+    if model_family == "timesfm":
+        print(f"    Samples: {cache.n_total} (official variable-length TimesFM batches)  "
+              f"cap={cap}  H={horizon}")
+    else:
+        print(f"    Samples: {cache.n_total} ({n_width_groups} exact width-groups, full-native)  "
+              f"cap={cap}  H={horizon}")
 
     per_sample = compute_per_sample_metrics(
         fr, tgts, cache.naive_seasonal_mae_train, seasonal_errors=se_cell)
@@ -2270,17 +2334,20 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
         len(window_sizes) + (1 if include_full_native else 0))
     n_cached = sum(
         1
-        for _, _, model_short in models
+        for _, model_family, model_short in models
         for _, term, dataset_display, _ in datasets
         for window_size in window_sizes
-        if _result_cached(dataset_display, model_short, term, window_size)
+        if _result_cached_for_family(
+            dataset_display, model_short, term, window_size, model_family)
     )
     if include_full_native:
         n_cached += sum(
             1
-            for _, _, model_short in models
+            for _, model_family, model_short in models
             for _, term, dataset_display, _ in datasets
-            if _result_cached(dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+            if _result_cached_for_family(
+                dataset_display, model_short, term, FULL_NATIVE_WINDOW,
+                model_family)
         )
     pct_cached = 100.0 * n_cached / n_planned if n_planned else 100.0
     print(Fore.CYAN
@@ -2300,15 +2367,14 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
         # Foundation models are loaded lazily + memoized: the first cell that
         # actually needs prediction triggers the load. This keeps a sharded
         # worker from loading models it owns no work for, and lets the
-        # coordinator's all-cached aggregation pass skip GPU model loads
-        # entirely. (timesfm loads per-cell; context_parroting needs nothing.)
+                # coordinator's all-cached aggregation pass skip GPU model loads
+                # entirely. (context_parroting needs no model handle.)
         _handle = [None]
         _handle_loaded = [False]
 
         def ensure_handle():
             if not _handle_loaded[0]:
-                has_persistent_handle = model_family not in (
-                    "timesfm", "context_parroting")
+                has_persistent_handle = model_family != "context_parroting"
                 if has_persistent_handle:
                     print(Fore.CYAN
                           + f"    Loading {model_short} model weights on {device} "
@@ -2381,7 +2447,9 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                           + Fore.RESET)
                     continue
 
-                if _result_cached(dataset_display, model_short, term, window_size):
+                if _result_cached_for_family(
+                        dataset_display, model_short, term, window_size,
+                        model_family):
                     cached = _load_cached_result(dataset_display, model_short, term, window_size)
                     _backfill_served_index(
                         dataset_display, model_short, term, window_size,
@@ -2474,10 +2542,12 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     if short_mode == "pad":
                         groups = cache.build_batches_padded(
                             window_size, args.batch_size, device,
-                            pin_memory=True, window_grid=window_sizes)
+                            pin_memory=True, window_grid=window_sizes,
+                            preserve_missing=(model_family == "timesfm"))
                     else:
                         batches, all_x_cpu, all_y_cpu, valid_indices = cache.build_batches(
-                            window_size, args.batch_size, device, pin_memory=True)
+                            window_size, args.batch_size, device, pin_memory=True,
+                            preserve_missing=(model_family == "timesfm"))
                 except RuntimeError as exc:
                     print(Fore.RED + f"    SKIP: {exc}" + Fore.RESET); continue
 
@@ -2559,6 +2629,8 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 metrics["elapsed_seconds"] = round(elapsed, 3)
                 metrics["horizon"] = horizon
                 metrics["_dynamic_batch_sizes"] = effective_batch_sizes
+                if model_family == "timesfm":
+                    metrics["_timesfm_gifteval_recipe"] = TIMESFM_GIFTEVAL_RECIPE
 
                 for k, v in metrics.items():
                     if isinstance(v, float):
@@ -2752,6 +2824,9 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
             )
             compare_records.append({
                 "model": model_id, "model_short": model_short,
+                "timesfm_gifteval_recipe": (
+                    TIMESFM_GIFTEVAL_RECIPE
+                    if model_family == "timesfm" else ""),
                 "dataset_display": dataset_display, "term": term,
                 "horizon_real": int(horizon_real),
                 "horizon_pred_idx": int(h_idx),

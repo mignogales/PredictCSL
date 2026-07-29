@@ -53,6 +53,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import random
@@ -73,6 +74,7 @@ from experiments.build_context_length_dataset import (
 )
 from experiments import models_config
 from experiments.gifteval_reference import NORMALIZATION_REFERENCE
+from experiments.timesfm_gifteval import TIMESFM_GIFTEVAL_RECIPE
 
 
 # Master run set: (model_id, family, display), sourced from the single config in
@@ -457,6 +459,34 @@ def _done_stage_3(family: str, display: str = "") -> Tuple[bool, str]:
     marker = os.path.join(compare_dir, "compare_summary.csv")
     if not os.path.isfile(marker):
         return False, "no compare_summary.csv"
+    if family == "timesfm":
+        try:
+            with open(marker, newline="") as f:
+                rows = list(csv.DictReader(f))
+        except OSError:
+            return False, "compare_summary.csv unreadable"
+        if not rows:
+            return False, "empty TimesFM compare_summary.csv"
+        current = 0
+        for row in rows:
+            if row.get("timesfm_gifteval_recipe") != TIMESFM_GIFTEVAL_RECIPE:
+                return False, "compare artifacts use stale TimesFM forecasts"
+            term = str(row["term"])
+            dataset_display = str(row["dataset_display"])
+            metrics_path = os.path.join(
+                ABLATION_GENERAL, "datasets", dataset_display, display,
+                f"t{term}", "wfull_native", "metrics.json")
+            try:
+                with open(metrics_path) as f:
+                    metrics = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                return False, f"TimesFM official full-native caches {current}/{len(rows)}"
+            if (metrics.get("_timesfm_gifteval_recipe")
+                    != TIMESFM_GIFTEVAL_RECIPE):
+                return False, (
+                    "stale TimesFM inference cache "
+                    f"({dataset_display}/t{term})")
+            current += 1
     n_npz = sum(1 for n in os.listdir(compare_dir) if n.endswith(".npz"))
     return True, f"{n_npz} comparison .npz files"
 
@@ -473,6 +503,10 @@ def _done_stage_4(family: str, display: str = "") -> Tuple[bool, str]:
         except (OSError, json.JSONDecodeError):
             return False, "summary_stats.json unreadable"
         if reference == NORMALIZATION_REFERENCE:
+            if family == "timesfm":
+                recipe = stats.get("inference_recipes", {}).get("timesfm")
+                if recipe != TIMESFM_GIFTEVAL_RECIPE:
+                    return False, "summary_stats.json uses stale TimesFM forecasts"
             return True, "summary_stats.json uses published naive CSV"
         return False, "summary_stats.json uses stale/local naive denominator"
     return False, "summary_stats.json missing"
