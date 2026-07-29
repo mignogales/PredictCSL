@@ -585,7 +585,6 @@ def evaluate_pipeline_on_dataset(model_id: str, model_family: str,
     import torch
 
     import experiments.test_window_ablation_gifteval_v5 as wab
-    from experiments.gifteval_mase import gluonts_leaderboard_mase
     from gift_eval.data import Dataset
 
     to_univariate = Dataset(
@@ -630,15 +629,8 @@ def evaluate_pipeline_on_dataset(model_id: str, model_family: str,
                         results.append((idx, fr, _tgts))
                     fr, _tgts = wab._merge_grouped(
                         results, cache.n_total, horizon, device)
-                median = fr.median.detach().cpu().float().numpy()
-                quantiles = (fr.quantiles.detach().cpu().float().numpy()
-                             if fr.quantiles is not None else None)
-                samples = (fr.samples.detach().cpu().float().numpy()
-                           if fr.samples is not None else None)
-                mase = gluonts_leaderboard_mase(
-                    median, cache.starts, cache.contexts_raw, cache.labels_np,
-                    cache.freq, quantiles=quantiles,
-                    quantile_levels=fr.quantile_levels, samples=samples)
+                mase = wab.cell_mase_gluonts_real(
+                    fr, cache, np.arange(cache.n_total))
                 return {
                     "MASE[0.5]": float(mase),
                     "_recipe": "pipeline_full_context",

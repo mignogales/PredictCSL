@@ -54,8 +54,8 @@ from gift_eval.data import Dataset as GiftEvalDataset
 
 # Leaderboard-faithful (gluonts) MASE primitives: per-instance seasonal error +
 # gluonts seasonality map. Used to compute the `mase_gluonts` metric alongside the
-# project's own `mase` (see compute_all_metrics). `gluonts_leaderboard_mase` runs
-# gluonts' OWN evaluate_forecasts to produce the `mase_gluonts_real` column.
+# project's own `mase` (see compute_all_metrics). `gluonts_leaderboard_mase` is a
+# vectorized equivalent of GluonTS evaluate_forecasts for `mase_gluonts_real`.
 from experiments.gifteval_mase import (
     get_seasonality, per_instance_seasonal_errors, gluonts_leaderboard_mase,
 )
@@ -201,33 +201,23 @@ CACHE_ROOT_PREDICTOR = "logs/experiments/context_length_predictor"
 # Bump whenever the `mase_gluonts` definition changes so cached cells re-derive it
 # cheaply (backfill from per-instance MAE, NO TSFM re-inference) on the next
 # `--force 3` pass instead of silently keeping stale numbers.
-#   v1: initial port      v2: seasonal_error zero-fallback fixed to 1.0 (gluonts),
-#                             was 1e-9 -> exploded MASE on constant/intermittent cells
-#   v3: seasonal errors computed from RAW contexts (NaNs preserved, like the
-#       leaderboard) instead of the NaN->0-filled model-input copy; naive
-#       baseline's mase_gluonts_real now runs the actual gluonts machinery.
-MASE_GLUONTS_VER = 3
+#   v1: initial port      v2: historical denominator fallback revision
+#   v3: seasonal errors computed from RAW contexts (NaNs preserved)
+#   v4: exact current gluonts seasonal-error, global aggregation, and sample
+#       quantile semantics; vectorized instead of creating one Forecast per row.
+MASE_GLUONTS_VER = 4
 
-# Inference-only dynamic batching. ``--batch-size`` is interpreted as the safe
-# size at this reference width; shorter contexts start proportionally larger.
-# OOM-derived safe sizes are cached per model/width/horizon; accelerator OOMs
-# halve the candidate and retry the complete cell.
+# Inference-only context-scaled batching. ``--batch-size`` is interpreted as the
+# safe size at this reference width; shorter contexts start proportionally larger.
+# There is deliberately no probe/autotune cache: every cell runs immediately at
+# the heuristic size, and only an actual accelerator OOM halves it and retries.
 DYNAMIC_BATCH_REFERENCE_CONTEXT = 1024
 DYNAMIC_BATCH_MAX_SIZE = 4096
-_DYNAMIC_BATCH_CACHE: Dict[Tuple[str, str, int, int], int] = {}
-# Preserve official outer-batch conventions where they exist. Other
-# deterministic families may probe up to the global ceiling.
 _DYNAMIC_BATCH_FAMILY_CAP = {
     "timesfm": 1024,
     "chronos_bolt": 1024,
     "patchtst_fm": 2048,
 }
-# Probe calls are discarded before the real cell run. Never advance RNG/state
-# for sample-generating families, where extra calls or changed batch composition
-# can alter forecasts even under a fixed seed.
-_DYNAMIC_BATCH_NO_PROBE = frozenset({
-    "sundial", "moirai_1_1", "context_parroting",
-})
 
 
 # ==============================================================================
@@ -802,11 +792,12 @@ def _load_cached_result_for_family(
         dataset_display, model_short, term, window_size)
     if metrics is None:
         return None
-    # Parity runs must use GluonTS' actual evaluate_forecasts result. Older
-    # backfills sometimes copied the NumPy port into `mase_gluonts_real` when
-    # forecast objects were no longer available; force only those cells through
-    # inference again rather than asking users to delete the complete cache.
-    if metrics.get("_mase_gluonts_real_standin"):
+    # A MASE definition/aggregation revision must recompute from forecasts. The
+    # v4 sample-forecast 0.5 selection cannot be recovered from cached per-row MAE.
+    # Treat stale records as misses so one ordinary rerun refreshes them without
+    # requiring users to delete cache directories manually.
+    if (metrics.get("_mase_gluonts_real_standin") or
+            metrics.get("_mase_gluonts_ver", 0) < MASE_GLUONTS_VER):
         return None
     return metrics if _inference_recipe_current(metrics, model_family) else None
 
@@ -877,14 +868,14 @@ def _backfill_mase_gluonts(dataset_display, model_short, term, window_size,
     if vi.shape[0] != per_mae.shape[0]:
         return None
     se = cache.seasonal_errors_gluonts[vi]
-    # Mirror compute_mase_gluonts' instance masking: an instance with no valid
-    # horizon points (all-NaN labels on *_with_missing-style cells) has NaN
-    # per-instance MAE — drop it instead of letting one NaN poison the cell mean
-    # (which left the whole gluonts curve NaN and the cell out of stage 4).
-    ok = np.isfinite(per_mae) & np.isfinite(se) & (se > 0)
+    valid_counts = np.isfinite(cache.labels_np[vi]).sum(axis=1)
+    # Reconstruct GluonTS' global point mean from cached per-row horizon means.
+    ok = np.isfinite(per_mae) & (valid_counts > 0)
     if not ok.any():
         return None
-    return float(np.mean(per_mae[ok] / se[ok]))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        numerator = np.sum((per_mae[ok] / se[ok]) * valid_counts[ok])
+    return float(numerator / np.sum(valid_counts[ok]))
 
 
 # ==============================================================================
@@ -939,13 +930,12 @@ def compute_all_metrics(
     rmse = float(np.sqrt(mse))
     mase = mae / naive_seasonal_mae
 
-    # Leaderboard (gluonts) MASE: average of PER-INSTANCE ratios
-    # mean(|y-yhat|)_horizon / seasonal_error_instance. `seasonal_errors` must be
-    # aligned to the instances in this cell (one float per row of `pred`).
+    # Leaderboard (gluonts) MASE: global valid-point mean of absolute error divided
+    # by that row's seasonal error. `seasonal_errors` must align with `pred` rows.
     mase_gluonts = compute_mase_gluonts(abs_err, valid, seasonal_errors)
-    # `mase_gluonts_real` (the actual gluonts machinery value) is filled by the
-    # caller, which holds the forecast objects + start Periods needed to run
-    # evaluate_forecasts. Placeholder NaN here keeps the dict shape stable.
+    # `mase_gluonts_real` (the exact vectorized machinery equivalent) is filled by
+    # the caller, which also holds quantile/sample outputs. Placeholder NaN keeps
+    # the dictionary shape stable.
     mase_gluonts_real = float("nan")
 
     denom_smape = (pred_safe.abs() + y_safe.abs()).clamp(min=1e-13)
@@ -977,8 +967,8 @@ def compute_mase_gluonts(
 
     ``abs_err`` / ``valid`` are (N, H); ``seasonal_errors`` is length-N (one
     seasonal error per instance, in the SAME row order as ``abs_err``). Returns
-    the mean over instances of ``mean_h(|y-yhat|) / seasonal_error`` (NaN when no
-    seasonal errors are supplied or no instance is usable)."""
+    the global mean over valid points of ``|y-yhat| / seasonal_error(instance)``
+    (NaN when no seasonal errors are supplied or no point is usable)."""
     if seasonal_errors is None:
         return float("nan")
     se = torch.as_tensor(
@@ -987,48 +977,35 @@ def compute_mase_gluonts(
     )
     if se.shape[0] != abs_err.shape[0]:
         return float("nan")
-    vmask = valid.to(abs_err.dtype)
-    n_per = vmask.sum(dim=1)
-    inst_ok = n_per > 0
-    if not bool(inst_ok.any()):
+    scaled = abs_err / se[:, None]
+    if not bool(valid.any()):
         return float("nan")
-    per_inst_mae = (abs_err * vmask).sum(dim=1) / n_per.clamp(min=1)
-    ratios = per_inst_mae[inst_ok] / se[inst_ok]
-    return float(ratios.mean().item())
-
-
-# Warn once (per process) if gluonts is unavailable, so the log isn't spammed.
-_GLUONTS_REAL_WARNED = [False]
+    return float(scaled[valid].mean().item())
 
 
 def cell_mase_gluonts_real(fr, cache: "GiftEvalCache", served_indices) -> float:
-    """Leaderboard MASE for one cell via the ACTUAL gluonts machinery (the
-    `mase_gluonts_real` metric). ``served_indices`` are the instance positions the
-    forecast ``fr`` covers, in row order: skip mode -> ``valid_indices``; pad mode
-    -> ``arange(n_total)``. Returns NaN (warning once) if gluonts is unavailable or
-    evaluation fails, so the ablation never crashes on it."""
+    """Leaderboard-exact vectorized MASE for one cell.
+
+    Selects GluonTS' 0.5 point on-device first, so quantile/sample cubes are not
+    copied to CPU merely to score MASE. ``served_indices`` are in forecast order.
+    """
     try:
         idx = np.asarray(served_indices)
-        median = fr.median.detach().cpu().float().numpy()
-        quantiles = (fr.quantiles.detach().cpu().float().numpy()
-                     if fr.quantiles is not None else None)
-        samples = (fr.samples.detach().cpu().float().numpy()
-                   if fr.samples is not None else None)
-        starts = [cache.starts[i] for i in idx]
-        # RAW contexts (NaNs preserved): gluonts derives each instance's seasonal
-        # error from these, and the leaderboard sees the missing values as NaN.
-        contexts = [cache.contexts_raw[i] for i in idx]
+        point = fr.median
+        if fr.quantiles is not None and fr.quantile_levels is not None:
+            matching = [i for i, level in enumerate(fr.quantile_levels)
+                        if float(level) == 0.5]
+            if matching:
+                point = fr.quantiles[:, matching[-1], :]
+        elif fr.samples is not None:
+            sample_idx = int(np.round((fr.samples.shape[1] - 1) * 0.5))
+            point = torch.kthvalue(fr.samples, sample_idx + 1, dim=1).values
+        median = point.detach().cpu().float().numpy()
         labels = cache.labels_np[idx]
         return gluonts_leaderboard_mase(
-            median, starts, contexts, labels, cache.freq,
-            quantiles=quantiles, quantile_levels=fr.quantile_levels, samples=samples)
-    except ImportError:
-        if not _GLUONTS_REAL_WARNED[0]:
-            print(Fore.YELLOW + "  [mase_gluonts_real] gluonts unavailable -> "
-                  "leaving NaN (the mase_gluonts port still populates)." + Fore.RESET)
-            _GLUONTS_REAL_WARNED[0] = True
-        return float("nan")
-    except Exception as exc:  # noqa: BLE001 - never let the real metric sink a cell
+            median, None, None, labels, cache.freq,
+            seasonal_errors=cache.seasonal_errors_gluonts[idx])
+    except Exception as exc:  # noqa: BLE001 - never let metric scoring sink a cell
         print(Fore.YELLOW + f"  [mase_gluonts_real] eval failed: {exc}" + Fore.RESET)
         return float("nan")
 
@@ -1151,81 +1128,23 @@ def _forecast_cell_dynamic(model_family, handle, model_id, batches, width,
     if all_x is None:
         raise ValueError("Cannot forecast an empty batch list")
     n_samples = int(all_x.shape[0])
-    key = (str(model_id), model_family, int(width), int(horizon))
     family_cap = _DYNAMIC_BATCH_FAMILY_CAP.get(
         model_family, DYNAMIC_BATCH_MAX_SIZE)
     search_cap = min(n_samples, DYNAMIC_BATCH_MAX_SIZE, family_cap)
-    if key in _DYNAMIC_BATCH_CACHE:
-        candidate = min(_DYNAMIC_BATCH_CACHE[key], n_samples)
-    else:
-        scale = (1 if model_family == "patchtst_fm" else
-                 max(1, DYNAMIC_BATCH_REFERENCE_CONTEXT // max(1, int(width))))
-        candidate = min(search_cap,
-                        max(1, int(base_batch_size)) * scale)
+    scale = (1 if model_family == "patchtst_fm" else
+             max(1, DYNAMIC_BATCH_REFERENCE_CONTEXT // max(1, int(width))))
+    candidate = min(search_cap, max(1, int(base_batch_size)) * scale)
 
-    # One-time upward search for deterministic families. Probe only a single
-    # batch at each doubled size (not the whole cell), cache the largest safe
-    # size, then run the complete cell exactly once at that size. Subsequent
-    # datasets with the same model/width/horizon skip probing entirely.
-    can_probe = (
-        str(device).startswith("cuda")
-        and model_family not in _DYNAMIC_BATCH_NO_PROBE
-        and key not in _DYNAMIC_BATCH_CACHE
-        and candidate < search_cap
-    )
-    if can_probe:
-        safe = 0
-        probe = candidate
-        while True:
-            probe_batches = [{"x": all_x[:probe], "y": all_y[:probe]}]
-            try:
-                probe_result = _forecast_cell(
-                    model_family, handle, model_id, probe_batches,
-                    width, horizon, device, probe,
-                    flowstate_scale=flowstate_scale,
-                )
-                # Prevent successful probe kernels from overlapping the next,
-                # larger probe and creating a false OOM from concurrent work.
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                del probe_result, probe_batches
-                safe = probe
-                if probe >= search_cap:
-                    candidate = safe
-                    break
-                probe = min(search_cap, probe * 2)
-            except Exception as exc:
-                if not _is_accelerator_oom(exc):
-                    raise
-                del probe_batches
-                _clear_accelerator_cache()
-                if safe > 0:
-                    candidate = safe
-                    break
-                if probe <= 1:
-                    raise
-                probe = max(1, probe // 2)
-        _DYNAMIC_BATCH_CACHE[key] = candidate
-        print(Fore.GREEN
-              + f"    Dynamic batch autotune: safe_bs={candidate}  "
-                f"search_cap={search_cap}  W={width}  H={horizon}"
-              + Fore.RESET)
-
-    reduced_after_oom = False
     while True:
         trial_batches = _slice_flat_batches(all_x, all_y, candidate)
         print(Fore.CYAN
-              + f"    Dynamic batch: samples={n_samples}  effective_bs={candidate}  "
+              + f"    Batching: samples={n_samples}  effective_bs={candidate}  "
                 f"actual_batches={len(trial_batches)}  W={width}  H={horizon}"
               + Fore.RESET)
         try:
             result = _forecast_cell(
                 model_family, handle, model_id, trial_batches, width, horizon,
                 device, candidate, flowstate_scale=flowstate_scale)
-            # Do not cache a size merely capped by a tiny dataset: that would
-            # unnecessarily throttle a later, larger dataset at the same width.
-            if reduced_after_oom or key in _DYNAMIC_BATCH_CACHE:
-                _DYNAMIC_BATCH_CACHE[key] = candidate
             return result[0], result[1], candidate
         except Exception as exc:
             if not _is_accelerator_oom(exc) or candidate <= 1:
@@ -1238,7 +1157,6 @@ def _forecast_cell_dynamic(model_family, handle, model_id, batches, width,
             del trial_batches
             _clear_accelerator_cache()
             candidate = next_candidate
-            reduced_after_oom = True
 
 
 def load_chronos_bolt(model_id, device):
@@ -2418,6 +2336,7 @@ def _run_full_native_baseline(
     if (cached is not None
             and int(cached.get("_context_cap", -1)) == cap
             and not cached.get("_mase_gluonts_real_standin", False)
+            and cached.get("_mase_gluonts_ver", 0) >= MASE_GLUONTS_VER
             and _inference_recipe_current(cached, model_family)):
         _backfill_served_index(
             dataset_display, model_short, term, FULL_NATIVE_WINDOW, cache, "pad")

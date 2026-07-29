@@ -7,9 +7,9 @@ don't line up. The leaderboard uses gluonts' definition:
 
     * seasonal error is computed **per test instance from that instance's own
       context** (``calculate_seasonal_error``), and
-    * MASE is ``mean(|y - yhat|) / seasonal_error`` **per instance**, then averaged
-      (``mase``), with the seasonality ``m`` taken from gluonts'
-      ``DEFAULT_SEASONALITIES`` map.
+    * MASE is the global mean over valid forecast points of
+      ``|y - yhat| / seasonal_error(instance)``, with the seasonality ``m`` taken
+      from gluonts' ``DEFAULT_SEASONALITIES`` map.
 
 This module ports those two pieces verbatim (see
 https://github.com/awslabs/gluonts ``time_feature/seasonality.py`` and
@@ -82,32 +82,21 @@ def get_seasonality(freq: str, seasonalities: Dict[str, int] = GLUONTS_SEASONALI
 
 
 def seasonal_error(context: np.ndarray, season: int) -> float:
-    """Port of gluonts ``calculate_seasonal_error`` over a single instance's
-    context: ``mean(|x[m:] - x[:-m]|)``.
+    """Exact univariate port of ``gluonts.ev.ts_stats.seasonal_error``.
 
-    Matches gluonts EXACTLY, including its critical zero-fallback: when the
-    seasonal difference is ~0 (constant / intermittent context) gluonts returns
-    **1.0**, not a tiny epsilon —
-    ``return seasonal_mae if not np.isclose(seasonal_mae, 0.0) else 1.0``.
-
-    The old code clamped to ``1e-9`` instead, which exploded such a cell's MASE to
-    ~1e6 (model/naive MAE ÷ ~0) and dragged the normalised leaderboard geomean far
-    below its true value (e.g. 0.55 vs the board's ~0.75). Also falls back to lag
-    ``m = 1`` when the context is shorter than the seasonal lag, and ignores NaNs.
+    GluonTS masks invalid context values, switches to lag 1 only when the
+    requested seasonality is *longer* than the context, and otherwise returns
+    ``mean(abs(x[m:] - x[:-m]))``. It does not replace zero denominators.
     """
-    x = np.asarray(context, dtype=np.float64)
-    n = x.shape[0]
-    m = season if 0 < season < n else 1
-    if n <= m:
-        # Not enough history even for a lag-1 difference -> gluonts sentinel.
-        return 1.0
-    diff = np.abs(x[m:] - x[:-m])
-    diff = diff[~np.isnan(diff)]
-    if diff.size == 0:
-        return 1.0
-    mae = float(diff.mean())
-    # gluonts: near-zero seasonal error -> 1.0 (avoids the MASE blow-up), never 0.
-    return mae if not np.isclose(mae, 0.0) else 1.0
+    x = np.ma.masked_invalid(np.asarray(context, dtype=np.float64))
+    n = x.shape[-1]
+    m = int(season)
+    if m > n:
+        m = 1
+    value = np.abs(x[m:] - x[:-m]).mean(axis=-1, keepdims=True)
+    # ``evaluate_forecasts`` places the masked-array result into np.array, which
+    # intentionally exposes the underlying value (zero for a fully masked mean).
+    return float(np.asarray(value, dtype=np.float64).reshape(-1)[0])
 
 
 def per_instance_seasonal_errors(contexts: Sequence[np.ndarray], season: int) -> np.ndarray:
@@ -116,101 +105,63 @@ def per_instance_seasonal_errors(contexts: Sequence[np.ndarray], season: int) ->
 
 
 # ==============================================================================
-#  Leaderboard MASE via the ACTUAL gluonts machinery
+#  Vectorized equivalent of the leaderboard's gluonts machinery
 # ==============================================================================
-# Everything above PORTS the gluonts definition in numpy — cheap and backfillable
-# from cached per-instance MAE. The function below instead runs gluonts' own
-# ``evaluate_forecasts`` + ``ev.MASE`` on real Forecast objects: the exact path the
-# HF GiftEval leaderboard uses, and the ground truth the port reproduces (validated
-# to <1%). Stage 3 records its output as the ``mase_gluonts_real`` metric column and
-# the standalone ``compare_mase_variants`` script uses it for verification. gluonts
-# is imported lazily so the port keeps working without it.
+# This avoids constructing one Forecast object per test instance and the
+# ``evaluate_forecasts`` Python loop (45k instances took about a minute in the
+# Bitbrains case). The formulas below were checked against the installed GluonTS
+# implementation, including QuantileForecast/SampleForecast 0.5 selection.
 
 
-class _ListTestData:
-    """Minimal stand-in for gluonts' ``split.TestData``: ``evaluate_forecasts``
-    only needs re-iterable ``.input`` / ``.label`` (entry dicts) and to zip them.
-    Lists satisfy the re-iteration it does internally (seasonal error over
-    ``.input``, then labels over ``.label``)."""
-
-    def __init__(self, inputs, labels):
-        self.input = inputs
-        self.label = labels
-
-    def __iter__(self):
-        return zip(self.input, self.label)
-
-    def __len__(self):
-        return len(self.input)
-
-
-def _build_gluonts_forecasts(median, starts, quantiles=None, quantile_levels=None,
-                             samples=None):
-    """Per-instance gluonts Forecast objects — QuantileForecast when the model
-    emits quantiles, else SampleForecast (from samples, or the median as a lone
-    sample). ``median`` is (N, H); ``quantiles`` (N, Q, H); ``samples`` (N, S, H);
-    ``starts[i]`` is the pandas Period at which instance i's forecast begins."""
-    from gluonts.model.forecast import QuantileForecast, SampleForecast
-
+def _forecast_point_05(median, quantiles=None, quantile_levels=None, samples=None):
+    """Return exactly what GluonTS Forecast objects expose as ``forecast['0.5']``."""
     median = np.asarray(median, dtype=np.float64)
-    n, _h = median.shape
-    forecasts = []
-
     if quantiles is not None and quantile_levels is not None:
-        q = np.asarray(quantiles, dtype=np.float64)          # (N, Q, H)
-        keys = [str(float(l)) for l in quantile_levels]
-        has_median = any(abs(float(l) - 0.5) < 1e-9 for l in quantile_levels)
-        for i in range(n):
-            arrays, fkeys = q[i], list(keys)
-            if not has_median:                                # ensure a 0.5 key
-                arrays = np.concatenate([arrays, median[i][None, :]], axis=0)
-                fkeys = fkeys + ["0.5"]
-            forecasts.append(QuantileForecast(
-                forecast_arrays=arrays, start_date=starts[i],
-                forecast_keys=fkeys, item_id=str(i)))
-    elif samples is not None:
-        s = np.asarray(samples, dtype=np.float64)            # (N, S, H)
-        for i in range(n):
-            forecasts.append(SampleForecast(
-                samples=s[i], start_date=starts[i], item_id=str(i)))
-    else:
-        for i in range(n):                                    # median-only fallback
-            forecasts.append(SampleForecast(
-                samples=median[i][None, :], start_date=starts[i], item_id=str(i)))
-
-    return forecasts
+        levels = [float(level) for level in quantile_levels]
+        matching = [i for i, level in enumerate(levels) if level == 0.5]
+        # _build_gluonts_forecasts previously appended ``median`` as an explicit
+        # 0.5 key when a model did not provide one.
+        return (np.asarray(quantiles)[:, matching[-1], :].astype(
+                    np.float64, copy=False)
+                if matching else median)
+    if samples is not None:
+        values = np.asarray(samples)
+        # SampleForecast.quantile: sorted_samples[round((S - 1) * q)]. This is
+        # observably different from torch.median for an even number of samples.
+        sample_idx = int(np.round((values.shape[1] - 1) * 0.5))
+        return np.partition(values, sample_idx, axis=1)[:, sample_idx, :].astype(
+            np.float64, copy=False)
+    return median
 
 
 def gluonts_leaderboard_mase(median, starts, contexts, labels, freq,
-                             quantiles=None, quantile_levels=None, samples=None):
-    """Aggregate MASE from gluonts' own ``evaluate_forecasts`` + ``ev.MASE``.
+                             quantiles=None, quantile_levels=None, samples=None,
+                             seasonal_errors=None):
+    """Exact vectorized equivalent of ``evaluate_forecasts(..., MASE(), axis=None)``.
 
-    All array args are indexed 0..N-1 in the SAME instance order: row ``i`` of
-    ``median`` / ``labels`` (each (N, H)), ``contexts[i]`` (that series' full
-    context, from which gluonts derives its per-instance seasonal error), and
-    ``starts[i]`` (the forecast-start Period) are the same instance. Lazy-imports
-    gluonts (raises ImportError if unavailable). Returns the MASE float.
+    All array args are indexed 0..N-1 in the same instance order. ``contexts``
+    can be omitted when precomputed ``seasonal_errors`` are supplied. ``starts``
+    remains in the signature for compatibility, but MASE itself does not use
+    timestamps. Returns the aggregate MASE float.
     """
-    from gluonts.model import evaluate_forecasts
-    from gluonts.ev.metrics import MASE
-
-    forecasts = _build_gluonts_forecasts(
-        median, starts, quantiles=quantiles,
+    del starts
+    point = _forecast_point_05(
+        median, quantiles=quantiles,
         quantile_levels=quantile_levels, samples=samples)
-
     labels = np.asarray(labels, dtype=np.float64)
-    inputs, label_entries = [], []
-    for i in range(len(forecasts)):
-        ctx = np.asarray(contexts[i], dtype=np.float64)
-        inputs.append({"start": starts[i] - len(ctx), "target": ctx})
-        label_entries.append({"start": starts[i], "target": labels[i]})
-    test_data = _ListTestData(inputs, label_entries)
-
-    df = evaluate_forecasts(
-        forecasts, test_data=test_data, metrics=[MASE()],
-        axis=None, seasonality=get_seasonality(freq))
-    col = next((c for c in df.columns if str(c).upper().startswith("MASE")), None)
-    if col is None:
-        raise RuntimeError(
-            f"No MASE column in evaluate_forecasts output: {list(df.columns)}")
-    return float(np.asarray(df[col]).ravel()[0])
+    if point.shape != labels.shape:
+        raise ValueError(f"Forecast/label shape mismatch: {point.shape} vs {labels.shape}")
+    if np.isnan(point).any():
+        raise ValueError("Forecast contains NaN values")
+    errors = (per_instance_seasonal_errors(contexts, get_seasonality(freq))
+              if seasonal_errors is None else
+              np.asarray(seasonal_errors, dtype=np.float64))
+    if errors.shape != (labels.shape[0],):
+        raise ValueError(
+            f"Seasonal-error shape mismatch: {errors.shape} vs {(labels.shape[0],)}")
+    masked_labels = np.ma.masked_invalid(labels)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scaled = np.ma.abs(masked_labels - point) / errors[:, None]
+    # GluonTS Mean(axis=(0, 1)) sums/counts every unmasked forecast point. This
+    # is not a mean of per-instance horizon means when validity counts differ.
+    return float(np.ma.mean(scaled))

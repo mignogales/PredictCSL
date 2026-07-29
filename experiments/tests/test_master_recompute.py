@@ -17,6 +17,7 @@ from experiments import master_run_all as master
 from experiments import models_config
 from experiments import predict_context_length as predictor
 from experiments.compare_window_strategies_gifteval import _geomean
+from experiments.gifteval_mase import gluonts_leaderboard_mase
 from experiments.test_window_ablation_gifteval_v5 import (
     ForecastResult, compute_per_sample_metrics)
 
@@ -284,6 +285,29 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
         np.testing.assert_allclose(metrics["mase_gluonts"], [1.0, 1.5])
 
 
+class GluonTSMaseVectorizedTest(unittest.TestCase):
+    def test_global_point_aggregation_with_missing_labels(self) -> None:
+        contexts = [np.array([0.0, 2.0, 4.0]),
+                    np.array([0.0, 10.0, 20.0])]
+        labels = np.array([[2.0, 4.0], [10.0, np.nan]])
+        median = np.zeros((2, 2))
+
+        value = gluonts_leaderboard_mase(
+            median, [None, None], contexts, labels, "D")
+
+        # Scaled valid point errors are [1, 2, 1], so GluonTS axis=None is 4/3.
+        self.assertAlmostEqual(value, 4.0 / 3.0)
+
+    def test_even_sample_forecast_uses_gluonts_upper_middle_index(self) -> None:
+        samples = np.array([[[0.0], [1.0], [2.0], [100.0]]])
+        value = gluonts_leaderboard_mase(
+            np.array([[1.0]]), [None], [np.array([0.0, 1.0])],
+            np.array([[2.0]]), "D", samples=samples)
+
+        # GluonTS uses sorted_samples[round((S-1)*.5)] = index 2, prediction 2.
+        self.assertEqual(value, 0.0)
+
+
 class Chronos2IndependenceTest(unittest.TestCase):
     class FakePipeline:
         quantiles = [0.1, 0.5, 0.9]
@@ -322,15 +346,7 @@ class Chronos2IndependenceTest(unittest.TestCase):
 
 
 class AblationDynamicBatchTest(unittest.TestCase):
-    def setUp(self) -> None:
-        from experiments import test_window_ablation_gifteval_v5 as ablation
-        ablation._DYNAMIC_BATCH_CACHE.clear()
-
-    def tearDown(self) -> None:
-        from experiments import test_window_ablation_gifteval_v5 as ablation
-        ablation._DYNAMIC_BATCH_CACHE.clear()
-
-    def test_deterministic_family_probes_up_and_reuses_safe_size(self) -> None:
+    def test_deterministic_family_runs_once_without_autotune_probe(self) -> None:
         from experiments import test_window_ablation_gifteval_v5 as ablation
 
         calls = []
@@ -340,8 +356,6 @@ class AblationDynamicBatchTest(unittest.TestCase):
             _device, batch_size, **_kwargs,
         ):
             calls.append(batch_size)
-            if batch_size > 8:
-                raise torch.cuda.OutOfMemoryError("synthetic OOM")
             n = sum(batch["x"].shape[0] for batch in batches)
             zeros = torch.zeros((n, horizon))
             return ForecastResult(median=zeros), zeros
@@ -350,21 +364,13 @@ class AblationDynamicBatchTest(unittest.TestCase):
             "x": torch.zeros((20, 1024, 1)),
             "y": torch.zeros((20, 4, 1)),
         }]
-        with mock.patch.object(ablation, "_forecast_cell", fake_forecast), \
-                mock.patch.object(ablation, "_clear_accelerator_cache"):
+        with mock.patch.object(ablation, "_forecast_cell", fake_forecast):
             _fr, _targets, size = ablation._forecast_cell_dynamic(
                 "flowstate", object(), "example/model", batches,
                 1024, 4, "cuda", 2)
-            first_calls = list(calls)
-            calls.clear()
-            _fr, _targets, cached_size = ablation._forecast_cell_dynamic(
-                "flowstate", object(), "example/model", batches,
-                1024, 4, "cuda", 2)
 
-        self.assertEqual(first_calls, [2, 4, 8, 16, 8])
-        self.assertEqual(size, 8)
-        self.assertEqual(calls, [8])
-        self.assertEqual(cached_size, 8)
+        self.assertEqual(calls, [2])
+        self.assertEqual(size, 2)
 
     def test_sampling_family_does_not_probe(self) -> None:
         from experiments import test_window_ablation_gifteval_v5 as ablation
@@ -390,6 +396,35 @@ class AblationDynamicBatchTest(unittest.TestCase):
                 1024, 4, "cuda", 2)
 
         self.assertEqual(calls, [2])
+
+    def test_oom_halves_batch_and_retries_without_caching(self) -> None:
+        from experiments import test_window_ablation_gifteval_v5 as ablation
+
+        calls = []
+
+        def fake_forecast(
+            _family, _handle, _model_id, batches, _width, horizon,
+            _device, batch_size, **_kwargs,
+        ):
+            calls.append(batch_size)
+            if batch_size > 4:
+                raise torch.cuda.OutOfMemoryError("synthetic OOM")
+            n = sum(batch["x"].shape[0] for batch in batches)
+            zeros = torch.zeros((n, horizon))
+            return ForecastResult(median=zeros), zeros
+
+        batches = [{
+            "x": torch.zeros((20, 256, 1)),
+            "y": torch.zeros((20, 4, 1)),
+        }]
+        with mock.patch.object(ablation, "_forecast_cell", fake_forecast), \
+                mock.patch.object(ablation, "_clear_accelerator_cache"):
+            _fr, _targets, size = ablation._forecast_cell_dynamic(
+                "flowstate", object(), "example/model", batches,
+                256, 4, "cuda", 2)
+
+        self.assertEqual(calls, [8, 4])
+        self.assertEqual(size, 4)
 
 class SoftClassificationLossTest(unittest.TestCase):
     def test_top3_rank_weights_and_invalid_class_mask(self) -> None:
@@ -601,7 +636,7 @@ class TiRexCompatibilityTest(unittest.TestCase):
 
         self.assertEqual(tuple(result.shape), (10, 2))
         self.assertEqual(seen[:2], [8, 4])
-        self.assertEqual(tuned[32], 4)
+        self.assertEqual(tuned, {})
 
 
 if __name__ == "__main__":

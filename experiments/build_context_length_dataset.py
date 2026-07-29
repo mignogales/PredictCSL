@@ -958,9 +958,11 @@ def _forecast_uniform(
     recipe's required compile for each batch."""
     n = int(x_all.shape[0])
     max_batch_size = max(batch_size, int(max_batch_size or batch_size))
-    tuned_batch_sizes = tuned_batch_sizes if tuned_batch_sizes is not None else {}
-    cached_batch = tuned_batch_sizes.get(int(width))
-    current_batch = min(cached_batch or batch_size, max_batch_size, n)
+    # Kept as a compatibility argument for older callers; upward probing and the
+    # cross-shard tuned-size cache are intentionally disabled. Start immediately
+    # at the context-scaled heuristic size and only reduce after a real OOM.
+    del tuned_batch_sizes
+    current_batch = min(batch_size, max_batch_size, n)
     if family == "moirai":
         runner = _build_moirai(base, horizon, width, device)
     else:
@@ -968,9 +970,6 @@ def _forecast_uniform(
 
     medians: List[torch.Tensor] = []
     start = 0
-    last_success = 0
-    probing = (dynamic_batching and _is_cuda(device) and family != "timesfm"
-               and cached_batch is None and current_batch < min(max_batch_size, n))
     while start < n:
         size = min(current_batch, n - start)
         xb = x_all[start:start + size]
@@ -1002,27 +1001,13 @@ def _forecast_uniform(
                 raise
             del exc
             torch.cuda.empty_cache()
-            current_batch = max(1, last_success or size // 2)
-            probing = False
-            tuned_batch_sizes[int(width)] = current_batch
+            current_batch = max(1, size // 2)
             print(Fore.YELLOW + f"  dynamic batch [{family}] W={width}: "
                   + f"OOM at {size}; using {current_batch}" + Fore.RESET,
                   flush=True)
             continue
         medians.append(m)
         start += size
-        if probing and size == current_batch:
-            last_success = current_batch
-            current_batch = min(max_batch_size, n, current_batch * 2)
-            probing = current_batch > last_success
-
-    if dynamic_batching and _is_cuda(device):
-        tuned = max(1, last_success or min(current_batch, n))
-        if cached_batch is None:
-            tuned_batch_sizes[int(width)] = tuned
-            print(Fore.CYAN + f"  dynamic batch [{family}] W={width}: tuned={tuned}, "
-                  + f"search_cap={min(max_batch_size, n)}" + Fore.RESET,
-                  flush=True)
 
     if family == "moirai":
         del runner
@@ -1154,7 +1139,6 @@ def gpu_worker(
     n_win = len(WINDOW_GRID)
     n_h = len(HORIZON_GRID)
     tb_shown = False        # print a full traceback only for the first shard failure
-    tuned_batch_sizes = {}  # safe CUDA microbatch cached across shards by width
 
     try:
         base = setup_model(family, model_id, device)
@@ -1208,7 +1192,7 @@ def gpu_worker(
                     family, base, model_id, ctx, w, real_len, max_horizon,
                     batch_size, device, dynamic_batching,
                     batch_reference_context, max_batch_size,
-                    tuned_batch_sizes)                      # (B, MAX_HORIZON)
+                    None)                                   # (B, MAX_HORIZON)
                 for h_idx, h in enumerate(HORIZON_GRID):
                     err = medians[:, :h] - tgt_t[:, :h]
                     cm[:, w_idx, h_idx] = err.abs().mean(dim=1).cpu().numpy()
