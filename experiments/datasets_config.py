@@ -110,9 +110,8 @@ CATALOG: List[DatasetSpec] = [
     DatasetSpec("solar/H",                     "medium", "Solar-H",         False, True),
     DatasetSpec("solar/H",                     "long",   "Solar-H",         False, True),
     DatasetSpec("solar/D",                     "short",  "Solar-D",         False, True),
-    # solar/W has only ~44 context points/instance -> just one WINDOW_GRID window
-    # (32) fits, so the ablation's >=2-point compare guard skips it. Too short for
-    # a context-length study; excluded from the run set (ablation ceiling = 95).
+    # Excluded from the experiment cohort: only W=32 fits, so there is no
+    # context-window selection problem to evaluate here.
     DatasetSpec("solar/W",                     "short",  "Solar-W",         False, False),
     DatasetSpec("hierarchical_sales/D",        "short",  "HierSales-D",     False, True),
     DatasetSpec("hierarchical_sales/W",        "short",  "HierSales-W",     False, True),
@@ -146,9 +145,8 @@ CATALOG: List[DatasetSpec] = [
     DatasetSpec("kdd_cup_2018_with_missing/H", "medium", "KDDCup2018-H",   False, True),
     DatasetSpec("kdd_cup_2018_with_missing/H", "long",   "KDDCup2018-H",   False, True),
     DatasetSpec("kdd_cup_2018_with_missing/D", "short",  "KDDCup2018-D",   False, True),
-    # car_parts_with_missing has only ~39 context points/instance -> just one
-    # WINDOW_GRID window (32) fits, so the ablation's >=2-point compare guard skips
-    # it. Too short for a context-length study; excluded (ablation ceiling = 95).
+    # As above, W=32 is the only selectable window; keep it in the official
+    # 97-row reference catalog but out of our 95-cell experiment cohort.
     DatasetSpec("car_parts_with_missing",      "short",  "CarParts",       False, False),
     DatasetSpec("temperature_rain_with_missing", "short", "TempRain",      False, True),
 ]

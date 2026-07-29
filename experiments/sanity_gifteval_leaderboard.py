@@ -517,7 +517,7 @@ def _pipeline_context_cap(family: str, horizon: int, requested: Optional[int],
     hard_caps = {
         "chronos2": 8192,
         "chronos_bolt": 2048,
-        "moirai": max(1, 8192 - int(horizon)),
+        "moirai": wab._moirai_max_context(horizon),
         "moirai_1_1": max(1, 8192 - int(horizon)),
         "timesfm": 15360,
         "patchtst_fm": 8192,
@@ -537,7 +537,8 @@ def _pipeline_context_cap(family: str, horizon: int, requested: Optional[int],
 
 
 def _pipeline_full_context_batches(cache, cap: int, batch_size: int,
-                                   device: str, pin_memory: bool):
+                                   device: str, pin_memory: bool,
+                                   preserve_missing: bool = False):
     """Exact full-native batches: every instance uses its last min(len, cap)
     samples, grouped by that effective length so wrappers see rectangular tensors
     without synthetic left padding."""
@@ -546,12 +547,13 @@ def _pipeline_full_context_batches(cache, cap: int, batch_size: int,
 
     lengths = np.maximum(1, np.minimum(cache.context_lengths, int(cap)))
     groups = []
+    source_contexts = cache.contexts_raw if preserve_missing else cache.contexts
     for width in np.unique(lengths):
         width = int(width)
         idx = np.flatnonzero(lengths == width)
         x_np = np.empty((idx.size, width), dtype=np.float32)
         for j, i in enumerate(idx):
-            ctx = np.asarray(cache.contexts[i], dtype=np.float32)
+            ctx = np.asarray(source_contexts[i], dtype=np.float32)
             if ctx.size >= width:
                 x_np[j] = ctx[-width:]
             else:
@@ -598,25 +600,36 @@ def evaluate_pipeline_on_dataset(model_id: str, model_family: str,
                 ds_name, ds_term, cap, cache.min_context, cache.max_context,
                 cache.n_total)
 
-    handle = None if model_family in ("timesfm", "context_parroting") \
-        else wab.load_handle(model_family, model_id, device)
+    handle = (None if model_family == "context_parroting"
+              else wab.load_handle(model_family, model_id, device))
 
     try:
         def _run(eval_batch_size: int) -> dict:
             groups = None
             results = []
             try:
-                groups = _pipeline_full_context_batches(
-                    cache, cap, eval_batch_size, device,
-                    pin_memory=(device == "cuda"))
-                for idx, width, batches in groups:
-                    fr, _tgts = wab._forecast_cell(
-                        model_family, handle, model_id, batches, width, horizon,
-                        device, eval_batch_size,
-                        flowstate_scale=cache.flowstate_scale)
-                    results.append((idx, fr, _tgts))
-                fr, _tgts = wab._merge_grouped(
-                    results, cache.n_total, horizon, device)
+                if model_family in {
+                        "timesfm", "chronos_bolt", "patchtst_fm", "sundial"}:
+                    contexts = [
+                        np.asarray(ctx[-cap:], dtype=np.float32)
+                        for ctx in cache.contexts_raw
+                    ]
+                    fr, _tgts = wab.predict_official_full_contexts(
+                        model_family, handle, contexts, cache.labels_np,
+                        horizon, device, eval_batch_size)
+                else:
+                    groups = _pipeline_full_context_batches(
+                        cache, cap, eval_batch_size, device,
+                        pin_memory=(device == "cuda"),
+                        preserve_missing=wab.preserves_missing(model_family))
+                    for idx, width, batches in groups:
+                        fr, _tgts = wab._forecast_cell(
+                            model_family, handle, model_id, batches, width, horizon,
+                            device, eval_batch_size,
+                            flowstate_scale=cache.flowstate_scale)
+                        results.append((idx, fr, _tgts))
+                    fr, _tgts = wab._merge_grouped(
+                        results, cache.n_total, horizon, device)
                 median = fr.median.detach().cpu().float().numpy()
                 quantiles = (fr.quantiles.detach().cpu().float().numpy()
                              if fr.quantiles is not None else None)

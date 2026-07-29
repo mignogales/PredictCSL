@@ -14,6 +14,7 @@ import numpy as np
 from experiments import timesfm_gifteval
 from experiments import run_all
 from experiments import test_window_ablation_gifteval_v5 as ablation
+from experiments.gifteval_inference_recipes import inference_recipe
 
 
 class _FakeForecastConfig:
@@ -63,13 +64,14 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
         np.testing.assert_array_equal(model.inputs[1][0], np.zeros(2, dtype=np.float32))
 
     def test_old_timesfm_cache_is_rejected(self) -> None:
-        self.assertFalse(ablation._inference_recipe_current({}, "timesfm"))
-        self.assertTrue(ablation._inference_recipe_current(
-            {"_timesfm_gifteval_recipe":
-             timesfm_gifteval.TIMESFM_GIFTEVAL_RECIPE},
-            "timesfm",
-        ))
-        self.assertTrue(ablation._inference_recipe_current({}, "chronos2"))
+        for family in (
+                "timesfm", "chronos2", "chronos_bolt", "moirai", "patchtst_fm",
+                "sundial", "tirex"):
+            with self.subTest(family=family):
+                self.assertFalse(
+                    ablation._inference_recipe_current({}, family))
+                self.assertTrue(ablation._inference_recipe_current(
+                    {"_inference_recipe": inference_recipe(family)}, family))
 
     def test_stage3_done_marker_rejects_then_accepts_recipe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,19 +86,22 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
                 row = {
                     "dataset_display": "Example",
                     "term": "short",
-                    "timesfm_gifteval_recipe": "old",
+                    "inference_recipe": "old",
                 }
                 with open(summary, "w", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=list(row))
                     writer.writeheader()
                     writer.writerow(row)
 
-                done, _ = run_all._done_stage_3(
-                    "timesfm", "TimesFM2.5-200M")
+                one_cell = [("example", "short", "Example", False)]
+                with mock.patch.object(
+                        run_all.datasets_config, "datasets_to_run",
+                        return_value=one_cell):
+                    done, _ = run_all._done_stage_3(
+                        "timesfm", "TimesFM2.5-200M")
                 self.assertFalse(done)
 
-                row["timesfm_gifteval_recipe"] = (
-                    timesfm_gifteval.TIMESFM_GIFTEVAL_RECIPE)
+                row["inference_recipe"] = inference_recipe("timesfm")
                 with open(summary, "w", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=list(row))
                     writer.writeheader()
@@ -107,12 +112,14 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
                 os.makedirs(metrics_dir)
                 with open(os.path.join(metrics_dir, "metrics.json"), "w") as f:
                     json.dump({
-                        "_timesfm_gifteval_recipe":
-                            timesfm_gifteval.TIMESFM_GIFTEVAL_RECIPE,
+                        "_inference_recipe": inference_recipe("timesfm"),
                     }, f)
 
-                done, _ = run_all._done_stage_3(
-                    "timesfm", "TimesFM2.5-200M")
+                with mock.patch.object(
+                        run_all.datasets_config, "datasets_to_run",
+                        return_value=one_cell):
+                    done, _ = run_all._done_stage_3(
+                        "timesfm", "TimesFM2.5-200M")
                 self.assertTrue(done)
             finally:
                 run_all.ABLATION_GENERAL = old_root

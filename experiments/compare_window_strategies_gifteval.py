@@ -108,7 +108,9 @@ from colorama import Fore
 from experiments.gifteval_reference import (
     NORMALIZATION_REFERENCE, published_naive_by_display,
 )
-from experiments.timesfm_gifteval import TIMESFM_GIFTEVAL_RECIPE
+from experiments.gifteval_inference_recipes import inference_recipe
+from experiments import models_config
+from experiments import datasets_config
 
 CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
 FULL_NATIVE_WINDOW = "full_native"
@@ -816,14 +818,21 @@ def load_strategy_records(
             full_native_metrics = _load_metrics(
                 cache_root, dataset_display, model_short, term, FULL_NATIVE_WINDOW)
             if full_native_metrics is not None:
-                if ("timesfm" in model.lower()
-                        and full_native_metrics.get("_timesfm_gifteval_recipe")
-                        != TIMESFM_GIFTEVAL_RECIPE):
+                model_family = next(
+                    (family for model_id, family, display in models_config.CATALOG
+                     if model.lower() in {model_id.lower(), display.lower()}),
+                    None,
+                )
+                expected_recipe = (
+                    inference_recipe(model_family) if model_family is not None else None)
+                if (expected_recipe is not None
+                        and full_native_metrics.get("_inference_recipe")
+                        != expected_recipe):
                     raise RuntimeError(
-                        "Stale TimesFM full-native cache for "
+                        "Stale model full-native cache for "
                         f"{dataset_display}/t{term}: rerun stage 3 before stage 4. "
-                        "The old cache used compiled_decode/zero-filled contexts "
-                        "instead of the official GiftEval forecast recipe."
+                        "The cached forecast predates the current GiftEval "
+                        "inference recipe."
                     )
                 native_mase = full_native_metrics.get(mase_metric)
                 native_standin = False
@@ -1122,14 +1131,20 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
             "missing_values": "drop",
             "zero_handling": "exact_zero",
             "reference": NORMALIZATION_REFERENCE,
+            "cohort_size": int(len(r)),
+            "expected_official_configs": int(
+                len(datasets_config.datasets_to_run())),
         }
     }
-    if ("model" in df.columns
-            and df["model"].astype(str).str.contains(
-                "timesfm", case=False, regex=False).any()):
-        stats["inference_recipes"] = {
-            "timesfm": TIMESFM_GIFTEVAL_RECIPE,
-        }
+    if "model" in df.columns:
+        active = {}
+        model_values = set(df["model"].astype(str).str.lower())
+        for model_id, family, display in models_config.CATALOG:
+            recipe = inference_recipe(family)
+            if recipe is not None and ({model_id.lower(), display.lower()} & model_values):
+                active[family] = recipe
+        if active:
+            stats["inference_recipes"] = active
 
     # Seasonal-naive normaliser present? Then also report the leaderboard-style
     # normalised geomean (geomean of MASE_strategy / MASE_seasonalnaive), over the

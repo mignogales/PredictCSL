@@ -73,6 +73,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from experiments import models_config
+from experiments.gifteval_inference_recipes import inference_recipe
+from experiments.timesfm_gifteval import (
+    forecast_quantiles as forecast_timesfm_quantiles,
+    load_model as load_timesfm_official,
+)
 
 
 # ==============================================================================
@@ -177,8 +182,9 @@ MODELS = models_config.catalog()
 
 # -- Quantile bookkeeping (per model family) ----------------------------------
 MOIRAI2_MEDIAN_IDX              = 4
-PATCHTST_FM_MEDIAN_QUANTILE_IDX = 49
-SUNDIAL_NUM_SAMPLES             = 20
+PATCHTST_FM_QUANTILE_LEVELS     = [i / 10.0 for i in range(1, 10)]
+PATCHTST_FM_MEDIAN_QUANTILE_IDX = 4
+SUNDIAL_NUM_SAMPLES             = 100
 SUNDIAL_MAX_CONTEXT             = 2880
 TIMEMOE_MAX_TOTAL               = 4096   # context + horizon must not exceed this
 TOTO_NUM_QUANTILES              = 9      # Toto 2.0 quantile head: [0.1..0.9]
@@ -607,17 +613,18 @@ def predict_chronos2(pipeline, x: torch.Tensor, horizon: int, device: str) -> to
 
 
 def load_chronos_bolt(model_id: str, device: str):
-    from chronos import ChronosBoltPipeline
-    return ChronosBoltPipeline.from_pretrained(
-        model_id, device_map=device,
-        torch_dtype=torch.bfloat16 if _is_cuda(device) else torch.float32,
-    )
+    from chronos import BaseChronosPipeline
+    return BaseChronosPipeline.from_pretrained(model_id, device_map=device)
 
 
 def predict_chronos_bolt(pipeline, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
-    samples = pipeline.predict(inputs=x[:, :, 0], prediction_length=horizon)
-    samples = samples.to(device=device, dtype=torch.float32)
-    return torch.median(samples, dim=1).values
+    context = [row for row in x[:, :, 0]]
+    quantiles = torch.as_tensor(
+        pipeline.predict(context, prediction_length=horizon),
+        device=device, dtype=torch.float32)
+    levels = [float(q) for q in pipeline.quantiles]
+    median_idx = min(range(len(levels)), key=lambda i: abs(levels[i] - 0.5))
+    return quantiles[:, median_idx, :horizon]
 
 
 def load_moirai_module(model_id: str):
@@ -642,44 +649,12 @@ def predict_moirai(model, x: torch.Tensor, horizon: int, device: str) -> torch.T
     return forecast_t[:, MOIRAI2_MEDIAN_IDX, :]
 
 
-def load_timesfm(model_id: str, window: int, horizon: int, batch_size: int):
-    import timesfm
-    model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(model_id)
-    model.compile(
-        timesfm.ForecastConfig(
-            max_context=window, max_horizon=horizon,
-            normalize_inputs=True, use_continuous_quantile_head=True,
-            force_flip_invariance=True, per_core_batch_size=batch_size,
-            infer_is_positive=True, fix_quantile_crossing=True,
-        )
-    )
-    return model
-
-
 def predict_timesfm(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
-    """Median forecast (B, horizon).
-
-    NOTE: TimesFM-2.5's ``point_forecast`` IS the 0.5-quantile, not the mean —
-    ``compiled_decode`` returns ``full_forecast[..., 5]`` (``decode_index=5``;
-    columns are ``[mean-head, q0.1..q0.9]``), which is exactly what the GiftEval
-    leaderboard scores as MASE[0.5]. Do NOT "fix" this to the mean head (col 0).
-    """
-    PATCH = 32
-    bs, ws, _ = x.shape
-    x_np = x[:, :, 0].numpy()
-    pad_len = (PATCH - ws % PATCH) % PATCH
-    if pad_len > 0:
-        padding = np.zeros((bs, pad_len), dtype=np.float32)
-        padded = np.concatenate([padding, x_np], axis=1)
-        masks_np = np.concatenate(
-            [np.ones((bs, pad_len), bool), np.zeros((bs, ws), bool)], axis=1)
-    else:
-        padded, masks_np = x_np, np.zeros((bs, ws), bool)
-    values = [padded[i] for i in range(bs)]
-    masks = [masks_np[i] for i in range(bs)]
-    point_forecast, _ = model.compiled_decode(horizon, values, masks)
+    contexts = [np.asarray(row, dtype=np.float32) for row in x[:, :, 0].numpy()]
+    quantiles = forecast_timesfm_quantiles(
+        model, contexts, horizon, batch_size=len(contexts))
     return torch.as_tensor(
-        point_forecast[:, :horizon], dtype=torch.float32, device=device)
+        quantiles[:, 4, :horizon], dtype=torch.float32, device=device)
 
 
 def load_patchtst_fm(model_id: str, device: str):
@@ -690,42 +665,39 @@ def load_patchtst_fm(model_id: str, device: str):
 
 
 def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
-    past_values = x.to(device, non_blocking=True).squeeze(-1)
-    # PatchTST-FM-R1 has a FIXED context_length (8192) and no observed-mask input;
-    # a shorter tensor makes its internal padding NaN out. Left-pad to the native
-    # context with NaN, which the model treats as its missing-value indicator and
-    # masks out (empirically the least-distorting pad: matches mean-padding, beats
-    # zeros). So genuine samples drive the forecast and output stays finite.
-    ctx_len = model.config.context_length
-    if past_values.shape[1] < ctx_len:
-        pad = past_values.new_full(
-            (past_values.shape[0], ctx_len - past_values.shape[1]), float("nan"))
-        past_values = torch.cat([pad, past_values], dim=1)
-    elif past_values.shape[1] > ctx_len:
-        past_values = past_values[:, -ctx_len:]
-    # tsfm_public's multi-step rollout (forecast_single_step) builds its forecast
-    # mask with a bare `torch.ones(f_i)` (no device arg), which lands on CPU and
-    # trips a device-mismatch `cat` against the CUDA hidden state whenever horizon
-    # exceeds the model's single-shot length (e.g. long-term GiftEval, h=720). Run
-    # the forward under a default-device context so those factory tensors land on
-    # `device`; a no-op for tensors that already carry an explicit device.
+    target = []
+    for row in x[:, :, 0]:
+        row = row.to(device, non_blocking=True, dtype=torch.float32)
+        missing = torch.isnan(row)
+        if bool(missing.any()):
+            fill = (row[~missing].mean() if bool((~missing).any())
+                    else row.new_tensor(0.0))
+            row = torch.where(missing, fill, row)
+        target.append(row)
     with torch.device(device):
-        # Granite-TSFM renamed the first forward argument from ``inputs`` to
-        # ``past_values``. Positional dispatch works with both releases.
-        raw = model(past_values, prediction_length=horizon)[0]
-    if raw.dim() == 4:                                 # (B, Q, H, 1)
-        qf = raw[:, :, :horizon, 0]
-        return qf[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :].to(torch.float32)
-    if raw.dim() == 3:                                 # (B, Q, H), (B, 1, H), or (B, H, 1)
-        if raw.shape[1] == 1:
-            return raw[:, 0, :horizon].to(torch.float32)
-        if raw.shape[2] == 1:
-            return raw[:, :horizon, 0].to(torch.float32)
-        if raw.shape[2] == len(PATCHTST_FM_QUANTILE_LEVELS):
-            qf = raw[:, :horizon, :].permute(0, 2, 1)
-            return qf[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :].to(torch.float32)
-        return torch.median(raw[:, :, :horizon], dim=1).values.to(torch.float32)
-    return raw[:, :horizon].to(torch.float32)          # (B, H)
+        output = model(
+            past_values=target, prediction_length=horizon,
+            quantile_levels=PATCHTST_FM_QUANTILE_LEVELS)
+    raw = output.quantile_outputs
+    if isinstance(raw, (list, tuple)):
+        raw = torch.stack([torch.as_tensor(item) for item in raw], dim=0)
+    else:
+        raw = torch.as_tensor(raw)
+    if raw.dim() == 4 and raw.shape[-1] == 1:
+        raw = raw[..., 0]
+    if raw.dim() != 3:
+        raise ValueError(f"Unexpected PatchTST quantile shape {tuple(raw.shape)}")
+    q_count = len(PATCHTST_FM_QUANTILE_LEVELS)
+    if raw.shape[1] == q_count:
+        qf = raw[:, :, :horizon]
+    elif raw.shape[2] == q_count:
+        qf = raw[:, :horizon, :].permute(0, 2, 1)
+    else:
+        raise ValueError(f"PatchTST output has no quantile axis: {tuple(raw.shape)}")
+    if qf.shape[2] != horizon:
+        raise ValueError(f"PatchTST returned horizon={qf.shape[2]}, expected {horizon}")
+    return qf[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :].to(
+        device=device, dtype=torch.float32)
 
 
 def _patch_dynamic_cache_seen_tokens() -> None:
@@ -775,7 +747,8 @@ def _patch_dynamic_cache_seen_tokens() -> None:
 
 
 def load_sundial(model_id: str, device: str):
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, set_seed
+    set_seed(1)
     _patch_dynamic_cache_seen_tokens()
     model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
     model.to(device).eval()
@@ -783,10 +756,19 @@ def load_sundial(model_id: str, device: str):
 
 
 def predict_sundial(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
-    seqs = x[:, :, 0].to(device, non_blocking=True)
-    samples = model.generate(
-        seqs, max_new_tokens=horizon, num_samples=SUNDIAL_NUM_SAMPLES,
-    )                                                  # (B, S, H)
+    from contextlib import nullcontext
+    from gluonts.transform import LastValueImputation
+    rows = []
+    for row in x[:, :, 0].numpy():
+        rows.append(LastValueImputation()(row) if np.isnan(row).any() else row)
+    seqs = torch.as_tensor(np.vstack(rows), dtype=torch.float32, device=device)
+    amp = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+           if _is_cuda(device) else nullcontext())
+    with amp:
+        samples = model.generate(
+            seqs, max_new_tokens=horizon, revin=True,
+            num_samples=SUNDIAL_NUM_SAMPLES,
+        )                                              # (B, S, H)
     samples = samples[:, :, :horizon].to(torch.float32)
     return torch.median(samples, dim=1).values         # (B, H)
 
@@ -940,7 +922,7 @@ def setup_model(family: str, model_id: str, device: str):
     if family == "moirai":
         return load_moirai_module(model_id)            # per-window forecast obj
     if family == "timesfm":
-        return None                                    # recompiled per window
+        return load_timesfm_official(model_id)
     if family == "patchtst_fm":
         return load_patchtst_fm(model_id, device)
     if family == "sundial":
@@ -971,8 +953,9 @@ def _forecast_uniform(
 ) -> torch.Tensor:
     """Forecast a uniform-width batch; return median (n, horizon) on `device`.
 
-    moirai/timesfm recompile against `width`, so this is called once per distinct
-    context width (see forecast_window's grouping)."""
+    Moirai rebuilds its forecast object against ``width``. TimesFM keeps one
+    official checkpoint handle and its public forecast method performs the
+    recipe's required compile for each batch."""
     n = int(x_all.shape[0])
     max_batch_size = max(batch_size, int(max_batch_size or batch_size))
     tuned_batch_sizes = tuned_batch_sizes if tuned_batch_sizes is not None else {}
@@ -980,8 +963,6 @@ def _forecast_uniform(
     current_batch = min(cached_batch or batch_size, max_batch_size, n)
     if family == "moirai":
         runner = _build_moirai(base, horizon, width, device)
-    elif family == "timesfm":
-        runner = load_timesfm(model_id, width, horizon, batch_size)
     else:
         runner = base
 
@@ -1043,7 +1024,7 @@ def _forecast_uniform(
                   + f"search_cap={min(max_batch_size, n)}" + Fore.RESET,
                   flush=True)
 
-    if family in ("moirai", "timesfm"):
+    if family == "moirai":
         del runner
         if _is_cuda(device):
             torch.cuda.empty_cache()
@@ -1240,7 +1221,8 @@ def gpu_worker(
             with open(os.path.join(sd, "done.json"), "w") as f:
                 json.dump({"shard_id": shard_id, "start": start, "end": end,
                            "window_indices": win_indices,
-                           "horizon_grid": HORIZON_GRID}, f)
+                           "horizon_grid": HORIZON_GRID,
+                           "inference_recipe": inference_recipe(family)}, f)
 
             elapsed = time.perf_counter() - t0
             result_queue.put({"shard_id": shard_id, "status": "ok",
@@ -1270,7 +1252,7 @@ def gpu_worker(
 # ==============================================================================
 
 def merge_shards(
-    model_dir: str, n_series: int, window_indices: List[int]
+    model_dir: str, n_series: int, window_indices: List[int], family: str
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """Concatenate completed shard curves into top-level (N, n_win, n_h) arrays.
 
@@ -1292,7 +1274,8 @@ def merge_shards(
             with open(dpath) as f:
                 d = json.load(f)
             if (d.get("window_indices") != window_indices
-                    or d.get("horizon_grid") != HORIZON_GRID):
+                    or d.get("horizon_grid") != HORIZON_GRID
+                    or d.get("inference_recipe") != inference_recipe(family)):
                 continue
             s, e = d["start"], d["end"]
             shard_mae = np.load(os.path.join(sdir, name, "curves_mae.npy"))
@@ -1478,6 +1461,7 @@ def main() -> None:
                     cached_ok = (
                         done_meta.get("window_indices") == win_indices
                         and done_meta.get("horizon_grid") == HORIZON_GRID
+                        and done_meta.get("inference_recipe") == inference_recipe(family)
                     )
                 except (OSError, json.JSONDecodeError):
                     cached_ok = False
@@ -1536,12 +1520,14 @@ def main() -> None:
             print(Fore.MAGENTA + f"   Labeling wall-clock: {time.perf_counter() - t0:.1f}s"
                   + Fore.RESET)
 
-        curves_mae, _, n_done = merge_shards(model_dir, n_series, win_indices)
+        curves_mae, _, n_done = merge_shards(
+            model_dir, n_series, win_indices, family)
         total_shards = (n_series + args.shard_size - 1) // args.shard_size
 
         with open(os.path.join(model_dir, "meta.json"), "w") as f:
             json.dump({
                 "model_id": model_id, "model_family": family, "model_display": display,
+                "inference_recipe": inference_recipe(family),
                 "window_indices": win_indices,
                 "shards_done": n_done, "shards_total": total_shards,
                 "devices": devices, "shard_size": args.shard_size,

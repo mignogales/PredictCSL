@@ -29,6 +29,8 @@ import numpy as np
 import pandas as pd
 from colorama import Fore
 
+from experiments import datasets_config
+
 
 VARIANT_TREES: Dict[str, str] = {
     "cheap_curve": "general_v3",
@@ -57,6 +59,11 @@ def _cell_from_path(path: str, model: str) -> Optional[Cell]:
 
 def discover_cells(ablation_root: str, models: Optional[Iterable[str]]) -> List[Cell]:
     allowed = set(models or [])
+    active_dataset_cells = {
+        (display, str(term))
+        for _ge_name, term, display, _to_univariate
+        in datasets_config.datasets_to_run()
+    }
     found: Dict[Tuple[str, str, str], Cell] = {}
     for tree in VARIANT_TREES.values():
         pattern = os.path.join(
@@ -67,7 +74,12 @@ def discover_cells(ablation_root: str, models: Optional[Iterable[str]]) -> List[
             if allowed and model not in allowed:
                 continue
             cell = _cell_from_path(path, model)
-            if cell is not None:
+            # A resumed run may retain old derived NPZs for datasets that were
+            # subsequently removed from the experiment cohort. The authoritative
+            # run-set filter prevents those stale files (notably Solar-W and
+            # CarParts) from leaking back into instance-level aggregates.
+            if (cell is not None
+                    and (cell.dataset, str(cell.term)) in active_dataset_cells):
                 found.setdefault((model, cell.dataset, cell.term), cell)
     return [found[key] for key in sorted(found)]
 

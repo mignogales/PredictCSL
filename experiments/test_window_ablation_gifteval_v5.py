@@ -59,11 +59,16 @@ from gift_eval.data import Dataset as GiftEvalDataset
 from experiments.gifteval_mase import (
     get_seasonality, per_instance_seasonal_errors, gluonts_leaderboard_mase,
 )
-from experiments.gifteval_reference import published_naive_record
+from experiments.gifteval_reference import (
+    REFERENCE_DIR, leaderboard_dataset_key, published_naive_record,
+)
 from experiments.timesfm_gifteval import (
     TIMESFM_GIFTEVAL_RECIPE,
     forecast_quantiles as forecast_timesfm_quantiles,
     load_model as load_timesfm_official,
+)
+from experiments.gifteval_inference_recipes import (
+    inference_recipe, preserves_missing,
 )
 
 try:
@@ -99,13 +104,15 @@ MOIRAI_1_1_PATCH_SIZE = 32
 TIMESFM_QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 TIMESFM_FULL_CONTEXT = 15360
 FULL_NATIVE_WINDOW = "full_native"
-PATCHTST_FM_QUANTILE_LEVELS = [i / 100.0 for i in range(1, 100)]
-PATCHTST_FM_MEDIAN_QUANTILE_IDX = 49
-SUNDIAL_NUM_SAMPLES = 20
+PATCHTST_FM_QUANTILE_LEVELS = [i / 10.0 for i in range(1, 10)]
+PATCHTST_FM_MEDIAN_QUANTILE_IDX = 4
+SUNDIAL_NUM_SAMPLES = 100
 SUNDIAL_MAX_CONTEXT = 2880
 TIMEMOE_MAX_TOTAL   = 4096   # context + horizon must not exceed this
-# Moirai2-R-small's checkpoint has max_seq_len=512 and patch_size=16.  Its
-# forecast input contains both context and prediction tokens.
+# Moirai2-R-small's checkpoint has max_seq_len=512 and patch_size=16. Its
+# forecast input contains both context and prediction tokens, hence an 8192
+# total-point capacity. The published leaderboard notebook chose a conservative
+# context_length=4000; this ablation intentionally measures the native capacity.
 MOIRAI_MAX_SEQ_LEN  = 512
 MOIRAI_PATCH_SIZE   = 16
 MOIRAI_MAX_TOTAL    = MOIRAI_MAX_SEQ_LEN * MOIRAI_PATCH_SIZE
@@ -306,10 +313,10 @@ class GiftEvalCache:
             if len(label) < self.horizon:
                 continue
             # Two copies of the context, and the split matters for leaderboard
-            # exactness: most model wrappers use the NaN->0 ``contexts`` copy;
-            # TimesFM and all metric paths use ``contexts_raw`` because the
-            # official TimesFM wrapper interpolates partial missing values
-            # internally and GluonTS excludes them from seasonal errors.
+            # exactness. Legacy wrappers use the NaN->0 ``contexts`` copy;
+            # parity-sensitive wrappers and all metric paths use
+            # ``contexts_raw`` so each model applies its official missing-value
+            # policy and GluonTS excludes missing values from seasonal errors.
             raw = np.asarray(target, dtype=np.float32)
             ctx = np.nan_to_num(raw, nan=0.0)
             lbl = np.asarray(label[: self.horizon], dtype=np.float32)
@@ -564,6 +571,189 @@ def _load_cached_result(dataset_display, model_short, term, window_size) -> dict
     path = os.path.join(_cache_dir(dataset_display, model_short, term, window_size), "metrics.json")
     with open(path, "r") as f:
         return json.load(f)
+
+
+def _write_leaderboard_parity_summary(models, datasets, run_dir: str) -> str:
+    """Persist the normalized full-native MASE immediately after precompute.
+
+    This is intentionally independent of predictor training. It applies the
+    leaderboard aggregation directly to each model's full-native forecast:
+    geometric mean over dataset cells of model MASE divided by the *published*
+    Seasonal Naive MASE from GIFT-Eval's CSV.
+    """
+    path = os.path.join(run_dir, "leaderboard_parity_summary.json")
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+
+    payload.update({
+        "aggregation": "geomean(model_mase / published_seasonal_naive_mase)",
+        "metric": "mase_gluonts_real",
+        "normalization_reference": (
+            "leaderboard_reference/seasonal_naive_all_results.csv"),
+        "expected_cells": len(datasets),
+        "excluded_short_cells": ["Solar-W/short", "CarParts/short"],
+    })
+    model_payload = payload.setdefault("models", {})
+
+    published_files = {
+        "TimesFM2.5-200M": "timesfm-2.5_all_results.csv",
+        "Chronos2-Base": "chronos-2_all_results.csv",
+        "Chronos2-Synth": "chronos-2-synth_all_results.csv",
+    }
+
+    for model_id, family, model_short in models:
+        ratios: List[float] = []
+        missing: List[str] = []
+        standins: List[str] = []
+        for ge_name, term, dataset_display, _to_univariate in datasets:
+            cell = f"{dataset_display}/t{term}"
+            try:
+                metrics = _load_cached_result(
+                    dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+            except (OSError, json.JSONDecodeError):
+                missing.append(cell)
+                continue
+            model_mase = metrics.get(
+                "mase_gluonts_real", metrics.get("mase_gluonts"))
+            naive = published_naive_record(ge_name, term)["mase_gluonts_real"]
+            try:
+                ratio = float(model_mase) / float(naive)
+            except (TypeError, ValueError, ZeroDivisionError):
+                missing.append(cell)
+                continue
+            if not np.isfinite(ratio) or ratio < 0:
+                missing.append(cell)
+                continue
+            ratios.append(ratio)
+            if metrics.get("_mase_gluonts_real_standin"):
+                standins.append(cell)
+
+        if not ratios:
+            score = None
+        elif any(value == 0 for value in ratios):
+            score = 0.0
+        else:
+            score = float(np.exp(np.mean(np.log(np.asarray(ratios)))))
+
+        published_score = None
+        reference_file = published_files.get(model_short)
+        if reference_file is not None:
+            reference_path = os.path.join(REFERENCE_DIR, reference_file)
+            try:
+                reference_df = pd.read_csv(reference_path)
+                reference_mase = dict(zip(
+                    reference_df["dataset"],
+                    reference_df["eval_metrics/MASE[0.5]"],
+                ))
+                reference_ratios = []
+                for ge_name, term, _dataset_display, _to_univariate in datasets:
+                    key = leaderboard_dataset_key(ge_name, term)
+                    reference_ratios.append(
+                        float(reference_mase[key])
+                        / float(published_naive_record(
+                            ge_name, term)["mase_gluonts_real"])
+                    )
+                if any(value == 0 for value in reference_ratios):
+                    published_score = 0.0
+                else:
+                    published_score = float(np.exp(np.mean(
+                        np.log(np.asarray(reference_ratios)))))
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                print(Fore.YELLOW
+                      + f"  Could not calculate {model_short}'s published "
+                        f"{len(datasets)}-cell target from {reference_file}: {exc}"
+                      + Fore.RESET)
+
+        record = {
+            "model_id": model_id,
+            "model_family": family,
+            "inference_recipe": inference_recipe(family),
+            "geomean_normalized_mase": score,
+            "cells": len(ratios),
+            "expected_cells": len(datasets),
+            "complete": len(ratios) == len(datasets),
+            "missing_cells": missing,
+            "gluonts_real_standin_cells": standins,
+            "published_reference_file": reference_file,
+            "published_cohort_geomean_normalized_mase": published_score,
+            "delta_from_published": (
+                None if score is None or published_score is None
+                else score - published_score),
+        }
+        model_payload[model_short] = record
+        score_text = "n/a" if score is None else f"{score:.6f}"
+        colour = Fore.GREEN if record["complete"] and not standins else Fore.YELLOW
+        print(colour
+              + f"  LEADERBOARD PARITY {model_short}: normalized MASE={score_text} "
+              + f"({len(ratios)}/{len(datasets)} cells; "
+              + f"real-standins={len(standins)})"
+              + Fore.RESET)
+        if published_score is not None:
+            delta = None if score is None else score - published_score
+            delta_text = "n/a" if delta is None else f"{delta:+.6f}"
+            print(colour
+                  + f"    published target on same {len(datasets)} cells="
+                    f"{published_score:.6f}; delta={delta_text}"
+                  + Fore.RESET)
+
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    print(Fore.GREEN + f"  Leaderboard parity summary: {path}" + Fore.RESET)
+
+    # Keep a human-readable table and an always-current plot beside the JSON so
+    # the review gate does not require jq or waiting for predictor/stage-4 plots.
+    parity_rows = []
+    for model_short, record in model_payload.items():
+        score = record.get("geomean_normalized_mase")
+        if score is None:
+            continue
+        parity_rows.append({
+            "model": model_short,
+            "ours_normalized_mase": score,
+            "published_same_cohort": record.get(
+                "published_cohort_geomean_normalized_mase"),
+            "delta_from_published": record.get("delta_from_published"),
+            "cells": record.get("cells"),
+            "expected_cells": record.get("expected_cells"),
+            "complete": record.get("complete"),
+        })
+    parity_frame = pd.DataFrame(parity_rows).sort_values("model")
+    parity_csv = os.path.join(run_dir, "leaderboard_parity_summary.csv")
+    parity_frame.to_csv(parity_csv, index=False)
+    if not parity_frame.empty:
+        fig_width = max(10.0, 0.8 * len(parity_frame))
+        fig, ax = plt.subplots(figsize=(fig_width, 5.5))
+        x = np.arange(len(parity_frame), dtype=np.float64)
+        width = 0.38
+        ours = parity_frame["ours_normalized_mase"].to_numpy(dtype=float)
+        ax.bar(x - width / 2, ours, width=width,
+               label="Our full-native run", color="#264FA0")
+        published = parity_frame["published_same_cohort"].to_numpy(dtype=float)
+        have_published = np.isfinite(published)
+        if have_published.any():
+            ax.bar(x[have_published] + width / 2, published[have_published],
+                   width=width, label="Published (same cohort)",
+                   color="#A9511B")
+        ax.set_xticks(x)
+        ax.set_xticklabels(parity_frame["model"], rotation=35, ha="right")
+        ax.set_ylabel("Geometric mean normalized MASE (lower is better)")
+        ax.set_title(
+            f"GIFT-Eval full-native parity — {len(datasets)}-cell cohort")
+        ax.grid(axis="y", alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        parity_plot = os.path.join(
+            run_dir, "bar_leaderboard_parity_full_native.png")
+        fig.savefig(parity_plot, dpi=180)
+        plt.close(fig)
+        print(Fore.GREEN + f"  Leaderboard parity plot: {parity_plot}"
+              + Fore.RESET)
+    return path
 
 
 def _result_cached_for_family(
@@ -950,22 +1140,53 @@ def _forecast_cell_dynamic(model_family, handle, model_id, batches, width,
 
 
 def load_chronos_bolt(model_id, device):
-    from chronos import ChronosBoltPipeline
-    return ChronosBoltPipeline.from_pretrained(
-        model_id, device_map=device,
-        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-    )
+    # Match the submitted GIFT-Eval notebook: BaseChronosPipeline chooses the
+    # checkpoint's forecast type and native float32 weights.  Forcing bf16 here
+    # measurably changes the MASE numerator.
+    from chronos import BaseChronosPipeline
+    return BaseChronosPipeline.from_pretrained(model_id, device_map=device)
 
 
 def predict_chronos_bolt(pipeline, batches, horizon, device):
     def step(x, y):
-        samples = pipeline.predict(inputs=x[:, :, 0], prediction_length=horizon)
-        return ({"samples": samples.to(device=device, dtype=torch.float32, non_blocking=True)},
+        # The official wrapper passes a list, preserving NaNs and allowing
+        # Chronos to apply its native variable-length padding/missing mask.
+        context = [row for row in x[:, :, 0]]
+        quantiles = pipeline.predict(context, prediction_length=horizon)
+        quantiles = torch.as_tensor(
+            quantiles, device=device, dtype=torch.float32)
+        return ({"quantiles": quantiles},
                 y[:, :, 0].to(device, non_blocking=True))
     out, all_tgts = _run_batches(batches, "  Chronos-Bolt", step)
-    all_samples = out["samples"]
-    median = torch.median(all_samples, dim=1).values
-    return ForecastResult(median=median, samples=all_samples), all_tgts
+    all_quantiles = out["quantiles"]
+    levels = [float(q) for q in pipeline.quantiles]
+    median_idx = min(range(len(levels)), key=lambda i: abs(levels[i] - 0.5))
+    median = all_quantiles[:, median_idx, :horizon]
+    return ForecastResult(
+        median=median, quantiles=all_quantiles[:, :, :horizon],
+        quantile_levels=levels,
+    ), all_tgts
+
+
+def predict_chronos_bolt_contexts(
+    pipeline, contexts, targets, horizon, device, batch_size=1024,
+):
+    """Official variable-length/original-order Chronos-Bolt full baseline."""
+    chunks = []
+    for start in range(0, len(contexts), int(batch_size)):
+        batch = [torch.as_tensor(c, dtype=torch.float32)
+                 for c in contexts[start:start + int(batch_size)]]
+        chunks.append(torch.as_tensor(
+            pipeline.predict(batch, prediction_length=horizon),
+            dtype=torch.float32, device=device))
+    quantiles = torch.cat(chunks, dim=0)[:, :, :horizon]
+    levels = [float(q) for q in pipeline.quantiles]
+    median_idx = min(range(len(levels)), key=lambda i: abs(levels[i] - 0.5))
+    tgts = torch.as_tensor(np.asarray(targets), dtype=torch.float32, device=device)
+    return ForecastResult(
+        median=quantiles[:, median_idx, :], quantiles=quantiles,
+        quantile_levels=levels,
+    ), tgts
 
 
 def load_chronos2(model_id, device):
@@ -1131,72 +1352,84 @@ def load_patchtst_fm(model_id, device):
     return model
 
 
+def _patchtst_quantiles_for_contexts(model, contexts, horizon, device):
+    target = []
+    for context in contexts:
+        row = torch.as_tensor(context, dtype=torch.float32, device=device)
+        missing = torch.isnan(row)
+        if bool(missing.any()):
+            fill = (row[~missing].mean() if bool((~missing).any())
+                    else row.new_tensor(0.0))
+            row = torch.where(missing, fill, row)
+        target.append(row)
+    with torch.device(device):
+        output = model(
+            past_values=target,
+            prediction_length=horizon,
+            quantile_levels=PATCHTST_FM_QUANTILE_LEVELS,
+        )
+    raw = output.quantile_outputs
+    if isinstance(raw, (list, tuple)):
+        raw = torch.stack([torch.as_tensor(item) for item in raw], dim=0)
+    else:
+        raw = torch.as_tensor(raw)
+    if raw.dim() == 4 and raw.shape[-1] == 1:
+        raw = raw[..., 0]
+    if raw.dim() != 3:
+        raise ValueError(
+            f"Unexpected PatchTST quantile output shape {tuple(raw.shape)}")
+    q_count = len(PATCHTST_FM_QUANTILE_LEVELS)
+    if raw.shape[1] == q_count:                         # (B, Q, H)
+        preds = raw[:, :, :horizon]
+    elif raw.shape[2] == q_count:                       # (B, H, Q)
+        preds = raw[:, :horizon, :].permute(0, 2, 1)
+    else:
+        raise ValueError(
+            "PatchTST quantile_outputs has no nine-quantile axis: "
+            f"{tuple(raw.shape)}")
+    if preds.shape[2] != horizon:
+        raise ValueError(
+            f"PatchTST returned horizon={preds.shape[2]}, expected {horizon}")
+    return preds.to(device=device, dtype=torch.float32)
+
+
 def predict_patchtst_fm(model, batches, horizon, device):
     def step(x_cpu, y_cpu):
-        x = x_cpu.to(device, non_blocking=True)
         y = y_cpu.to(device, non_blocking=True)
-        B = x.shape[0]
-        # PatchTST-FM-R1 has a FIXED context_length (8192) and no observed-mask
-        # input; a shorter tensor makes its internal padding NaN out. Left-pad to
-        # the native context with NaN, which the model treats as its missing-value
-        # indicator and masks (empirically the least-distorting pad: matches
-        # mean-padding, beats zeros). Genuine samples drive the forecast; output
-        # stays finite. Any incoming NaN pad region (pad-mode short inputs) is
-        # likewise masked.
-        ctx_len = model.config.context_length
-        past_values = x.squeeze(-1)                          # (B, W)
-        if past_values.shape[1] < ctx_len:
-            pad = past_values.new_full((B, ctx_len - past_values.shape[1]), float("nan"))
-            past_values = torch.cat([pad, past_values], dim=1)
-        elif past_values.shape[1] > ctx_len:
-            past_values = past_values[:, -ctx_len:]
-        # tsfm_public's multi-step rollout (forecast_single_step) builds its mask
-        # with a bare `torch.ones(f_i)` (no device arg) -> CPU, tripping a device
-        # mismatch against the CUDA hidden state when horizon exceeds the model's
-        # single-shot length (long-term GiftEval). Run under a default-device
-        # context so those factory tensors land on `device`.
-        with torch.device(device):
-            # Granite-TSFM renamed the first argument from ``inputs`` to
-            # ``past_values``. Positional dispatch supports both APIs.
-            output = model(past_values, prediction_length=horizon)
-        raw = output[0]
-        if raw.dim() == 4:
-            qf = raw[:, :, :horizon, 0]
-            pred_len = qf.shape[2]
-            if pred_len < horizon:
-                pad = qf[:, :, -1:].expand(B, qf.shape[1], horizon - pred_len)
-                qf = torch.cat([qf, pad], dim=2)
-            preds = qf.to(torch.float32)
-        elif raw.dim() == 3:
-            if raw.shape[1] == 1:
-                preds = raw[:, :, :horizon]
-            elif raw.shape[2] == 1:
-                preds = raw[:, :horizon, 0].unsqueeze(1)
-            elif raw.shape[1] == len(PATCHTST_FM_QUANTILE_LEVELS):
-                preds = raw[:, :, :horizon]
-            elif raw.shape[2] == len(PATCHTST_FM_QUANTILE_LEVELS):
-                preds = raw[:, :horizon, :].permute(0, 2, 1)
-            else:
-                preds = raw[:, :, :horizon]
-            preds = preds.to(torch.float32)
-        elif raw.dim() == 2:
-            preds = raw[:, :horizon].unsqueeze(1).to(torch.float32)
-        else:
-            raise ValueError(f"Unexpected output shape {raw.shape}")
+        # Port of PatchTSTFMEvalPredictor.preprocess: partial gaps use the
+        # series mean and all-NaN histories use zero.  Pass a LIST afterwards so
+        # the model's own mean-padding and true pad mask are used.
+        preds = _patchtst_quantiles_for_contexts(
+            model, list(x_cpu[:, :, 0]), horizon, device)
         return {"quantiles": preds}, y[:, :, 0]
     out, all_tgts = _run_batches(batches, "  PatchTST-FM", step)
     all_quantiles = out["quantiles"]
-    if all_quantiles.shape[1] == len(PATCHTST_FM_QUANTILE_LEVELS):
-        median = all_quantiles[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :]
-        return ForecastResult(
-            median=median, quantiles=all_quantiles,
-            quantile_levels=PATCHTST_FM_QUANTILE_LEVELS,
-        ), all_tgts
-    return ForecastResult(median=all_quantiles.squeeze(1)), all_tgts
+    median = all_quantiles[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :]
+    return ForecastResult(
+        median=median, quantiles=all_quantiles,
+        quantile_levels=PATCHTST_FM_QUANTILE_LEVELS,
+    ), all_tgts
+
+
+def predict_patchtst_fm_contexts(
+    model, contexts, targets, horizon, device, batch_size=2048,
+):
+    chunks = []
+    for start in range(0, len(contexts), int(batch_size)):
+        chunks.append(_patchtst_quantiles_for_contexts(
+            model, contexts[start:start + int(batch_size)], horizon, device))
+    quantiles = torch.cat(chunks, dim=0)
+    tgts = torch.as_tensor(np.asarray(targets), dtype=torch.float32, device=device)
+    return ForecastResult(
+        median=quantiles[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :],
+        quantiles=quantiles,
+        quantile_levels=PATCHTST_FM_QUANTILE_LEVELS,
+    ), tgts
 
 
 def load_sundial(model_id, device):
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, set_seed
+    set_seed(1)
     model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
     model.to(device).eval()
     return model
@@ -1204,16 +1437,77 @@ def load_sundial(model_id, device):
 
 def predict_sundial(model, batches, horizon, device):
     def step(x, y):
-        seqs = x[:, :, 0].to(device, non_blocking=True)
-        samples = model.generate(
-            seqs, max_new_tokens=horizon, num_samples=SUNDIAL_NUM_SAMPLES,
-        )
+        from contextlib import nullcontext
+        from gluonts.transform import LastValueImputation
+        rows = []
+        for row in x[:, :, 0].numpy():
+            rows.append(LastValueImputation()(row) if np.isnan(row).any() else row)
+        seqs = torch.as_tensor(
+            np.vstack(rows), dtype=torch.float32, device=device)
+        amp = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+               if str(device).startswith("cuda") else nullcontext())
+        with amp:
+            samples = model.generate(
+                seqs, max_new_tokens=horizon, revin=True,
+                num_samples=SUNDIAL_NUM_SAMPLES,
+            )
         samples = samples[:, :, :horizon].to(torch.float32)
         return {"samples": samples}, y[:, :, 0].to(device, non_blocking=True)
     out, all_tgts = _run_batches(batches, "  Sundial", step)
     all_samples = out["samples"]
     median = torch.median(all_samples, dim=1).values
     return ForecastResult(median=median, samples=all_samples), all_tgts
+
+
+def predict_sundial_contexts(
+    model, contexts, targets, horizon, device, batch_size=1024,
+):
+    """Published Sundial batching, padding, imputation, and sampling recipe."""
+    from contextlib import nullcontext
+    from gluonts.transform import LastValueImputation
+
+    chunks = []
+    for start in range(0, len(contexts), int(batch_size)):
+        batch = contexts[start:start + int(batch_size)]
+        width = max(len(c) for c in batch)
+        padded = np.full((len(batch), width), np.nan, dtype=np.float32)
+        for row_idx, context in enumerate(batch):
+            padded[row_idx, -len(context):] = context
+        if np.isnan(padded).any():
+            padded = np.vstack([LastValueImputation()(row) for row in padded])
+        seqs = torch.as_tensor(padded, dtype=torch.float32, device=device)
+        amp = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+               if str(device).startswith("cuda") else nullcontext())
+        with amp:
+            samples = model.generate(
+                seqs, max_new_tokens=horizon, revin=True,
+                num_samples=SUNDIAL_NUM_SAMPLES,
+            )
+        chunks.append(samples[:, :, :horizon].to(torch.float32))
+    samples = torch.cat(chunks, dim=0)
+    tgts = torch.as_tensor(np.asarray(targets), dtype=torch.float32, device=device)
+    return ForecastResult(
+        median=torch.median(samples, dim=1).values, samples=samples,
+    ), tgts
+
+
+def predict_official_full_contexts(
+    model_family, handle, contexts, targets, horizon, device, batch_size,
+):
+    """Dispatch full-history parity paths that require variable-length lists."""
+    if model_family == "timesfm":
+        return predict_timesfm_contexts(
+            handle, contexts, targets, horizon, device, batch_size=batch_size)
+    if model_family == "chronos_bolt":
+        return predict_chronos_bolt_contexts(
+            handle, contexts, targets, horizon, device, batch_size=batch_size)
+    if model_family == "patchtst_fm":
+        return predict_patchtst_fm_contexts(
+            handle, contexts, targets, horizon, device, batch_size=batch_size)
+    if model_family == "sundial":
+        return predict_sundial_contexts(
+            handle, contexts, targets, horizon, device, batch_size=batch_size)
+    raise ValueError(f"No variable-length full-context recipe for {model_family}")
 
 
 def load_timemoe(model_id, device):
@@ -1687,8 +1981,12 @@ def _zscore_curve(curve: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     Returns the z-scored array (with NaNs preserved) and a boolean valid-mask.
     """
     valid = ~np.isnan(curve)
-    if valid.sum() < 2:
+    if valid.sum() == 0:
         return np.full_like(curve, np.nan, dtype=np.float64), valid
+    if valid.sum() == 1:
+        out = np.full_like(curve, np.nan, dtype=np.float64)
+        out[valid] = 0.0
+        return out, valid
     vals = curve[valid].astype(np.float64)
     mu = vals.mean()
     sd = vals.std()
@@ -1966,6 +2264,7 @@ def _moirai_max_context(horizon: int) -> int:
 
 def _full_native_context_cap(model_family: str, horizon: int, max_available: int) -> int:
     caps = {
+        "chronos_bolt": 2048,
         "timesfm": TIMESFM_FULL_CONTEXT,
         "patchtst_fm": 8192,
         "sundial": SUNDIAL_MAX_CONTEXT,
@@ -1992,9 +2291,8 @@ def _missing_metric(metrics: dict, key: str) -> bool:
 
 def _inference_recipe_current(metrics: dict, model_family: str) -> bool:
     """Whether a cached forecast was produced by the active model recipe."""
-    if model_family == "timesfm":
-        return metrics.get("_timesfm_gifteval_recipe") == TIMESFM_GIFTEVAL_RECIPE
-    return True
+    expected = inference_recipe(model_family)
+    return expected is None or metrics.get("_inference_recipe") == expected
 
 
 def _run_full_native_baseline(
@@ -2055,20 +2353,28 @@ def _run_full_native_baseline(
 
     results = []
     effective_batch_sizes = []
-    if model_family == "timesfm":
-        # The leaderboard wrapper sends the variable-length contexts in original
-        # dataset order through tfm.forecast() with an outer batch of 1024.  Do
-        # not exact-width-group or zero-fill here: both change TimesFM's compile /
-        # preprocessing path and were the source of the 0.744 vs 0.705 gap.
+    variable_full_families = {
+        "timesfm": 1024,
+        "chronos_bolt": 1024,
+        "patchtst_fm": 2048,
+        "sundial": 1024,
+    }
+    if model_family in variable_full_families:
+        # The published wrappers preserve dataset order and batch
+        # variable-length series as lists. Do not exact-width-group here:
+        # PatchTST/Chronos own the pad mask, TimesFM owns compilation, and
+        # Sundial's seeded sampling depends on batch composition.
         effective_lengths = np.maximum(
             1, np.minimum(cache.context_lengths, int(cap))).astype(np.int32)
-        candidate = min(1024, cache.n_total)
+        contexts = [np.asarray(ctx[-int(cap):], dtype=np.float32)
+                    for ctx in cache.contexts_raw]
+        candidate = min(variable_full_families[model_family], cache.n_total)
         while True:
             try:
                 _sync()
                 t_start = time.perf_counter()
-                fr, tgts = predict_timesfm_contexts(
-                    ensure_handle(), cache.contexts_raw, cache.labels_np,
+                fr, tgts = predict_official_full_contexts(
+                    model_family, ensure_handle(), contexts, cache.labels_np,
                     horizon, device, batch_size=candidate)
                 _sync()
                 elapsed = time.perf_counter() - t_start
@@ -2079,7 +2385,7 @@ def _run_full_native_baseline(
                     raise
                 next_candidate = max(1, candidate // 2)
                 print(Fore.YELLOW
-                      + f"    TimesFM official full-native: OOM at {candidate}; "
+                      + f"    {model_family} official full-native: OOM at {candidate}; "
                         f"retrying with {next_candidate}"
                       + Fore.RESET)
                 _clear_accelerator_cache()
@@ -2087,7 +2393,8 @@ def _run_full_native_baseline(
         n_width_groups = 1
     else:
         groups, effective_lengths = cache.build_batches_full_native(
-            cap, batch_size, device, pin_memory=True)
+            cap, batch_size, device, pin_memory=True,
+            preserve_missing=preserves_missing(model_family))
         _sync()
         t_start = time.perf_counter()
         for L, batches_L, _ax, _ay, idx_L in groups:
@@ -2116,7 +2423,11 @@ def _run_full_native_baseline(
     metrics["elapsed_seconds"] = round(elapsed, 3)
     metrics["horizon"] = horizon
     metrics["_full_native_baseline"] = True
+    active_recipe = inference_recipe(model_family)
+    if active_recipe is not None:
+        metrics["_inference_recipe"] = active_recipe
     if model_family == "timesfm":
+        # Transitional compatibility for existing downstream readers.
         metrics["_timesfm_gifteval_recipe"] = TIMESFM_GIFTEVAL_RECIPE
     metrics["_context_cap"] = int(cap)
     metrics["_min_effective_context"] = int(np.min(effective_lengths))
@@ -2129,8 +2440,8 @@ def _run_full_native_baseline(
         if isinstance(v, float):
             print(Fore.YELLOW + f"    {k}: {v:.6f}" + Fore.RESET)
     print(Fore.MAGENTA + f"    TIME  {elapsed:.1f}s" + Fore.RESET)
-    if model_family == "timesfm":
-        print(f"    Samples: {cache.n_total} (official variable-length TimesFM batches)  "
+    if model_family in variable_full_families:
+        print(f"    Samples: {cache.n_total} (official variable-length {model_family} batches)  "
               f"cap={cap}  H={horizon}")
     else:
         print(f"    Samples: {cache.n_total} ({n_width_groups} exact width-groups, full-native)  "
@@ -2176,6 +2487,13 @@ def parse_args() -> argparse.Namespace:
                    help="Root holding context-length-predictor runs. Latest run is auto-picked.")
     p.add_argument("--predictor-dir", type=str, default=None,
                    help="Override: use this specific predictor run directory.")
+    p.add_argument(
+        "--forecast-only", action="store_true",
+        help=("Precompute the full-native baseline and every model-family window "
+              "cell without loading a context-length predictor. Writes a "
+              "leaderboard-parity summary, then exits. A later normal stage-3 "
+              "run reuses these exact cached forecasts for predictor overlays."),
+    )
     p.add_argument("--predictor-batch-size", type=int, default=64,
                    help="Batch size used when running the predictor on test-instance contexts.")
     p.add_argument("--short-context-mode", choices=["skip", "pad"], default="skip",
@@ -2269,29 +2587,6 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
     global CACHE_ROOT
     CACHE_ROOT = args.cache_root
 
-    # ---- Load predictor + derive window grid + horizon grid ------------------
-    predictor_dir = args.predictor_dir or find_latest_predictor_run(
-        args.predictor_cache_root)
-    print(Fore.CYAN + f"Predictor run: {predictor_dir}" + Fore.RESET)
-    predictor, pred_cfg = load_predictor(predictor_dir, device)
-    window_grid: List[int] = list(pred_cfg["window_grid"])
-    horizon_grid: List[int] = list(pred_cfg["horizon_grid"])
-    pred_ctx_len: int = int(pred_cfg["context_length"])
-    pred_curve_metric: str = pred_cfg.get("curve_metric", "mae")
-    training_objective: str = pred_cfg.get("training_objective", "curve")
-    print(Fore.CYAN
-          + f"  window_grid ({len(window_grid)}): {window_grid}\n"
-          + f"  horizon_grid: {horizon_grid}\n"
-          + f"  context_length={pred_ctx_len}  curve_metric={pred_curve_metric}\n"
-          + f"  training_objective={training_objective}\n"
-          + f"  label_model={pred_cfg.get('label_model')}"
-          + Fore.RESET)
-
-    window_sizes = sorted(set(window_grid))
-    short_mode = args.short_context_mode
-    print(Fore.CYAN + f"Device: {device}  |  ablation windows: {window_sizes}"
-          + f"  |  short-context mode: {short_mode}" + Fore.RESET)
-
     models = [m for m in MODELS if (args.models is None or m[2] in args.models)]
     # Fail loud on an empty model filter. Otherwise the ablation runs over zero
     # models, writes nothing, and exits 0 — which downstream surfaces as an
@@ -2305,6 +2600,56 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
             + f"  Known: {known}\n"
             + "  Add the missing entry to MODELS (and ensure its family has "
             + "load_*/predict_* wrappers + dispatch)." + Fore.RESET)
+
+    # Forecast-first mode deliberately has no predictor checkpoint yet. Use the
+    # union of the selected families' training grids so the expensive cells are
+    # exactly those every later predictor variant can reuse. In the normal path,
+    # the trained predictor remains the source of its own grid and horizons.
+    predictor_dir: Optional[str]
+    predictor = None
+    pred_cfg: dict = {}
+    pred_ctx_len = 0
+    pred_curve_metric = "mae"
+    training_objective = "curve"
+    if args.forecast_only:
+        from experiments.build_context_length_dataset import (
+            HORIZON_GRID, window_grid_for_family,
+        )
+
+        predictor_dir = None
+        window_grid = sorted({
+            int(window)
+            for _model_id, family, _display in models
+            for window in window_grid_for_family(family)
+        })
+        horizon_grid = list(HORIZON_GRID)
+        print(Fore.CYAN
+              + "Forecast-only parity pass (no predictor loaded).\n"
+              + f"  union window_grid ({len(window_grid)}): {window_grid}"
+              + Fore.RESET)
+    else:
+        predictor_dir = args.predictor_dir or find_latest_predictor_run(
+            args.predictor_cache_root)
+        print(Fore.CYAN + f"Predictor run: {predictor_dir}" + Fore.RESET)
+        predictor, pred_cfg = load_predictor(predictor_dir, device)
+        window_grid = list(pred_cfg["window_grid"])
+        horizon_grid = list(pred_cfg["horizon_grid"])
+        pred_ctx_len = int(pred_cfg["context_length"])
+        pred_curve_metric = pred_cfg.get("curve_metric", "mae")
+        training_objective = pred_cfg.get("training_objective", "curve")
+        print(Fore.CYAN
+              + f"  window_grid ({len(window_grid)}): {window_grid}\n"
+              + f"  horizon_grid: {horizon_grid}\n"
+              + f"  context_length={pred_ctx_len}  curve_metric={pred_curve_metric}\n"
+              + f"  training_objective={training_objective}\n"
+              + f"  label_model={pred_cfg.get('label_model')}"
+              + Fore.RESET)
+
+    window_sizes = sorted(set(window_grid))
+    short_mode = args.short_context_mode
+    print(Fore.CYAN + f"Device: {device}  |  ablation windows: {window_sizes}"
+          + f"  |  short-context mode: {short_mode}" + Fore.RESET)
+
     datasets = [d for d in DATASETS if (args.datasets is None or d[2] in args.datasets)]
 
     # Smoke test: keep only a random subset of (dataset, term) entries. Seeded so
@@ -2543,11 +2888,11 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                         groups = cache.build_batches_padded(
                             window_size, args.batch_size, device,
                             pin_memory=True, window_grid=window_sizes,
-                            preserve_missing=(model_family == "timesfm"))
+                            preserve_missing=preserves_missing(model_family))
                     else:
                         batches, all_x_cpu, all_y_cpu, valid_indices = cache.build_batches(
                             window_size, args.batch_size, device, pin_memory=True,
-                            preserve_missing=(model_family == "timesfm"))
+                            preserve_missing=preserves_missing(model_family))
                 except RuntimeError as exc:
                     print(Fore.RED + f"    SKIP: {exc}" + Fore.RESET); continue
 
@@ -2629,6 +2974,9 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 metrics["elapsed_seconds"] = round(elapsed, 3)
                 metrics["horizon"] = horizon
                 metrics["_dynamic_batch_sizes"] = effective_batch_sizes
+                active_recipe = inference_recipe(model_family)
+                if active_recipe is not None:
+                    metrics["_inference_recipe"] = active_recipe
                 if model_family == "timesfm":
                     metrics["_timesfm_gifteval_recipe"] = TIMESFM_GIFTEVAL_RECIPE
 
@@ -2715,6 +3063,13 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
     merged_df.to_csv(csv_path, index=False)
     print(Fore.GREEN + f"\n  Results CSV: {csv_path}" + Fore.RESET)
 
+    if args.forecast_only:
+        _write_leaderboard_parity_summary(models, datasets, run_dir)
+        print(Fore.GREEN
+              + "Forecast-only pass complete. Predictor stages will reuse these cells."
+              + Fore.RESET)
+        return
+
     # Summary plots span every model present in the combined table, not just
     # this run's, so the shared folder shows a true cross-model comparison.
     model_names_in_run = list(
@@ -2764,12 +3119,6 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
 
             real_curve_gluonts = _curve_for("mase_gluonts")
             real_curve_gluonts_real = _curve_for("mase_gluonts_real")
-            if np.sum(~np.isnan(real_curve)) < 2:
-                print(Fore.YELLOW
-                      + f"  Compare SKIP  {dataset_display} t={term} "
-                      + f"({model_short}): <2 real-curve points." + Fore.RESET)
-                continue
-
             cache = ge_cache.get((ge_name, term))
             if cache is None:
                 continue
@@ -2824,6 +3173,7 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
             )
             compare_records.append({
                 "model": model_id, "model_short": model_short,
+                "inference_recipe": inference_recipe(model_family) or "",
                 "timesfm_gifteval_recipe": (
                     TIMESFM_GIFTEVAL_RECIPE
                     if model_family == "timesfm" else ""),

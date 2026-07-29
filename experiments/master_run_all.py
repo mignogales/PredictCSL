@@ -1,6 +1,6 @@
 """
-PredictCSL recomputation master: label -> train -> GiftEval -> compare ->
-per-instance window evaluation.
+PredictCSL recomputation master: GIFT-Eval forecast/parity -> label -> train ->
+predictor overlay -> compare -> per-instance window evaluation.
 
 The requested predictor matrix is deliberately small:
 
@@ -9,12 +9,17 @@ The requested predictor matrix is deliberately small:
   * bidirectional Mamba, curve regression
   * bidirectional Mamba, soft top-3 window classification
 
-Stage 1 runs once. All four predictor variants share one canonical GiftEval cell
-cache, so the expensive TSFM forecasts are also computed once; only predictor
-inference and post-processing repeat. The full/base predictor and
-robust-timing-only v5 pass are not part of this master.
+The first pass computes full-native and window-ablation forecasts before any
+synthetic labeling or predictor training, and immediately reports leaderboard
+parity. All four predictor variants share that canonical GiftEval cell cache, so
+only predictor inference and post-processing repeat. The default invocation
+stops after every model completes this first pass, providing an explicit review
+gate. ``--pipeline-only`` then runs the remaining work model-by-model: one model
+finishes labels, predictor training, overlay, and comparison before the next
+model starts. The full/base predictor and robust-timing-only v5 pass are not
+part of this master.
 
-Stage 5 evaluates every predictor both ways: the historical dataset-shared
+Phase 6 evaluates every predictor both ways: the historical dataset-shared
 choice and a genuine per-instance W_i choice. It retrieves each selected
 instance's cached leaderboard MASE and compares against full-native context,
 fixed windows, heuristics, and dataset/per-instance oracles.
@@ -54,7 +59,9 @@ mamba). That keeps master_run_all the single fuse-everything entry point.
 
 Usage
 -----
-    python -m experiments.master_run_all                       # everything, all models
+    python -m experiments.master_run_all                       # all-model ablation, then stop
+    python -m experiments.master_run_all --pipeline-only       # reviewed: model-by-model pipeline
+    python -m experiments.master_run_all --continue-after-ablation  # both without review stop
     python -m experiments.master_run_all --models Chronos2-Small
     python -m experiments.master_run_all --models TiRex2 --stage1-batch-size 8 --stage1-shard-size 50
     python -m experiments.master_run_all --only-variants cheap mamba
@@ -310,6 +317,18 @@ def parse_args() -> argparse.Namespace:
                    help=f"Run only these variants (default: all of {names}).")
     p.add_argument("--skip-variants", nargs="+", default=[], choices=names,
                    help="Variants to skip.")
+    phase = p.add_mutually_exclusive_group()
+    phase.add_argument(
+        "--pipeline-only", action="store_true",
+        help=("Skip the all-model GIFT-Eval ablation pass and run the remaining "
+              "pipeline model-by-model. Use this after reviewing "
+              "leaderboard_parity_summary.json from the default run."),
+    )
+    phase.add_argument(
+        "--continue-after-ablation", action="store_true",
+        help=("Run the all-model ablation and immediately continue through the "
+              "model-by-model pipeline instead of stopping for review."),
+    )
     p.add_argument("--force", nargs="*", default=None,
                    metavar="STAGE",
                    help="Forwarded verbatim to every variant (and the stage-1 "
@@ -325,10 +344,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-rollup", action="store_true",
                    help="Skip the final cross-predictor rollup_all_predictors pass.")
     p.add_argument("--no-instance-eval", action="store_true",
-                   help="Skip Stage 5 (period heuristic + genuine per-instance "
+                   help="Skip Phase 6 (period heuristic + genuine per-instance "
                         "window evaluation).")
     p.add_argument("--no-period-heuristic", action="store_true",
-                   help="In Stage 5, evaluate cached grid methods but do not run "
+                   help="In Phase 6, evaluate cached grid methods but do not run "
                         "the additional per-series 2x-period TSFM forecasts.")
     p.add_argument("--stage1-batch-size", type=int, default=None,
                    help="Forwarded to build_context_length_dataset --batch-size. "
@@ -387,15 +406,40 @@ def _stage1_cmd(
     return _py(env, *args)
 
 
+def _forecast_precompute_cmd(
+    env: Optional[str],
+    display: str,
+    test: bool = False,
+) -> List[str]:
+    """Build the predictor-independent GIFT-Eval cache for one model."""
+    cache_root = os.path.join(
+        os.environ["PREDICTCSL_ABLATION_ROOT"], "general")
+    args = [
+        "experiments.test_window_ablation_gifteval_v5",
+        "--models", display,
+        "--cache-root", cache_root,
+        "--forecast-only",
+        "--short-context-mode", "skip",
+        "--no-plots",
+    ]
+    if test:
+        # Match run_all_v3/v4's smoke subset so phase 4 is cache-only too.
+        args += ["--test-datasets", "3", "--test-datasets-seed", "42"]
+    return _py(env, *args)
+
+
 def _variant_cmd(
     env: Optional[str],
     variant: Variant,
     displays: List[str],
     vflag: List[str],
     fflag: List[str],
+    only_stage: Optional[str] = None,
 ) -> List[str]:
     args = [variant.module]
-    if variant.skip_stages:
+    if only_stage is not None:
+        args += ["--only-stages", only_stage]
+    elif variant.skip_stages:
         args += ["--skip-stages", *variant.skip_stages]
     args += variant.extra + ["--models", *displays] + vflag + fflag
     return _py(env, *args)
@@ -456,28 +500,70 @@ def main() -> None:
         os.environ["PREDICTCSL_RUN_LOG_ROOT"] = os.path.join(
             smoke_root, "run_all_logs")
 
-    # ---- Stage 1 once, per env group (each labels only its own families). ----
-    for env, displays in groups.items():
-        build_args = list(stage1_build_args)
-        if args.test:
-            build_args += ["--n-series", str(200)]
-        stage1 = _stage1_cmd(env, displays, vflag, fflag, build_args)
-        _run(stage1,
-             f"Stage 1 — labeling [{_env_label(env)}]: {displays}")
-
-    # ---- Each variant × env group, with its shared stages skipped. -----------
-    for v in variants:
+    # ---- Phase 1: predictor-independent GIFT-Eval forecasts + parity. --------
+    # One model per invocation keeps its native window grid exact (no union of
+    # unrelated family grids). Every model completes before the review gate.
+    if not args.pipeline_only:
         for env, displays in groups.items():
-            if v.needs_mamba and _env_label(env) in ENVS_WITHOUT_MAMBA:
-                print(Fore.YELLOW
-                      + f"  ⤷ skip {v.name} for {displays} "
-                        f"({_env_label(env)} has no mamba-ssm)." + Fore.RESET)
-                continue
-            cmd = _variant_cmd(env, v, displays, vflag, fflag)
-            _run(cmd, f"{v.name} [{_env_label(env)}] — {v.label}  "
-                      f"(skip stages {v.skip_stages or 'none'})")
+            for display in displays:
+                precompute = _forecast_precompute_cmd(
+                    env, display, test=args.test)
+                _run(
+                    precompute,
+                    f"Phase 1 — GIFT-Eval window ablation/parity "
+                    f"[{_env_label(env)}]: {display}",
+                )
 
-    # ---- Stage 5: genuine per-instance context choice. -----------------------
+        # A real run deliberately stops here so leaderboard discrepancies are
+        # caught before spending time on synthetic labels/predictor sweeps.
+        # Smoke tests remain end-to-end; --continue-after-ablation is the
+        # explicit unattended/full-run escape hatch.
+        if not args.continue_after_ablation and not args.test:
+            parity_path = os.path.join(
+                os.environ["PREDICTCSL_ABLATION_ROOT"], "general",
+                "leaderboard_parity_summary.json",
+            )
+            total = time.perf_counter() - t_start
+            print(Fore.GREEN
+                  + f"\nAll-model ablation complete in {total/60:.1f} min."
+                  + Fore.RESET)
+            print(Fore.CYAN
+                  + f"Review: {parity_path}\n"
+                  + "Then run: python -m experiments.master_run_all "
+                    "--pipeline-only"
+                  + Fore.RESET)
+            return
+
+    # ---- Remaining work is deliberately MODEL-major. -----------------------
+    # For one model: build labels once, then run every applicable predictor
+    # variant through train -> cached ablation overlay -> comparison. Only after
+    # that complete model pipeline succeeds do we advance to the next model.
+    for env, displays in groups.items():
+        for display in displays:
+            build_args = list(stage1_build_args)
+            if args.test:
+                build_args += ["--n-series", str(200)]
+            stage1 = _stage1_cmd(env, [display], vflag, fflag, build_args)
+            _run(
+                stage1,
+                f"Model pipeline · {display} · synthetic labeling "
+                f"[{_env_label(env)}]",
+            )
+
+            for v in variants:
+                if v.needs_mamba and _env_label(env) in ENVS_WITHOUT_MAMBA:
+                    print(Fore.YELLOW
+                          + f"  ⤷ skip {v.name} for {display} "
+                            f"({_env_label(env)} has no mamba-ssm)." + Fore.RESET)
+                    continue
+                cmd = _variant_cmd(env, v, [display], vflag, fflag)
+                _run(
+                    cmd,
+                    f"Model pipeline · {display} · {v.name} · stages 2→4 "
+                    f"[{_env_label(env)}]",
+                )
+
+    # ---- Phase 6: genuine per-instance context choice. -----------------------
     # The period heuristic performs additional TSFM inference and therefore uses
     # the same per-family conda routing. The final evaluator only reads caches.
     if not args.no_instance_eval:
@@ -495,7 +581,7 @@ def main() -> None:
                     period_cmd.append("--force")
                 _run(
                     period_cmd,
-                    f"Stage 5a — per-instance period heuristic "
+                    f"Phase 6a — per-instance period heuristic "
                     f"[{_env_label(env)}]: {displays}",
                 )
 
@@ -513,7 +599,7 @@ def main() -> None:
             instance_cmd += ["--models", *args.models]
         _run(
             instance_cmd,
-            "Stage 5b — per-instance W_i evaluation (all predictor variants)",
+            "Phase 6b — per-instance W_i evaluation (all predictor variants)",
         )
 
     # ---- Final combined cross-predictor overview (pure post-processing). -----
@@ -525,7 +611,7 @@ def main() -> None:
                    "--output-dir", os.path.join(ablation_root, "general_all")]
         if args.models:
             rollup += ["--models", *args.models]
-        _run(rollup, "rollup_all_predictors — combined cross-predictor overview")
+        _run(rollup, "Phase 7 — combined cross-predictor overview")
 
     total = time.perf_counter() - t_start
     print(Fore.GREEN + f"\nMaster run complete in {total/60:.1f} min." + Fore.RESET)

@@ -73,8 +73,9 @@ from experiments.build_context_length_dataset import (
     window_grid_for_family,
 )
 from experiments import models_config
+from experiments import datasets_config
 from experiments.gifteval_reference import NORMALIZATION_REFERENCE
-from experiments.timesfm_gifteval import TIMESFM_GIFTEVAL_RECIPE
+from experiments.gifteval_inference_recipes import inference_recipe
 
 
 # Master run set: (model_id, family, display), sourced from the single config in
@@ -425,6 +426,11 @@ def _done_stage_1(family: str, display: str = "") -> Tuple[bool, str]:
     if meta.get("window_grid") != expected_grid:
         return False, (
             f"stale window grid {meta.get('window_grid')} != {expected_grid}")
+    expected_recipe = inference_recipe(family)
+    if meta.get("inference_recipe") != expected_recipe:
+        return False, (
+            f"stale inference recipe {meta.get('inference_recipe')!r} != "
+            f"{expected_recipe!r}")
     pct = 100.0 * done / total if total > 0 else 0.0
     if total > 0 and done >= total:
         return True, f"{done}/{total} shards ({pct:.1f}%)"
@@ -443,6 +449,14 @@ def _done_stage_2(family: str, display: str = "") -> Tuple[bool, str]:
                     if n.startswith("trial_") and n.endswith(".json"))
                 if os.path.isdir(trial_dir) else 0)
     if have_model and have_cfg:
+        try:
+            with open(os.path.join(fdir, "best_config.json")) as f:
+                cfg = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return False, "best_config.json unreadable"
+        expected_recipe = inference_recipe(family)
+        if cfg.get("label_inference_recipe") != expected_recipe:
+            return False, "predictor was trained on stale inference labels"
         return True, f"best_model.pt + {n_trials} trials"
     return False, (
         "missing best_model.pt/best_config.json "
@@ -459,18 +473,30 @@ def _done_stage_3(family: str, display: str = "") -> Tuple[bool, str]:
     marker = os.path.join(compare_dir, "compare_summary.csv")
     if not os.path.isfile(marker):
         return False, "no compare_summary.csv"
-    if family == "timesfm":
-        try:
-            with open(marker, newline="") as f:
-                rows = list(csv.DictReader(f))
-        except OSError:
-            return False, "compare_summary.csv unreadable"
-        if not rows:
-            return False, "empty TimesFM compare_summary.csv"
+    try:
+        with open(marker, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except OSError:
+        return False, "compare_summary.csv unreadable"
+    if not rows:
+        return False, "empty compare_summary.csv"
+    expected_cells = {
+        (display_name, term)
+        for _ge_name, term, display_name, _to_univariate
+        in datasets_config.datasets_to_run()
+    }
+    actual_cells = {
+        (str(row.get("dataset_display")), str(row.get("term"))) for row in rows
+    }
+    if actual_cells != expected_cells:
+        return False, (
+            f"compare cohort is stale ({len(actual_cells)}/{len(expected_cells)} cells)")
+    expected_recipe = inference_recipe(family)
+    if expected_recipe is not None:
         current = 0
         for row in rows:
-            if row.get("timesfm_gifteval_recipe") != TIMESFM_GIFTEVAL_RECIPE:
-                return False, "compare artifacts use stale TimesFM forecasts"
+            if row.get("inference_recipe") != expected_recipe:
+                return False, "compare artifacts use stale model forecasts"
             term = str(row["term"])
             dataset_display = str(row["dataset_display"])
             metrics_path = os.path.join(
@@ -480,11 +506,10 @@ def _done_stage_3(family: str, display: str = "") -> Tuple[bool, str]:
                 with open(metrics_path) as f:
                     metrics = json.load(f)
             except (OSError, json.JSONDecodeError):
-                return False, f"TimesFM official full-native caches {current}/{len(rows)}"
-            if (metrics.get("_timesfm_gifteval_recipe")
-                    != TIMESFM_GIFTEVAL_RECIPE):
+                return False, f"current full-native caches {current}/{len(rows)}"
+            if metrics.get("_inference_recipe") != expected_recipe:
                 return False, (
-                    "stale TimesFM inference cache "
+                    "stale model inference cache "
                     f"({dataset_display}/t{term})")
             current += 1
     n_npz = sum(1 for n in os.listdir(compare_dir) if n.endswith(".npz"))
@@ -500,13 +525,19 @@ def _done_stage_4(family: str, display: str = "") -> Tuple[bool, str]:
             with open(out) as f:
                 stats = json.load(f)
             reference = stats.get("headline_aggregation", {}).get("reference")
+            cohort_size = stats.get("headline_aggregation", {}).get("cohort_size")
         except (OSError, json.JSONDecodeError):
             return False, "summary_stats.json unreadable"
         if reference == NORMALIZATION_REFERENCE:
-            if family == "timesfm":
-                recipe = stats.get("inference_recipes", {}).get("timesfm")
-                if recipe != TIMESFM_GIFTEVAL_RECIPE:
-                    return False, "summary_stats.json uses stale TimesFM forecasts"
+            expected_size = len(datasets_config.datasets_to_run())
+            if cohort_size != expected_size:
+                return False, (
+                    f"summary cohort is stale ({cohort_size}/{expected_size} cells)")
+            expected_recipe = inference_recipe(family)
+            if expected_recipe is not None:
+                recipe = stats.get("inference_recipes", {}).get(family)
+                if recipe != expected_recipe:
+                    return False, "summary_stats.json uses stale model forecasts"
             return True, "summary_stats.json uses published naive CSV"
         return False, "summary_stats.json uses stale/local naive denominator"
     return False, "summary_stats.json missing"

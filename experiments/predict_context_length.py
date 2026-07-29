@@ -1505,6 +1505,7 @@ def main() -> None:
 
     # ---------- Inspect dataset --------------------------------------------
     meta = load_dataset_meta(dataset_dir)
+    label_inference_recipe = meta.get("inference_recipe")
     window_grid = meta["window_grid"]
     n_windows = len(window_grid)
     if "horizon_grid" not in meta:
@@ -1564,6 +1565,7 @@ def main() -> None:
     for idx, trial in enumerate(trial_configs):
         cached = _load_trial_result(run_label, idx)
         if (cached is not None
+                and cached.get("label_inference_recipe") == label_inference_recipe
                 and "val_curve_mse" in cached
                 and not (isinstance(cached["val_curve_mse"], float)
                          and math.isnan(cached["val_curve_mse"]))):
@@ -1612,6 +1614,7 @@ def main() -> None:
                   + f"({n_received}/{n_expected})." + Fore.RESET)
             continue
         fresh_results.append(r); n_received += 1
+        r["label_inference_recipe"] = label_inference_recipe
         # Flush this trial's JSON immediately so an interrupted sweep can resume
         # from it. The durable weights (trial_NNN_best.pt) are written by the
         # worker, but _load_trial_result keys resume on the JSON — without this
@@ -1668,6 +1671,7 @@ def main() -> None:
                 "lambda_recon":     LAMBDA_RECON,
                 "dataset_dir":      dataset_dir,
                 "label_model":      meta.get("model_display"),
+                "label_inference_recipe": label_inference_recipe,
             }, f, indent=2)
         with open(os.path.join(run_dir, "selection_report.json"), "w") as f:
             json.dump(report, f, indent=2)

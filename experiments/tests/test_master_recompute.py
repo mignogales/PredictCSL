@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import tempfile
 import unittest
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -13,6 +14,7 @@ import torch
 from experiments import build_context_length_dataset as build
 from experiments import evaluate_instance_windows as instance_eval
 from experiments import master_run_all as master
+from experiments import models_config
 from experiments import predict_context_length as predictor
 from experiments.compare_window_strategies_gifteval import _geomean
 from experiments.test_window_ablation_gifteval_v5 import (
@@ -20,6 +22,28 @@ from experiments.test_window_ablation_gifteval_v5 import (
 
 
 class MasterRecomputeConfigTest(unittest.TestCase):
+    def test_all_chronos2_variants_share_independent_recipe(self) -> None:
+        chronos2 = {
+            spec.display: spec.family
+            for spec in models_config.CATALOG
+            if spec.display in {
+                "Chronos2-Small", "Chronos2-Base", "Chronos2-Synth",
+            }
+        }
+        self.assertEqual(
+            chronos2,
+            {
+                "Chronos2-Small": "chronos2",
+                "Chronos2-Base": "chronos2",
+                "Chronos2-Synth": "chronos2",
+            },
+        )
+        from experiments.gifteval_inference_recipes import inference_recipe
+        self.assertEqual(
+            inference_recipe("chronos2"),
+            "chronos2_univariate_no_cross_learning_v1",
+        )
+
     def test_requested_predictor_matrix(self) -> None:
         self.assertEqual(
             [v.name for v in master.VARIANTS],
@@ -104,6 +128,32 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         )
         self.assertIn("--verbose-ablation", cmd)
 
+    def test_variant_can_be_dispatched_with_a_global_stage_barrier(self) -> None:
+        cmd = master._variant_cmd(
+            None,
+            master.VARIANTS[0],
+            ["Chronos2-Small"],
+            [],
+            [],
+            only_stage="3",
+        )
+        self.assertIn("--only-stages", cmd)
+        self.assertIn("3", cmd)
+        self.assertNotIn("--skip-stages", cmd)
+
+    def test_forecast_precompute_needs_no_predictor(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"PREDICTCSL_ABLATION_ROOT": "/tmp/predictcsl-ablation"},
+        ):
+            cmd = master._forecast_precompute_cmd(
+                None, "Chronos2-Small", test=True)
+        self.assertIn("--forecast-only", cmd)
+        self.assertIn("--cache-root", cmd)
+        self.assertIn("/tmp/predictcsl-ablation/general", cmd)
+        self.assertIn("--test-datasets", cmd)
+        self.assertNotIn("--predictor-dir", cmd)
+
     def test_dedicated_stage1_args_are_inside_activated_shell(self) -> None:
         old_names = master._CONDA_ENV_NAMES
         master._CONDA_ENV_NAMES = {"predictcsl-legacy"}
@@ -148,6 +198,26 @@ class MasterRecomputeConfigTest(unittest.TestCase):
 
 
 class PerInstanceWindowEvaluationTest(unittest.TestCase):
+    def test_discovery_excludes_stale_short_dataset_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            compare_dir = os.path.join(
+                root, "general_v3", "models", "TimesFM2.5-200M",
+                "compare_real_vs_predicted",
+            )
+            os.makedirs(compare_dir)
+            for dataset in ("Solar-W", "CarParts", "M4-Yearly"):
+                path = os.path.join(
+                    compare_dir,
+                    f"compare_{dataset}_tshort_TimesFM2.5-200M.npz",
+                )
+                with open(path, "wb"):
+                    pass
+
+            cells = instance_eval.discover_cells(root, None)
+
+        self.assertEqual([(c.dataset, c.term) for c in cells],
+                         [("M4-Yearly", "short")])
+
     def test_predictor_choice_is_per_row_and_masks_unavailable_windows(self) -> None:
         windows = np.array([32, 64])
         errors = np.array([
@@ -200,6 +270,43 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
         np.testing.assert_allclose(metrics["mase_gluonts"], [1.0, 1.5])
 
 
+class Chronos2IndependenceTest(unittest.TestCase):
+    class FakePipeline:
+        quantiles = [0.1, 0.5, 0.9]
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def predict(self, **kwargs):
+            self.calls.append(kwargs)
+            inputs = kwargs["inputs"]
+            horizon = kwargs["prediction_length"]
+            return torch.zeros(
+                (inputs.shape[0], len(self.quantiles), horizon),
+                dtype=torch.float32,
+            )
+
+    def test_stage1_disables_cross_learning(self) -> None:
+        pipeline = self.FakePipeline()
+        out = build.predict_chronos2(
+            pipeline, torch.zeros((2, 32, 1)), horizon=4, device="cpu")
+        self.assertEqual(tuple(out.shape), (2, 4))
+        self.assertIs(pipeline.calls[0]["cross_learning"], False)
+
+    def test_gifteval_ablation_disables_cross_learning(self) -> None:
+        from experiments import test_window_ablation_gifteval_v5 as ablation
+
+        pipeline = self.FakePipeline()
+        batches = [{
+            "x": torch.zeros((2, 32, 1)),
+            "y": torch.zeros((2, 4, 1)),
+        }]
+        forecast, _targets = ablation.predict_chronos2(
+            pipeline, batches, horizon=4, device="cpu", batch_size=2)
+        self.assertEqual(tuple(forecast.median.shape), (2, 4))
+        self.assertIs(pipeline.calls[0]["cross_learning"], False)
+
+
 class SoftClassificationLossTest(unittest.TestCase):
     def test_top3_rank_weights_and_invalid_class_mask(self) -> None:
         old_objective = predictor.TRAINING_OBJECTIVE
@@ -226,41 +333,39 @@ class SoftClassificationLossTest(unittest.TestCase):
 
 
 class PatchTSTFMCompatibilityTest(unittest.TestCase):
-    def test_new_past_values_forward_signature(self) -> None:
+    def test_official_quantile_head_and_list_input(self) -> None:
         class NewGraniteAPI(torch.nn.Module):
-            config = SimpleNamespace(context_length=8)
-
-            def forward(self, past_values, prediction_length):
+            def forward(self, past_values, prediction_length, quantile_levels):
                 self.seen = past_values
                 forecast = torch.zeros(
-                    past_values.shape[0], 99, prediction_length, 1,
-                    device=past_values.device,
+                    len(past_values), len(quantile_levels), prediction_length, 1,
                 )
                 forecast[:, build.PATCHTST_FM_MEDIAN_QUANTILE_IDX, :, 0] = 2.0
-                return (forecast,)
+                return SimpleNamespace(quantile_outputs=forecast)
 
         model = NewGraniteAPI()
         result = build.predict_patchtst_fm(
             model, torch.ones(2, 5, 1), horizon=3, device="cpu")
 
-        self.assertEqual(tuple(model.seen.shape), (2, 8))
+        self.assertIsInstance(model.seen, list)
+        self.assertEqual([tuple(x.shape) for x in model.seen], [(5,), (5,)])
         self.assertEqual(tuple(result.shape), (2, 3))
         self.assertTrue(torch.equal(result, torch.full((2, 3), 2.0)))
 
-    def test_legacy_inputs_forward_signature(self) -> None:
-        class LegacyAPI(torch.nn.Module):
-            config = SimpleNamespace(context_length=8)
-
-            def forward(self, inputs, prediction_length):
+    def test_mean_imputes_missing_values(self) -> None:
+        class API(torch.nn.Module):
+            def forward(self, past_values, prediction_length, quantile_levels):
+                self.seen = past_values
                 forecast = torch.ones(
-                    inputs.shape[0], 1, prediction_length,
-                    device=inputs.device,
-                )
-                return (forecast,)
+                    len(past_values), len(quantile_levels), prediction_length, 1)
+                return SimpleNamespace(quantile_outputs=forecast)
 
+        model = API()
+        x = torch.tensor([[[1.0], [float("nan")], [3.0]]])
         result = build.predict_patchtst_fm(
-            LegacyAPI(), torch.ones(1, 8, 1), horizon=2, device="cpu")
+            model, x, horizon=2, device="cpu")
 
+        self.assertTrue(torch.equal(model.seen[0], torch.tensor([1.0, 2.0, 3.0])))
         self.assertTrue(torch.equal(result, torch.ones(1, 2)))
 
 
@@ -273,6 +378,11 @@ class TiRexCompatibilityTest(unittest.TestCase):
             os.environ["PREDICTCSL_TIREX_BACKEND"] = self.old_backend
         else:
             os.environ.pop("PREDICTCSL_TIREX_BACKEND", None)
+
+    def test_catalog_uses_published_gifteval_zero_shot_checkpoint(self) -> None:
+        tirex = next(spec for spec in models_config.CATALOG
+                     if spec.family == "tirex")
+        self.assertEqual(tirex.model_id, "NX-AI/TiRex-2-gifteval-zs")
 
     def test_load_tirex_normalizes_indexed_cuda_device(self) -> None:
         calls = []
