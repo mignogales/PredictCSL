@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 import sys
 import tempfile
@@ -306,6 +307,49 @@ class GluonTSMaseVectorizedTest(unittest.TestCase):
 
         # GluonTS uses sorted_samples[round((S-1)*.5)] = index 2, prediction 2.
         self.assertEqual(value, 0.0)
+
+
+class LeaderboardCheckpointTest(unittest.TestCase):
+    def test_checkpoint_persists_stage_and_official_aggregation(self) -> None:
+        from experiments import test_window_ablation_gifteval_v5 as ablation
+
+        datasets = [
+            ("dataset_one", "short", "Dataset-One", False),
+            ("dataset_two", "long", "Dataset-Two", False),
+        ]
+        models = [("example/model", "example_family", "Example-Model")]
+        naive = {
+            ("dataset_one", "short"): 1.0,
+            ("dataset_two", "long"): 2.0,
+        }
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(ablation, "CACHE_ROOT", root), \
+                mock.patch.object(
+                    ablation, "published_naive_record",
+                    side_effect=lambda name, term: {
+                        "mase_gluonts_real": naive[(name, term)]
+                    },
+                ):
+            for _name, term, display, _univariate in datasets:
+                value = 2.0 if display == "Dataset-One" else 8.0
+                ablation._save_result(
+                    display, "Example-Model", term,
+                    ablation.FULL_NATIVE_WINDOW,
+                    {"mae": 1.0, "mse": 1.0, "rmse": 1.0,
+                     "mase_gluonts_real": value,
+                     "_mase_gluonts_real_standin": False},
+                )
+            path = ablation._write_leaderboard_parity_summary(
+                models, datasets, root,
+                checkpoint_stage="stage_3_gift_eval_ablation")
+            with open(path) as f:
+                payload = json.load(f)
+
+        self.assertEqual(
+            payload["last_checkpoint_stage"], "stage_3_gift_eval_ablation")
+        record = payload["models"]["Example-Model"]
+        self.assertTrue(record["complete"])
+        self.assertAlmostEqual(record["geomean_normalized_mase"], math.sqrt(8.0))
 
 
 class Chronos2IndependenceTest(unittest.TestCase):

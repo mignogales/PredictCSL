@@ -1166,6 +1166,19 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
                 stats[strategy]["geomean_norm"] = _geomean(ratio)
                 stats[strategy]["n_norm"] = int(m.sum())
 
+    # Machine-readable stage checkpoint mirroring the official GIFT-Eval
+    # headline. This keeps the number easy to inspect without knowing the
+    # internal full_mase/best_mase/pred_mase summary layout.
+    stats["official_gifteval_checkpoint"] = {
+        "metric": "normalized_mase",
+        "formula": "geomean(cell_MASE / published_seasonal_naive_MASE)",
+        "reference": NORMALIZATION_REFERENCE,
+        "full_window": stats.get("full_mase", {}).get("geomean_norm"),
+        "oracle_window": stats.get("best_mase", {}).get("geomean_norm"),
+        "predicted_window": stats.get("pred_mase", {}).get("geomean_norm"),
+        "cells": stats.get("full_mase", {}).get("n_norm", 0),
+    }
+
     stats["pred_clamped_count"] = int(df["pred_clamped"].sum()) if "pred_clamped" in df.columns else 0
     pred_beats_full = int((r["pred_mase"] < r["full_mase"]).sum())
     stats["pred_beats_full_count"] = pred_beats_full
@@ -3375,6 +3388,29 @@ def main() -> None:
         print(Fore.GREEN + f"  Saved: {csv_path}" + Fore.RESET)
 
         stats = compute_summary_stats(df_subset)
+        checkpoint = stats["official_gifteval_checkpoint"]
+        model_names = list(df_subset["model_short"].dropna().unique())
+        if len(model_names) == 1:
+            parity_path = os.path.join(
+                run_dir, "leaderboard_parity_summary.json")
+            try:
+                with open(parity_path) as f:
+                    parity_payload = json.load(f)
+                parity_record = parity_payload.get("models", {}).get(
+                    str(model_names[0]), {})
+                published = parity_record.get(
+                    "published_cohort_geomean_normalized_mase")
+                checkpoint["published_same_cohort"] = published
+                full_value = checkpoint.get("full_window")
+                checkpoint["delta_full_from_published"] = (
+                    None if full_value is None or published is None
+                    else float(full_value) - float(published))
+                checkpoint["published_reference_file"] = parity_record.get(
+                    "published_reference_file")
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                # Most model families do not yet have a shipped official result
+                # CSV. Their normalized headline is still complete and printable.
+                pass
         stats_path = os.path.join(out_dir, "summary_stats.json")
         with open(stats_path, "w") as f:
             json.dump(stats, f, indent=2)
@@ -3435,13 +3471,19 @@ def main() -> None:
         # i.e. the number that lines up with the HF GiftEval board when the
         # primary metric is `mase_gluonts_real`.
         full_s = stats.get("full_mase", {})
-        print(Fore.CYAN + f"\n--- Aggregate {args.mase_metric} (full window) ---"
+        print(Fore.CYAN + f"\n--- OFFICIAL GIFT-EVAL HEADLINE CHECKPOINT "
+              f"({args.mase_metric}) ---"
               + Fore.RESET)
         print(f"  absolute geomean   : {full_s.get('geomean', float('nan')):.4f}")
         if "geomean_norm" in full_s:
             print(f"  NORMALISED geomean : {full_s['geomean_norm']:.4f}"
                   f"  <- leaderboard aggregation (÷ seasonal-naive, "
                   f"n={full_s.get('n_norm', 0)})")
+            published = checkpoint.get("published_same_cohort")
+            if published is not None:
+                delta = checkpoint.get("delta_full_from_published")
+                print(f"  PUBLISHED target   : {float(published):.4f}"
+                      f"  | delta={float(delta):+.4f}")
         else:
             print(Fore.YELLOW + "  NORMALISED geomean: no published Seasonal "
                   "Naive row found for the selected configs"

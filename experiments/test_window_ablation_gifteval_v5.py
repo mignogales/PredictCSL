@@ -592,7 +592,9 @@ def _load_cached_result(dataset_display, model_short, term, window_size) -> dict
         return json.load(f)
 
 
-def _write_leaderboard_parity_summary(models, datasets, run_dir: str) -> str:
+def _write_leaderboard_parity_summary(
+    models, datasets, run_dir: str, checkpoint_stage: str = "gift_eval_ablation",
+) -> str:
     """Persist the normalized full-native MASE immediately after precompute.
 
     This is intentionally independent of predictor training. It applies the
@@ -614,6 +616,7 @@ def _write_leaderboard_parity_summary(models, datasets, run_dir: str) -> str:
             "leaderboard_reference/seasonal_naive_all_results.csv"),
         "expected_cells": len(datasets),
         "excluded_short_cells": ["Solar-W/short", "CarParts/short"],
+        "last_checkpoint_stage": checkpoint_stage,
     })
     model_payload = payload.setdefault("models", {})
 
@@ -3055,6 +3058,19 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
             torch.cuda.empty_cache()
         gc.collect()
 
+        # Emit the official-style aggregate as soon as THIS model finishes. A
+        # family invocation may contain several checkpoints (e.g. all Chronos2
+        # variants); waiting until the process exits made it unnecessarily hard
+        # to catch parity problems before the next checkpoint began.
+        if (shard_id is None and not args.no_cell_cache
+                and not args.no_full_native_baseline):
+            _write_leaderboard_parity_summary(
+                [(model_id, model_family, model_short)], datasets, run_dir,
+                checkpoint_stage=(
+                    "phase_1_forecast_only" if args.forecast_only
+                    else "stage_3_gift_eval_ablation"),
+            )
+
     # A sharded worker only fills the per-cell cache; the coordinator runs the
     # aggregation tail once over the combined cache (see _run_coordinator).
     if shard_id is not None:
@@ -3089,7 +3105,6 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
     print(Fore.GREEN + f"\n  Results CSV: {csv_path}" + Fore.RESET)
 
     if args.forecast_only:
-        _write_leaderboard_parity_summary(models, datasets, run_dir)
         print(Fore.GREEN
               + "Forecast-only pass complete. Predictor stages will reuse these cells."
               + Fore.RESET)
