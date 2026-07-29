@@ -1026,8 +1026,6 @@ def _forecast_uniform(
 
     if family == "moirai":
         del runner
-        if _is_cuda(device):
-            torch.cuda.empty_cache()
 
     return torch.cat(medians, dim=0)                   # (n, H)
 
@@ -1171,6 +1169,14 @@ def gpu_worker(
             result_queue.put({"shard_id": spec[0], "status": "model_load_failed"})
         return
 
+    # Open each read-only array once per worker. Reopening three .npy memmaps for
+    # every shard added filesystem/metadata overhead and repeatedly rebuilt the
+    # mapping objects. Slices are still copied before torch conversion because
+    # the underlying mappings are read-only.
+    contexts_mm = np.load(contexts_path, mmap_mode="r")
+    targets_mm = np.load(targets_path, mmap_mode="r")
+    real_lengths_mm = np.load(real_lengths_path, mmap_mode="r")
+
     while True:
         spec = shard_queue.get()
         if spec is None:
@@ -1179,12 +1185,9 @@ def gpu_worker(
         t0 = time.perf_counter()
         try:
             # Read-only memmap slices must be copied before torch.from_numpy.
-            ctx = np.array(
-                np.load(contexts_path, mmap_mode="r")[start:end], copy=True)
-            tgt = np.array(
-                np.load(targets_path, mmap_mode="r")[start:end], copy=True)
-            real_len = np.array(
-                np.load(real_lengths_path, mmap_mode="r")[start:end], copy=True)  # (B,)
+            ctx = np.array(contexts_mm[start:end], copy=True)
+            tgt = np.array(targets_mm[start:end], copy=True)
+            real_len = np.array(real_lengths_mm[start:end], copy=True)  # (B,)
             tgt_t = torch.from_numpy(tgt).to(device)        # (B, MAX_HORIZON)
 
             cm = np.full((end - start, n_win, n_h), np.nan, dtype=np.float32)
@@ -1241,9 +1244,11 @@ def gpu_worker(
                 tb_shown = True
             result_queue.put({"shard_id": shard_id,
                               "status": f"error:{type(exc).__name__}"})
-        if _is_cuda(device):
-            torch.cuda.empty_cache()
-
+    del contexts_mm, targets_mm, real_lengths_mm, base
+    if _is_cuda(device):
+        # The persistent model is leaving scope: this is an appropriate allocator
+        # teardown boundary, unlike the previous per-shard flush.
+        torch.cuda.empty_cache()
     print(Fore.CYAN + f"  [{dev_label}] worker {worker_id} exited." + Fore.RESET)
 
 

@@ -408,15 +408,15 @@ def _stage1_cmd(
 
 def _forecast_precompute_cmd(
     env: Optional[str],
-    display: str,
+    displays: List[str],
     test: bool = False,
 ) -> List[str]:
-    """Build the predictor-independent GIFT-Eval cache for one model."""
+    """Build predictor-independent GIFT-Eval caches for one model family."""
     cache_root = os.path.join(
         os.environ["PREDICTCSL_ABLATION_ROOT"], "general")
     args = [
         "experiments.test_window_ablation_gifteval_v5",
-        "--models", display,
+        "--models", *displays,
         "--cache-root", cache_root,
         "--forecast-only",
         "--short-context-mode", "skip",
@@ -426,6 +426,21 @@ def _forecast_precompute_cmd(
         # Match run_all_v3/v4's smoke subset so phase 4 is cache-only too.
         args += ["--test-datasets", "3", "--test-datasets-seed", "42"]
     return _py(env, *args)
+
+
+def _precompute_model_groups(displays: List[str]) -> List[List[str]]:
+    """Group selected models by family while preserving first-family order.
+
+    Models in one family share the exact window grid. Running them in one v5
+    process lets its GiftEvalCache survive across checkpoints. This primarily
+    avoids loading/preprocessing all 95 datasets three times for Chronos2
+    Small/Base/Synth while keeping unlike grids in separate invocations.
+    """
+    family_by_display = dict(models_config.run_pairs())
+    grouped: "OrderedDict[str, List[str]]" = OrderedDict()
+    for display in displays:
+        grouped.setdefault(family_by_display[display], []).append(display)
+    return list(grouped.values())
 
 
 def _variant_cmd(
@@ -505,13 +520,13 @@ def main() -> None:
     # unrelated family grids). Every model completes before the review gate.
     if not args.pipeline_only:
         for env, displays in groups.items():
-            for display in displays:
+            for model_group in _precompute_model_groups(displays):
                 precompute = _forecast_precompute_cmd(
-                    env, display, test=args.test)
+                    env, model_group, test=args.test)
                 _run(
                     precompute,
                     f"Phase 1 — GIFT-Eval window ablation/parity "
-                    f"[{_env_label(env)}]: {display}",
+                    f"[{_env_label(env)}]: {model_group}",
                 )
 
         # A real run deliberately stops here so leaderboard discrepancies are

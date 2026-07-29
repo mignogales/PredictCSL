@@ -215,6 +215,19 @@ MASE_GLUONTS_VER = 3
 DYNAMIC_BATCH_REFERENCE_CONTEXT = 1024
 DYNAMIC_BATCH_MAX_SIZE = 4096
 _DYNAMIC_BATCH_CACHE: Dict[Tuple[str, str, int, int], int] = {}
+# Preserve official outer-batch conventions where they exist. Other
+# deterministic families may probe up to the global ceiling.
+_DYNAMIC_BATCH_FAMILY_CAP = {
+    "timesfm": 1024,
+    "chronos_bolt": 1024,
+    "patchtst_fm": 2048,
+}
+# Probe calls are discarded before the real cell run. Never advance RNG/state
+# for sample-generating families, where extra calls or changed batch composition
+# can alter forecasts even under a fixed seed.
+_DYNAMIC_BATCH_NO_PROBE = frozenset({
+    "sundial", "moirai_1_1", "context_parroting",
+})
 
 
 # ==============================================================================
@@ -551,20 +564,36 @@ def _cache_dir(dataset_display: str, model_short: str, term: str, window_size: W
     )
 
 
+def _result_file_exists(dataset_display, model_short, term, window_size) -> bool:
+    """Cheap resume-estimate check; semantic validation happens on first use."""
+    return os.path.isfile(os.path.join(
+        _cache_dir(dataset_display, model_short, term, window_size),
+        "metrics.json",
+    ))
+
+
 def _result_cached(dataset_display, model_short, term, window_size) -> bool:
+    return _load_valid_cached_result(
+        dataset_display, model_short, term, window_size) is not None
+
+
+def _load_valid_cached_result(
+    dataset_display, model_short, term, window_size,
+) -> Optional[dict]:
+    """Load and minimally validate one cached metrics record exactly once."""
     path = os.path.join(_cache_dir(dataset_display, model_short, term, window_size), "metrics.json")
     if not os.path.isfile(path):
-        return False
+        return None
     try:
         with open(path, "r") as f:
             metrics = json.load(f)
         for key in ("mae", "mse", "rmse"):
             v = metrics.get(key)
             if v is None or (isinstance(v, float) and np.isnan(v)):
-                return False
+                return None
     except (json.JSONDecodeError, OSError):
-        return False
-    return True
+        return None
+    return metrics
 
 
 def _load_cached_result(dataset_display, model_short, term, window_size) -> dict:
@@ -760,12 +789,26 @@ def _result_cached_for_family(
     dataset_display, model_short, term, window_size, model_family
 ) -> bool:
     """Like ``_result_cached``, also rejecting stale model-recipe caches."""
-    if not _result_cached(dataset_display, model_short, term, window_size):
-        return False
-    return _inference_recipe_current(
-        _load_cached_result(dataset_display, model_short, term, window_size),
-        model_family,
-    )
+    return _load_cached_result_for_family(
+        dataset_display, model_short, term, window_size, model_family,
+    ) is not None
+
+
+def _load_cached_result_for_family(
+    dataset_display, model_short, term, window_size, model_family,
+) -> Optional[dict]:
+    """Return one current family-aware cache record without reopening JSON."""
+    metrics = _load_valid_cached_result(
+        dataset_display, model_short, term, window_size)
+    if metrics is None:
+        return None
+    # Parity runs must use GluonTS' actual evaluate_forecasts result. Older
+    # backfills sometimes copied the NumPy port into `mase_gluonts_real` when
+    # forecast objects were no longer available; force only those cells through
+    # inference again rather than asking users to delete the complete cache.
+    if metrics.get("_mase_gluonts_real_standin"):
+        return None
+    return metrics if _inference_recipe_current(metrics, model_family) else None
 
 
 def _save_result(dataset_display, model_short, term, window_size, metrics: dict) -> None:
@@ -1077,12 +1120,17 @@ def _clear_accelerator_cache() -> None:
     gc.collect()
 
 
-def _rebatch(batches, batch_size: int):
-    """Re-slice a uniform-width CPU batch list without rebuilding the dataset."""
+def _flatten_batches(batches):
+    """Concatenate a uniform-width CPU batch list once for repeated slicing."""
     if not batches:
-        return []
+        return None, None
     all_x = torch.cat([batch["x"] for batch in batches], dim=0)
     all_y = torch.cat([batch["y"] for batch in batches], dim=0)
+    return all_x, all_y
+
+
+def _slice_flat_batches(all_x, all_y, batch_size: int):
+    """Create lightweight views over one flattened cell at ``batch_size``."""
     return [
         {"x": all_x[start:start + batch_size],
          "y": all_y[start:start + batch_size]}
@@ -1099,19 +1147,73 @@ def _forecast_cell_dynamic(model_family, handle, model_id, batches, width,
     PatchTST-FM does not scale with the requested window, so it starts at the
     configured base instead of receiving the short-window multiplier.
     """
-    n_samples = sum(int(batch["x"].shape[0]) for batch in batches)
+    all_x, all_y = _flatten_batches(batches)
+    if all_x is None:
+        raise ValueError("Cannot forecast an empty batch list")
+    n_samples = int(all_x.shape[0])
     key = (str(model_id), model_family, int(width), int(horizon))
+    family_cap = _DYNAMIC_BATCH_FAMILY_CAP.get(
+        model_family, DYNAMIC_BATCH_MAX_SIZE)
+    search_cap = min(n_samples, DYNAMIC_BATCH_MAX_SIZE, family_cap)
     if key in _DYNAMIC_BATCH_CACHE:
         candidate = min(_DYNAMIC_BATCH_CACHE[key], n_samples)
     else:
         scale = (1 if model_family == "patchtst_fm" else
                  max(1, DYNAMIC_BATCH_REFERENCE_CONTEXT // max(1, int(width))))
-        candidate = min(n_samples, DYNAMIC_BATCH_MAX_SIZE,
+        candidate = min(search_cap,
                         max(1, int(base_batch_size)) * scale)
+
+    # One-time upward search for deterministic families. Probe only a single
+    # batch at each doubled size (not the whole cell), cache the largest safe
+    # size, then run the complete cell exactly once at that size. Subsequent
+    # datasets with the same model/width/horizon skip probing entirely.
+    can_probe = (
+        str(device).startswith("cuda")
+        and model_family not in _DYNAMIC_BATCH_NO_PROBE
+        and key not in _DYNAMIC_BATCH_CACHE
+        and candidate < search_cap
+    )
+    if can_probe:
+        safe = 0
+        probe = candidate
+        while True:
+            probe_batches = [{"x": all_x[:probe], "y": all_y[:probe]}]
+            try:
+                probe_result = _forecast_cell(
+                    model_family, handle, model_id, probe_batches,
+                    width, horizon, device, probe,
+                    flowstate_scale=flowstate_scale,
+                )
+                # Prevent successful probe kernels from overlapping the next,
+                # larger probe and creating a false OOM from concurrent work.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                del probe_result, probe_batches
+                safe = probe
+                if probe >= search_cap:
+                    candidate = safe
+                    break
+                probe = min(search_cap, probe * 2)
+            except Exception as exc:
+                if not _is_accelerator_oom(exc):
+                    raise
+                del probe_batches
+                _clear_accelerator_cache()
+                if safe > 0:
+                    candidate = safe
+                    break
+                if probe <= 1:
+                    raise
+                probe = max(1, probe // 2)
+        _DYNAMIC_BATCH_CACHE[key] = candidate
+        print(Fore.GREEN
+              + f"    Dynamic batch autotune: safe_bs={candidate}  "
+                f"search_cap={search_cap}  W={width}  H={horizon}"
+              + Fore.RESET)
 
     reduced_after_oom = False
     while True:
-        trial_batches = _rebatch(batches, candidate)
+        trial_batches = _slice_flat_batches(all_x, all_y, candidate)
         print(Fore.CYAN
               + f"    Dynamic batch: samples={n_samples}  effective_bs={candidate}  "
                 f"actual_batches={len(trial_batches)}  W={width}  H={horizon}"
@@ -2133,15 +2235,11 @@ def _forecast_cell(model_family, handle, model_id, batches, width, horizon,
         m = build_moirai_forecast(handle, horizon, width, device)
         fr, tgts = predict_moirai(m, batches, horizon, device)
         del m
-        if device == "cuda":
-            torch.cuda.empty_cache()
         return fr, tgts
     if model_family == "moirai_1_1":
         m = build_moirai_1_1_forecast(handle, horizon, width, device)
         fr, tgts = predict_moirai_1_1(m, batches, horizon, device)
         del m
-        if device == "cuda":
-            torch.cuda.empty_cache()
         return fr, tgts
     if model_family == "timesfm":
         tfm = handle if handle is not None else load_timesfm_official(model_id)
@@ -2312,16 +2410,14 @@ def _run_full_native_baseline(
     tag = (f"{model_short} | {dataset_display} | t={term} | h={horizon} | "
            f"w={FULL_NATIVE_WINDOW} cap={cap}")
 
-    cached = (_load_cached_result(
+    cached = _load_valid_cached_result(
         dataset_display, model_short, term, FULL_NATIVE_WINDOW)
-        if _result_cached(
-            dataset_display, model_short, term, FULL_NATIVE_WINDOW)
-        else None)
     # ``full_native`` does not encode its numeric cap in the cache path.  Ignore
     # results produced with an older/different cap instead of silently reusing
     # forecasts that violate the model's current input limit.
     if (cached is not None
             and int(cached.get("_context_cap", -1)) == cap
+            and not cached.get("_mase_gluonts_real_standin", False)
             and _inference_recipe_current(cached, model_family)):
         _backfill_served_index(
             dataset_display, model_short, term, FULL_NATIVE_WINDOW, cache, "pad")
@@ -2455,10 +2551,11 @@ def _run_full_native_baseline(
                              FULL_NATIVE_WINDOW, per_sample)
     _save_result(dataset_display, model_short, term, FULL_NATIVE_WINDOW, metrics)
 
+    # Drop live references, but keep PyTorch's reusable allocator blocks. A
+    # per-cell empty_cache()/gc.collect() makes every following cell pay for
+    # fresh CUDA allocations; explicit cache flushing is reserved for OOM
+    # recovery and model teardown.
     del fr, tgts, per_sample, results
-    if device == "cuda":
-        torch.cuda.empty_cache()
-    gc.collect()
 
 
 def parse_args() -> argparse.Namespace:
@@ -2670,9 +2767,10 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
     os.makedirs(run_dir, exist_ok=True)
 
     # ---- Resume estimate: how many (model, dataset, window) cells are already
-    # on disk. Cheap file-stat scan, no dataset loading. The denominator is the
-    # full grid, so cells that will be skipped (can't serve / model context
-    # limits) are still counted — treat the percentage as a lower bound.
+    # on disk. This is deliberately a file-stat-only scan: each JSON is parsed
+    # and recipe-validated once, when its cell is actually visited. The
+    # denominator is the full grid, so unsupported cells remain counted in the
+    # plan and the percentage is only an approximate resume indicator.
     include_full_native = (not args.no_cell_cache
                            and not args.no_full_native_baseline)
     n_planned = len(models) * len(datasets) * (
@@ -2682,21 +2780,21 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
         for _, model_family, model_short in models
         for _, term, dataset_display, _ in datasets
         for window_size in window_sizes
-        if _result_cached_for_family(
-            dataset_display, model_short, term, window_size, model_family)
+        if _result_file_exists(
+            dataset_display, model_short, term, window_size)
     )
     if include_full_native:
         n_cached += sum(
             1
             for _, model_family, model_short in models
             for _, term, dataset_display, _ in datasets
-            if _result_cached_for_family(
-                dataset_display, model_short, term, FULL_NATIVE_WINDOW,
-                model_family)
+            if _result_file_exists(
+                dataset_display, model_short, term, FULL_NATIVE_WINDOW)
         )
     pct_cached = 100.0 * n_cached / n_planned if n_planned else 100.0
     print(Fore.CYAN
-          + f"Resume: {n_cached}/{n_planned} cells cached ({pct_cached:.1f}% complete)"
+          + f"Resume: {n_cached}/{n_planned} cell files present "
+            f"({pct_cached:.1f}%; validated lazily)"
           + Fore.RESET)
 
     ge_cache: Dict[Tuple[str, str], GiftEvalCache] = {}
@@ -2792,10 +2890,11 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                           + Fore.RESET)
                     continue
 
-                if _result_cached_for_family(
-                        dataset_display, model_short, term, window_size,
-                        model_family):
-                    cached = _load_cached_result(dataset_display, model_short, term, window_size)
+                cached = _load_cached_result_for_family(
+                    dataset_display, model_short, term, window_size,
+                    model_family,
+                )
+                if cached is not None:
                     _backfill_served_index(
                         dataset_display, model_short, term, window_size,
                         cache, short_mode)
@@ -2958,6 +3057,11 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     # matching per-instance seasonal errors for mase_gluonts.
                     se_cell = cache.seasonal_errors_gluonts[valid_indices]
 
+                # `_handle` owns the persistent model. Do not let the last cell's
+                # convenience alias keep that model alive past the explicit
+                # model-boundary teardown below.
+                del cell_handle
+
                 metrics = compute_all_metrics(fr, tgts, cache.naive_seasonal_mae_train,
                                               seasonal_errors=se_cell)
                 # Fill the leaderboard-machinery MASE (`mase_gluonts_real`) now that
@@ -3020,10 +3124,12 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     "horizon": horizon, "window_size": window_size, **metrics,
                 })
 
+                # Release tensor references while retaining allocator blocks for
+                # the next window. This is substantially cheaper than flushing
+                # CUDA + Python allocators after every cell.
                 del fr, tgts, all_x_cpu, per_sample
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-                gc.collect()
+                if short_mode == "pad":
+                    del results
 
         _handle[0] = None
         if device == "cuda":

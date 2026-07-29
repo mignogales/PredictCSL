@@ -128,7 +128,7 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         )
         self.assertIn("--verbose-ablation", cmd)
 
-    def test_variant_can_be_dispatched_with_a_global_stage_barrier(self) -> None:
+    def test_variant_can_be_dispatched_for_one_stage(self) -> None:
         cmd = master._variant_cmd(
             None,
             master.VARIANTS[0],
@@ -147,12 +147,26 @@ class MasterRecomputeConfigTest(unittest.TestCase):
             {"PREDICTCSL_ABLATION_ROOT": "/tmp/predictcsl-ablation"},
         ):
             cmd = master._forecast_precompute_cmd(
-                None, "Chronos2-Small", test=True)
+                None, ["Chronos2-Small"], test=True)
         self.assertIn("--forecast-only", cmd)
         self.assertIn("--cache-root", cmd)
         self.assertIn("/tmp/predictcsl-ablation/general", cmd)
         self.assertIn("--test-datasets", cmd)
         self.assertNotIn("--predictor-dir", cmd)
+
+    def test_chronos2_precompute_reuses_one_dataset_cache(self) -> None:
+        groups = master._precompute_model_groups([
+            "Chronos2-Small",
+            "Moirai2-Small",
+            "Chronos2-Synth",
+            "Chronos2-Base",
+            "TimesFM2.5-200M",
+        ])
+        self.assertEqual(groups, [
+            ["Chronos2-Small", "Chronos2-Synth", "Chronos2-Base"],
+            ["Moirai2-Small"],
+            ["TimesFM2.5-200M"],
+        ])
 
     def test_dedicated_stage1_args_are_inside_activated_shell(self) -> None:
         old_names = master._CONDA_ENV_NAMES
@@ -306,6 +320,76 @@ class Chronos2IndependenceTest(unittest.TestCase):
         self.assertEqual(tuple(forecast.median.shape), (2, 4))
         self.assertIs(pipeline.calls[0]["cross_learning"], False)
 
+
+class AblationDynamicBatchTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from experiments import test_window_ablation_gifteval_v5 as ablation
+        ablation._DYNAMIC_BATCH_CACHE.clear()
+
+    def tearDown(self) -> None:
+        from experiments import test_window_ablation_gifteval_v5 as ablation
+        ablation._DYNAMIC_BATCH_CACHE.clear()
+
+    def test_deterministic_family_probes_up_and_reuses_safe_size(self) -> None:
+        from experiments import test_window_ablation_gifteval_v5 as ablation
+
+        calls = []
+
+        def fake_forecast(
+            _family, _handle, _model_id, batches, _width, horizon,
+            _device, batch_size, **_kwargs,
+        ):
+            calls.append(batch_size)
+            if batch_size > 8:
+                raise torch.cuda.OutOfMemoryError("synthetic OOM")
+            n = sum(batch["x"].shape[0] for batch in batches)
+            zeros = torch.zeros((n, horizon))
+            return ForecastResult(median=zeros), zeros
+
+        batches = [{
+            "x": torch.zeros((20, 1024, 1)),
+            "y": torch.zeros((20, 4, 1)),
+        }]
+        with mock.patch.object(ablation, "_forecast_cell", fake_forecast), \
+                mock.patch.object(ablation, "_clear_accelerator_cache"):
+            _fr, _targets, size = ablation._forecast_cell_dynamic(
+                "flowstate", object(), "example/model", batches,
+                1024, 4, "cuda", 2)
+            first_calls = list(calls)
+            calls.clear()
+            _fr, _targets, cached_size = ablation._forecast_cell_dynamic(
+                "flowstate", object(), "example/model", batches,
+                1024, 4, "cuda", 2)
+
+        self.assertEqual(first_calls, [2, 4, 8, 16, 8])
+        self.assertEqual(size, 8)
+        self.assertEqual(calls, [8])
+        self.assertEqual(cached_size, 8)
+
+    def test_sampling_family_does_not_probe(self) -> None:
+        from experiments import test_window_ablation_gifteval_v5 as ablation
+
+        calls = []
+
+        def fake_forecast(
+            _family, _handle, _model_id, batches, _width, horizon,
+            _device, batch_size, **_kwargs,
+        ):
+            calls.append(batch_size)
+            n = sum(batch["x"].shape[0] for batch in batches)
+            zeros = torch.zeros((n, horizon))
+            return ForecastResult(median=zeros), zeros
+
+        batches = [{
+            "x": torch.zeros((20, 1024, 1)),
+            "y": torch.zeros((20, 4, 1)),
+        }]
+        with mock.patch.object(ablation, "_forecast_cell", fake_forecast):
+            ablation._forecast_cell_dynamic(
+                "sundial", object(), "example/model", batches,
+                1024, 4, "cuda", 2)
+
+        self.assertEqual(calls, [2])
 
 class SoftClassificationLossTest(unittest.TestCase):
     def test_top3_rank_weights_and_invalid_class_mask(self) -> None:

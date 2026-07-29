@@ -73,6 +73,30 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
                 self.assertTrue(ablation._inference_recipe_current(
                     {"_inference_recipe": inference_recipe(family)}, family))
 
+    def test_real_mase_standin_is_not_a_valid_forecast_cache(self) -> None:
+        metrics = {
+            "mae": 1.0,
+            "mse": 1.0,
+            "rmse": 1.0,
+            "mase": 1.0,
+            "mase_gluonts": 1.0,
+            "mase_gluonts_real": 1.0,
+            "smape": 1.0,
+            "crps": 1.0,
+            "_mase_gluonts_real_standin": True,
+            "_inference_recipe": inference_recipe("chronos2"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root = ablation.CACHE_ROOT
+            ablation.CACHE_ROOT = tmp
+            try:
+                ablation._save_result(
+                    "Example", "Chronos2-Small", "short", 32, metrics)
+                self.assertFalse(ablation._result_cached_for_family(
+                    "Example", "Chronos2-Small", "short", 32, "chronos2"))
+            finally:
+                ablation.CACHE_ROOT = old_root
+
     def test_stage3_done_marker_rejects_then_accepts_recipe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             old_root = run_all.ABLATION_GENERAL
