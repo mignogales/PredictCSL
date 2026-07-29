@@ -59,6 +59,7 @@ from gift_eval.data import Dataset as GiftEvalDataset
 from experiments.gifteval_mase import (
     get_seasonality, per_instance_seasonal_errors, gluonts_leaderboard_mase,
 )
+from experiments.gifteval_reference import published_naive_record
 
 try:
     from tsfm_public import PatchTSTFMForPrediction
@@ -513,104 +514,12 @@ class GiftEvalCache:
 
 
 # ==============================================================================
-#  NAIVE BASELINE
+#  PUBLISHED LEADERBOARD NORMALIZER
 # ==============================================================================
-
-def _naive_cache_path(dataset_display: str, term: str) -> str:
-    return os.path.join(
-        CACHE_ROOT, "datasets", dataset_display, "_naive_seasonal", f"t{term}", "metrics.json"
-    )
-
-
-def _seasonal_naive_preds(cache: GiftEvalCache, season: int) -> np.ndarray:
-    """Seasonal-naive forecast: repeat each series' last ``season`` values across
-    the horizon (plain persistence when ``season == 1``). Series shorter than one
-    season fall back to the last observed value. Returns an (n_total, horizon)
-    float32 array with NaNs zeroed."""
-    horizon = cache.horizon
-    preds = np.empty((cache.n_total, horizon), dtype=np.float32)
-    for i, ctx in enumerate(cache.contexts):
-        if len(ctx) >= season:
-            tail = ctx[-season:]
-            repeats = (horizon // season) + 1
-            preds[i] = np.tile(tail, repeats)[:horizon]
-        else:
-            preds[i] = ctx[-1] if len(ctx) else 0.0
-    return np.nan_to_num(preds, nan=0.0)
-
-
-def compute_naive_seasonal_test_metrics(cache: GiftEvalCache) -> Dict[str, float]:
-    """Seasonal-naive baseline metrics for one (dataset, term).
-
-    Two seasonalities are in play and MUST NOT be conflated:
-      * project metrics (mae/mse/`mase`) use the project season map (D->7, W->52),
-        matching the rest of the ablation and the naive reference lines in plots;
-      * the leaderboard `mase_gluonts` normaliser must use gluonts' Seasonal-Naive,
-        i.e. the forecast tiled with ``get_seasonality(freq)`` (D->1, W->1). So we
-        compute `mase_gluonts` from a SEPARATE gluonts-season forecast and splice it
-        in — otherwise D/W/S datasets would divide by the wrong baseline and the
-        normalised aggregate wouldn't line up with the HF GiftEval leaderboard.
-    """
-    tgts = torch.from_numpy(cache.labels_np)
-
-    # Project-season forecast -> mae/mse/`mase` + the plot reference lines. Naive
-    # preds cover ALL instances in order, so the gluonts seasonal errors align 1:1.
-    proj_preds = torch.from_numpy(_seasonal_naive_preds(cache, cache.season))
-    metrics = compute_all_metrics(
-        ForecastResult(median=proj_preds), tgts, cache.naive_seasonal_mae_train,
-        seasonal_errors=cache.seasonal_errors_gluonts,
-    )
-
-    # gluonts-season forecast -> leaderboard-faithful `mase_gluonts` normaliser.
-    # Mask NaN targets exactly like the model path (compute_all_metrics): the
-    # *_with_missing datasets carry NaN horizon labels, and an unmasked mean would
-    # turn the whole naive baseline into NaN — leaving those cells with no
-    # denominator (they'd silently drop out of the normalised aggregate).
-    gl_preds = torch.from_numpy(_seasonal_naive_preds(cache, cache.season_gluonts))
-    gl_valid = ~torch.isnan(tgts)
-    gl_abs = (gl_preds - torch.nan_to_num(tgts, nan=0.0)).abs()
-    metrics["mase_gluonts"] = compute_mase_gluonts(
-        gl_abs, gl_valid, cache.seasonal_errors_gluonts)
-    # `mase_gluonts_real` for the naive: run the ACTUAL gluonts machinery on the
-    # naive forecast (we hold preds + starts + raw contexts, so nothing stops us).
-    # This is the normalisation denominator for the leaderboard-style aggregate —
-    # a port stand-in here would make every normalised number slightly off. Falls
-    # back to the port only if gluonts is unavailable or the eval fails.
-    try:
-        metrics["mase_gluonts_real"] = gluonts_leaderboard_mase(
-            gl_preds.numpy().astype(np.float64), cache.starts,
-            cache.contexts_raw, cache.labels_np, cache.freq)
-    except Exception as exc:  # noqa: BLE001 - never sink the baseline on this
-        print(Fore.YELLOW + f"  [naive mase_gluonts_real] gluonts eval failed "
-              f"({exc}) -> standing in with the port value." + Fore.RESET)
-        metrics["mase_gluonts_real"] = metrics["mase_gluonts"]
-
-    # Cache-version sentinels: `_gluonts_naive_faithful` marks the gluonts-season
-    # forecast (vs the old project-season one); `_gluonts_naive_ver` tracks the
-    # gluonts-MASE definition so a seasonal-error fix invalidates stale naives too.
-    metrics["_gluonts_naive_faithful"] = True
-    metrics["_gluonts_naive_ver"] = MASE_GLUONTS_VER
-    return metrics
-
-
-def load_or_compute_naive_baseline(
-    cache: GiftEvalCache, term: str
-) -> Dict[str, float]:
-    path = _naive_cache_path(cache.dataset_display, term)
-    if os.path.isfile(path):
-        with open(path, "r") as f:
-            cached = json.load(f)
-        # Reuse only a faithful naive at the CURRENT gluonts-MASE version. Older
-        # caches (project-season forecast, or a superseded seasonal_error) are
-        # recomputed here (the loaded cache is on hand anyway, so it's cheap).
-        if cached.get("_gluonts_naive_faithful") \
-                and cached.get("_gluonts_naive_ver", 0) >= MASE_GLUONTS_VER:
-            return cached
-    metrics = compute_naive_seasonal_test_metrics(cache)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(metrics, f, indent=2)
-    return metrics
+# The normalized GIFT-Eval headline uses the Seasonal Naive MASE published in
+# ``leaderboard_reference/seasonal_naive_all_results.csv``.  Do not reconstruct
+# that forecast locally: even a tiny implementation/environment difference makes
+# the final geometric mean differ from the published leaderboard.
 
 
 # ==============================================================================
@@ -2379,7 +2288,7 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
           + Fore.RESET)
 
     ge_cache: Dict[Tuple[str, str], GiftEvalCache] = {}
-    naive_baseline_cache: Dict[Tuple[str, str], Dict[str, float]] = {}
+    naive_baseline_cache: Dict[Tuple[str, str], dict] = {}
     all_results: List[dict] = []
 
     # ----- Model -> Dataset -> Window ----------------------------------------
@@ -2448,7 +2357,8 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                       + f"ctx_range=[{cache.min_context},{cache.max_context}]  "
                       + f"naive_mae_train={cache.naive_seasonal_mae_train:.6f}"
                       + Fore.RESET)
-                naive_baseline_cache[(dataset_display, term)] = load_or_compute_naive_baseline(cache, term)
+                naive_baseline_cache[(dataset_display, term)] = (
+                    published_naive_record(ge_name, term))
             cache = ge_cache[ds_key]
             naive_bl = naive_baseline_cache[(dataset_display, term)]
             horizon = cache.horizon
@@ -2872,20 +2782,10 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
             naive_baseline=naive_baseline_cache.get(key),
         )
 
-    # Merge naive baselines into the shared file (keyed by dataset/term, so
-    # baselines from earlier model runs are preserved).
-    naive_path = os.path.join(run_dir, "naive_baselines.json")
-    naive_all: Dict[str, dict] = {}
-    if os.path.isfile(naive_path):
-        try:
-            with open(naive_path) as f:
-                naive_all = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            naive_all = {}
-    naive_all.update({f"{k[0]}/t{k[1]}": v for k, v in naive_baseline_cache.items()})
-    with open(naive_path, "w") as f:
-        json.dump(naive_all, f, indent=2)
-    print(Fore.GREEN + f"  Naive baselines: {naive_path}" + Fore.RESET)
+    print(Fore.GREEN
+          + "  Normalized MASE denominator: published "
+            "leaderboard_reference/seasonal_naive_all_results.csv"
+          + Fore.RESET)
 
     # ---- Persist a small marker tying this run to the predictor checkpoint --
     with open(os.path.join(run_dir, "predictor_meta.json"), "w") as f:

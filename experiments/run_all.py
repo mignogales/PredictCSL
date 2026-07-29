@@ -72,6 +72,7 @@ from experiments.build_context_length_dataset import (
     window_grid_for_family,
 )
 from experiments import models_config
+from experiments.gifteval_reference import NORMALIZATION_REFERENCE
 
 
 # Master run set: (model_id, family, display), sourced from the single config in
@@ -95,7 +96,8 @@ RUN_LOG_ROOT   = os.environ.get(
     "PREDICTCSL_RUN_LOG_ROOT", "logs/experiments/run_all_logs")
 # Shared, cross-model gifteval ablation output (stage 3). One folder for every
 # model — v5 keys its artefacts by (dataset, model_short), so models coexist
-# here without collision and share the dataset cache + naive baselines.
+# here without collision and share the dataset cache. Normalized MASE always
+# reads its denominator from the shipped GIFT-Eval leaderboard CSV.
 ABLATION_GENERAL = os.path.join(ABLATION_ROOT, "general")
 
 # Per-model strategy-comparison subfolder (stage 4). Made mode-specific in main()
@@ -460,12 +462,19 @@ def _done_stage_3(family: str, display: str = "") -> Tuple[bool, str]:
 
 
 def _done_stage_4(family: str, display: str = "") -> Tuple[bool, str]:
-    """Stage 4 is done when summary_stats.json exists in the model's
-    strategy_comparison/ folder."""
+    """Stage 4 is done when its summary uses the current normalization source."""
     out = os.path.join(ABLATION_ROOT, display, STRATEGY_SUBDIR,
                        "summary_stats.json")
     if os.path.isfile(out):
-        return True, "summary_stats.json present"
+        try:
+            with open(out) as f:
+                stats = json.load(f)
+            reference = stats.get("headline_aggregation", {}).get("reference")
+        except (OSError, json.JSONDecodeError):
+            return False, "summary_stats.json unreadable"
+        if reference == NORMALIZATION_REFERENCE:
+            return True, "summary_stats.json uses published naive CSV"
+        return False, "summary_stats.json uses stale/local naive denominator"
     return False, "summary_stats.json missing"
 
 

@@ -31,6 +31,8 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
+from experiments.gifteval_reference import published_naive_by_display
+
 
 def _main_to_sanity_key_map() -> Dict[Tuple[str, str], str]:
     from experiments import datasets_config
@@ -152,22 +154,12 @@ def _load_main(run_dir: str, model: str, metric: str, window: str,
     if not os.path.isdir(root):
         raise SystemExit(f"No datasets/ under main run dir: {run_dir}")
     key_map = _main_to_sanity_key_map()
+    published_naive = published_naive_by_display()
     rows = {}
     for dataset in sorted(os.listdir(root)):
         ddir = os.path.join(root, dataset)
         if not os.path.isdir(ddir):
             continue
-
-        naive_by_term = {}
-        naive_dir = os.path.join(ddir, "_naive_seasonal")
-        for term, tdir in _term_dirs(naive_dir):
-            nd = _load_json(os.path.join(tdir, "metrics.json")) or {}
-            naive_by_term[term] = {
-                "mase_gluonts": _float(nd.get("mase_gluonts")),
-                "mase_gluonts_real": _float(nd.get("mase_gluonts_real")),
-                "faithful": bool(nd.get("_gluonts_naive_faithful")),
-                "ver": nd.get("_gluonts_naive_ver"),
-            }
 
         model_dir = os.path.join(ddir, model)
         for term, tdir in _term_dirs(model_dir):
@@ -175,10 +167,8 @@ def _load_main(run_dir: str, model: str, metric: str, window: str,
             if picked is None:
                 continue
             w, mase, md = picked
-            ninfo = naive_by_term.get(term, {})
-            # Prefer the actual naive gluonts machinery value if present; fall
-            # back to the port so older caches can still be diagnosed.
-            sn = ninfo.get("mase_gluonts_real") or ninfo.get("mase_gluonts")
+            ninfo = published_naive.get(f"{dataset}/t{term}", {})
+            sn = ninfo.get("mase_gluonts_real")
             key = key_map.get((dataset, term), f"{dataset}/{term}")
             rows[key] = {
                 "mase": mase,
@@ -233,7 +223,8 @@ def _row_diff(sanity_rows: Dict[str, dict], main_rows: Dict[str, dict],
         "main_norm": mn,
         "norm_abs_diff": abs(mn - sn) if sn is not None and mn is not None else None,
         "main_window": mr.get("window"),
-        "naive_faithful": mr.get("naive", {}).get("faithful"),
+        "naive_faithful": (
+            mr.get("naive", {}).get("_source") == "gift_eval_published_csv"),
     }
 
 
@@ -247,7 +238,7 @@ def main() -> None:
                     help="Main ablation run dir containing datasets/")
     ap.add_argument("--main-model", default="TimesFM2.5-200M")
     ap.add_argument("--main-metric", default="mase_gluonts_real",
-                    choices=["mase_gluonts", "mase_gluonts_real", "mase"])
+                    choices=["mase_gluonts", "mase_gluonts_real"])
     ap.add_argument("--main-window", default="full",
                     help="'full' = largest cached window, 'best', or an integer")
     ap.add_argument("--no-prefer-real", action="store_true",

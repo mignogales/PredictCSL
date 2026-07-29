@@ -25,20 +25,16 @@ NO TSFM inference happens — it's a pure read over cached numbers.
 
 Cache layout it walks (default `--metric mase_gluonts`):
     <run-dir>/datasets/<dataset>/<model>/t<term>/w<window>/metrics.json
-    <run-dir>/datasets/<dataset>/_naive_seasonal/t<term>/metrics.json   (denominator)
+
+The denominator always comes from the shipped official GIFT-Eval
+``leaderboard_reference/seasonal_naive_all_results.csv``.
 
 Window selection per cell (`--window`):
     full  -> the largest w<N> present   (default; matches leaderboard full-context)
     best  -> the w<N> with the smallest chosen metric (oracle)
     <int> -> a specific window size
 
-Caveats it prints (so the comparison is honest):
-  * Legacy Seasonal-Naive caches (written before the gluonts-season fix) tiled the
-    naive forecast with the PROJECT seasonality map (D->7, W->52, S->86400) instead
-    of gluonts' (D->1, W->1, S->3600), so for D/W/S datasets their `mase_gluonts`
-    denominator is not the leaderboard's baseline. Such cells are detected via the
-    `_gluonts_naive_faithful` sentinel and flagged. Re-run stage 3 (or --force 3)
-    to refresh them. (H/T/M/Q/etc. agree regardless, so they're always exact.)
+Caveat it prints (so the comparison is honest):
   * The geomean is only comparable to the board if the cell set matches the
     board's. Missing cells are listed.
 
@@ -59,13 +55,7 @@ import re
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
-# Frequencies where the project seasonality map disagrees with gluonts', so a
-# LEGACY (non-faithful) Seasonal-Naive denominator would be the wrong baseline.
-# Derived from the two maps in gifteval_mase.py (gluonts: D->1,W->1,S->3600) vs
-# test_window_ablation_gifteval_v5._get_seasonality (project: D->7,W->52,S->86400).
-# Only matters when the naive cache predates the gluonts-season fix (detected via
-# the `_gluonts_naive_faithful` sentinel).
-_SEASON_MISMATCH_SUFFIXES = ("-D", "-W", "-S")
+from experiments.gifteval_reference import published_naive_by_display
 
 
 def _term_dirs(model_dir: str) -> List[Tuple[str, str]]:
@@ -155,30 +145,16 @@ def collect(run_dir: str, metric: str, window: str,
             f"No 'datasets/' under {run_dir!r}. Point --run-dir at the folder that "
             f"contains datasets/ (e.g. .../window_ablation_gifteval/general).")
 
-    # per model: list of Cell(dataset, term, model_mase, naive_mase_or_None,
-    #                         mismatch, degenerate)
+    # per model: list of Cell(dataset, term, model_mase,
+    #                         published_naive_mase_or_None, degenerate)
     rows: Dict[str, List[tuple]] = defaultdict(list)
     naive_missing: Dict[str, List[str]] = defaultdict(list)
+    published_naive = published_naive_by_display()
 
     for dataset in sorted(os.listdir(datasets_root)):
         ddir = os.path.join(datasets_root, dataset)
         if not os.path.isdir(ddir):
             continue
-
-        # --- naive baseline per term (the denominator) --------------------
-        # The naive has no gluonts-machinery value, so it always uses the port.
-        naive_dir = os.path.join(ddir, "_naive_seasonal")
-        naive_by_term: Dict[str, Optional[float]] = {}
-        naive_faithful: Dict[str, bool] = {}
-        for term, tdir in _term_dirs(naive_dir):
-            nd = _load(os.path.join(tdir, "metrics.json"))
-            v = nd.get(metric) if nd else None
-            naive_by_term[term] = v if (v is not None and math.isfinite(v)) else None
-            naive_faithful[term] = bool(nd.get("_gluonts_naive_faithful")) if nd else False
-
-        # A legacy (non-faithful) naive cache only mis-normalises D/W/S datasets,
-        # where the project and gluonts seasons differ. Faithful caches are exact.
-        legacy_suffix = dataset.endswith(_SEASON_MISMATCH_SUFFIXES)
 
         # --- each model -----------------------------------------------------
         for model in sorted(os.listdir(ddir)):
@@ -194,16 +170,16 @@ def collect(run_dir: str, metric: str, window: str,
                 if picked is None:
                     continue
                 _w, _md, mv = picked
-                nv = naive_by_term.get(term)
+                nv = published_naive.get(
+                    f"{dataset}/t{term}", {}).get("mase_gluonts_real")
                 if nv is None:
                     naive_missing[model].append(f"{dataset}/t{term}")
-                mismatch = legacy_suffix and not naive_faithful.get(term, False)
                 # Degenerate: model or naive MASE is astronomically large, i.e. the
                 # per-instance seasonal error hit its 1e-9 floor (near-constant /
                 # intermittent series). These cancel in the ratio but wreck raw
                 # geomean/mean — flag so they can be excluded from the diagnosis.
                 degen = mv > degen_mase or (nv is not None and nv > degen_mase)
-                rows[model].append((dataset, term, mv, nv, mismatch, degen))
+                rows[model].append((dataset, term, mv, nv, degen))
 
     if not rows:
         raise SystemExit(f"No model cells found under {datasets_root} for metric={metric!r}.")
@@ -220,7 +196,7 @@ def collect(run_dir: str, metric: str, window: str,
         # keeps its stale pre-intersection count (cells already dropped here).
         naive_missing.clear()
         for model, cells in rows.items():
-            for ds, tm, _mv, nv, _mm, _dg in cells:
+            for ds, tm, _mv, nv, _dg in cells:
                 if nv is None:
                     naive_missing[model].append(f"{ds}/t{tm}")
         print(f"[--common-cells] intersecting to {len(shared)} cells shared by all "
@@ -240,17 +216,16 @@ def _report(rows, naive_missing, metric, window, prefer_real, degen_mase,
     # G_naive  : geomean of the naive denominator over the normalised cells
     #            (= raw_g/norm_g; a shared constant iff cells match across models)
     print(f"{'model':<20} {'cells':>5} {'raw_g':>8} {'norm_g':>8} {'norm_g*':>8} "
-          f"{'G_naive':>8} {'median':>8} {'degen':>6} {'no_nv':>6} {'seas?':>6}")
+          f"{'G_naive':>8} {'median':>8} {'degen':>6} {'no_nv':>6}")
     print("-" * 100)
 
     for model in sorted(rows):
         cells = rows[model]
-        raw = [mv for _, _, mv, _, _, _ in cells]
-        ratios = [mv / nv for _, _, mv, nv, _, _ in cells if nv]
-        ratios_clean = [mv / nv for _, _, mv, nv, _, dg in cells if nv and not dg]
-        naive_vals = [nv for _, _, _, nv, _, _ in cells if nv]
+        raw = [mv for _, _, mv, _, _ in cells]
+        ratios = [mv / nv for _, _, mv, nv, _ in cells if nv]
+        ratios_clean = [mv / nv for _, _, mv, nv, dg in cells if nv and not dg]
+        naive_vals = [nv for _, _, _, nv, _ in cells if nv]
         n_degen = sum(1 for *_, dg in cells if dg)
-        n_mismatch = sum(1 for _, _, _, nv, mm, _ in cells if nv and mm)
         srt = sorted(raw)
         median = srt[len(srt) // 2] if srt else float("nan")
         raw_g = _geomean(raw)
@@ -259,7 +234,7 @@ def _report(rows, naive_missing, metric, window, prefer_real, degen_mase,
         g_naive = _geomean(naive_vals)
         print(f"{model:<20} {len(cells):>5} {raw_g:>8.4f} {norm_g:>8.4f} "
               f"{norm_g_clean:>8.4f} {g_naive:>8.4f} {median:>8.4f} "
-              f"{n_degen:>6} {len(naive_missing.get(model, [])):>6} {n_mismatch:>6}")
+              f"{n_degen:>6} {len(naive_missing.get(model, [])):>6}")
 
     print("-" * 100)
     print("norm_g  = LEADERBOARD value: exp(mean(log( MASE_model / MASE_seasonalnaive )))")
@@ -276,7 +251,7 @@ def _report(rows, naive_missing, metric, window, prefer_real, degen_mase,
     if breakdown > 0:
         for model in sorted(rows):
             scored = sorted(
-                ((c[0], c[1], c[2], c[3], c[2] / c[3], c[5])
+                ((c[0], c[1], c[2], c[3], c[2] / c[3], c[4])
                  for c in rows[model] if c[3]),
                 key=lambda t: t[4])
             if not scored:
@@ -301,17 +276,12 @@ def _report(rows, naive_missing, metric, window, prefer_real, degen_mase,
 
     # --- coverage / caveat detail -----------------------------------------
     any_missing = any(naive_missing.values())
-    any_mismatch = any(mm for cells in rows.values() for *_, mm, _ in cells)
     if any_missing:
         print("!! Cells with NO naive baseline (excluded from norm_g):")
         for model, miss in naive_missing.items():
             if miss:
                 shown = ", ".join(miss[:8]) + (" ..." if len(miss) > 8 else "")
                 print(f"   {model}: {len(miss)} cells -> {shown}")
-        print()
-    if any_mismatch:
-        print("!! 'seas?' counts D/W/S cells whose Seasonal-Naive cache is LEGACY")
-        print("   (no _gluonts_naive_faithful sentinel). Re-run stage 3 (--force 3).")
         print()
     print("Reminder: norm_g matches the board ONLY over the board's exact 97 configs.")
     print("If G_naive differs across models, their cell sets differ — use --common-cells")
@@ -324,8 +294,11 @@ def parse_args():
     p.add_argument("--run-dir", default="logs/experiments/window_ablation_gifteval/general",
                    help="Folder containing datasets/ (the shared 'general' ablation tree).")
     p.add_argument("--metric", default="mase_gluonts",
-                   choices=["mase_gluonts", "mase_gluonts_real", "mase"],
-                   help="Metric column to aggregate (default: mase_gluonts).")
+                   choices=["mase_gluonts", "mase_gluonts_real"],
+                   help="GluonTS MASE column to aggregate (default: "
+                        "mase_gluonts). The legacy project MASE is intentionally "
+                        "excluded because it is incompatible with the published "
+                        "GIFT-Eval denominator.")
     p.add_argument("--window", default="full",
                    help="Per-cell window: 'full' (max, default), 'best' (argmin), or an int.")
     p.add_argument("--models", nargs="+", default=None,

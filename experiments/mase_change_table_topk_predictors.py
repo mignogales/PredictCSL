@@ -743,15 +743,9 @@ def run_one_variant(variant: str, args: argparse.Namespace,
     if args.models:
         model_shorts = [m for m in model_shorts if m in set(args.models)]
 
-    # Seasonal-naive denominators are predictor-independent, so a variant tree
-    # missing its own naive_baselines.json falls back to the base general tree.
+    # Seasonal-naive denominators come directly from the published GIFT-Eval CSV;
+    # ``run_dir`` is accepted by the shared loader only for API compatibility.
     naive_baselines = _load_naive_baselines(run_dir)
-    if not naive_baselines:
-        base_general = os.path.join(args.ablation_root, "general")
-        naive_baselines = _load_naive_baselines(base_general)
-        if naive_baselines:
-            print(Fore.YELLOW + f"  Using naive baselines from {base_general} "
-                  "(variant tree had none)." + Fore.RESET)
 
     ge_cache: Dict[Tuple[str, str], Optional[GiftEvalCache]] = {}
     all_records: List[dict] = []

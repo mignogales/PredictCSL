@@ -105,6 +105,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from colorama import Fore
+from experiments.gifteval_reference import (
+    NORMALIZATION_REFERENCE, published_naive_by_display,
+)
 
 CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
 FULL_NATIVE_WINDOW = "full_native"
@@ -647,18 +650,14 @@ def _load_variant_pred_mean(
 
 
 def _load_naive_baselines(run_dir: str) -> Dict[str, dict]:
-    """Per-(dataset, term) seasonal-naive baseline metrics that stage 3 writes to
-    ``run_dir/naive_baselines.json`` (keyed ``'<dataset_display>/t<term>'``). These
-    are the denominators for the leaderboard-style normalised MASE. Empty dict if
-    the file is absent (older runs) — callers then leave ``naive_mase`` NaN."""
-    path = os.path.join(run_dir, "naive_baselines.json")
-    if not os.path.isfile(path):
-        return {}
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    """Published per-config Seasonal Naive MASE denominators.
+
+    ``run_dir`` is retained for API compatibility with downstream scripts. Old
+    ``naive_baselines.json`` files are deliberately ignored: the shipped
+    GIFT-Eval CSV is the only normalization source.
+    """
+    del run_dir
+    return published_naive_by_display()
 
 
 def load_strategy_records(
@@ -834,10 +833,8 @@ def load_strategy_records(
                     full_native_width_groups = float(
                         full_native_metrics.get("_n_width_groups", float("nan")))
 
-            # Seasonal-naive denominator for this cell (leaderboard-style
-            # normalisation: MASE_strategy / MASE_seasonalnaive). NaN when the
-            # baseline is missing (older runs) so the row drops out of the
-            # normalised aggregate but stays in the absolute one.
+            # Published Seasonal Naive denominator for this official GiftEval
+            # config. The local/reconstructed baseline is intentionally unused.
             naive_mase = float(
                 naive_baselines.get(f"{dataset_display}/t{term}", {})
                 .get(_naive_field, float("nan")))
@@ -1114,7 +1111,7 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
             "cell_weighting": "unweighted",
             "missing_values": "drop",
             "zero_handling": "exact_zero",
-            "reference": "sanity_gifteval_leaderboard.py",
+            "reference": NORMALIZATION_REFERENCE,
         }
     }
 
@@ -2807,7 +2804,7 @@ def plot_mase_change_table(rollup: pd.DataFrame, out_dir: str,
 
     # The leaderboard-normalised (÷ seasonal-naive) twin columns are shown only
     # when a baseline was available (non-NaN norm), so runs without
-    # naive_baselines.json keep the plain absolute-MASE table.
+    # a published Seasonal Naive row keep the plain absolute-MASE table.
     has_norm = ("geomean_full_mase_norm" in r.columns
                 and r["geomean_full_mase_norm"].notna().any())
 
@@ -3415,8 +3412,8 @@ def main() -> None:
                   f"  <- leaderboard aggregation (÷ seasonal-naive, "
                   f"n={full_s.get('n_norm', 0)})")
         else:
-            print(Fore.YELLOW + "  NORMALISED geomean: no naive baseline found — "
-                  "re-run stage 3 (or --force 3) to write naive_baselines.json"
+            print(Fore.YELLOW + "  NORMALISED geomean: no published Seasonal "
+                  "Naive row found for the selected configs"
                   + Fore.RESET)
 
         if "speedup_pred_vs_full" in stats:

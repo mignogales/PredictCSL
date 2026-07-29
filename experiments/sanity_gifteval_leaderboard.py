@@ -76,6 +76,8 @@ import numbers
 import os
 from typing import Callable, List, Optional, Tuple, TypeVar
 
+from experiments.gifteval_reference import published_seasonal_naive_mase
+
 try:
     from dotenv import load_dotenv
 
@@ -240,7 +242,6 @@ REFERENCE_CSVS = {
     "autogluon/chronos-2": "chronos-2_all_results.csv",  # same weights
     "autogluon/chronos-2-synth": "chronos-2-synth_all_results.csv",
 }
-SEASONAL_NAIVE_CSV = "seasonal_naive_all_results.csv"
 
 # CLI shorthand -> HF id of the official submission.
 MODEL_ALIASES = {
@@ -832,7 +833,7 @@ def compare_and_report(ours: dict, model_name: str, out_dir: str) -> None:
     ``comparison.csv``."""
     pd = _require_pandas("compare against leaderboard reference CSVs")
 
-    sn = _load_reference_mase(SEASONAL_NAIVE_CSV)
+    sn = published_seasonal_naive_mase()
     ref_csv = REFERENCE_CSVS.get(model_name)
     ref = _load_reference_mase(ref_csv) if ref_csv else {}
     if not ref:
