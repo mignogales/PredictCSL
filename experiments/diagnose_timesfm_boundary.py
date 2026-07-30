@@ -21,11 +21,41 @@ import time
 from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
 
 from experiments.timesfm_gifteval import forecast_quantiles, load_model
 
 
 MODEL_ID = "google/timesfm-2.5-200m-pytorch"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# Match the main GiftEval experiment entry points: their dataset location is
+# normally supplied by the repository .env file rather than an exported shell
+# variable.
+load_dotenv(PROJECT_ROOT / ".env")
+
+
+def _resolve_gift_eval_root(explicit: str | None) -> tuple[Path | None, list[Path]]:
+    """Find the existing GiftEval root used by the main experiment scripts."""
+    raw_candidates = [
+        explicit,
+        os.environ.get("GIFT_EVAL"),
+        PROJECT_ROOT / "GiftEval",
+        PROJECT_ROOT / "data" / "GiftEval",
+        PROJECT_ROOT.parent / "GiftEval",
+        PROJECT_ROOT.parent / "data" / "GiftEval",
+    ]
+    candidates: list[Path] = []
+    for raw in raw_candidates:
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser().resolve()
+        if candidate in candidates:
+            continue
+        candidates.append(candidate)
+        if (candidate / "electricity" / "15T").is_dir():
+            return candidate, candidates
+    return None, candidates
 
 
 def _parse_indices(value: str) -> list[int]:
@@ -108,8 +138,9 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--gift-eval", default=os.environ.get("GIFT_EVAL"),
-        help="GiftEval root containing electricity/15T")
+        "--gift-eval",
+        help=("GiftEval root containing electricity/15T; defaults to GIFT_EVAL "
+              "from the repository .env, then common project data locations"))
     parser.add_argument(
         "--checkpoint", default=(os.environ.get("TIMESFM_2P5_CHECKPOINT")
                                   or os.environ.get("TIMESFM_CHECKPOINT")),
@@ -130,9 +161,12 @@ def main() -> None:
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
 
-    if not args.gift_eval:
-        parser.error("--gift-eval or GIFT_EVAL is required")
-    os.environ["GIFT_EVAL"] = str(args.gift_eval)
+    gift_eval_root, searched = _resolve_gift_eval_root(args.gift_eval)
+    if gift_eval_root is None:
+        parser.error(
+            "could not find GiftEval electricity/15T data. Checked: "
+            + ", ".join(map(str, searched)))
+    os.environ["GIFT_EVAL"] = str(gift_eval_root)
     if args.checkpoint:
         os.environ["TIMESFM_2P5_CHECKPOINT"] = str(args.checkpoint)
 
