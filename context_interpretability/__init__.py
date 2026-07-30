@@ -6,7 +6,7 @@ forecast-relevant causal influence (predictive redundancy), while the model
 retains the ability to use distant observations when they carry additional
 predictive information.
 
-Six experiments share one config interface, one tabular results schema and one
+Nine experiments share one config interface, one tabular results schema and one
 figure pipeline:
 
   exp0  attention_masking      — the EXISTING attention-span restriction
@@ -22,6 +22,12 @@ figure pipeline:
                                  where ignoring far context WOULD be a mistake.
   exp5  integrated_gradients   — corroborative gradient sensitivity (not causal
                                  evidence on its own).
+  exp6  predictor contrast IG  — explains E_hat(long)-E_hat(short) from one
+                                 fixed-width predictor input.
+  exp7  context decomposition  — separates the masking/slicing gap into a
+                                 normalization proxy and position/width residual.
+  exp8  TSFM contrast saliency — signed IG for realised
+                                 loss(long context)-loss(short context).
 
 Entry point (SERVER — nothing runs locally, see the repo CLAUDE.md):
 

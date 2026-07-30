@@ -45,6 +45,11 @@ experiments:                # which experiments run by default
   exp3_forecast_lens: true
   exp4_synthetic_controls: true
   exp5_integrated_gradients: true
+  # These additions require either a trained predictor checkpoint (exp6) or
+  # several extra TSFM forwards (exp7), so opt in explicitly for existing runs.
+  exp6_predictor_contrast_saliency: false
+  exp7_context_decomposition: false
+  exp8_tsfm_contrast_saliency: false
 
 perturbation:               # Experiment 1 (spec §4)
   methods: [block_mean, permutation, matched_block, noise]
@@ -77,12 +82,54 @@ forecast_lens:              # Experiment 3 (spec §6)
 
 integrated_gradients:       # Experiment 5 (spec §8)
   steps: 64
+  batch_size: 16
   convergence_steps: [16, 32, 64]
   internal_batch_size: 8
   baselines: [context_mean, zero_after_norm, random_sample]
   n_random_baselines: 3
   target: mean_forecast     # mean_forecast | horizon_step:<h> | loss
   supplementary_loss_target: true
+
+# Experiment 6: explain why the learned predictor prefers one curve point over
+# another. The default checkpoint path is
+# logs/experiments/context_length_predictor/<model display>/; override it for
+# v3/v4 or classification predictors. ``predictor_dir`` may also be a mapping
+# keyed by model display or family.
+predictor_contrast_saliency:
+  predictor_dir: null
+  predictor_root: logs/experiments/context_length_predictor
+  # With null endpoints, use the smallest/largest checkpoint window. A list of
+  # explicit [short, long] pairs takes precedence.
+  short_window: null
+  long_window: null
+  window_pairs: null
+  steps: 64
+  baselines: [zero, random_sample]
+  n_random_baselines: 3
+  max_blocks: 64
+
+# Experiment 7: masking/slicing decomposition. By default only the largest W is
+# used, avoiding an O(K^2) sweep. ``all_full_contexts: true`` enables every
+# nested W; ``full_contexts``/``visible_lengths`` can select exact grid points.
+context_decomposition:
+  metrics: [mae, mse]
+  all_full_contexts: false
+  full_contexts: null
+  visible_lengths: null
+
+# Experiment 8: direct TSFM saliency for realised forecast-loss contrast.
+# The long input is the common differentiable variable; the short branch sees
+# its suffix. Currently capability-gated to PatchTST-FM, the only adapter with a
+# differentiable forecasting wrapper.
+tsfm_contrast_saliency:
+  metrics: [mae, mse]
+  short_window: null
+  long_window: null
+  window_pairs: null
+  steps: 64
+  batch_size: 8
+  baselines: [context_mean, random_sample]
+  n_random_baselines: 3
 
 synthetic_controls:         # Experiment 4 (spec §7)
   n_instances: 128

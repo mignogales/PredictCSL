@@ -9,7 +9,8 @@ import numpy as np
 
 from context_interpretability.experiments import (
     activation_patching, attention_masking, forecast_lens,
-    integrated_gradients, synthetic_controls)
+    integrated_gradients, synthetic_controls, context_decomposition,
+    predictor_contrast_saliency, tsfm_contrast_saliency)
 from context_interpretability.schema import load_results
 from context_interpretability.tests.dummy_adapter import (
     DummyAdapter, make_config, make_data)
@@ -112,6 +113,146 @@ class TestIntegratedGradientsExp5(unittest.TestCase):
                                                "done.json")))
             self.assertIn("convergence", done)
             self.assertIn("limitations", done)
+
+
+class TestPredictorContrastSaliencyExp6(unittest.TestCase):
+    @staticmethod
+    def _checkpoint(path):
+        import torch
+        from experiments.predict_context_length import build_predictor
+
+        cfg = {
+            "arch": "patchtst", "context_length": 64,
+            "patch_length": 8, "d_model": 16,
+            "num_hidden_layers": 1, "num_attention_heads": 4,
+            "dropout": 0.0, "mask_ratio": 0.0,
+            "n_windows": 3, "window_grid": [16, 32, 64],
+            "n_horizons": 1, "horizon_grid": [8],
+            "training_objective": "curve", "curve_metric": "mae",
+        }
+        model = build_predictor(cfg, 3, 1)
+        os.makedirs(path, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(path, "best_model.pt"))
+        with open(os.path.join(path, "best_config.json"), "w") as f:
+            json.dump(cfg, f)
+
+    def test_curve_coordinates_share_one_fixed_input(self):
+        import torch
+        from experiments.predict_context_length import build_predictor
+
+        cfg = {
+            "arch": "patchtst", "context_length": 64,
+            "patch_length": 8, "d_model": 16,
+            "num_hidden_layers": 1, "num_attention_heads": 4,
+            "dropout": 0.0, "mask_ratio": 0.0,
+        }
+        model = build_predictor(cfg, 3, 1).eval()
+        x = torch.randn(2, 64)
+        h = torch.zeros(2, dtype=torch.long)
+        curve = model(x.unsqueeze(-1), h)[0]
+        contrast = predictor_contrast_saliency.contrast_target(
+            model, x, h, 0, 2)
+        self.assertEqual(tuple(x.shape), (2, 64))
+        torch.testing.assert_close(contrast, curve[:, 2] - curve[:, 0])
+
+    def test_end_to_end_checkpoint_saliency(self):
+        adapter = DummyAdapter()
+        data = make_data()
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = os.path.join(tmp, "predictor")
+            self._checkpoint(checkpoint)
+            cfg = make_config(tmp)
+            cfg["predictor_contrast_saliency"].update({
+                "predictor_dir": checkpoint,
+                "window_pairs": [[16, 64]],
+                "steps": 8,
+                "baselines": ["zero"],
+            })
+            out = os.path.join(tmp, "exp6")
+            predictor_contrast_saliency.run(
+                adapter, data, cfg, out, seed=0)
+            df = load_results(out)
+            self.assertFalse(df.empty)
+            self.assertTrue(
+                (df["method"] == "predictor_contrast_saliency").all())
+            self.assertTrue(np.isfinite(df["attribution_score"]).all())
+            cell = os.path.join(out, "dummy", "h8_L16_to_L64")
+            with np.load(os.path.join(cell, "attr_zero.npz")) as z:
+                self.assertEqual(z["attributions"].shape, (data.n, 64))
+                self.assertTrue(np.isfinite(z["completeness_err"]).all())
+            with open(os.path.join(cell, "done.json")) as f:
+                done = json.load(f)
+            self.assertEqual(done["contrast_semantics"],
+                             "predicted_z_error(long)-predicted_z_error(short)")
+
+
+class TestContextDecompositionExp7(unittest.TestCase):
+    def test_tail_stat_prefix_preserves_visible_tail_and_stats(self):
+        rng = np.random.default_rng(4)
+        x = rng.normal(size=(4, 64)).astype(np.float32)
+        matched = context_decomposition.tail_stat_matched_prefix(x, 32)
+        np.testing.assert_array_equal(matched[:, -32:], x[:, -32:])
+        np.testing.assert_allclose(matched.mean(axis=1),
+                                   x[:, -32:].mean(axis=1), atol=1e-6)
+        np.testing.assert_allclose(matched.std(axis=1),
+                                   x[:, -32:].std(axis=1), atol=1e-6)
+
+    def test_end_to_end_mae_mse_differences(self):
+        adapter = DummyAdapter()
+        data = make_data()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "exp7")
+            context_decomposition.run(
+                adapter, data, make_config(tmp), out, seed=0)
+            df = load_results(out)
+            self.assertFalse(df.empty)
+            self.assertEqual(set(df["metric"]), {"mae", "mse"})
+            self.assertEqual(set(df["perturbation_type"]), {
+                context_decomposition.VARIANT_FULL,
+                context_decomposition.VARIANT_TAIL,
+            })
+            np.testing.assert_allclose(
+                df["loss_delta"],
+                df["intervened_loss"] - df["clean_loss"], atol=1e-7)
+            cell = os.path.join(out, "dummy", "w64")
+            self.assertTrue(os.path.isfile(
+                os.path.join(cell, "predictions_L16.npz")))
+
+
+class TestTSFMLossContrastSaliencyExp8(unittest.TestCase):
+    def test_target_is_long_loss_minus_short_loss(self):
+        import torch
+
+        adapter = DummyAdapter(linear=True)
+        data = make_data(n=3)
+        x = torch.from_numpy(data.window(64)).requires_grad_(True)
+        y = torch.from_numpy(data.targets)
+        contrast, long_loss, short_loss = (
+            tsfm_contrast_saliency.loss_contrast(
+                adapter, x, y, short_length=16, metric="mse"))
+        torch.testing.assert_close(contrast, long_loss - short_loss)
+        self.assertEqual(tuple(contrast.shape), (3,))
+        self.assertIsNotNone(contrast.grad_fn)
+
+    def test_end_to_end_tsfm_saliency(self):
+        adapter = DummyAdapter()
+        data = make_data()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "exp8")
+            tsfm_contrast_saliency.run(
+                adapter, data, make_config(tmp), out, seed=0)
+            df = load_results(out)
+            self.assertFalse(df.empty)
+            self.assertEqual(set(df["metric"]), {"mae", "mse"})
+            self.assertTrue(
+                (df["method"] == "tsfm_loss_contrast_saliency").all())
+            np.testing.assert_allclose(
+                df["loss_delta"],
+                df["intervened_loss"] - df["clean_loss"], atol=1e-6)
+            cell = os.path.join(out, "dummy", "mae_L16_to_L64")
+            with np.load(os.path.join(cell, "attr_context_mean.npz")) as z:
+                self.assertEqual(z["attributions"].shape, (data.n, 64))
+                self.assertTrue(np.isfinite(z["completeness_err"]).all())
 
 
 class TestSyntheticControlsExp4(unittest.TestCase):

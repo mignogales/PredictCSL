@@ -221,6 +221,24 @@ def make_config(tmp_root: str) -> dict:
             "target": "mean_forecast",
             "supplementary_loss_target": True,
         },
+        "predictor_contrast_saliency": {
+            "predictor_dir": None, "steps": 8,
+            "batch_size": 3,
+            "baselines": ["zero"], "n_random_baselines": 1,
+            "max_blocks": 64,
+        },
+        "context_decomposition": {
+            "metrics": ["mae", "mse"],
+            "all_full_contexts": False,
+            "full_contexts": None, "visible_lengths": None,
+        },
+        "tsfm_contrast_saliency": {
+            "metrics": ["mae", "mse"],
+            "window_pairs": [[16, 64]],
+            "steps": 8, "batch_size": 3,
+            "baselines": ["context_mean"],
+            "n_random_baselines": 1,
+        },
         "synthetic_controls": {
             "n_instances": 12,
             "series_length": 64,

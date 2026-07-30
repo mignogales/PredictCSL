@@ -46,6 +46,10 @@ EXPERIMENTS = {
     "exp3": ("exp3_forecast_lens", "forecast_lens"),
     "exp4": ("exp4_synthetic_controls", "synthetic_controls"),
     "exp5": ("exp5_integrated_gradients", "integrated_gradients"),
+    "exp6": ("exp6_predictor_contrast_saliency",
+             "predictor_contrast_saliency"),
+    "exp7": ("exp7_context_decomposition", "context_decomposition"),
+    "exp8": ("exp8_tsfm_contrast_saliency", "tsfm_contrast_saliency"),
 }
 
 # capability gate per experiment (None -> any forecaster; exp4 gates its
@@ -57,6 +61,11 @@ CAPABILITY_GATE = {
     "exp3": "forecast_lens",
     "exp4": None,
     "exp5": "integrated_gradients",
+    # exp6 differentiates the separate context-length predictor checkpoint;
+    # it does not require a differentiable TSFM adapter.
+    "exp6": None,
+    "exp7": "attention_masking",
+    "exp8": "integrated_gradients",
 }
 
 
@@ -108,7 +117,7 @@ def _load_datasets(config: dict, adapter) -> List:
 
 
 def run_model(display: str, exps: List[str], config: dict, device: str,
-              analyze_only: bool) -> None:
+              analyze_only: bool, force_selected: bool = False) -> None:
     from context_interpretability.adapters.registry import build_adapter
     from context_interpretability.analysis import figures, hypotheses
     from context_interpretability.analysis.significance import save_significance
@@ -137,7 +146,8 @@ def run_model(display: str, exps: List[str], config: dict, device: str,
             meta.note("effective_context_lengths", {
                 str(r): e for r, e in adapter.effective_context_lengths(
                     config["context_lengths"])})
-            _run_experiments(adapter, exps, config, run_dir, meta, seed)
+            _run_experiments(adapter, exps, config, run_dir, meta, seed,
+                             force_selected=force_selected)
         finally:
             meta.finalize()
             adapter.close()
@@ -158,14 +168,18 @@ def run_model(display: str, exps: List[str], config: dict, device: str,
 
 
 def _run_experiments(adapter, exps: List[str], config: dict, run_dir: str,
-                     meta: RunMeta, seed: int) -> None:
+                     meta: RunMeta, seed: int,
+                     force_selected: bool = False) -> None:
     import importlib
 
     enabled = config.get("experiments") or {}
     datasets = None
     for key in exps:
         subdir, modname = EXPERIMENTS[key]
-        if not enabled.get(subdir, True):
+        # An explicit CLI selection is an opt-in and overrides a conservative
+        # config default of false (used by expensive/new experiments). With no
+        # --experiments argument, the config remains authoritative.
+        if not force_selected and not enabled.get(subdir, True):
             meta.skip(subdir, "disabled in config")
             continue
         gate = CAPABILITY_GATE[key]
@@ -202,9 +216,10 @@ def main() -> None:
     ap.add_argument("--config", default=default_cfg)
     ap.add_argument("--models", nargs="+", required=True,
                     help="model display names (experiments/models_config.py)")
-    ap.add_argument("--experiments", nargs="+", default=list(EXPERIMENTS),
+    ap.add_argument("--experiments", nargs="+", default=None,
                     choices=list(EXPERIMENTS), metavar="expK",
-                    help=f"subset of {list(EXPERIMENTS)}")
+                    help=(f"subset of {list(EXPERIMENTS)}; an explicit subset "
+                          "overrides per-experiment enabled:false settings"))
     ap.add_argument("--source", choices=["synthetic", "gifteval"], default=None,
                     help="override datasets.source")
     ap.add_argument("--horizon", type=int, default=None)
@@ -234,11 +249,13 @@ def main() -> None:
             device = "cpu"
 
     failed = []
+    selected_experiments = args.experiments or list(EXPERIMENTS)
+    explicitly_selected = args.experiments is not None
     for display in args.models:
-        print(f"\n=== {display} ({', '.join(args.experiments)}) ===")
+        print(f"\n=== {display} ({', '.join(selected_experiments)}) ===")
         try:
-            run_model(display, args.experiments, config, device,
-                      args.analyze_only)
+            run_model(display, selected_experiments, config, device,
+                      args.analyze_only, force_selected=explicitly_selected)
         except Exception as exc:  # noqa: BLE001 — isolate models
             failed.append((display, repr(exc)))
             traceback.print_exc()

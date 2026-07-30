@@ -186,7 +186,7 @@ predictor-derived, so no TSFM re-inference):
 
 **Interpretability framework (`context_interpretability/`, top-level package):**
 Tests whether observations beyond the sufficient context are causally inert
-(predictive redundancy) vs architecturally unreachable. Six experiments behind
+(predictive redundancy) vs architecturally unreachable. Nine experiments behind
 one config (`configs/experiments.yaml`), one tabular schema (`schema.py`) and
 one figure/hypothesis pipeline (`analysis/`): **exp0** = the EXISTING attention
 masking (`experiments/context_attention_mask.py`, mechanism untouched — only
@@ -195,13 +195,23 @@ principal causal evidence: mean/permute/matched/noise), **exp2** activation
 patching (recovery scores per layer×block), **exp3** frozen-head forecast lens
 (identity-skip of deeper residual blocks), **exp4** synthetic distant-dependency
 controls (MANDATORY; ridge oracles verify lag-d is genuinely predictive before
-any model conclusion), **exp5** integrated gradients (corroborative only).
+any model conclusion), **exp5** integrated gradients (corroborative only),
+**exp6** context-predictor contrast saliency for
+`E_hat(long)-E_hat(short)` (one fixed predictor input; the two lengths select
+output-curve coordinates), and **exp7** masking/slicing decomposition with a
+tail-stat-matched hidden prefix to estimate normalization effects and paired
+MAE/MSE difference plots, and **exp8** direct TSFM loss-contrast saliency for
+`loss(f(long), y)-loss(f(short), y)`. Exp6 supports PatchTST and
+bidirectional-Mamba predictor checkpoints; exp7 capability-gates on attention
+masking; exp8 capability-gates on a differentiable TSFM forecast (currently
+PatchTST-FM only). Full details and commands are in
+`context_interpretability/README.md`.
 Model access goes through `adapters/` (capability flags in
 `configs/models/capabilities.yaml`; unsupported methods are skipped + logged in
 `run_meta.json`, never approximated); the TSFM adapter reuses `setup_model` /
 `_forecast_uniform` / `context_attention_mask` verbatim. Entry point (SERVER):
 `python -m context_interpretability.run_experiment --models <display> \
-[--experiments exp0..exp5] [--source synthetic|gifteval] [--analyze-only]`.
+[--experiments exp0..exp8] [--source synthetic|gifteval] [--analyze-only]`.
 Cross-environment entry point (SERVER, launch from `predictcsl-main`):
 `python -m context_interpretability.master_run`; it partitions the run-set by
 the main/legacy/Toto/TiRex env mapping, fills the shared resumable output tree,

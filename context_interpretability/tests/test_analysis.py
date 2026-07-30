@@ -13,7 +13,8 @@ from context_interpretability.analysis import aggregate as agg
 from context_interpretability.analysis import figures, hypotheses
 from context_interpretability.analysis.significance import significance_table
 from context_interpretability.experiments import (
-    attention_masking, forecast_lens, integrated_gradients, perturbation)
+    attention_masking, forecast_lens, integrated_gradients, perturbation,
+    context_decomposition, tsfm_contrast_saliency)
 from context_interpretability.schema import load_results
 from context_interpretability.tests.dummy_adapter import (
     DummyAdapter, make_config, make_data)
@@ -35,6 +36,12 @@ def _build_run(tmp: str) -> str:
     integrated_gradients.run(
         adapter, data, cfg,
         os.path.join(run_dir, "exp5_integrated_gradients"), seed=0)
+    context_decomposition.run(
+        adapter, data, cfg,
+        os.path.join(run_dir, "exp7_context_decomposition"), seed=0)
+    tsfm_contrast_saliency.run(
+        adapter, data, cfg,
+        os.path.join(run_dir, "exp8_tsfm_contrast_saliency"), seed=0)
     return run_dir
 
 
@@ -173,6 +180,9 @@ class TestAnalysis(unittest.TestCase):
         self.assertTrue(any(n.startswith("05_lens") for n in names))
         self.assertTrue(any(n.startswith("06_ig") for n in names))
         self.assertTrue(any(n.startswith("09_cross_method") for n in names))
+        self.assertIn("12_context_decomposition_mae.png", names)
+        self.assertIn("12_context_decomposition_mse.png", names)
+        self.assertIn("13_tsfm_loss_contrast_saliency.png", names)
 
     def test_cross_model_masking_figure(self):
         root = os.path.dirname(self.run_dir)

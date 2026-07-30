@@ -2283,6 +2283,7 @@ def _moirai_max_context(horizon: int) -> int:
 
 def _full_native_context_cap(model_family: str, horizon: int, max_available: int) -> int:
     caps = {
+        "chronos2": models_config.context_limit("chronos2"),
         "chronos_bolt": 2048,
         "timesfm": TIMESFM_FULL_CONTEXT,
         "patchtst_fm": 8192,
@@ -2312,6 +2313,155 @@ def _inference_recipe_current(metrics: dict, model_family: str) -> bool:
     """Whether a cached forecast was produced by the active model recipe."""
     expected = inference_recipe(model_family)
     return expected is None or metrics.get("_inference_recipe") == expected
+
+
+def _full_native_reusable_grid_cap(
+    cache: GiftEvalCache,
+    model_family: str,
+    horizon: int,
+    window_sizes,
+) -> Optional[int]:
+    """Return the native cap when its grid cell is exactly the same workload.
+
+    Merely having the numeric cap in the grid is not sufficient: full-native
+    always serves every instance with ``min(context_length, cap)`` history,
+    whereas a skip-mode grid cell omits instances shorter than the window (and
+    pad mode may bucket them to smaller grid widths).  The two cells are
+    interchangeable only when every instance has at least ``cap`` observations.
+    """
+    cap = _full_native_context_cap(model_family, horizon, cache.max_context)
+    if int(cap) not in {int(window) for window in window_sizes}:
+        return None
+    if not bool(np.all(cache.context_lengths >= int(cap))):
+        return None
+    return int(cap)
+
+
+def _reuse_grid_cell_as_full_native(
+    cache: GiftEvalCache,
+    dataset_display: str,
+    term: str,
+    model_family: str,
+    model_short: str,
+    cap: int,
+    short_mode: str,
+) -> bool:
+    """Materialize ``wfull_native`` from an equivalent numeric grid cache.
+
+    Returns False when the grid result or its per-sample payload is unavailable
+    or stale, allowing the caller to fall back to a real full-native forecast.
+    The single measured grid runtime is retained because no second inference is
+    performed.
+    """
+    grid_metrics = _load_cached_result_for_family(
+        dataset_display, model_short, term, int(cap), model_family)
+    if grid_metrics is None:
+        return False
+    if not _backfill_served_index(
+            dataset_display, model_short, term, int(cap), cache, short_mode):
+        return False
+
+    per_sample_path = os.path.join(
+        _cache_dir(dataset_display, model_short, term, int(cap)),
+        "per_sample_metrics.npz",
+    )
+    if not os.path.isfile(per_sample_path):
+        return False
+    try:
+        with np.load(per_sample_path) as data:
+            per_sample = {key: np.asarray(data[key]) for key in data.files}
+    except (OSError, ValueError):
+        return False
+
+    served = np.asarray(per_sample.get("served_index", []), dtype=np.int64)
+    expected = np.arange(cache.n_total, dtype=np.int64)
+    if not np.array_equal(served, expected):
+        return False
+    per_sample["effective_context"] = np.full(
+        cache.n_total, int(cap), dtype=np.int32)
+
+    metrics = dict(grid_metrics)
+    metrics.update({
+        "_full_native_baseline": True,
+        "_full_native_reused_from_grid": int(cap),
+        "_context_cap": int(cap),
+        "_min_effective_context": int(cap),
+        "_mean_effective_context": float(cap),
+        "_max_effective_context": int(cap),
+        "_n_width_groups": 1,
+    })
+    _save_per_sample_metrics(
+        dataset_display, model_short, term, FULL_NATIVE_WINDOW, per_sample)
+    _save_result(
+        dataset_display, model_short, term, FULL_NATIVE_WINDOW, metrics)
+    print(Fore.GREEN
+          + f"  REUSED  {model_short} | {dataset_display} | t={term} | "
+            f"w={FULL_NATIVE_WINDOW} <- w={cap} "
+            f"(MAE={metrics['mae']:.6f}, no second inference)"
+          + Fore.RESET)
+    return True
+
+
+def _reuse_full_native_cell_as_grid(
+    cache: GiftEvalCache,
+    dataset_display: str,
+    term: str,
+    model_family: str,
+    model_short: str,
+    cap: int,
+) -> bool:
+    """Materialize a missing numeric cap cell from current ``wfull_native``.
+
+    This is the resume-time inverse of ``_reuse_grid_cell_as_full_native``.  It
+    avoids recomputing the grid cap when an earlier run already paid for the
+    equivalent native forecast.
+    """
+    native_metrics = _load_valid_cached_result(
+        dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+    if (native_metrics is None
+            or int(native_metrics.get("_context_cap", -1)) != int(cap)
+            or native_metrics.get("_mase_gluonts_real_standin", False)
+            or native_metrics.get("_mase_gluonts_ver", 0) < MASE_GLUONTS_VER
+            or not _inference_recipe_current(native_metrics, model_family)):
+        return False
+    if not _backfill_served_index(
+            dataset_display, model_short, term, FULL_NATIVE_WINDOW,
+            cache, "pad"):
+        return False
+
+    per_sample_path = os.path.join(
+        _cache_dir(dataset_display, model_short, term, FULL_NATIVE_WINDOW),
+        "per_sample_metrics.npz",
+    )
+    if not os.path.isfile(per_sample_path):
+        return False
+    try:
+        with np.load(per_sample_path) as data:
+            per_sample = {key: np.asarray(data[key]) for key in data.files}
+    except (OSError, ValueError):
+        return False
+    served = np.asarray(per_sample.get("served_index", []), dtype=np.int64)
+    if not np.array_equal(served, np.arange(cache.n_total, dtype=np.int64)):
+        return False
+
+    metrics = dict(native_metrics)
+    for key in (
+        "_full_native_baseline", "_full_native_reused_from_grid",
+        "_context_cap", "_min_effective_context", "_mean_effective_context",
+        "_max_effective_context", "_n_width_groups",
+    ):
+        metrics.pop(key, None)
+    metrics["_grid_reused_from_full_native"] = True
+    per_sample.pop("effective_context", None)
+    _save_per_sample_metrics(
+        dataset_display, model_short, term, int(cap), per_sample)
+    _save_result(dataset_display, model_short, term, int(cap), metrics)
+    print(Fore.GREEN
+          + f"  REUSED  {model_short} | {dataset_display} | t={term} | "
+            f"w={cap} <- w={FULL_NATIVE_WINDOW} "
+            f"(MAE={metrics['mae']:.6f}, no second inference)"
+          + Fore.RESET)
+    return True
 
 
 def _run_full_native_baseline(
@@ -2794,11 +2944,27 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
             naive_bl = naive_baseline_cache[(dataset_display, term)]
             horizon = cache.horizon
 
+            full_native_reuse_cap = None
             if not args.no_cell_cache and not args.no_full_native_baseline:
-                _run_full_native_baseline(
-                    cache, dataset_display, ge_name, term,
-                    model_id, model_family, model_short,
-                    args.batch_size, device, ensure_handle)
+                full_native_reuse_cap = _full_native_reusable_grid_cap(
+                    cache, model_family, horizon, window_sizes)
+                if full_native_reuse_cap is None:
+                    _run_full_native_baseline(
+                        cache, dataset_display, ge_name, term,
+                        model_id, model_family, model_short,
+                        args.batch_size, device, ensure_handle)
+                else:
+                    if _load_cached_result_for_family(
+                            dataset_display, model_short, term,
+                            full_native_reuse_cap, model_family) is None:
+                        _reuse_full_native_cell_as_grid(
+                            cache, dataset_display, term, model_family,
+                            model_short, full_native_reuse_cap)
+                    print(Fore.CYAN
+                          + f"  DEFER   {model_short} | {dataset_display} | "
+                            f"t={term} | w={FULL_NATIVE_WINDOW}: native cap "
+                            f"{full_native_reuse_cap} is an equivalent grid cell"
+                          + Fore.RESET)
 
             for window_size in window_sizes:
                 tag = f"{model_short} | {dataset_display} | t={term} | h={horizon} | w={window_size}"
@@ -3052,6 +3218,20 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                 del fr, tgts, all_x_cpu, per_sample
                 if short_mode == "pad":
                     del results
+
+            if full_native_reuse_cap is not None:
+                reused = _reuse_grid_cell_as_full_native(
+                    cache, dataset_display, term, model_family, model_short,
+                    full_native_reuse_cap, short_mode)
+                if not reused:
+                    print(Fore.YELLOW
+                          + f"  Grid w={full_native_reuse_cap} could not supply "
+                            f"{FULL_NATIVE_WINDOW}; running the native baseline."
+                          + Fore.RESET)
+                    _run_full_native_baseline(
+                        cache, dataset_display, ge_name, term,
+                        model_id, model_family, model_short,
+                        args.batch_size, device, ensure_handle)
 
         _handle[0] = None
         if device == "cuda":

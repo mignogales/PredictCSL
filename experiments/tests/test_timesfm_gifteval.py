@@ -24,7 +24,7 @@ class _FakeForecastConfig:
 
 class _FakeTimesFM:
     def __init__(self):
-        self.model = SimpleNamespace(p=32)
+        self.model = SimpleNamespace(p=32, o=128)
         self.compiles = []
         self.inputs = []
 
@@ -40,7 +40,85 @@ class _FakeTimesFM:
         return full[:, :, 0], full
 
 
+class _FakeNonFiniteTimesFM(_FakeTimesFM):
+    def forecast(self, horizon, inputs):
+        mean, full = super().forecast(horizon, inputs)
+        if len(inputs) > 1:
+            full[1, 2, 5] = np.nan
+        return mean, full
+
+
 class TimesFMGiftEvalRecipeTest(unittest.TestCase):
+    def tearDown(self) -> None:
+        timesfm_gifteval._MODEL_CACHE.clear()
+
+    def test_local_checkpoint_uses_from_pretrained(self) -> None:
+        class FakeClass:
+            loaded_from = None
+
+            def load_checkpoint(self, path):
+                raise AssertionError("abstract loader must not be called")
+
+            @classmethod
+            def from_pretrained(cls, path):
+                cls.loaded_from = path
+                return SimpleNamespace(source=path)
+
+        fake_module = ModuleType("timesfm.timesfm_2p5.timesfm_2p5_torch")
+        fake_module.TimesFM_2p5_200M_torch = FakeClass
+        fake_package = ModuleType("timesfm.timesfm_2p5")
+        fake_package.timesfm_2p5_torch = fake_module
+
+        with mock.patch.dict(
+                sys.modules,
+                {
+                    "timesfm.timesfm_2p5": fake_package,
+                    "timesfm.timesfm_2p5.timesfm_2p5_torch": fake_module,
+                }), mock.patch.dict(
+                    os.environ, {"TIMESFM_2P5_CHECKPOINT": "/tmp/checkpoint"}):
+            loaded = timesfm_gifteval.load_model("fake/model")
+
+        self.assertEqual(FakeClass.loaded_from, "/tmp/checkpoint")
+        self.assertEqual(loaded.source, "/tmp/checkpoint")
+
+    def test_local_checkpoint_handles_hub_proxies_incompatibility(self) -> None:
+        loaded = SimpleNamespace(calls=[])
+
+        class FakeClass:
+            WEIGHTS_FILENAME = "weights.safetensors"
+
+            def __init__(self):
+                self.model = SimpleNamespace(
+                    load_checkpoint=lambda path, torch_compile: loaded.calls.append(
+                        (path, torch_compile)))
+                self.torch_compile = True
+
+            def load_checkpoint(self, path):
+                raise AssertionError("abstract loader must not be called")
+
+            @classmethod
+            def from_pretrained(cls, path):
+                raise TypeError("unexpected keyword argument 'proxies'")
+
+        fake_module = ModuleType("timesfm.timesfm_2p5.timesfm_2p5_torch")
+        fake_module.TimesFM_2p5_200M_torch = FakeClass
+        fake_package = ModuleType("timesfm.timesfm_2p5")
+        fake_package.timesfm_2p5_torch = fake_module
+
+        with tempfile.TemporaryDirectory() as checkpoint, mock.patch.dict(
+                sys.modules,
+                {
+                    "timesfm.timesfm_2p5": fake_package,
+                    "timesfm.timesfm_2p5.timesfm_2p5_torch": fake_module,
+                }), mock.patch.dict(
+                    os.environ, {"TIMESFM_2P5_CHECKPOINT": checkpoint}):
+            timesfm_gifteval.load_model("fake/model")
+
+        self.assertEqual(
+            loaded.calls,
+            [(os.path.join(checkpoint, "weights.safetensors"), True)],
+        )
+
     def test_official_batch_compile_and_missing_value_handling(self) -> None:
         fake_timesfm = ModuleType("timesfm")
         fake_timesfm.configs = SimpleNamespace(ForecastConfig=_FakeForecastConfig)
@@ -58,10 +136,49 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
         self.assertEqual(result.shape, (3, 9, 4))
         np.testing.assert_allclose(result[:, 4, :], 5.0)
         self.assertEqual([cfg.max_context for cfg in model.compiles], [64, 32])
+        self.assertEqual([cfg.max_horizon for cfg in model.compiles], [128, 128])
         self.assertEqual(
             [cfg.per_core_batch_size for cfg in model.compiles], [2, 1])
         self.assertTrue(np.isnan(model.inputs[0][1][1]))
         np.testing.assert_array_equal(model.inputs[1][0], np.zeros(2, dtype=np.float32))
+
+    def test_compile_horizon_override(self) -> None:
+        fake_timesfm = ModuleType("timesfm")
+        fake_timesfm.configs = SimpleNamespace(ForecastConfig=_FakeForecastConfig)
+        model = _FakeTimesFM()
+
+        with mock.patch.dict(sys.modules, {"timesfm": fake_timesfm}):
+            timesfm_gifteval.forecast_quantiles(
+                model, [np.arange(15360, dtype=np.float32)],
+                prediction_length=48, batch_size=1, max_horizon=128)
+
+        self.assertEqual(model.compiles[0].max_context, 15360)
+        self.assertEqual(model.compiles[0].max_horizon, 128)
+
+    def test_nonfinite_forecast_reports_batch_and_rows(self) -> None:
+        fake_timesfm = ModuleType("timesfm")
+        fake_timesfm.configs = SimpleNamespace(ForecastConfig=_FakeForecastConfig)
+        model = _FakeNonFiniteTimesFM()
+        contexts = [np.arange(8, dtype=np.float32) for _ in range(3)]
+
+        with mock.patch.dict(sys.modules, {"timesfm": fake_timesfm}):
+            with self.assertRaisesRegex(
+                    FloatingPointError,
+                    r"batch=0 .*call_rows=\[1\] .*batch_rows=\[1\] "
+                    r".*source_rows=\[501\].*compiled_max_horizon=128"):
+                timesfm_gifteval.forecast_quantiles(
+                    model, contexts, prediction_length=4, batch_size=2,
+                    max_horizon=128, forecast_row_indices=[500, 501, 502])
+
+    def test_compile_horizon_must_cover_requested_horizon(self) -> None:
+        fake_timesfm = ModuleType("timesfm")
+        fake_timesfm.configs = SimpleNamespace(ForecastConfig=_FakeForecastConfig)
+
+        with mock.patch.dict(sys.modules, {"timesfm": fake_timesfm}):
+            with self.assertRaisesRegex(ValueError, "must cover"):
+                timesfm_gifteval.forecast_quantiles(
+                    _FakeTimesFM(), [np.arange(8, dtype=np.float32)],
+                    prediction_length=48, max_horizon=32)
 
     def test_old_timesfm_cache_is_rejected(self) -> None:
         for family in (

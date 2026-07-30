@@ -591,6 +591,122 @@ def fig_instance_sufficient_context(clean_cache_dir: str, out_dir: str,
     _save(fig, out_dir, f"10_instance_sufficient_context_{tag}.png")
 
 
+# -- 11. predictor curve-contrast saliency --------------------------------------
+
+def fig_predictor_contrast_saliency(df: pd.DataFrame, out_dir: str) -> None:
+    """Signed block attribution for E_hat(long)-E_hat(short).
+
+    Positive cells push the predictor toward higher long-window error; negative
+    cells push it toward lower long-window error. Rows are lookback distances,
+    columns retain the baseline and window-pair label.
+    """
+    d = df[df["method"] == "predictor_contrast_saliency"]
+    if d.empty:
+        return
+    piv = d.pivot_table(
+        index="lookback_start", columns="perturbation_type",
+        values="attribution_score", aggfunc="mean").sort_index()
+    if piv.empty:
+        return
+    fig, ax = plt.subplots(figsize=(max(8, 1.6 * len(piv.columns)), 6))
+    _heat(
+        ax, piv.T, "predictor-patch lookback (timesteps)",
+        "baseline / curve contrast",
+        "predictor saliency: signed IG for E_hat(long) - E_hat(short)",
+        center_zero=True)
+    _save(fig, out_dir, "11_predictor_contrast_saliency.png")
+
+
+# -- 12. masking/slicing/normalization decomposition -----------------------------
+
+def fig_context_decomposition(df: pd.DataFrame, out_dir: str) -> None:
+    d = df[df["method"] == "context_decomposition"]
+    if d.empty:
+        return
+    full_name = "attention_mask/full_history_stats"
+    tail_name = "attention_mask/tail_matched_stats"
+    for metric in sorted(d["metric"].dropna().unique()):
+        dm = d[d["metric"] == metric]
+        contexts = sorted(int(v) for v in dm["context_length"].unique())
+        colors = _masking_colors(contexts)
+        fig, axes = plt.subplots(1, 3, figsize=(17, 4.8))
+        for W, g in dm.groupby("context_length"):
+            color = colors[int(W)]
+            grouped = g.groupby(
+                ["lookback_start", "perturbation_type"], as_index=False
+            )[["clean_loss", "intervened_loss", "loss_delta"]].mean()
+            sliced = (grouped.groupby("lookback_start")["clean_loss"]
+                      .mean().sort_index())
+            axes[0].plot(sliced.index, sliced.values, "s--", color=color,
+                         label=f"slice, W={int(W)}")
+            deltas = {}
+            for variant, marker, label in [
+                (full_name, "o", "mask/full stats"),
+                (tail_name, "^", "mask/tail stats"),
+            ]:
+                v = grouped[grouped["perturbation_type"] == variant]
+                if v.empty:
+                    continue
+                prof = v.set_index("lookback_start").sort_index()
+                axes[0].plot(
+                    prof.index, prof["intervened_loss"], marker + "-",
+                    color=color, alpha=0.85,
+                    label=f"{label}, W={int(W)}")
+                axes[1].plot(
+                    prof.index, prof["loss_delta"], marker + "-",
+                    color=color, alpha=0.85,
+                    label=f"{label}, W={int(W)}")
+                deltas[variant] = prof["loss_delta"]
+            if full_name in deltas and tail_name in deltas:
+                common = deltas[full_name].index.intersection(
+                    deltas[tail_name].index)
+                norm_component = (
+                    deltas[full_name].loc[common]
+                    - deltas[tail_name].loc[common])
+                axes[2].plot(common, norm_component, "d-", color=color,
+                             label=f"W={int(W)}")
+
+        for ax in axes:
+            ax.set_xscale("log", base=2)
+            ax.set_xlabel("visible suffix L")
+            ax.axhline(0, color="black", lw=0.6, alpha=0.6)
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=6)
+        axes[0].set_ylabel(f"mean {metric.upper()}")
+        axes[0].set_title("absolute forecast error")
+        axes[1].set_ylabel(f"Δ {metric.upper()} vs slicing")
+        axes[1].set_title("masking minus slicing")
+        axes[2].set_ylabel(f"Δ {metric.upper()}")
+        axes[2].set_title("normalization proxy: full-stats mask − tail-stats mask")
+        fig.suptitle(
+            f"Context restriction decomposition — {metric.upper()}",
+            fontsize=13)
+        _save(fig, out_dir, f"12_context_decomposition_{metric}.png",
+              tight_rect=(0, 0, 1, 0.94))
+
+
+# -- 13. direct TSFM loss-contrast saliency -------------------------------------
+
+def fig_tsfm_contrast_saliency(df: pd.DataFrame, out_dir: str) -> None:
+    d = df[df["method"] == "tsfm_loss_contrast_saliency"].copy()
+    if d.empty:
+        return
+    d["contrast"] = d["metric"].astype(str).str.upper() + " | " + \
+        d["perturbation_type"].astype(str)
+    piv = d.pivot_table(
+        index="lookback_start", columns="contrast",
+        values="attribution_score", aggfunc="mean").sort_index()
+    if piv.empty:
+        return
+    fig, ax = plt.subplots(figsize=(max(9, 1.5 * len(piv.columns)), 6))
+    _heat(
+        ax, piv.T, "long-input lookback (timesteps)",
+        "loss / baseline / context pair",
+        "TSFM saliency: signed IG for loss(long) - loss(short)",
+        center_zero=True)
+    _save(fig, out_dir, "13_tsfm_loss_contrast_saliency.png")
+
+
 # -- driver ----------------------------------------------------------------------------
 
 def generate_all(run_dir: str, tolerance: float = 0.05) -> None:
@@ -614,6 +730,9 @@ def generate_all(run_dir: str, tolerance: float = 0.05) -> None:
         fig_patching_heatmaps(df, out_dir)
         fig_lens_heatmaps(df, out_dir)
         fig_cross_method(df, out_dir)
+        fig_predictor_contrast_saliency(df, out_dir)
+        fig_context_decomposition(df, out_dir)
+        fig_tsfm_contrast_saliency(df, out_dir)
     # error curves + instance distributions from every clean cache found
     for dirpath, dirs, _files in os.walk(run_dir):
         for d in dirs:
