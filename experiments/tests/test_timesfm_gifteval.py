@@ -48,6 +48,15 @@ class _FakeNonFiniteTimesFM(_FakeTimesFM):
         return mean, full
 
 
+class _FakeInputValueTimesFM(_FakeTimesFM):
+    def forecast(self, horizon, inputs):
+        self.inputs.append(inputs)
+        full = np.zeros((len(inputs), horizon, 10), dtype=np.float32)
+        for row, values in enumerate(inputs):
+            full[row, :, 1:] = float(values[-1])
+        return full[:, :, 0], full
+
+
 class TimesFMGiftEvalRecipeTest(unittest.TestCase):
     def tearDown(self) -> None:
         timesfm_gifteval._MODEL_CACHE.clear()
@@ -154,6 +163,44 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
 
         self.assertEqual(model.compiles[0].max_context, 15360)
         self.assertEqual(model.compiles[0].max_horizon, 128)
+
+    def test_leading_nan_context_is_stripped_isolated_and_reordered(self) -> None:
+        fake_timesfm = ModuleType("timesfm")
+        fake_timesfm.configs = SimpleNamespace(ForecastConfig=_FakeForecastConfig)
+        model = _FakeInputValueTimesFM()
+        contexts = [
+            np.array([10.0, 11.0], dtype=np.float32),
+            np.array([np.nan, np.nan, 20.0, 21.0], dtype=np.float32),
+            np.array([30.0, 31.0], dtype=np.float32),
+        ]
+
+        with mock.patch.dict(sys.modules, {"timesfm": fake_timesfm}):
+            result = timesfm_gifteval.forecast_quantiles(
+                model, contexts, prediction_length=4, batch_size=3)
+
+        self.assertEqual([len(inputs) for inputs in model.inputs], [2, 1])
+        np.testing.assert_array_equal(
+            model.inputs[1][0], np.array([20.0, 21.0], dtype=np.float32))
+        np.testing.assert_allclose(result[:, 0, 0], [11.0, 21.0, 31.0])
+        self.assertEqual(
+            [cfg.per_core_batch_size for cfg in model.compiles], [2, 1])
+
+    def test_leading_nan_isolation_can_be_disabled_for_diagnosis(self) -> None:
+        fake_timesfm = ModuleType("timesfm")
+        fake_timesfm.configs = SimpleNamespace(ForecastConfig=_FakeForecastConfig)
+        model = _FakeTimesFM()
+        contexts = [
+            np.array([1.0, 2.0], dtype=np.float32),
+            np.array([np.nan, 3.0], dtype=np.float32),
+        ]
+
+        with mock.patch.dict(sys.modules, {"timesfm": fake_timesfm}):
+            timesfm_gifteval.forecast_quantiles(
+                model, contexts, prediction_length=4, batch_size=2,
+                isolate_leading_nans=False)
+
+        self.assertEqual([len(inputs) for inputs in model.inputs], [2])
+        self.assertTrue(np.isnan(model.inputs[0][1][0]))
 
     def test_nonfinite_forecast_reports_batch_and_rows(self) -> None:
         fake_timesfm = ModuleType("timesfm")
