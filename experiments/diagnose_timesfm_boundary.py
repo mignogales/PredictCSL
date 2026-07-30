@@ -12,6 +12,7 @@ TimesFM inference wrapper.  It is also suitable for rerunning on the server:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.metadata
 import itertools
 import json
@@ -106,18 +107,26 @@ def _load_contexts(indices: list[int], term: str, max_width: int
 
 def _run_case(tfm, contexts: list[np.ndarray], source_rows: list[int],
               width: int, max_horizon: int, prediction_length: int,
-              batch_size: int):
+              batch_size: int, sdpa_backend: str,
+              strip_leading_nans: bool):
     inputs = [context[-width:] for context in contexts]
+    if strip_leading_nans:
+        stripped = []
+        for context in inputs:
+            valid = np.flatnonzero(~np.isnan(context))
+            stripped.append(context[int(valid[0]):] if valid.size else context)
+        inputs = stripped
     started = time.perf_counter()
     try:
-        forecasts = forecast_quantiles(
-            tfm,
-            inputs,
-            prediction_length=prediction_length,
-            batch_size=batch_size,
-            max_horizon=max_horizon,
-            forecast_row_indices=source_rows,
-        )
+        with _sdpa_context(sdpa_backend):
+            forecasts = forecast_quantiles(
+                tfm,
+                inputs,
+                prediction_length=prediction_length,
+                batch_size=batch_size,
+                max_horizon=max_horizon,
+                forecast_row_indices=source_rows,
+            )
     except FloatingPointError as exc:
         return None, {
             "finite": False,
@@ -131,6 +140,25 @@ def _run_case(tfm, contexts: list[np.ndarray], source_rows: list[int],
         "maximum": float(np.max(forecasts)),
         "elapsed_seconds": round(time.perf_counter() - started, 6),
     }
+
+
+def _sdpa_context(backend: str):
+    """Select one CUDA SDPA implementation across supported Torch versions."""
+    if backend == "default":
+        return contextlib.nullcontext()
+
+    import torch
+
+    flags = {
+        "enable_flash": backend == "flash",
+        "enable_math": backend == "math",
+        "enable_mem_efficient": backend == "mem_efficient",
+    }
+    try:
+        return torch.backends.cuda.sdp_kernel(**flags, enable_cudnn=False)
+    except TypeError:
+        # torch 2.4 does not expose the cuDNN SDPA flag yet.
+        return torch.backends.cuda.sdp_kernel(**flags)
 
 
 def main() -> None:
@@ -158,6 +186,15 @@ def main() -> None:
         default=_parse_cases("15360:128,15360:1024,12288:128,12288:1024"),
         help="Comma-separated width:max_horizon cases")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--sdpa-backend",
+        choices=("default", "math", "flash", "mem_efficient"),
+        default="default",
+        help="Temporarily force a PyTorch attention backend for diagnosis")
+    parser.add_argument(
+        "--strip-leading-nans", action="store_true",
+        help=("Strip leading NaNs before TimesFM batching; use batch size 1 to "
+              "test an equivalent no-left-padding workaround"))
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
 
@@ -216,6 +253,8 @@ def main() -> None:
         "cuda_available": bool(torch.cuda.is_available()),
         "cuda_device_name": (
             torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),
+        "sdpa_backend": args.sdpa_backend,
+        "strip_leading_nans": bool(args.strip_leading_nans),
         "term": args.term,
         "prediction_length": prediction_length,
         "model_context_limit": int(tfm.model.config.context_limit),
@@ -235,7 +274,8 @@ def main() -> None:
         print(f"Running {key} on source rows {display_rows}{suffix}...", flush=True)
         arrays[key], report["cases"][key] = _run_case(
             tfm, contexts, args.indices, width, max_horizon,
-            prediction_length, args.batch_size)
+            prediction_length, args.batch_size, args.sdpa_backend,
+            args.strip_leading_nans)
         print(json.dumps(report["cases"][key], indent=2), flush=True)
 
     report["comparisons"] = {}
