@@ -109,7 +109,7 @@ def _run_case(tfm, contexts: list[np.ndarray], source_rows: list[int],
               width: int, max_horizon: int, prediction_length: int,
               batch_size: int, sdpa_backend: str,
               strip_leading_nans: bool,
-              isolate_leading_nans: bool):
+              safe_variable_length_batching: bool):
     inputs = [context[-width:] for context in contexts]
     if strip_leading_nans:
         stripped = []
@@ -127,7 +127,7 @@ def _run_case(tfm, contexts: list[np.ndarray], source_rows: list[int],
                 batch_size=batch_size,
                 max_horizon=max_horizon,
                 forecast_row_indices=source_rows,
-                isolate_leading_nans=isolate_leading_nans,
+                safe_variable_length_batching=safe_variable_length_batching,
             )
     except FloatingPointError as exc:
         return None, {
@@ -198,9 +198,12 @@ def main() -> None:
         help=("Strip leading NaNs before TimesFM batching; use batch size 1 to "
               "test an equivalent no-left-padding workaround"))
     parser.add_argument(
+        "--legacy-variable-length-batching", action="store_true",
+        help=("Disable production patch-width bucketing to reproduce the old "
+              "CUDA fully-masked-padding failure"))
+    parser.add_argument(
         "--legacy-leading-nan-batching", action="store_true",
-        help=("Disable the production singleton isolation workaround to "
-              "reproduce the old CUDA failure"))
+        help=argparse.SUPPRESS)
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
 
@@ -261,7 +264,9 @@ def main() -> None:
             torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),
         "sdpa_backend": args.sdpa_backend,
         "strip_leading_nans": bool(args.strip_leading_nans),
-        "isolate_leading_nans": not args.legacy_leading_nan_batching,
+        "safe_variable_length_batching": not (
+            args.legacy_variable_length_batching
+            or args.legacy_leading_nan_batching),
         "term": args.term,
         "prediction_length": prediction_length,
         "model_context_limit": int(tfm.model.config.context_limit),
@@ -283,7 +288,8 @@ def main() -> None:
             tfm, contexts, args.indices, width, max_horizon,
             prediction_length, args.batch_size, args.sdpa_backend,
             args.strip_leading_nans,
-            not args.legacy_leading_nan_batching)
+            not (args.legacy_variable_length_batching
+                 or args.legacy_leading_nan_batching))
         print(json.dumps(report["cases"][key], indent=2), flush=True)
 
     report["comparisons"] = {}

@@ -16,7 +16,7 @@ import numpy as np
 # Stored in every TimesFM cell cache.  Bump this whenever anything that can
 # change a forecast (loader, missing-value handling, compile config, output head)
 # changes; stage 3 will then recompute old cells instead of silently reusing them.
-TIMESFM_GIFTEVAL_RECIPE = "official_timesfm2p5_leading_nan_isolation_v3"
+TIMESFM_GIFTEVAL_RECIPE = "official_timesfm2p5_patch_bucket_batching_v4"
 QUANTILE_LEVELS = tuple(i / 10.0 for i in range(1, 10))
 
 _MODEL_CACHE: dict[str, object] = {}
@@ -91,17 +91,18 @@ def forecast_quantiles(
     max_context_knob: Optional[int] = None,
     max_horizon: Optional[int] = None,
     forecast_row_indices: Optional[Sequence[int]] = None,
-    isolate_leading_nans: bool = True,
+    safe_variable_length_batching: bool = True,
 ) -> np.ndarray:
     """Return q0.1..q0.9 as ``(series, quantile, horizon)``.
 
     This is the model-facing part of the official TimesFM GiftEval predictor:
     variable-length series stay variable length, compile bounds are rounded to
     the model patch, and the public ``forecast`` method is used instead of the
-    lower-level ``compiled_decode`` shortcut. Contexts with partial leading
-    NaNs are pre-stripped (the first step of TimesFM's own preprocessing) and
-    isolated into singleton batches. This avoids fully masked left-pad
-    attention rows, which produce all-NaN forecasts with torch 2.4 CUDA.
+    lower-level ``compiled_decode`` shortcut. Before batching, contexts are
+    pre-stripped of leading NaNs (the first step of TimesFM's preprocessing)
+    and grouped by their patch-rounded effective length. Inputs in one model
+    batch therefore need less than one patch of left padding. This avoids fully
+    masked attention rows, which produce all-NaN forecasts with torch 2.4 CUDA.
     """
     from timesfm import configs
 
@@ -136,105 +137,119 @@ def forecast_quantiles(
         (len(contexts), len(QUANTILE_LEVELS), prediction_length),
         dtype=np.float32,
     )
+    patch_size = int(tfm.model.p)
+    context_limit = 15360
+    prepared = []
+    for call_row, raw in enumerate(contexts):
+        arr = model_context(raw)
+        if max_context_knob is not None:
+            arr = model_context(arr[-int(max_context_knob):])
+        raw_nan_count = int(np.isnan(arr).sum())
+        leading_nans_stripped = 0
+        if safe_variable_length_batching and arr.size and np.isnan(arr[0]):
+            valid = np.flatnonzero(~np.isnan(arr))
+            if valid.size:
+                leading_nans_stripped = int(valid[0])
+                arr = arr[leading_nans_stripped:]
+        effective_length = min(context_limit, int(arr.shape[0]))
+        compiled_context = min(
+            context_limit,
+            ((effective_length + patch_size - 1) // patch_size) * patch_size,
+        )
+        prepared.append({
+            "call_row": int(call_row),
+            "input": arr,
+            "raw_nan_count": raw_nan_count,
+            "leading_nans_stripped": leading_nans_stripped,
+            "compiled_context": compiled_context,
+        })
+
+    if safe_variable_length_batching:
+        patch_buckets: dict[int, list[dict[str, object]]] = {}
+        for item in prepared:
+            patch_buckets.setdefault(int(item["compiled_context"]), []).append(item)
+        model_batches = [
+            bucket[start:start + int(batch_size)]
+            for bucket in patch_buckets.values()
+            for start in range(0, len(bucket), int(batch_size))
+        ]
+    else:
+        model_batches = [
+            prepared[start:start + int(batch_size)]
+            for start in range(0, len(prepared), int(batch_size))
+        ]
+
     model_batch_index = 0
-    for start in range(0, len(contexts), int(batch_size)):
-        prepared = []
-        for offset, raw in enumerate(contexts[start:start + int(batch_size)]):
-            arr = model_context(raw)
-            if max_context_knob is not None:
-                arr = model_context(arr[-int(max_context_knob):])
-            raw_nan_count = int(np.isnan(arr).sum())
-            leading_nans_stripped = 0
-            if isolate_leading_nans and arr.size and np.isnan(arr[0]):
-                valid = np.flatnonzero(~np.isnan(arr))
-                if valid.size:
-                    leading_nans_stripped = int(valid[0])
-                    arr = arr[leading_nans_stripped:]
-            prepared.append({
-                "call_row": int(start + offset),
-                "input": arr,
-                "raw_nan_count": raw_nan_count,
-                "leading_nans_stripped": leading_nans_stripped,
-            })
-
-        regular = [
-            item for item in prepared if not item["leading_nans_stripped"]]
-        isolated = [
-            [item] for item in prepared if item["leading_nans_stripped"]]
-        model_batches = ([regular] if regular else []) + isolated
-
-        for model_batch in model_batches:
-            model_inputs = [item["input"] for item in model_batch]
-            call_rows = np.asarray(
-                [item["call_row"] for item in model_batch], dtype=np.int64)
-            max_context = max(int(arr.shape[0]) for arr in model_inputs)
-            patch_size = int(tfm.model.p)
-            compiled_context = (
-                (max_context + patch_size - 1) // patch_size) * patch_size
-            tfm.compile(
-                forecast_config=configs.ForecastConfig(
-                    max_context=min(15360, compiled_context),
-                    max_horizon=max_horizon,
-                    infer_is_positive=True,
-                    use_continuous_quantile_head=True,
-                    fix_quantile_crossing=True,
-                    force_flip_invariance=True,
-                    return_backcast=False,
-                    normalize_inputs=True,
-                    per_core_batch_size=max(1, min(128, len(model_inputs))),
-                ),
+    for model_batch in model_batches:
+        model_inputs = [item["input"] for item in model_batch]
+        call_rows = np.asarray(
+            [item["call_row"] for item in model_batch], dtype=np.int64)
+        compiled_context = max(
+            int(item["compiled_context"]) for item in model_batch)
+        tfm.compile(
+            forecast_config=configs.ForecastConfig(
+                max_context=compiled_context,
+                max_horizon=max_horizon,
+                infer_is_positive=True,
+                use_continuous_quantile_head=True,
+                fix_quantile_crossing=True,
+                force_flip_invariance=True,
+                return_backcast=False,
+                normalize_inputs=True,
+                per_core_batch_size=max(1, min(128, len(model_inputs))),
+            ),
+        )
+        _, full_predictions = tfm.forecast(
+            horizon=prediction_length, inputs=model_inputs)
+        full_predictions = np.asarray(full_predictions)
+        requested_predictions = full_predictions[:, :prediction_length, :]
+        bad = ~np.isfinite(requested_predictions)
+        if np.any(bad):
+            bad_local_rows = np.flatnonzero(np.any(bad, axis=(1, 2)))
+            bad_call_rows = call_rows[bad_local_rows]
+            bad_source_rows = [
+                int(forecast_row_indices[int(i)]) for i in bad_call_rows]
+            locations = np.argwhere(bad)
+            preview = [tuple(map(int, loc)) for loc in locations[:20]]
+            input_bad = [
+                {
+                    "batch_row": int(i),
+                    "call_row": int(call_rows[int(i)]),
+                    "source_row": int(forecast_row_indices[
+                        int(call_rows[int(i)])]),
+                    "length": int(model_inputs[int(i)].shape[0]),
+                    "raw_nan_count": int(model_batch[int(i)][
+                        "raw_nan_count"]),
+                    "leading_nans_stripped": int(model_batch[int(i)][
+                        "leading_nans_stripped"]),
+                    "remaining_nan_count": int(np.isnan(
+                        model_inputs[int(i)]).sum()),
+                    "inf_count": int(np.isinf(model_inputs[int(i)]).sum()),
+                }
+                for i in bad_local_rows
+            ]
+            raise FloatingPointError(
+                "TimesFM forecast contains non-finite values; evaluation was "
+                "stopped without dropping or replacing forecasts. "
+                f"batch={model_batch_index} "
+                f"call_rows={bad_call_rows.tolist()} "
+                f"batch_rows={bad_local_rows.tolist()} "
+                f"source_rows={bad_source_rows} "
+                f"nan_count={int(np.isnan(requested_predictions).sum())} "
+                f"inf_count={int(np.isinf(requested_predictions).sum())} "
+                f"locations(batch_row,horizon_step,channel)={preview} "
+                f"compiled_max_context={compiled_context} "
+                f"compiled_max_horizon={max_horizon} "
+                f"input_rows={input_bad}"
             )
-            _, full_predictions = tfm.forecast(
-                horizon=prediction_length, inputs=model_inputs)
-            full_predictions = np.asarray(full_predictions)
-            requested_predictions = full_predictions[:, :prediction_length, :]
-            bad = ~np.isfinite(requested_predictions)
-            if np.any(bad):
-                bad_local_rows = np.flatnonzero(np.any(bad, axis=(1, 2)))
-                bad_call_rows = call_rows[bad_local_rows]
-                bad_source_rows = [
-                    int(forecast_row_indices[int(i)]) for i in bad_call_rows]
-                locations = np.argwhere(bad)
-                preview = [tuple(map(int, loc)) for loc in locations[:20]]
-                input_bad = [
-                    {
-                        "batch_row": int(i),
-                        "call_row": int(call_rows[int(i)]),
-                        "source_row": int(forecast_row_indices[
-                            int(call_rows[int(i)])]),
-                        "length": int(model_inputs[int(i)].shape[0]),
-                        "raw_nan_count": int(model_batch[int(i)][
-                            "raw_nan_count"]),
-                        "leading_nans_stripped": int(model_batch[int(i)][
-                            "leading_nans_stripped"]),
-                        "remaining_nan_count": int(np.isnan(
-                            model_inputs[int(i)]).sum()),
-                        "inf_count": int(np.isinf(model_inputs[int(i)]).sum()),
-                    }
-                    for i in bad_local_rows
-                ]
-                raise FloatingPointError(
-                    "TimesFM forecast contains non-finite values; evaluation was "
-                    "stopped without dropping or replacing forecasts. "
-                    f"batch={model_batch_index} "
-                    f"call_rows={bad_call_rows.tolist()} "
-                    f"batch_rows={bad_local_rows.tolist()} "
-                    f"source_rows={bad_source_rows} "
-                    f"nan_count={int(np.isnan(requested_predictions).sum())} "
-                    f"inf_count={int(np.isinf(requested_predictions).sum())} "
-                    f"locations(batch_row,horizon_step,channel)={preview} "
-                    f"compiled_max_context={min(15360, compiled_context)} "
-                    f"compiled_max_horizon={max_horizon} "
-                    f"input_rows={input_bad}"
-                )
-            quantiles = np.asarray(
-                requested_predictions[:, :, 1:], dtype=np.float32)
-            if quantiles.shape[2] != len(QUANTILE_LEVELS):
-                raise ValueError(
-                    "TimesFM forecast output must contain mean + q0.1..q0.9; "
-                    f"got shape {tuple(np.asarray(full_predictions).shape)}"
-                )
-            outputs[call_rows] = quantiles.transpose((0, 2, 1))
-            model_batch_index += 1
+        quantiles = np.asarray(
+            requested_predictions[:, :, 1:], dtype=np.float32)
+        if quantiles.shape[2] != len(QUANTILE_LEVELS):
+            raise ValueError(
+                "TimesFM forecast output must contain mean + q0.1..q0.9; "
+                f"got shape {tuple(np.asarray(full_predictions).shape)}"
+            )
+        outputs[call_rows] = quantiles.transpose((0, 2, 1))
+        model_batch_index += 1
 
     return outputs

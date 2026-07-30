@@ -57,6 +57,19 @@ class _FakeInputValueTimesFM(_FakeTimesFM):
         return full[:, :, 0], full
 
 
+class _FakeMaskedPaddingTimesFM(_FakeInputValueTimesFM):
+    """Reproduce the CUDA failure from a completely left-masked patch."""
+
+    def forecast(self, horizon, inputs):
+        mean, full = super().forecast(horizon, inputs)
+        compiled_context = self.compiles[-1].max_context
+        for row, values in enumerate(inputs):
+            effective_length = min(len(values), compiled_context)
+            if compiled_context - effective_length >= self.model.p:
+                full[row] = np.nan
+        return mean, full
+
+
 class TimesFMGiftEvalRecipeTest(unittest.TestCase):
     def tearDown(self) -> None:
         timesfm_gifteval._MODEL_CACHE.clear()
@@ -147,9 +160,9 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
         self.assertEqual([cfg.max_context for cfg in model.compiles], [64, 32])
         self.assertEqual([cfg.max_horizon for cfg in model.compiles], [128, 128])
         self.assertEqual(
-            [cfg.per_core_batch_size for cfg in model.compiles], [2, 1])
-        self.assertTrue(np.isnan(model.inputs[0][1][1]))
-        np.testing.assert_array_equal(model.inputs[1][0], np.zeros(2, dtype=np.float32))
+            [cfg.per_core_batch_size for cfg in model.compiles], [1, 2])
+        self.assertTrue(np.isnan(model.inputs[1][0][1]))
+        np.testing.assert_array_equal(model.inputs[1][1], np.zeros(2, dtype=np.float32))
 
     def test_compile_horizon_override(self) -> None:
         fake_timesfm = ModuleType("timesfm")
@@ -164,7 +177,7 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
         self.assertEqual(model.compiles[0].max_context, 15360)
         self.assertEqual(model.compiles[0].max_horizon, 128)
 
-    def test_leading_nan_context_is_stripped_isolated_and_reordered(self) -> None:
+    def test_leading_nan_context_is_stripped_bucketed_and_reordered(self) -> None:
         fake_timesfm = ModuleType("timesfm")
         fake_timesfm.configs = SimpleNamespace(ForecastConfig=_FakeForecastConfig)
         model = _FakeInputValueTimesFM()
@@ -178,14 +191,14 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
             result = timesfm_gifteval.forecast_quantiles(
                 model, contexts, prediction_length=4, batch_size=3)
 
-        self.assertEqual([len(inputs) for inputs in model.inputs], [2, 1])
+        self.assertEqual([len(inputs) for inputs in model.inputs], [3])
         np.testing.assert_array_equal(
-            model.inputs[1][0], np.array([20.0, 21.0], dtype=np.float32))
+            model.inputs[0][1], np.array([20.0, 21.0], dtype=np.float32))
         np.testing.assert_allclose(result[:, 0, 0], [11.0, 21.0, 31.0])
         self.assertEqual(
-            [cfg.per_core_batch_size for cfg in model.compiles], [2, 1])
+            [cfg.per_core_batch_size for cfg in model.compiles], [3])
 
-    def test_leading_nan_isolation_can_be_disabled_for_diagnosis(self) -> None:
+    def test_safe_variable_length_batching_can_be_disabled_for_diagnosis(self) -> None:
         fake_timesfm = ModuleType("timesfm")
         fake_timesfm.configs = SimpleNamespace(ForecastConfig=_FakeForecastConfig)
         model = _FakeTimesFM()
@@ -197,10 +210,40 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"timesfm": fake_timesfm}):
             timesfm_gifteval.forecast_quantiles(
                 model, contexts, prediction_length=4, batch_size=2,
-                isolate_leading_nans=False)
+                safe_variable_length_batching=False)
 
         self.assertEqual([len(inputs) for inputs in model.inputs], [2])
         self.assertTrue(np.isnan(model.inputs[0][1][0]))
+
+    def test_patch_bucketing_avoids_fully_masked_padding_and_reorders(self) -> None:
+        fake_timesfm = ModuleType("timesfm")
+        fake_timesfm.configs = SimpleNamespace(ForecastConfig=_FakeForecastConfig)
+        contexts = [
+            np.full(64, 10.0, dtype=np.float32),
+            np.full(96, 20.0, dtype=np.float32),
+            np.full(65, 30.0, dtype=np.float32),
+            np.full(95, 40.0, dtype=np.float32),
+        ]
+
+        with mock.patch.dict(sys.modules, {"timesfm": fake_timesfm}):
+            with self.assertRaisesRegex(
+                    FloatingPointError, r"call_rows=\[0\]"):
+                timesfm_gifteval.forecast_quantiles(
+                    _FakeMaskedPaddingTimesFM(), contexts,
+                    prediction_length=4, batch_size=4,
+                    safe_variable_length_batching=False)
+
+            model = _FakeMaskedPaddingTimesFM()
+            result = timesfm_gifteval.forecast_quantiles(
+                model, contexts, prediction_length=4, batch_size=4)
+
+        self.assertEqual([cfg.max_context for cfg in model.compiles], [64, 96])
+        self.assertEqual(
+            [[len(values) for values in inputs] for inputs in model.inputs],
+            [[64], [96, 65, 95]],
+        )
+        self.assertTrue(np.isfinite(result).all())
+        np.testing.assert_allclose(result[:, 0, 0], [10.0, 20.0, 30.0, 40.0])
 
     def test_nonfinite_forecast_reports_batch_and_rows(self) -> None:
         fake_timesfm = ModuleType("timesfm")
