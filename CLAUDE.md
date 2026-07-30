@@ -157,11 +157,15 @@ predictor-derived, so no TSFM re-inference):
 - **Stage 3** (`test_window_ablation_gifteval_v5.py`) — computes both columns per
   cell. Seasonal errors come from **raw contexts (NaNs preserved)** — `GiftEvalCache`
   keeps `contexts_raw` for the metric paths and the NaN→0-filled `contexts` only
-  for model input (leaderboard exactness; `MASE_GLUONTS_VER = 3`). On **fresh**
+  for model input; zero/non-finite per-instance seasonal denominators are masked
+  exactly like GluonTS (`MASE_GLUONTS_VER = 5`). On **fresh**
   inference `cell_mase_gluonts_real` runs the machinery; **cached cells** have no
   stored forecasts so `_real` **stands in with the port** (marked
   `_mase_gluonts_real_standin: true`; `--force 3` recomputes truly — needed for
   exactness only on NaN-label `*_with_missing` cells, elsewhere port == machinery).
+  Metric caches also carry `_metric_suite_ver`; suite v2 fixes zero-target MAPE,
+  quantile CRPS scaling, and missing-target CRPS. Older cells are rejected by
+  stage 3 and its done-marker and therefore rerun automatically.
   The naive baseline's `mase_gluonts_real` **runs the actual machinery** (it's the
   normalisation denominator). Each `compare_*.npz` carries `real_curve_gluonts`
   and `real_curve_gluonts_real`.

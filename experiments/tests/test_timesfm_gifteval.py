@@ -15,6 +15,7 @@ from experiments import timesfm_gifteval
 from experiments import run_all
 from experiments import test_window_ablation_gifteval_v5 as ablation
 from experiments.gifteval_inference_recipes import inference_recipe
+from experiments.gifteval_metric_version import METRIC_SUITE_VER
 
 
 class _FakeForecastConfig:
@@ -344,6 +345,7 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
                 with open(os.path.join(metrics_dir, "metrics.json"), "w") as f:
                     json.dump({
                         "_inference_recipe": inference_recipe("timesfm"),
+                        "_metric_suite_ver": METRIC_SUITE_VER,
                     }, f)
 
                 with mock.patch.object(
@@ -352,6 +354,19 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
                     done, _ = run_all._done_stage_3(
                         "timesfm", "TimesFM2.5-200M")
                 self.assertTrue(done)
+
+                with open(os.path.join(metrics_dir, "metrics.json"), "w") as f:
+                    json.dump({
+                        "_inference_recipe": inference_recipe("timesfm"),
+                        "_metric_suite_ver": METRIC_SUITE_VER - 1,
+                    }, f)
+                with mock.patch.object(
+                        run_all.datasets_config, "datasets_to_run",
+                        return_value=one_cell):
+                    done, reason = run_all._done_stage_3(
+                        "timesfm", "TimesFM2.5-200M")
+                self.assertFalse(done)
+                self.assertIn("stale metric cache", reason)
             finally:
                 run_all.ABLATION_GENERAL = old_root
 

@@ -441,6 +441,32 @@ class AblationDynamicBatchTest(unittest.TestCase):
 
         self.assertEqual(calls, [2])
 
+    def test_short_context_uses_ceiling_scaled_batch(self) -> None:
+        from experiments import test_window_ablation_gifteval_v5 as ablation
+
+        calls = []
+
+        def fake_forecast(
+            _family, _handle, _model_id, batches, _width, horizon,
+            _device, batch_size, **_kwargs,
+        ):
+            calls.append(batch_size)
+            n = sum(batch["x"].shape[0] for batch in batches)
+            zeros = torch.zeros((n, horizon))
+            return ForecastResult(median=zeros), zeros
+
+        batches = [{
+            "x": torch.zeros((192, 384, 1)),
+            "y": torch.zeros((192, 4, 1)),
+        }]
+        with mock.patch.object(ablation, "_forecast_cell", fake_forecast):
+            _fr, _targets, size = ablation._forecast_cell_dynamic(
+                "timesfm", object(), "example/model", batches,
+                384, 4, "cuda", 32)
+
+        self.assertEqual(calls, [96])
+        self.assertEqual(size, 96)
+
     def test_oom_halves_batch_and_retries_without_caching(self) -> None:
         from experiments import test_window_ablation_gifteval_v5 as ablation
 

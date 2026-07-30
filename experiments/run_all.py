@@ -76,6 +76,7 @@ from experiments import models_config
 from experiments import datasets_config
 from experiments.gifteval_reference import NORMALIZATION_REFERENCE
 from experiments.gifteval_inference_recipes import inference_recipe
+from experiments.gifteval_metric_version import METRIC_SUITE_VER
 
 
 # Master run set: (model_id, family, display), sourced from the single config in
@@ -492,26 +493,31 @@ def _done_stage_3(family: str, display: str = "") -> Tuple[bool, str]:
         return False, (
             f"compare cohort is stale ({len(actual_cells)}/{len(expected_cells)} cells)")
     expected_recipe = inference_recipe(family)
-    if expected_recipe is not None:
-        current = 0
-        for row in rows:
+    current = 0
+    for row in rows:
+        if expected_recipe is not None:
             if row.get("inference_recipe") != expected_recipe:
                 return False, "compare artifacts use stale model forecasts"
-            term = str(row["term"])
-            dataset_display = str(row["dataset_display"])
-            metrics_path = os.path.join(
-                ABLATION_GENERAL, "datasets", dataset_display, display,
-                f"t{term}", "wfull_native", "metrics.json")
-            try:
-                with open(metrics_path) as f:
-                    metrics = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                return False, f"current full-native caches {current}/{len(rows)}"
+        term = str(row["term"])
+        dataset_display = str(row["dataset_display"])
+        metrics_path = os.path.join(
+            ABLATION_GENERAL, "datasets", dataset_display, display,
+            f"t{term}", "wfull_native", "metrics.json")
+        try:
+            with open(metrics_path) as f:
+                metrics = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return False, f"current full-native caches {current}/{len(rows)}"
+        if metrics.get("_metric_suite_ver", 0) < METRIC_SUITE_VER:
+            return False, (
+                "stale metric cache "
+                f"({dataset_display}/t{term}; rerun stage 3)")
+        if expected_recipe is not None:
             if metrics.get("_inference_recipe") != expected_recipe:
                 return False, (
                     "stale model inference cache "
                     f"({dataset_display}/t{term})")
-            current += 1
+        current += 1
     n_npz = sum(1 for n in os.listdir(compare_dir) if n.endswith(".npz"))
     return True, f"{n_npz} comparison .npz files"
 

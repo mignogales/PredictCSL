@@ -72,6 +72,7 @@ class FullNativeContextCapTest(unittest.TestCase):
             "mase_gluonts_real": 0.8,
             "_mase_gluonts_real_standin": False,
             "_mase_gluonts_ver": ablation.MASE_GLUONTS_VER,
+            "_metric_suite_ver": ablation.METRIC_SUITE_VER,
             "elapsed_seconds": 3.5,
             "_dynamic_batch_sizes": [8],
         }
@@ -112,6 +113,7 @@ class FullNativeContextCapTest(unittest.TestCase):
             "mase_gluonts_real": 0.6,
             "_mase_gluonts_real_standin": False,
             "_mase_gluonts_ver": ablation.MASE_GLUONTS_VER,
+            "_metric_suite_ver": ablation.METRIC_SUITE_VER,
             "_full_native_baseline": True,
             "_context_cap": 128,
             "_min_effective_context": 128,

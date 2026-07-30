@@ -70,6 +70,7 @@ from experiments.timesfm_gifteval import (
 from experiments.gifteval_inference_recipes import (
     inference_recipe, preserves_missing,
 )
+from experiments.gifteval_metric_version import METRIC_SUITE_VER
 
 try:
     from tsfm_public import PatchTSTFMForPrediction
@@ -205,7 +206,9 @@ CACHE_ROOT_PREDICTOR = "logs/experiments/context_length_predictor"
 #   v3: seasonal errors computed from RAW contexts (NaNs preserved)
 #   v4: exact current gluonts seasonal-error, global aggregation, and sample
 #       quantile semantics; vectorized instead of creating one Forecast per row.
-MASE_GLUONTS_VER = 4
+#   v5: mask zero/non-finite seasonal denominators like GluonTS instead of
+#       allowing one constant-history instance to poison the aggregate with NaN.
+MASE_GLUONTS_VER = 5
 
 # Inference-only context-scaled batching. ``--batch-size`` is interpreted as the
 # safe size at this reference width; shorter contexts start proportionally larger.
@@ -799,7 +802,8 @@ def _load_cached_result_for_family(
     # v4 sample-forecast 0.5 selection cannot be recovered from cached per-row MAE.
     # Treat stale records as misses so one ordinary rerun refreshes them without
     # requiring users to delete cache directories manually.
-    if (metrics.get("_mase_gluonts_real_standin") or
+    if (metrics.get("_metric_suite_ver", 0) < METRIC_SUITE_VER or
+            metrics.get("_mase_gluonts_real_standin") or
             metrics.get("_mase_gluonts_ver", 0) < MASE_GLUONTS_VER):
         return None
     return metrics if _inference_recipe_current(metrics, model_family) else None
@@ -872,8 +876,10 @@ def _backfill_mase_gluonts(dataset_display, model_short, term, window_size,
         return None
     se = cache.seasonal_errors_gluonts[vi]
     valid_counts = np.isfinite(cache.labels_np[vi]).sum(axis=1)
-    # Reconstruct GluonTS' global point mean from cached per-row horizon means.
-    ok = np.isfinite(per_mae) & (valid_counts > 0)
+    # GluonTS uses a masked division, so rows with a zero/non-finite seasonal
+    # denominator contribute no forecast points to the aggregate.
+    ok = (np.isfinite(per_mae) & np.isfinite(se) & (se != 0)
+          & (valid_counts > 0))
     if not ok.any():
         return None
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -885,22 +891,41 @@ def _backfill_mase_gluonts(dataset_display, model_short, term, window_size,
 #  METRICS
 # ==============================================================================
 
-def crps_energy_score(samples: torch.Tensor, targets: torch.Tensor) -> float:
-    N, S, H = samples.shape
+def crps_energy_score(
+    samples: torch.Tensor,
+    targets: torch.Tensor,
+    valid: Optional[torch.Tensor] = None,
+) -> float:
+    _N, S, _H = samples.shape
     term1 = (samples - targets.unsqueeze(1)).abs().mean(dim=1)
     sorted_samples, _ = samples.sort(dim=1)
     indices = torch.arange(1, S + 1, device=samples.device, dtype=samples.dtype)
     weights = (2 * indices - S - 1).reshape(1, S, 1)
     term2 = (weights * sorted_samples).sum(dim=1) / (S * S)
-    return float((term1 - term2).mean().item())
+    score = term1 - term2
+    usable = torch.isfinite(targets) if valid is None else valid
+    usable = usable & torch.isfinite(score)
+    return (float(score[usable].mean().item()) if bool(usable.any())
+            else float("nan"))
 
 
-def crps_quantile_loss(quantiles: torch.Tensor, quantile_levels: List[float], targets: torch.Tensor) -> float:
+def crps_quantile_loss(
+    quantiles: torch.Tensor,
+    quantile_levels: List[float],
+    targets: torch.Tensor,
+    valid: Optional[torch.Tensor] = None,
+) -> float:
     Q = len(quantile_levels)
     tau = torch.tensor(quantile_levels, dtype=quantiles.dtype, device=quantiles.device).reshape(1, Q, 1)
     errors = targets.unsqueeze(1) - quantiles
     pinball = torch.where(errors >= 0, tau * errors, (tau - 1) * errors)
-    return float((2.0 / Q) * pinball.mean().item())
+    # ``mean(dim=1)`` already divides by Q.  The previous ``2 / Q`` multiplier
+    # divided by Q a second time (9x too small for q=.1,...,.9).
+    score = 2.0 * pinball.mean(dim=1)
+    usable = torch.isfinite(targets) if valid is None else valid
+    usable = usable & torch.isfinite(score)
+    return (float(score[usable].mean().item()) if bool(usable.any())
+            else float("nan"))
 
 
 def compute_all_metrics(
@@ -912,7 +937,7 @@ def compute_all_metrics(
     pred = forecast_result.median
     y = targets
 
-    valid = ~torch.isnan(y)
+    valid = torch.isfinite(y)
     if not valid.all():
         y_safe = y.clone(); y_safe[~valid] = 0.0
         pred_safe = pred.clone(); pred_safe[~valid] = 0.0
@@ -924,9 +949,11 @@ def compute_all_metrics(
     n_valid = valid.sum()
 
     if n_valid == 0:
-        return {k: float("nan") for k in
+        empty = {k: float("nan") for k in
                 ["mae", "mse", "rmse", "mase", "mase_gluonts", "mase_gluonts_real",
                  "smape", "mape", "nd", "nrmse", "crps"]}
+        empty["_metric_suite_ver"] = METRIC_SUITE_VER
+        return empty
 
     mae = float(abs_err[valid].mean().item())
     mse = float(sq_err[valid].mean().item())
@@ -943,20 +970,28 @@ def compute_all_metrics(
 
     denom_smape = (pred_safe.abs() + y_safe.abs()).clamp(min=1e-13)
     smape = float((2.0 * abs_err / denom_smape)[valid].mean().item())
-    mape = float((abs_err / y_safe.abs().clamp(min=1e-13))[valid].mean().item())
+    # MAPE is undefined at a zero target.  Exclude exactly-zero targets instead
+    # of dividing by 1e-13, which produced meaningless values around 1e12.
+    mape_valid = valid & (y_safe != 0)
+    mape = (float((abs_err / y_safe.abs().clamp(min=torch.finfo(y.dtype).tiny))[
+                    mape_valid].mean().item())
+            if bool(mape_valid.any()) else float("nan"))
     nd = float(abs_err[valid].sum().item() / y_safe.abs()[valid].sum().clamp(min=1e-13).item())
     nrmse = rmse / float(y_safe.abs()[valid].mean().clamp(min=1e-13).item())
 
     crps = float("nan")
     if forecast_result.samples is not None:
-        crps = crps_energy_score(forecast_result.samples, y_safe)
+        crps = crps_energy_score(forecast_result.samples, y_safe, valid)
     elif forecast_result.quantiles is not None and forecast_result.quantile_levels is not None:
-        crps = crps_quantile_loss(forecast_result.quantiles, forecast_result.quantile_levels, y_safe)
+        crps = crps_quantile_loss(
+            forecast_result.quantiles, forecast_result.quantile_levels,
+            y_safe, valid)
 
     return {
         "mae": mae, "mse": mse, "rmse": rmse, "mase": mase,
         "mase_gluonts": mase_gluonts, "mase_gluonts_real": mase_gluonts_real,
         "smape": smape, "mape": mape, "nd": nd, "nrmse": nrmse, "crps": crps,
+        "_metric_suite_ver": METRIC_SUITE_VER,
     }
 
 
@@ -981,9 +1016,10 @@ def compute_mase_gluonts(
     if se.shape[0] != abs_err.shape[0]:
         return float("nan")
     scaled = abs_err / se[:, None]
-    if not bool(valid.any()):
+    usable = valid & torch.isfinite(scaled)
+    if not bool(usable.any()):
         return float("nan")
-    return float(scaled[valid].mean().item())
+    return float(scaled[usable].mean().item())
 
 
 def cell_mase_gluonts_real(fr, cache: "GiftEvalCache", served_indices) -> float:
@@ -1041,7 +1077,10 @@ def compute_per_sample_metrics(
     if seasonal_errors is not None:
         se = np.asarray(seasonal_errors, dtype=np.float64)
         if se.shape[0] == per_mae.shape[0]:
-            out["mase_gluonts"] = per_mae / se
+            scaled = np.full(per_mae.shape, np.nan, dtype=np.float64)
+            np.divide(per_mae, se, out=scaled,
+                      where=np.isfinite(se) & (se != 0))
+            out["mase_gluonts"] = scaled
 
     if forecast_result.samples is not None:
         S = forecast_result.samples
@@ -1134,8 +1173,14 @@ def _forecast_cell_dynamic(model_family, handle, model_id, batches, width,
     family_cap = _DYNAMIC_BATCH_FAMILY_CAP.get(
         model_family, DYNAMIC_BATCH_MAX_SIZE)
     search_cap = min(n_samples, DYNAMIC_BATCH_MAX_SIZE, family_cap)
-    scale = (1 if model_family == "patchtst_fm" else
-             max(1, DYNAMIC_BATCH_REFERENCE_CONTEXT // max(1, int(width))))
+    # Ceiling division keeps the context*batch workload near the reference.
+    # Floor division unnecessarily selected 64 for TimesFM at W=384; 96 is
+    # only 12.5% above the reference workload and OOM backoff remains active.
+    scale = (1 if model_family == "patchtst_fm" else max(
+        1,
+        (DYNAMIC_BATCH_REFERENCE_CONTEXT + max(1, int(width)) - 1)
+        // max(1, int(width)),
+    ))
     candidate = min(search_cap, max(1, int(base_batch_size)) * scale)
 
     while True:
@@ -2420,6 +2465,7 @@ def _reuse_full_native_cell_as_grid(
         dataset_display, model_short, term, FULL_NATIVE_WINDOW)
     if (native_metrics is None
             or int(native_metrics.get("_context_cap", -1)) != int(cap)
+            or native_metrics.get("_metric_suite_ver", 0) < METRIC_SUITE_VER
             or native_metrics.get("_mase_gluonts_real_standin", False)
             or native_metrics.get("_mase_gluonts_ver", 0) < MASE_GLUONTS_VER
             or not _inference_recipe_current(native_metrics, model_family)):
@@ -2488,6 +2534,7 @@ def _run_full_native_baseline(
     # forecasts that violate the model's current input limit.
     if (cached is not None
             and int(cached.get("_context_cap", -1)) == cap
+            and cached.get("_metric_suite_ver", 0) >= METRIC_SUITE_VER
             and not cached.get("_mase_gluonts_real_standin", False)
             and cached.get("_mase_gluonts_ver", 0) >= MASE_GLUONTS_VER
             and _inference_recipe_current(cached, model_family)):
