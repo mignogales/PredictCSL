@@ -7,6 +7,7 @@ configuration in one place prevents the two numerators from drifting again.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from typing import Iterable, Optional, Sequence
 
@@ -16,10 +17,67 @@ import numpy as np
 # Stored in every TimesFM cell cache.  Bump this whenever anything that can
 # change a forecast (loader, missing-value handling, compile config, output head)
 # changes; stage 3 will then recompute old cells instead of silently reusing them.
+# This optimization preserves the v4 forecast semantics: only padding-query
+# attention rows that no real query can attend to are changed. Keep the recipe
+# stable so completed v4 cells remain reusable.
 TIMESFM_GIFTEVAL_RECIPE = "official_timesfm2p5_patch_bucket_batching_v4"
 QUANTILE_LEVELS = tuple(i / 10.0 for i in range(1, 10))
 
 _MODEL_CACHE: dict[str, object] = {}
+
+
+def _stabilize_fully_masked_attention_rows(mask):
+    """Give otherwise-empty attention rows one isolated padding key.
+
+    TimesFM masks every leading padding patch as a key.  For a padded query
+    patch this can leave the whole attention row false, which some torch 2.4
+    CUDA attention kernels turn into NaNs.  Letting only those query rows attend
+    to key zero keeps them finite.  Real query rows are unchanged and continue
+    to mask every padding key, so the added edge cannot affect a forecast token.
+    """
+    if mask is None or getattr(mask, "dtype", None) is None:
+        return mask
+    import torch
+
+    if mask.dtype != torch.bool or mask.ndim < 2 or mask.shape[-1] == 0:
+        return mask
+    empty_rows = ~mask.any(dim=-1)
+    # ``make_attn_mask`` returns a fresh tensor. Mutate it in place to avoid a
+    # clone and, crucially, avoid ``bool(empty_rows.any())``, which would force
+    # one CPU/GPU synchronization per transformer layer.
+    mask[..., 0] |= empty_rows
+    return mask
+
+
+@contextmanager
+def _timesfm_padding_safe_attention(enabled: bool):
+    """Temporarily stabilize TimesFM's internally constructed attention mask."""
+    if not enabled:
+        yield
+        return
+
+    try:
+        import timesfm.torch.transformer as transformer
+    except (ImportError, AttributeError):
+        # Older/newer TimesFM builds may keep mask construction elsewhere.  The
+        # finite-output check below still falls back to exact patch buckets.
+        yield
+        return
+
+    original = getattr(transformer, "make_attn_mask", None)
+    if original is None:
+        yield
+        return
+
+    def wrapped(*args, **kwargs):
+        return _stabilize_fully_masked_attention_rows(
+            original(*args, **kwargs))
+
+    transformer.make_attn_mask = wrapped
+    try:
+        yield
+    finally:
+        transformer.make_attn_mask = original
 
 
 def model_context(entry_target) -> np.ndarray:
@@ -100,9 +158,11 @@ def forecast_quantiles(
     the model patch, and the public ``forecast`` method is used instead of the
     lower-level ``compiled_decode`` shortcut. Before batching, contexts are
     pre-stripped of leading NaNs (the first step of TimesFM's preprocessing)
-    and grouped by their patch-rounded effective length. Inputs in one model
-    batch therefore need less than one patch of left padding. This avoids fully
-    masked attention rows, which produce all-NaN forecasts with torch 2.4 CUDA.
+    and forecast in large batches under a padding-safe attention-mask shim.  The
+    shim changes only fully masked padding-query rows, which real query rows can
+    never attend to.  If a TimesFM build does not use the shimmed mask function
+    and still returns a non-finite batch, that batch is retried in exact
+    patch-width buckets as a correctness fallback.
     """
     from timesfm import configs
 
@@ -164,47 +224,66 @@ def forecast_quantiles(
             "compiled_context": compiled_context,
         })
 
-    if safe_variable_length_batching:
-        patch_buckets: dict[int, list[dict[str, object]]] = {}
-        for item in prepared:
-            patch_buckets.setdefault(int(item["compiled_context"]), []).append(item)
-        model_batches = [
-            bucket[start:start + int(batch_size)]
-            for bucket in patch_buckets.values()
-            for start in range(0, len(bucket), int(batch_size))
-        ]
-    else:
-        model_batches = [
-            prepared[start:start + int(batch_size)]
-            for start in range(0, len(prepared), int(batch_size))
-        ]
+    model_batches = [
+        prepared[start:start + int(batch_size)]
+        for start in range(0, len(prepared), int(batch_size))
+    ]
 
     model_batch_index = 0
     for model_batch in model_batches:
-        model_inputs = [item["input"] for item in model_batch]
-        call_rows = np.asarray(
-            [item["call_row"] for item in model_batch], dtype=np.int64)
-        compiled_context = max(
-            int(item["compiled_context"]) for item in model_batch)
-        tfm.compile(
-            forecast_config=configs.ForecastConfig(
-                max_context=compiled_context,
-                max_horizon=max_horizon,
-                infer_is_positive=True,
-                use_continuous_quantile_head=True,
-                fix_quantile_crossing=True,
-                force_flip_invariance=True,
-                return_backcast=False,
-                normalize_inputs=True,
-                per_core_batch_size=max(1, min(128, len(model_inputs))),
-            ),
-        )
-        _, full_predictions = tfm.forecast(
-            horizon=prediction_length, inputs=model_inputs)
-        full_predictions = np.asarray(full_predictions)
-        requested_predictions = full_predictions[:, :prediction_length, :]
-        bad = ~np.isfinite(requested_predictions)
-        if np.any(bad):
+        pending = [model_batch]
+        while pending:
+            current_batch = pending.pop(0)
+            model_inputs = [item["input"] for item in current_batch]
+            call_rows = np.asarray(
+                [item["call_row"] for item in current_batch], dtype=np.int64)
+            compiled_context = max(
+                int(item["compiled_context"]) for item in current_batch)
+            tfm.compile(
+                forecast_config=configs.ForecastConfig(
+                    max_context=compiled_context,
+                    max_horizon=max_horizon,
+                    infer_is_positive=True,
+                    use_continuous_quantile_head=True,
+                    fix_quantile_crossing=True,
+                    force_flip_invariance=True,
+                    return_backcast=False,
+                    normalize_inputs=True,
+                    per_core_batch_size=max(1, min(128, len(model_inputs))),
+                ),
+            )
+            with _timesfm_padding_safe_attention(
+                    safe_variable_length_batching):
+                _, full_predictions = tfm.forecast(
+                    horizon=prediction_length, inputs=model_inputs)
+            full_predictions = np.asarray(full_predictions)
+            requested_predictions = full_predictions[:, :prediction_length, :]
+            bad = ~np.isfinite(requested_predictions)
+            if not np.any(bad):
+                quantiles = np.asarray(
+                    requested_predictions[:, :, 1:], dtype=np.float32)
+                if quantiles.shape[2] != len(QUANTILE_LEVELS):
+                    raise ValueError(
+                        "TimesFM forecast output must contain mean + q0.1..q0.9; "
+                        f"got shape {tuple(np.asarray(full_predictions).shape)}"
+                    )
+                outputs[call_rows] = quantiles.transpose((0, 2, 1))
+                model_batch_index += 1
+                continue
+
+            # Some TimesFM/torch combinations capture mask construction before
+            # the temporary shim is installed. Retry only this failed batch in
+            # the proven-safe exact patch buckets. The fallback cannot recurse:
+            # a one-bucket failure is a genuine non-finite model result.
+            patch_buckets: dict[int, list[dict[str, object]]] = {}
+            if safe_variable_length_batching:
+                for item in current_batch:
+                    patch_buckets.setdefault(
+                        int(item["compiled_context"]), []).append(item)
+            if len(patch_buckets) > 1:
+                pending[0:0] = list(patch_buckets.values())
+                continue
+
             bad_local_rows = np.flatnonzero(np.any(bad, axis=(1, 2)))
             bad_call_rows = call_rows[bad_local_rows]
             bad_source_rows = [
@@ -218,9 +297,9 @@ def forecast_quantiles(
                     "source_row": int(forecast_row_indices[
                         int(call_rows[int(i)])]),
                     "length": int(model_inputs[int(i)].shape[0]),
-                    "raw_nan_count": int(model_batch[int(i)][
+                    "raw_nan_count": int(current_batch[int(i)][
                         "raw_nan_count"]),
-                    "leading_nans_stripped": int(model_batch[int(i)][
+                    "leading_nans_stripped": int(current_batch[int(i)][
                         "leading_nans_stripped"]),
                     "remaining_nan_count": int(np.isnan(
                         model_inputs[int(i)]).sum()),
@@ -242,14 +321,5 @@ def forecast_quantiles(
                 f"compiled_max_horizon={max_horizon} "
                 f"input_rows={input_bad}"
             )
-        quantiles = np.asarray(
-            requested_predictions[:, :, 1:], dtype=np.float32)
-        if quantiles.shape[2] != len(QUANTILE_LEVELS):
-            raise ValueError(
-                "TimesFM forecast output must contain mean + q0.1..q0.9; "
-                f"got shape {tuple(np.asarray(full_predictions).shape)}"
-            )
-        outputs[call_rows] = quantiles.transpose((0, 2, 1))
-        model_batch_index += 1
 
     return outputs

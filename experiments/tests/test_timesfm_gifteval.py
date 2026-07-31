@@ -161,9 +161,9 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
         self.assertEqual([cfg.max_context for cfg in model.compiles], [64, 32])
         self.assertEqual([cfg.max_horizon for cfg in model.compiles], [128, 128])
         self.assertEqual(
-            [cfg.per_core_batch_size for cfg in model.compiles], [1, 2])
-        self.assertTrue(np.isnan(model.inputs[1][0][1]))
-        np.testing.assert_array_equal(model.inputs[1][1], np.zeros(2, dtype=np.float32))
+            [cfg.per_core_batch_size for cfg in model.compiles], [2, 1])
+        self.assertTrue(np.isnan(model.inputs[0][1][1]))
+        np.testing.assert_array_equal(model.inputs[1][0], np.zeros(2, dtype=np.float32))
 
     def test_compile_horizon_override(self) -> None:
         fake_timesfm = ModuleType("timesfm")
@@ -238,13 +238,53 @@ class TimesFMGiftEvalRecipeTest(unittest.TestCase):
             result = timesfm_gifteval.forecast_quantiles(
                 model, contexts, prediction_length=4, batch_size=4)
 
-        self.assertEqual([cfg.max_context for cfg in model.compiles], [64, 96])
+        # The fast heterogeneous batch is attempted once. This fake does not
+        # use TimesFM's attention mask, so it deliberately returns NaNs and
+        # exercises the exact-width correctness fallback.
+        self.assertEqual(
+            [cfg.max_context for cfg in model.compiles], [96, 64, 96])
         self.assertEqual(
             [[len(values) for values in inputs] for inputs in model.inputs],
-            [[64], [96, 65, 95]],
+            [[64, 96, 65, 95], [64], [96, 65, 95]],
         )
         self.assertTrue(np.isfinite(result).all())
         np.testing.assert_allclose(result[:, 0, 0], [10.0, 20.0, 30.0, 40.0])
+
+    def test_finite_variable_lengths_stay_in_one_large_batch(self) -> None:
+        fake_timesfm = ModuleType("timesfm")
+        fake_timesfm.configs = SimpleNamespace(ForecastConfig=_FakeForecastConfig)
+        contexts = [
+            np.full(64, 10.0, dtype=np.float32),
+            np.full(96, 20.0, dtype=np.float32),
+            np.full(65, 30.0, dtype=np.float32),
+            np.full(95, 40.0, dtype=np.float32),
+        ]
+        model = _FakeInputValueTimesFM()
+
+        with mock.patch.dict(sys.modules, {"timesfm": fake_timesfm}):
+            result = timesfm_gifteval.forecast_quantiles(
+                model, contexts, prediction_length=4, batch_size=4)
+
+        self.assertEqual(len(model.inputs), 1)
+        self.assertEqual(model.compiles[0].max_context, 96)
+        self.assertEqual(model.compiles[0].per_core_batch_size, 4)
+        np.testing.assert_allclose(result[:, 0, 0], [10.0, 20.0, 30.0, 40.0])
+
+    def test_attention_stabilizer_only_changes_empty_query_rows(self) -> None:
+        import torch
+
+        mask = torch.tensor([[
+            [False, False, False],
+            [False, True, False],
+            [False, True, True],
+        ]])
+        original = mask.clone()
+        safe = timesfm_gifteval._stabilize_fully_masked_attention_rows(mask)
+
+        expected = original.clone()
+        expected[0, 0, 0] = True
+        self.assertTrue(torch.equal(safe, expected))
+        self.assertTrue(torch.equal(safe[..., 1:, :], original[..., 1:, :]))
 
     def test_nonfinite_forecast_reports_batch_and_rows(self) -> None:
         fake_timesfm = ModuleType("timesfm")
