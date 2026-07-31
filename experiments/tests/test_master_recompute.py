@@ -19,6 +19,9 @@ from experiments import models_config
 from experiments import predict_context_length as predictor
 from experiments.compare_window_strategies_gifteval import _geomean
 from experiments.gifteval_mase import gluonts_leaderboard_mase
+from experiments.patchtst_gifteval import (
+    stabilize_fully_masked_attention_rows,
+)
 from experiments.test_window_ablation_gifteval_v5 import (
     ForecastResult, compute_per_sample_metrics)
 
@@ -522,6 +525,27 @@ class SoftClassificationLossTest(unittest.TestCase):
 
 
 class PatchTSTFMCompatibilityTest(unittest.TestCase):
+    def test_padding_attention_rows_are_stabilized_without_changing_real_rows(self) -> None:
+        mask = torch.tensor([[[-float("inf"), -float("inf")],
+                              [0.0, -float("inf")]]])
+        original_real_row = mask[:, 1].clone()
+
+        result = stabilize_fully_masked_attention_rows(mask)
+
+        self.assertIs(result, mask)
+        self.assertTrue(torch.equal(result[:, 1], original_real_row))
+        self.assertTrue(torch.equal(
+            result[:, 0], torch.tensor([[0.0, -float("inf")]])))
+        self.assertTrue(torch.isfinite(torch.softmax(result, dim=-1)).all())
+
+    def test_patchtst_recipe_invalidates_nan_padding_caches(self) -> None:
+        from experiments.gifteval_inference_recipes import inference_recipe
+
+        self.assertEqual(
+            inference_recipe("patchtst_fm"),
+            "official_patchtst_fm_list_q05_padding_safe_v2",
+        )
+
     def test_official_quantile_head_and_list_input(self) -> None:
         class NewGraniteAPI(torch.nn.Module):
             def forward(self, past_values, prediction_length, quantile_levels):
@@ -540,6 +564,7 @@ class PatchTSTFMCompatibilityTest(unittest.TestCase):
         self.assertEqual([tuple(x.shape) for x in model.seen], [(5,), (5,)])
         self.assertEqual(tuple(result.shape), (2, 3))
         self.assertTrue(torch.equal(result, torch.full((2, 3), 2.0)))
+        self.assertFalse(result.requires_grad)
 
     def test_mean_imputes_missing_values(self) -> None:
         class API(torch.nn.Module):

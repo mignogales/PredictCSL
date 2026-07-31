@@ -63,6 +63,20 @@ class GiftEvalReferenceTest(unittest.TestCase):
         ) / len(model))
         self.assertAlmostEqual(score, 0.7050307775530733, places=14)
 
+    def test_published_patchtst_headline_is_reproduced(self) -> None:
+        path = os.path.join(REFERENCE_DIR, "patchtst-fm-r1_all_results.csv")
+        with open(path, newline="") as f:
+            model = {
+                row["dataset"]: float(row["eval_metrics/MASE[0.5]"])
+                for row in csv.DictReader(f)
+            }
+        naive = published_seasonal_naive_mase()
+        self.assertEqual(len(model), 97)
+        score = math.exp(sum(
+            math.log(model[key] / naive[key]) for key in model
+        ) / len(model))
+        self.assertAlmostEqual(score, 0.7069359006427615, places=14)
+
 
 if __name__ == "__main__":
     unittest.main()

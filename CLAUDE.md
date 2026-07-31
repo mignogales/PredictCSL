@@ -231,12 +231,14 @@ Token-mapping / hook assumptions per family carry "verify on server" notes in
 - **`sanity_gifteval_leaderboard.py`** — clean-room replication of the OFFICIAL
   GiftEval leaderboard evaluation for one model, a line-for-line port of the
   official submission notebooks (SalesforceAIResearch/gift-eval
-  `notebooks/timesfm2p5.ipynb` + `notebooks/chronos-2.ipynb`). Runs all 97
+  `notebooks/timesfm2p5.ipynb`, `notebooks/chronos-2.ipynb`, and
+  `notebooks/patchtst_fm.ipynb`). Runs all 97
   configs with each model's official recipe, then diffs per config against the
   leaderboard's published `all_results.csv` and prints the PUBLISHED
   aggregation (geomean of MASE[0.5] ÷ published seasonal_naive MASE[0.5];
   reference CSVs in `experiments/leaderboard_reference/`). Targets:
-  **timesfm-2.5 0.7050 (DEFAULT)**, chronos-2 0.6978, chronos-2-synth 0.7203.
+  **timesfm-2.5 0.7050 (DEFAULT)**, chronos-2 0.6978, chronos-2-synth 0.7203,
+  PatchTST-FM-r1 0.7069.
   TimesFM-2.5 is the default replication gate because its official recipe has
   no extras (univariate flattening, independent series, full context capped
   15360, per-batch compile, 0.5-quantile head scored) — the cleanest
@@ -271,8 +273,13 @@ FlowState-R1, TiRex. Each has a `load_*` + `predict_*` wrapper in
 `build_context_length_dataset.py` (catalog in `models_config.py`, append-only).
 
 ### Model-specific gotchas baked into the code
-- **PatchTST-FM** has a fixed 8192 context and no mask input → genuine samples are
-  **NaN-padded** to native length (NaN is its missing-value indicator).
+- **PatchTST-FM** has a fixed 8192 context. The wrapper passes exact-length lists;
+  Granite mean-fills missing values, pads to 8192 internally, and constructs the
+  true pad mask. Granite-TSFM 0.3.6 masks padded queries as well as keys, creating
+  all-`-inf` attention rows that CUDA SDPA can turn into NaNs. The shared
+  `patchtst_padding_safe_attention` shim gives only those empty padded-query rows
+  one inert padding key; real query masks are unchanged. Inference recipe v2
+  invalidates every older NaN-contaminated stage-1/stage-3 cache.
 - Variable-length models (chronos, timesfm, moirai, sundial, timemoe) get only
   the genuine (un-padded) suffix; short series flatten the label curve past
   `real_len`.
@@ -334,6 +341,7 @@ python -m experiments.synth_param_sweeps --models Sundial-Base-128M TimeMoE-200M
 python -m experiments.synth_param_sweeps --experiments period delay --plot-only
 python -m experiments.sanity_gifteval_leaderboard                  # official-recipe TimesFM-2.5, target 0.7050
 python -m experiments.sanity_gifteval_leaderboard --model chronos-2 # target 0.6978 (multivariate+joint recipe)
+python -m experiments.sanity_gifteval_leaderboard --model patchtst-fm # target 0.7069; shared ablation wrapper
 python -m experiments.sanity_gifteval_leaderboard --max-context 8192  # pipeline-style context cap
 ```
 Stage 1 alone: `python -m experiments.build_context_length_dataset --model-idx <i>`.

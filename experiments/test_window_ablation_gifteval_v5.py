@@ -71,6 +71,10 @@ from experiments.gifteval_inference_recipes import (
     inference_recipe, preserves_missing,
 )
 from experiments.gifteval_metric_version import METRIC_SUITE_VER
+from experiments.patchtst_gifteval import (
+    patchtst_padding_safe_attention,
+    require_finite_patchtst_forecast,
+)
 
 try:
     from tsfm_public import PatchTSTFMForPrediction
@@ -1430,7 +1434,11 @@ def _patchtst_quantiles_for_contexts(model, contexts, horizon, device):
                     else row.new_tensor(0.0))
             row = torch.where(missing, fill, row)
         target.append(row)
-    with torch.device(device):
+    # Full-native sanity calls this helper directly (outside ``_run_batches``),
+    # so own inference mode here. Without it, each accumulated chunk retains a
+    # complete 8192-step computation graph and eventually OOMs large datasets.
+    with (torch.inference_mode(), patchtst_padding_safe_attention(),
+          torch.device(device)):
         output = model(
             past_values=target,
             prediction_length=horizon,
@@ -1458,7 +1466,8 @@ def _patchtst_quantiles_for_contexts(model, contexts, horizon, device):
     if preds.shape[2] != horizon:
         raise ValueError(
             f"PatchTST returned horizon={preds.shape[2]}, expected {horizon}")
-    return preds.to(device=device, dtype=torch.float32)
+    return require_finite_patchtst_forecast(
+        preds.to(device=device, dtype=torch.float32))
 
 
 def predict_patchtst_fm(model, batches, horizon, device):

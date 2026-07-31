@@ -78,6 +78,10 @@ from experiments.timesfm_gifteval import (
     forecast_quantiles as forecast_timesfm_quantiles,
     load_model as load_timesfm_official,
 )
+from experiments.patchtst_gifteval import (
+    patchtst_padding_safe_attention,
+    require_finite_patchtst_forecast,
+)
 
 
 # ==============================================================================
@@ -674,7 +678,8 @@ def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> to
                     else row.new_tensor(0.0))
             row = torch.where(missing, fill, row)
         target.append(row)
-    with torch.device(device):
+    with (torch.inference_mode(), patchtst_padding_safe_attention(),
+          torch.device(device)):
         output = model(
             past_values=target, prediction_length=horizon,
             quantile_levels=PATCHTST_FM_QUANTILE_LEVELS)
@@ -696,8 +701,9 @@ def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> to
         raise ValueError(f"PatchTST output has no quantile axis: {tuple(raw.shape)}")
     if qf.shape[2] != horizon:
         raise ValueError(f"PatchTST returned horizon={qf.shape[2]}, expected {horizon}")
-    return qf[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :].to(
-        device=device, dtype=torch.float32)
+    return require_finite_patchtst_forecast(
+        qf[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :].to(
+            device=device, dtype=torch.float32))
 
 
 def _patch_dynamic_cache_seen_tokens() -> None:

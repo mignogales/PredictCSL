@@ -6,12 +6,14 @@ submission, then diffing per config against the leaderboard's published
 ``all_results.csv``. Until this reproduces the leaderboard headline for a model,
 no pipeline number for that model should be trusted.
 
-This is a deliberately faithful, line-for-line port of the OFFICIAL submission
-notebooks (linked from each model's ``results/<model>/config.json`` on the
-leaderboard space) — no monkeypatching, no clever framework-fighting:
+This is a deliberately faithful port of the OFFICIAL submission notebooks
+(linked from each model's ``results/<model>/config.json`` on the leaderboard
+space). PatchTST-FM uses the same v5 pipeline wrapper as the ablation so its
+sanity result is also an integration gate for short-context inference:
 
   timesfm-2.5   https://github.com/SalesforceAIResearch/gift-eval/blob/main/notebooks/timesfm2p5.ipynb
   chronos-2     https://github.com/SalesforceAIResearch/gift-eval/blob/main/notebooks/chronos-2.ipynb
+  patchtst-fm   https://github.com/SalesforceAIResearch/gift-eval/blob/main/notebooks/patchtst_fm.ipynb
 
 The headline is the PUBLISHED aggregation: geomean over the 97 configs of
 MASE[0.5] / the leaderboard's published seasonal_naive MASE[0.5] (reference CSVs
@@ -21,6 +23,7 @@ from those CSVs:
     timesfm-2.5     (google/timesfm-2.5-200m-pytorch)   0.7050   <- DEFAULT
     chronos-2       (amazon/chronos-2)                  0.6978
     chronos-2-synth (autogluon/chronos-2-synth)         0.7203
+    patchtst-fm-r1  (ibm-research/patchtst-fm-r1)        0.7069
 
 TimesFM-2.5 is the default because its official recipe has no "fancy stuff" —
 plain univariate flattening (``to_univariate = target_dim > 1``), independent
@@ -68,6 +71,7 @@ the faithful one.
 from __future__ import annotations
 
 import argparse
+import gc
 import itertools
 import json
 import logging
@@ -77,6 +81,7 @@ import os
 from typing import Callable, List, Optional, Tuple, TypeVar
 
 from experiments.gifteval_reference import published_seasonal_naive_mase
+from experiments.gifteval_inference_recipes import inference_recipe
 
 try:
     from dotenv import load_dotenv
@@ -159,6 +164,7 @@ def _is_oom_error(exc: BaseException) -> bool:
 
 
 def _clear_accelerator_cache() -> None:
+    gc.collect()
     try:
         torch = _require_torch("clear accelerator cache after OOM")
     except ImportError:
@@ -191,8 +197,10 @@ def _run_with_dynamic_batch(label: str, initial_batch_size: int,
             next_batch_size = max(1, batch_size // 2)
             logger.warning("%s OOM at batch_size=%d; retrying with %d",
                            label, batch_size, next_batch_size)
-            _clear_accelerator_cache()
             batch_size = next_batch_size
+        # Clear only after leaving the ``except`` suite: the exception and its
+        # traceback can retain the failed attempt's CUDA tensors until then.
+        _clear_accelerator_cache()
 
 
 # ==============================================================================
@@ -241,6 +249,7 @@ REFERENCE_CSVS = {
     "amazon/chronos-2": "chronos-2_all_results.csv",
     "autogluon/chronos-2": "chronos-2_all_results.csv",  # same weights
     "autogluon/chronos-2-synth": "chronos-2-synth_all_results.csv",
+    "ibm-research/patchtst-fm-r1": "patchtst-fm-r1_all_results.csv",
 }
 
 # CLI shorthand -> HF id of the official submission.
@@ -249,6 +258,8 @@ MODEL_ALIASES = {
     "timesfm-2.5": "google/timesfm-2.5-200m-pytorch",
     "chronos-2": "amazon/chronos-2",
     "chronos-2-synth": "autogluon/chronos-2-synth",
+    "patchtst": "ibm-research/patchtst-fm-r1",
+    "patchtst-fm": "ibm-research/patchtst-fm-r1",
 }
 
 QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -634,6 +645,7 @@ def evaluate_pipeline_on_dataset(model_id: str, model_family: str,
                 return {
                     "MASE[0.5]": float(mase),
                     "_recipe": "pipeline_full_context",
+                    "_inference_recipe": inference_recipe(model_family),
                     "_context_cap": int(cap),
                     "_model_family": model_family,
                     "_batch_size": int(eval_batch_size),
@@ -829,7 +841,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", default="timesfm-2.5",
                     help="official shorthand (timesfm-2.5, chronos-2, "
-                         "chronos-2-synth), a models_config display name "
+                         "chronos-2-synth, patchtst-fm), a models_config display name "
                          "(Moirai2-Small, PatchTST-FM-R1, ...), or a full HF id")
     ap.add_argument("--batch-size", type=int, default=100,
                     help="chronos-2 official notebook value: 100 (timesfm "
@@ -884,9 +896,20 @@ def main() -> None:
         cell_path = os.path.join(out_dir, cfg["key"].replace("/", "_") + ".json")
         if os.path.exists(cell_path):
             with open(cell_path) as f:
-                ours[cfg["key"]] = json.load(f)
-            logger.info(f"[{i + 1}/{len(configs)}] {cfg['key']}  (cached)")
-            continue
+                cached = json.load(f)
+            expected_recipe = (None if recipe == "official"
+                               else inference_recipe(pipeline_family))
+            cached_mase = cached.get("MASE[0.5]", float("nan"))
+            if ((expected_recipe is None or
+                 cached.get("_inference_recipe") == expected_recipe)
+                    and math.isfinite(float(cached_mase))):
+                ours[cfg["key"]] = cached
+                logger.info(f"[{i + 1}/{len(configs)}] {cfg['key']}  (cached)")
+                continue
+            logger.warning(
+                "[%d/%d] %s stale/non-finite cache; recomputing",
+                i + 1, len(configs), cfg["key"],
+            )
         logger.info(f"[{i + 1}/{len(configs)}] {cfg['key']}  running...")
         try:
             m = evaluate_on_dataset(
