@@ -5,22 +5,27 @@
 > from the working server envs via `pip freeze` on 2026-06-24. If you change a
 > model loader or a dependency, update the matching `setup-*.sh` here.
 
-## Why four envs (and not one)
+## Why five envs (and not one)
 
-Four environments are forced by hard, irreconcilable dependency conflicts — you
+Five environments are forced by hard, irreconcilable dependency conflicts — you
 cannot collapse them into one:
 
-| | `predictcsl-main` | `predictcsl-legacy` | `predictcsl-toto` | `predictcsl-tirex` |
-|---|---|---|---|---|
-| Python | 3.11 | 3.11 | **3.12** (toto-models 1.0.0 has no 3.11 wheel) | 3.11 |
-| torch | 2.4.1+cu121 | 2.4.1+cu121 (inherited) | **2.5.1+cu121** | **2.8.0+cu126** |
-| numpy | 1.26.4 | 1.26.4 (inherited) | 1.x/2.x per resolver | **2.1.3** |
-| transformers | 4.56.0 | **4.40.1** (Sundial/TimeMoE legacy `DynamicCache`) | (toto's own) | package resolver |
+| | `predictcsl-main` | `predictcsl-patchtst` | `predictcsl-legacy` | `predictcsl-toto` | `predictcsl-tirex` |
+|---|---|---|---|---|---|
+| Python | 3.11 | 3.11 | 3.11 | **3.12** (toto-models 1.0.0 has no 3.11 wheel) | 3.11 |
+| torch | 2.4.1+cu121 | **2.8.0+cu128** | 2.4.1+cu121 (inherited) | **2.5.1+cu121** | **2.8.0+cu126** |
+| numpy | 1.26.4 | 1.26.4 (inherited) | 1.26.4 (inherited) | 1.x/2.x per resolver | **2.1.3** |
+| transformers | 4.56.0 | 4.56.0 | **4.40.1** (Sundial/TimeMoE legacy `DynamicCache`) | (toto's own) | package resolver |
 
 - **`predictcsl-main`** — the workhorse. Modern TSFM stack + GiftEval **+ the
   Mamba predictor** (mamba-ssm ships here as a prebuilt wheel). Runs every model
-  except Toto, Sundial, TimeMoE, and TiRex2; runs both stage-2 predictors
+  except PatchTST-FM, Toto, Sundial, TimeMoE, and TiRex2; runs both stage-2 predictors
   (PatchTST + Mamba) for compatible env groups.
+- **`predictcsl-patchtst`** — a clone of main upgraded to torch 2.8.0, retaining
+  Granite commit `e4d488689` and transformers 4.56.0. This is the exact
+  leaderboard-era `forward(inputs=...)` path. Official torch-2.8 wheels for
+  causal-conv1d 1.5.4 and mamba-ssm 2.2.5 let it run both Mamba predictor
+  objectives as well.
 - **`predictcsl-legacy`** — a *clone of main* re-pinned to `transformers==4.40.1`.
   Only stage-1 labeling of Sundial (idx 5) + TimeMoE (idx 6).
 - **`predictcsl-toto`** — standalone Python-3.12 env. Only Toto-2.0-313m (idx 10).
@@ -45,6 +50,7 @@ resolve cleanly against `torch 2.4.1`. Don't "simplify" them to plain
 | Canonical (these files) | Server env |
 |-------------------------|------------|
 | `predictcsl-main`   | `TSFM_moirai` |
+| `predictcsl-patchtst` | `TSFM_PATCH` |
 | `predictcsl-legacy` | `TSFM_sundial_patch` |
 | `predictcsl-toto`   | `TSFM_toto` |
 | `predictcsl-tirex`  | `predictcsl-test` / `TSFM_tirex2` |
@@ -62,7 +68,7 @@ Stage-1 `--model-idx` order (from `experiments/models_config.py`, APPEND-ONLY):
 | 1 | ChronosBolt-Small *(catalog only, run=False)* | chronos_bolt | main |
 | 2 | Moirai2-Small | moirai (uni2ts) | main |
 | 3 | TimesFM2.5-200M | timesfm | main |
-| 4 | PatchTST-FM-R1 | patchtst_fm (granite-tsfm) | main |
+| **4** | **PatchTST-FM-R1** | **patchtst_fm (granite-tsfm)** | **patchtst** |
 | **5** | **Sundial-Base-128M** | **sundial** | **legacy** |
 | **6** | **TimeMoE-200M** | **timemoe** | **legacy** |
 | 7 | Chronos2-Synth | chronos2 | main |
@@ -74,7 +80,7 @@ Stage-1 `--model-idx` order (from `experiments/models_config.py`, APPEND-ONLY):
 
 - **Stage 2** (predictor training): the default PatchTST predictor can run in
   each model's env group. The Mamba variant requires an env with `mamba-ssm`; the
-  master skips mamba variants for `predictcsl-toto` and `predictcsl-tirex`.
+  master skips mamba variants only for `predictcsl-toto` and `predictcsl-tirex`.
 - **Stages 3–5** (GiftEval ablation / compare / timing): run in the env that can
   import that model's TSFM package. The master handles this routing.
 
@@ -84,8 +90,12 @@ Stage-1 `--model-idx` order (from `experiments/models_config.py`, APPEND-ONLY):
 # --- main: modern models + both predictors + all stages ---
 conda activate predictcsl-main
 python -m experiments.run_all --models \
-    Chronos2-Small Moirai2-Small TimesFM2.5-200M PatchTST-FM-R1 \
+    Chronos2-Small Moirai2-Small TimesFM2.5-200M \
     Chronos2-Synth Chronos2-Base ChronosBolt-Base FlowState-R1
+
+# --- patchtst: exact GIFT-Eval leaderboard wrapper/runtime ---
+conda activate predictcsl-patchtst
+python -m experiments.run_all --models PatchTST-FM-R1
 
 # --- legacy: the two trust_remote_code families (stage 1 only) ---
 conda activate predictcsl-legacy
@@ -111,13 +121,14 @@ PREDICTCSL_PREDICTOR_ARCH=mamba python -m experiments.run_all_v4    # Mamba pred
 One `setup-*.sh` script per env, all in this directory. Run from the repo root.
 
 ```bash
-bash envs/setup-all.sh        # builds all four, in the right order
+bash envs/setup-all.sh        # builds all five, in the right order
 ```
 
 Or one at a time (main must come before legacy — legacy clones it):
 
 ```bash
 bash envs/setup-main.sh       # predictcsl-main   (workhorse + Mamba predictor)
+bash envs/setup-patchtst.sh   # predictcsl-patchtst (published PatchTST path)
 bash envs/setup-legacy.sh     # predictcsl-legacy (clone of main + transformers 4.40.1)
 bash envs/setup-toto.sh       # predictcsl-toto   (Python 3.12, Toto only)
 bash envs/setup-tirex.sh      # predictcsl-tirex  (TiRex2 only)
@@ -126,10 +137,11 @@ bash envs/setup-tirex.sh      # predictcsl-tirex  (TiRex2 only)
 | Script | Env | Notes |
 |--------|-----|-------|
 | `setup-main.sh`   | `predictcsl-main`   | torch 2.4.1+cu121; modern TSFMs (git-pinned) + GiftEval + mamba |
+| `setup-patchtst.sh` | `predictcsl-patchtst` | clones main; torch 2.8.0+cu128 + published Granite `inputs=` API + torch-2.8 Mamba wheels |
 | `setup-legacy.sh` | `predictcsl-legacy` | clones main, re-pins `transformers`/`tokenizers`/`huggingface-hub` |
 | `setup-toto.sh`   | `predictcsl-toto`   | Python 3.12, torch 2.5.1+cu121, `toto-2` + `toto-models` |
 | `setup-tirex.sh`  | `predictcsl-tirex`  | Python 3.11, torch 2.8.0+cu126, `tirex-2` / `tirex2` |
-| `setup-all.sh`    | all four            | runs the above in order |
+| `setup-all.sh`    | all five            | runs the above in order |
 
 > **Pins:** `main` is captured exactly from `TSFM_moirai`. `legacy` and `toto`
 > have their hard constraints pinned exactly; a few generic deps in `toto` are
@@ -146,11 +158,11 @@ resolved package state here, use:
 bash envs/snapshot-conda-envs.sh export
 ```
 
-That writes `predictcsl-main.yml`, `predictcsl-legacy.yml`,
+That writes `predictcsl-main.yml`, `predictcsl-patchtst.yml`, `predictcsl-legacy.yml`,
 `predictcsl-toto.yml`, and `predictcsl-tirex.yml` under
 `envs/conda-snapshots/<timestamp>/`, plus matching `pip freeze` files for
 debugging. The exporter accepts the old server env aliases (`TSFM_moirai`,
-`TSFM_sundial_patch`, `TSFM_toto`, `predictcsl-test`, `TSFM_tirex2`) and saves
+`TSFM_PATCH`, `TSFM_sundial_patch`, `TSFM_toto`, `predictcsl-test`, `TSFM_tirex2`) and saves
 them under the canonical `predictcsl-*` names used by `master_run_all.py`. It
 also removes machine-specific `prefix:` paths from the exported YAML files.
 

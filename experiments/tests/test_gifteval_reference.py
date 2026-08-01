@@ -21,9 +21,9 @@ class GiftEvalReferenceTest(unittest.TestCase):
         self.assertEqual(len(published_seasonal_naive_mase()), 97)
         self.assertEqual(len(published_naive_by_display()), 97)
         run_set = datasets_config.datasets_to_run()
-        self.assertEqual(len(run_set), 95)
-        self.assertNotIn("Solar-W", {row[2] for row in run_set})
-        self.assertNotIn("CarParts", {row[2] for row in run_set})
+        self.assertEqual(len(run_set), 97)
+        self.assertIn("Solar-W", {row[2] for row in run_set})
+        self.assertIn("CarParts", {row[2] for row in run_set})
 
     def test_dataset_aliases_match_leaderboard_csv_keys(self) -> None:
         self.assertEqual(

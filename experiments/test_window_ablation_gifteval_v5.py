@@ -71,10 +71,7 @@ from experiments.gifteval_inference_recipes import (
     inference_recipe, preserves_missing,
 )
 from experiments.gifteval_metric_version import METRIC_SUITE_VER
-from experiments.patchtst_gifteval import (
-    patchtst_padding_safe_attention,
-    require_finite_patchtst_forecast,
-)
+from experiments.patchtst_gifteval import forecast_patchtst_quantiles_official
 
 try:
     from tsfm_public import PatchTSTFMForPrediction
@@ -109,6 +106,21 @@ MOIRAI_1_1_PATCH_SIZE = 32
 TIMESFM_QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 TIMESFM_FULL_CONTEXT = 15360
 FULL_NATIVE_WINDOW = "full_native"
+
+# Published normalized MASE values from the GIFT-Eval overall leaderboard.
+# These models do not yet have a checked-in per-dataset ``all_results.csv``, so
+# use the leaderboard headline only for the complete canonical cohort.  A
+# filtered/test cohort must not pretend that the global headline is a
+# same-cohort target.
+# Source: https://huggingface.co/spaces/Salesforce/GIFT-Eval
+PUBLISHED_LEADERBOARD_NORMALIZED_MASE = {
+    "FlowState-R1": 0.701,       # leaderboard row: FlowState-r1.1
+    "ChronosBolt-Base": 0.808,   # leaderboard row: chronos_bolt_base
+    "Sundial-Base-128M": 0.750,  # leaderboard row: sundial_base_128m
+    "PatchTST-FM-R1": 0.707,
+    "TiRex2": 0.697,             # leaderboard row: TiRex-2-Zeroshot
+}
+PUBLISHED_LEADERBOARD_URL = "https://huggingface.co/spaces/Salesforce/GIFT-Eval"
 PATCHTST_FM_QUANTILE_LEVELS = [i / 10.0 for i in range(1, 10)]
 PATCHTST_FM_MEDIAN_QUANTILE_IDX = 4
 SUNDIAL_NUM_SAMPLES = 100
@@ -622,7 +634,7 @@ def _write_leaderboard_parity_summary(
         "normalization_reference": (
             "leaderboard_reference/seasonal_naive_all_results.csv"),
         "expected_cells": len(datasets),
-        "excluded_short_cells": ["Solar-W/short", "CarParts/short"],
+        "excluded_short_cells": [],
         "last_checkpoint_stage": checkpoint_stage,
     })
     model_payload = payload.setdefault("models", {})
@@ -631,7 +643,9 @@ def _write_leaderboard_parity_summary(
         "TimesFM2.5-200M": "timesfm-2.5_all_results.csv",
         "Chronos2-Base": "chronos-2_all_results.csv",
         "Chronos2-Synth": "chronos-2-synth_all_results.csv",
+        "PatchTST-FM-R1": "patchtst-fm-r1_all_results.csv",
     }
+    is_canonical_cohort = list(datasets) == list(DATASETS)
 
     for model_id, family, model_short in models:
         ratios: List[float] = []
@@ -669,6 +683,7 @@ def _write_leaderboard_parity_summary(
 
         published_score = None
         reference_file = published_files.get(model_short)
+        reference_url = None
         if reference_file is not None:
             reference_path = os.path.join(REFERENCE_DIR, reference_file)
             try:
@@ -695,6 +710,11 @@ def _write_leaderboard_parity_summary(
                       + f"  Could not calculate {model_short}'s published "
                         f"{len(datasets)}-cell target from {reference_file}: {exc}"
                       + Fore.RESET)
+        elif is_canonical_cohort:
+            published_score = PUBLISHED_LEADERBOARD_NORMALIZED_MASE.get(
+                model_short)
+            if published_score is not None:
+                reference_url = PUBLISHED_LEADERBOARD_URL
 
         record = {
             "model_id": model_id,
@@ -707,6 +727,7 @@ def _write_leaderboard_parity_summary(
             "missing_cells": missing,
             "gluonts_real_standin_cells": standins,
             "published_reference_file": reference_file,
+            "published_reference_url": reference_url,
             "published_cohort_geomean_normalized_mase": published_score,
             "delta_from_published": (
                 None if score is None or published_score is None
@@ -1425,49 +1446,13 @@ def load_patchtst_fm(model_id, device):
 
 
 def _patchtst_quantiles_for_contexts(model, contexts, horizon, device):
-    target = []
-    for context in contexts:
-        row = torch.as_tensor(context, dtype=torch.float32, device=device)
-        missing = torch.isnan(row)
-        if bool(missing.any()):
-            fill = (row[~missing].mean() if bool((~missing).any())
-                    else row.new_tensor(0.0))
-            row = torch.where(missing, fill, row)
-        target.append(row)
-    # Full-native sanity calls this helper directly (outside ``_run_batches``),
-    # so own inference mode here. Without it, each accumulated chunk retains a
-    # complete 8192-step computation graph and eventually OOMs large datasets.
-    with (torch.inference_mode(), patchtst_padding_safe_attention(),
-          torch.device(device)):
-        output = model(
-            past_values=target,
-            prediction_length=horizon,
-            quantile_levels=PATCHTST_FM_QUANTILE_LEVELS,
-        )
-    raw = output.quantile_outputs
-    if isinstance(raw, (list, tuple)):
-        raw = torch.stack([torch.as_tensor(item) for item in raw], dim=0)
-    else:
-        raw = torch.as_tensor(raw)
-    if raw.dim() == 4 and raw.shape[-1] == 1:
-        raw = raw[..., 0]
-    if raw.dim() != 3:
-        raise ValueError(
-            f"Unexpected PatchTST quantile output shape {tuple(raw.shape)}")
-    q_count = len(PATCHTST_FM_QUANTILE_LEVELS)
-    if raw.shape[1] == q_count:                         # (B, Q, H)
-        preds = raw[:, :, :horizon]
-    elif raw.shape[2] == q_count:                       # (B, H, Q)
-        preds = raw[:, :horizon, :].permute(0, 2, 1)
-    else:
-        raise ValueError(
-            "PatchTST quantile_outputs has no nine-quantile axis: "
-            f"{tuple(raw.shape)}")
-    if preds.shape[2] != horizon:
-        raise ValueError(
-            f"PatchTST returned horizon={preds.shape[2]}, expected {horizon}")
-    return require_finite_patchtst_forecast(
-        preds.to(device=device, dtype=torch.float32))
+    return forecast_patchtst_quantiles_official(
+        model,
+        contexts,
+        horizon,
+        device,
+        PATCHTST_FM_QUANTILE_LEVELS,
+    )
 
 
 def predict_patchtst_fm(model, batches, horizon, device):

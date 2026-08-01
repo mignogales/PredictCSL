@@ -110,9 +110,9 @@ CATALOG: List[DatasetSpec] = [
     DatasetSpec("solar/H",                     "medium", "Solar-H",         False, True),
     DatasetSpec("solar/H",                     "long",   "Solar-H",         False, True),
     DatasetSpec("solar/D",                     "short",  "Solar-D",         False, True),
-    # Excluded from the experiment cohort: only W=32 fits, so there is no
-    # context-window selection problem to evaluate here.
-    DatasetSpec("solar/W",                     "short",  "Solar-W",         False, False),
+    # Only W=32 fits, so this cell contributes one point rather than a context
+    # selection curve; retain it to keep the experiment cohort leaderboard-complete.
+    DatasetSpec("solar/W",                     "short",  "Solar-W",         False, True),
     DatasetSpec("hierarchical_sales/D",        "short",  "HierSales-D",     False, True),
     DatasetSpec("hierarchical_sales/W",        "short",  "HierSales-W",     False, True),
     DatasetSpec("m4_yearly",                   "short",  "M4-Yearly",       False, True),
@@ -145,9 +145,9 @@ CATALOG: List[DatasetSpec] = [
     DatasetSpec("kdd_cup_2018_with_missing/H", "medium", "KDDCup2018-H",   False, True),
     DatasetSpec("kdd_cup_2018_with_missing/H", "long",   "KDDCup2018-H",   False, True),
     DatasetSpec("kdd_cup_2018_with_missing/D", "short",  "KDDCup2018-D",   False, True),
-    # As above, W=32 is the only selectable window; keep it in the official
-    # 97-row reference catalog but out of our 95-cell experiment cohort.
-    DatasetSpec("car_parts_with_missing",      "short",  "CarParts",       False, False),
+    # As above, W=32 is the only selectable window; retain it for complete
+    # 97-cell GIFT-Eval coverage.
+    DatasetSpec("car_parts_with_missing",      "short",  "CarParts",       False, True),
     DatasetSpec("temperature_rain_with_missing", "short", "TempRain",      False, True),
 ]
 

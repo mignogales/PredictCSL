@@ -17,7 +17,8 @@ doing part of the work.
 
 ENV: run Sundial / TimeMoE in the legacy ``transformers==4.40.1`` env
 (``TSFM_sundial_patch``); the main env's newer transformers breaks their remote
-mask build before any masking runs. Chronos-2 / PatchTST-FM use the main env.
+mask build before any masking runs. Chronos-2 uses the main env; PatchTST-FM
+uses the leaderboard-compatible ``predictcsl-patchtst`` env.
 
 Runs on the SERVER (needs the TSFM + GPU). Start small:
 

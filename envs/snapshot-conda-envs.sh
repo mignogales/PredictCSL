@@ -11,7 +11,8 @@
 #   bash envs/snapshot-conda-envs.sh restore --update-existing envs/conda-snapshots/YYYYmmdd-HHMMSS
 #
 # The canonical env names come from experiments/master_run_all.py:
-#   predictcsl-main, predictcsl-legacy, predictcsl-toto, predictcsl-tirex
+#   predictcsl-main, predictcsl-patchtst, predictcsl-legacy,
+#   predictcsl-toto, predictcsl-tirex
 #
 # Older server aliases are accepted during export and saved under canonical names.
 # =============================================================================
@@ -22,6 +23,7 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 
 CANONICAL_ENVS=(
   predictcsl-main
+  predictcsl-patchtst
   predictcsl-legacy
   predictcsl-toto
   predictcsl-tirex
@@ -71,6 +73,9 @@ aliases_for() {
   case "$1" in
     predictcsl-main)
       echo "predictcsl-main TSFM_moirai"
+      ;;
+    predictcsl-patchtst)
+      echo "predictcsl-patchtst TSFM_PATCH"
       ;;
     predictcsl-legacy)
       echo "predictcsl-legacy TSFM_sundial_patch"

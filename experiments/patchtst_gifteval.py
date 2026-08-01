@@ -1,93 +1,122 @@
-"""Shared PatchTST-FM inference safeguards for GIFT-Eval.
+"""Official PatchTST-FM inference helpers for GIFT-Eval.
 
-Granite-TSFM 0.3.6 builds an additive attention mask that masks both padded
-keys and padded queries.  A padded query therefore receives an all-``-inf``
-attention row.  CUDA scaled-dot-product attention can turn that row into NaNs;
-after the residual connection, later layers can propagate those NaNs into the
-real forecast tokens.  This is especially visible in context-window ablations,
-where every context shorter than PatchTST-FM's native 8192 steps is left padded.
+PatchTST-FM has had two public Granite APIs.  The leaderboard-producing branch
+accepts CPU ``inputs`` tensors and owns their device placement; newer Granite
+releases accept device-resident ``past_values``.  Moving the legacy inputs to
+CUDA in the caller changes the padded-context execution path and measurably
+changes forecasts, so the distinction below is deliberate.
 
-The official model still needs its pad mask: real query tokens must not attend
-to padded keys.  We therefore change only fully masked *query* rows, giving each
-one a single finite padding key.  Real query rows and their outputs are bitwise
-unchanged by the mask transformation.
+Both paths preserve the model's original attention mask and use ``no_grad``, as
+the official GIFT-Eval predictor does.  We do not modify fully masked padding
+rows: runtimes that cannot evaluate the official mask finitely must fail loudly
+instead of silently producing a different PatchTST variant.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import inspect
+from typing import Sequence
 
 
-def stabilize_fully_masked_attention_rows(mask):
-    """Make all-``-inf`` additive-attention rows numerically well-defined.
+def _uses_legacy_inputs_api(model) -> bool:
+    """Whether ``model.forward`` is the leaderboard-era ``inputs`` API."""
+    params = inspect.signature(model.forward).parameters
+    if "inputs" in params and "past_values" not in params:
+        return True
+    if "past_values" in params:
+        return False
+    raise RuntimeError(
+        "Unsupported PatchTST-FM API: expected forward(..., inputs=...) or "
+        "forward(..., past_values=...)."
+    )
 
-    ``make_attn_mask`` returns a fresh tensor, so mutating it avoids another
-    native-context-sized allocation.  The implementation also avoids a Python
-    truth test on a CUDA tensor (and therefore an unnecessary synchronization).
-    """
-    if mask is None or getattr(mask, "dtype", None) is None:
-        return mask
 
+def _official_preprocess(contexts: Sequence, *, device: str, legacy: bool):
+    """Port ``PatchTSTFMEvalPredictor.preprocess`` without changing placement."""
+    import numpy as np
     import torch
 
-    if not mask.dtype.is_floating_point or mask.ndim < 2 or mask.shape[-1] == 0:
-        return mask
-    empty_rows = torch.isneginf(mask).all(dim=-1)
-    mask[..., 0].masked_fill_(empty_rows, 0.0)
-    return mask
+    target = []
+    for context in contexts:
+        if isinstance(context, torch.Tensor):
+            values = context.detach().cpu().numpy()
+        else:
+            values = np.asarray(context)
+        if np.isnan(values).any():
+            if np.isnan(values).all():
+                values = np.zeros_like(values)
+            else:
+                values = np.nan_to_num(values, nan=np.nanmean(values))
+        row = torch.from_numpy(np.asarray(values)).float()
+        # The published legacy wrapper passes CPU tensors and lets the model
+        # place them. The current public wrapper explicitly moves past_values.
+        if not legacy:
+            row = row.to(device)
+        target.append(row)
+    return target
 
 
-@contextmanager
-def patchtst_padding_safe_attention():
-    """Temporarily stabilize PatchTST-FM's internally constructed pad mask.
+def forecast_patchtst_quantiles_official(
+    model, contexts: Sequence, horizon: int, device: str,
+    quantile_levels: Sequence[float],
+):
+    """Run either public Granite API with its official input-placement recipe."""
+    import torch
 
-    Patch both module bindings because ``modeling_patchtst_fm`` imports
-    ``make_attn_mask`` directly from ``basic``.  Wrapping the current binding
-    (rather than assuming both names still point to the same function) composes
-    correctly with the interpretability attention-mask context manager.
-    """
-    try:
-        import tsfm_public.models.patchtst_fm.basic as basic
-        import tsfm_public.models.patchtst_fm.modeling_patchtst_fm as modeling
-    except (ImportError, AttributeError):
-        # Unit tests use small API-compatible fake models and do not install the
-        # heavyweight TSFM dependency.
-        yield
-        return
+    legacy = _uses_legacy_inputs_api(model)
+    target = _official_preprocess(contexts, device=device, legacy=legacy)
+    with torch.no_grad():
+        if legacy:
+            output = model(
+                inputs=target,
+                prediction_length=horizon,
+                quantile_levels=list(quantile_levels),
+            )
+            raw = output.quantile_predictions
+        else:
+            output = model(
+                past_values=target,
+                prediction_length=horizon,
+                quantile_levels=list(quantile_levels),
+            )
+            raw = output.quantile_outputs
 
-    original_basic = getattr(basic, "make_attn_mask", None)
-    original_modeling = getattr(modeling, "make_attn_mask", None)
-    if original_basic is None or original_modeling is None:
-        yield
-        return
-
-    def wrap(original):
-        def wrapped(*args, **kwargs):
-            return stabilize_fully_masked_attention_rows(
-                original(*args, **kwargs))
-
-        return wrapped
-
-    basic.make_attn_mask = wrap(original_basic)
-    if original_modeling is original_basic:
-        modeling.make_attn_mask = basic.make_attn_mask
+    if isinstance(raw, (list, tuple)):
+        raw = torch.stack([torch.as_tensor(item) for item in raw], dim=0)
     else:
-        modeling.make_attn_mask = wrap(original_modeling)
-    try:
-        yield
-    finally:
-        basic.make_attn_mask = original_basic
-        modeling.make_attn_mask = original_modeling
+        raw = torch.as_tensor(raw)
+    if raw.dim() == 4 and raw.shape[-1] == 1:
+        raw = raw[..., 0]
+    if raw.dim() != 3:
+        raise ValueError(
+            f"Unexpected PatchTST quantile output shape {tuple(raw.shape)}")
+
+    q_count = len(quantile_levels)
+    if raw.shape[1] == q_count:                         # (B, Q, H)
+        quantiles = raw[:, :, :horizon]
+    elif raw.shape[2] == q_count:                       # (B, H, Q)
+        quantiles = raw[:, :horizon, :].permute(0, 2, 1)
+    else:
+        raise ValueError(
+            "PatchTST quantile output has no requested quantile axis: "
+            f"{tuple(raw.shape)}")
+    if quantiles.shape[2] != horizon:
+        raise ValueError(
+            f"PatchTST returned horizon={quantiles.shape[2]}, expected {horizon}")
+    return require_finite_patchtst_forecast(
+        quantiles.to(device=device, dtype=torch.float32))
 
 
 def require_finite_patchtst_forecast(forecast):
-    """Reject a poisoned PatchTST forecast before it can enter cell caches."""
+    """Reject a poisoned official forecast before it can enter cell caches."""
     import torch
 
     bad = ~torch.isfinite(forecast)
     if bool(bad.any()):
         raise RuntimeError(
-            "PatchTST-FM returned non-finite forecasts after padding-safe "
-            f"attention ({int(bad.sum().item())}/{forecast.numel()} values)."
+            "The official PatchTST-FM inference path returned non-finite "
+            f"forecasts ({int(bad.sum().item())}/{forecast.numel()} values). "
+            "Use the leaderboard-compatible PatchTST environment; do not "
+            "change the padding mask to make this runtime appear finite."
         )
     return forecast

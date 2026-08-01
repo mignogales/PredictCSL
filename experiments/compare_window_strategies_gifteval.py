@@ -2397,7 +2397,7 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
     # ``extra_strategies=False`` (the minimal-figures mode) keeps the bar on the
     # core full/best/pred trio: each extra strategy dropna's `r` to ITS coverage,
     # so partial period/v3/v4 trees would silently shrink n below the run's true
-    # cell count (e.g. 95 -> 80) — exactly the kind of headline distortion the
+    # cell count (e.g. 97 -> 80) — exactly the kind of headline distortion the
     # minimal figures exist to avoid.
     if extra_strategies and "period_mase" in r.columns and r["period_mase"].notna().any():
         r = r.dropna(subset=["period_mase"]).copy()

@@ -19,9 +19,6 @@ from experiments import models_config
 from experiments import predict_context_length as predictor
 from experiments.compare_window_strategies_gifteval import _geomean
 from experiments.gifteval_mase import gluonts_leaderboard_mase
-from experiments.patchtst_gifteval import (
-    stabilize_fully_masked_attention_rows,
-)
 from experiments.test_window_ablation_gifteval_v5 import (
     ForecastResult, compute_per_sample_metrics)
 
@@ -76,6 +73,19 @@ class MasterRecomputeConfigTest(unittest.TestCase):
     def test_tirex2_uses_dedicated_env(self) -> None:
         self.assertEqual(master.FAMILY_ENV["tirex"], "predictcsl-tirex")
         self.assertIn("predictcsl-tirex", master.ENVS_WITHOUT_MAMBA)
+
+    def test_patchtst_uses_leaderboard_compatible_env(self) -> None:
+        self.assertEqual(
+            master.FAMILY_ENV["patchtst_fm"], "predictcsl-patchtst")
+        self.assertNotIn("predictcsl-patchtst", master.ENVS_WITHOUT_MAMBA)
+        self.assertIn(
+            "mamba-ssm==2.2.5",
+            master.ENV_PREFLIGHTS["predictcsl-patchtst"],
+        )
+        self.assertEqual(
+            master._resolve_groups(["PatchTST-FM-R1"]),
+            {"predictcsl-patchtst": ["PatchTST-FM-R1"]},
+        )
 
     def test_toto_uses_dedicated_env(self) -> None:
         self.assertEqual(master.FAMILY_ENV["toto"], "predictcsl-toto")
@@ -217,7 +227,7 @@ class MasterRecomputeConfigTest(unittest.TestCase):
 
 
 class PerInstanceWindowEvaluationTest(unittest.TestCase):
-    def test_discovery_excludes_stale_short_dataset_artifacts(self) -> None:
+    def test_discovery_includes_complete_gifteval_cohort(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             compare_dir = os.path.join(
                 root, "general_v3", "models", "TimesFM2.5-200M",
@@ -234,8 +244,11 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
 
             cells = instance_eval.discover_cells(root, None)
 
-        self.assertEqual([(c.dataset, c.term) for c in cells],
-                         [("M4-Yearly", "short")])
+        self.assertEqual(
+            [(c.dataset, c.term) for c in cells],
+            [("CarParts", "short"), ("M4-Yearly", "short"),
+             ("Solar-W", "short")],
+        )
 
     def test_predictor_choice_is_per_row_and_masks_unavailable_windows(self) -> None:
         windows = np.array([32, 64])
@@ -525,26 +538,29 @@ class SoftClassificationLossTest(unittest.TestCase):
 
 
 class PatchTSTFMCompatibilityTest(unittest.TestCase):
-    def test_padding_attention_rows_are_stabilized_without_changing_real_rows(self) -> None:
-        mask = torch.tensor([[[-float("inf"), -float("inf")],
-                              [0.0, -float("inf")]]])
-        original_real_row = mask[:, 1].clone()
-
-        result = stabilize_fully_masked_attention_rows(mask)
-
-        self.assertIs(result, mask)
-        self.assertTrue(torch.equal(result[:, 1], original_real_row))
-        self.assertTrue(torch.equal(
-            result[:, 0], torch.tensor([[0.0, -float("inf")]])))
-        self.assertTrue(torch.isfinite(torch.softmax(result, dim=-1)).all())
-
-    def test_patchtst_recipe_invalidates_nan_padding_caches(self) -> None:
+    def test_patchtst_recipe_invalidates_padding_safe_v2_caches(self) -> None:
         from experiments.gifteval_inference_recipes import inference_recipe
 
         self.assertEqual(
             inference_recipe("patchtst_fm"),
-            "official_patchtst_fm_list_q05_padding_safe_v2",
+            "official_patchtst_fm_wrapper_v3",
         )
+
+    def test_legacy_official_api_keeps_inputs_on_cpu(self) -> None:
+        class LegacyGraniteAPI(torch.nn.Module):
+            def forward(self, inputs, prediction_length, quantile_levels):
+                self.seen = inputs
+                forecast = torch.zeros(
+                    len(inputs), len(quantile_levels), prediction_length)
+                forecast[:, build.PATCHTST_FM_MEDIAN_QUANTILE_IDX, :] = 3.0
+                return SimpleNamespace(quantile_predictions=forecast)
+
+        model = LegacyGraniteAPI()
+        result = build.predict_patchtst_fm(
+            model, torch.ones(2, 5, 1), horizon=3, device="cpu")
+
+        self.assertTrue(all(row.device.type == "cpu" for row in model.seen))
+        self.assertTrue(torch.equal(result, torch.full((2, 3), 3.0)))
 
     def test_official_quantile_head_and_list_input(self) -> None:
         class NewGraniteAPI(torch.nn.Module):

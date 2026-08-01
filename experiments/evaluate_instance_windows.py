@@ -76,8 +76,8 @@ def discover_cells(ablation_root: str, models: Optional[Iterable[str]]) -> List[
             cell = _cell_from_path(path, model)
             # A resumed run may retain old derived NPZs for datasets that were
             # subsequently removed from the experiment cohort. The authoritative
-            # run-set filter prevents those stale files (notably Solar-W and
-            # CarParts) from leaking back into instance-level aggregates.
+            # run-set filter prevents such stale files from leaking back into
+            # instance-level aggregates.
             if (cell is not None
                     and (cell.dataset, str(cell.term)) in active_dataset_cells):
                 found.setdefault((model, cell.dataset, cell.term), cell)

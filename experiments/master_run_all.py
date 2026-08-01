@@ -37,6 +37,8 @@ the non-main groups with ``conda run -n <env>``:
 
   * ``predictcsl-main``   — every family except the dedicated envs below (the env master is
     itself launched in; the main group uses the current interpreter).
+  * ``predictcsl-patchtst`` — PatchTST-FM-R1, using the exact leaderboard-era
+    Granite API and torch SDPA behavior.
   * ``predictcsl-legacy`` — Sundial + TimeMoE (transformers==4.40.1).
   * ``predictcsl-toto``   — Toto-2.0-313m (Python 3.12 + toto-2/toto-models).
   * ``predictcsl-tirex``  — TiRex2 (torch>=2.8 / numpy 2.1 + tirex2).
@@ -44,8 +46,9 @@ the non-main groups with ``conda run -n <env>``:
 This is correct because (a) Stage 1 only loads a model when its shards are pending
 and (b) the v5 ablation lazy-imports each TSFM loader only for that model's cells —
 so a ``--models <one family>`` run in its env never touches the packages it lacks.
-``predictcsl-toto`` has no ``mamba-ssm``, so Toto is skipped for the Mamba variant
-(v4); see ``ENVS_WITHOUT_MAMBA``.
+The Toto and TiRex envs have no compatible ``mamba-ssm``, so those families are
+skipped for the Mamba variant (v4); see ``ENVS_WITHOUT_MAMBA``. The PatchTST env
+uses the official torch-2.8 Mamba wheels and runs the complete predictor matrix.
 
   !! Launch master IN predictcsl-main:  conda run -n predictcsl-main python -m experiments.master_run_all
 
@@ -123,14 +126,18 @@ VARIANTS: List[Variant] = [
 MAIN_ENV = "predictcsl-main"
 # Model family -> dedicated conda env. Families absent here run in the main group.
 FAMILY_ENV: Dict[str, str] = {
+    "patchtst_fm": "predictcsl-patchtst",  # published Granite API + torch 2.8 SDPA
     "sundial": "predictcsl-legacy",   # transformers==4.40.1
     "timemoe": "predictcsl-legacy",
     "toto":    "predictcsl-toto",      # Python 3.12 + toto-2/toto-models
     "tirex":   "predictcsl-tirex",     # torch>=2.8 + tirex2 package
 }
 # Envs without mamba-ssm -> can't run the Mamba predictor variant (v4).
-ENVS_WITHOUT_MAMBA = {"predictcsl-toto", "predictcsl-tirex"}
+ENVS_WITHOUT_MAMBA = {
+    "predictcsl-toto", "predictcsl-tirex",
+}
 ENV_ALIASES = {
+    "predictcsl-patchtst": ("predictcsl-patchtst", "TSFM_PATCH"),
     "predictcsl-legacy": ("predictcsl-legacy", "TSFM_sundial_patch"),
     "predictcsl-toto": ("predictcsl-toto", "TSFM_toto"),
     "predictcsl-tirex": ("predictcsl-tirex", "predictcsl-test", "TSFM_tirex2"),
@@ -204,6 +211,39 @@ def _python_code(env: Optional[str], code: str) -> List[str]:
 
 
 ENV_PREFLIGHTS: Dict[str, str] = {
+    "predictcsl-patchtst": r"""
+import inspect
+import sys
+print("python", sys.executable)
+import torch
+print("torch", torch.__version__, "cuda", getattr(torch.version, "cuda", None))
+if not torch.__version__.startswith("2.8.0"):
+    raise SystemExit("predictcsl-patchtst expects torch==2.8.0 for leaderboard parity")
+import transformers
+print("transformers", transformers.__version__)
+if not transformers.__version__.startswith("4.56.0"):
+    raise SystemExit("predictcsl-patchtst expects transformers==4.56.0")
+import tsfm_public
+from tsfm_public import PatchTSTFMForPrediction
+version = getattr(tsfm_public, "__version__", "")
+print("granite-tsfm", version)
+signature = inspect.signature(PatchTSTFMForPrediction.forward)
+if "inputs" not in signature.parameters or "past_values" in signature.parameters:
+    raise SystemExit("predictcsl-patchtst expects the leaderboard-era inputs= Granite API")
+if "e4d488689" not in version:
+    raise SystemExit("predictcsl-patchtst expects granite-tsfm commit e4d488689")
+from gift_eval.data import Dataset
+print("gift_eval import OK")
+import causal_conv1d
+import mamba_ssm
+from mamba_ssm import Mamba
+print("causal-conv1d", causal_conv1d.__version__)
+print("mamba-ssm", mamba_ssm.__version__)
+if not causal_conv1d.__version__.startswith("1.5.4"):
+    raise SystemExit("predictcsl-patchtst expects causal-conv1d==1.5.4")
+if not mamba_ssm.__version__.startswith("2.2.5"):
+    raise SystemExit("predictcsl-patchtst expects mamba-ssm==2.2.5")
+""",
     "predictcsl-toto": r"""
 import sys
 print("python", sys.executable)
@@ -254,6 +294,7 @@ def _preflight_env(env: Optional[str]) -> None:
         if line.strip()
     )
     repair = {
+        "predictcsl-patchtst": "bash envs/setup-patchtst.sh",
         "predictcsl-toto": "bash envs/repair-toto.sh predictcsl-toto",
         "predictcsl-tirex": "bash envs/repair-tirex.sh predictcsl-tirex",
     }[label]
@@ -433,7 +474,7 @@ def _precompute_model_groups(displays: List[str]) -> List[List[str]]:
 
     Models in one family share the exact window grid. Running them in one v5
     process lets its GiftEvalCache survive across checkpoints. This primarily
-    avoids loading/preprocessing all 95 datasets three times for Chronos2
+    avoids loading/preprocessing all 97 datasets three times for Chronos2
     Small/Base/Synth while keeping unlike grids in separate invocations.
     """
     family_by_display = dict(models_config.run_pairs())

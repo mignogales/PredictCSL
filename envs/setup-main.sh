@@ -3,8 +3,8 @@
 # predictcsl-main — the workhorse env.  (Mirror of the working server env TSFM_moirai,
 # captured from `pip freeze` on 2026-06-24. Python 3.11.14, torch 2.4.1+cu121.)
 #
-# Runs: stage-1 labeling for the modern families except Toto, Sundial, TimeMoE,
-#       and TiRex2; BOTH stage-2 predictors — PatchTST and the Mamba variant
+# Runs: stage-1 labeling for the modern families except PatchTST-FM, Toto,
+#       Sundial, TimeMoE, and TiRex2; BOTH stage-2 predictors — PatchTST and the Mamba variant
 #       (run_all_v4), since mamba-ssm lives here; stages 3-5 for the compatible
 #       families, period eval, embedding saturation.
 #
@@ -61,4 +61,4 @@ pip install --no-deps \
 echo
 python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())"
 python -c "from mamba_ssm import Mamba; print('mamba-ssm import OK')"
-echo "predictcsl-main ready (Toto/TiRex2 NOT included — see envs/README.md)."
+echo "predictcsl-main ready (PatchTST-FM/Toto/TiRex2 use dedicated envs — see envs/README.md)."

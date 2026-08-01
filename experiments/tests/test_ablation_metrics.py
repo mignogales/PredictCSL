@@ -7,9 +7,27 @@ import torch
 
 from experiments.gifteval_metric_version import METRIC_SUITE_VER
 from experiments import test_window_ablation_gifteval_v5 as ablation
+from experiments import models_config
 
 
 class AblationMetricTest(unittest.TestCase):
+    def test_published_leaderboard_targets(self) -> None:
+        self.assertEqual(
+            ablation.PUBLISHED_LEADERBOARD_NORMALIZED_MASE,
+            {
+                "FlowState-R1": 0.701,
+                "ChronosBolt-Base": 0.808,
+                "Sundial-Base-128M": 0.750,
+                "PatchTST-FM-R1": 0.707,
+                "TiRex2": 0.697,
+            },
+        )
+
+    def test_tirex_uses_gifteval_zero_shot_checkpoint(self) -> None:
+        tirex = next(spec for spec in models_config.CATALOG
+                     if spec.display == "TiRex2")
+        self.assertEqual(tirex.model_id, "NX-AI/TiRex-2-gifteval-zs")
+
     def test_gluonts_mase_masks_zero_seasonal_denominators(self) -> None:
         abs_err = torch.tensor([[0.0, 2.0], [1.0, 1.0]])
         valid = torch.ones_like(abs_err, dtype=torch.bool)
@@ -52,4 +70,3 @@ class AblationMetricTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

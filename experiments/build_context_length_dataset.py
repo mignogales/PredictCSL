@@ -78,10 +78,7 @@ from experiments.timesfm_gifteval import (
     forecast_quantiles as forecast_timesfm_quantiles,
     load_model as load_timesfm_official,
 )
-from experiments.patchtst_gifteval import (
-    patchtst_padding_safe_attention,
-    require_finite_patchtst_forecast,
-)
+from experiments.patchtst_gifteval import forecast_patchtst_quantiles_official
 
 
 # ==============================================================================
@@ -669,41 +666,14 @@ def load_patchtst_fm(model_id: str, device: str):
 
 
 def predict_patchtst_fm(model, x: torch.Tensor, horizon: int, device: str) -> torch.Tensor:
-    target = []
-    for row in x[:, :, 0]:
-        row = row.to(device, non_blocking=True, dtype=torch.float32)
-        missing = torch.isnan(row)
-        if bool(missing.any()):
-            fill = (row[~missing].mean() if bool((~missing).any())
-                    else row.new_tensor(0.0))
-            row = torch.where(missing, fill, row)
-        target.append(row)
-    with (torch.inference_mode(), patchtst_padding_safe_attention(),
-          torch.device(device)):
-        output = model(
-            past_values=target, prediction_length=horizon,
-            quantile_levels=PATCHTST_FM_QUANTILE_LEVELS)
-    raw = output.quantile_outputs
-    if isinstance(raw, (list, tuple)):
-        raw = torch.stack([torch.as_tensor(item) for item in raw], dim=0)
-    else:
-        raw = torch.as_tensor(raw)
-    if raw.dim() == 4 and raw.shape[-1] == 1:
-        raw = raw[..., 0]
-    if raw.dim() != 3:
-        raise ValueError(f"Unexpected PatchTST quantile shape {tuple(raw.shape)}")
-    q_count = len(PATCHTST_FM_QUANTILE_LEVELS)
-    if raw.shape[1] == q_count:
-        qf = raw[:, :, :horizon]
-    elif raw.shape[2] == q_count:
-        qf = raw[:, :horizon, :].permute(0, 2, 1)
-    else:
-        raise ValueError(f"PatchTST output has no quantile axis: {tuple(raw.shape)}")
-    if qf.shape[2] != horizon:
-        raise ValueError(f"PatchTST returned horizon={qf.shape[2]}, expected {horizon}")
-    return require_finite_patchtst_forecast(
-        qf[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :].to(
-            device=device, dtype=torch.float32))
+    qf = forecast_patchtst_quantiles_official(
+        model,
+        list(x[:, :, 0]),
+        horizon,
+        device,
+        PATCHTST_FM_QUANTILE_LEVELS,
+    )
+    return qf[:, PATCHTST_FM_MEDIAN_QUANTILE_IDX, :]
 
 
 def _patch_dynamic_cache_seen_tokens() -> None:

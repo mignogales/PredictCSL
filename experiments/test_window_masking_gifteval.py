@@ -28,7 +28,8 @@ Runs on the SERVER (TSFM + GPU). Multi-GPU dataset-sharding mirrors v5.
 ENV: Sundial / TimeMoE need the legacy ``transformers==4.40.1`` env
 (``TSFM_sundial_patch``) — the main env's newer transformers breaks their
 ``trust_remote_code`` mask build (``_prepare_4d_causal_attention_mask`` shape
-error) even before any masking runs. Chronos-2 / PatchTST-FM run in the main env.
+error) even before any masking runs. Chronos-2 uses the main env; PatchTST-FM
+uses the leaderboard-compatible ``predictcsl-patchtst`` env.
 
     python -m experiments.test_window_masking_gifteval --models PatchTST-FM-R1
     python -m experiments.test_window_masking_gifteval --models Chronos2-Small

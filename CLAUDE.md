@@ -179,7 +179,7 @@ predictor-derived, so no TSFM re-inference):
   `bar_aggregate_mase_gluonts_normalized.png` (÷ same-definition Seasonal-Naive,
   =1.0 line — the leaderboard-faithful headline). The minimal bars hold the core
   full/best/pred trio ONLY: appending period/v3/v4 bars dropna's the rows to that
-  strategy's coverage, silently shrinking n (95→80) — extra-strategy bars exist
+  strategy's coverage, silently shrinking n (97→80) — extra-strategy bars exist
   solely under `--all-figures`. Every CSV /
   `summary_stats.json` still emits. `--all-figures` restores the historical set
   (metric twins — in that mode `_gluonts` in a filename means the PORT —
@@ -275,11 +275,14 @@ FlowState-R1, TiRex. Each has a `load_*` + `predict_*` wrapper in
 ### Model-specific gotchas baked into the code
 - **PatchTST-FM** has a fixed 8192 context. The wrapper passes exact-length lists;
   Granite mean-fills missing values, pads to 8192 internally, and constructs the
-  true pad mask. Granite-TSFM 0.3.6 masks padded queries as well as keys, creating
-  all-`-inf` attention rows that CUDA SDPA can turn into NaNs. The shared
-  `patchtst_padding_safe_attention` shim gives only those empty padded-query rows
-  one inert padding key; real query masks are unchanged. Inference recipe v2
-  invalidates every older NaN-contaminated stage-1/stage-3 cache.
+  true pad mask. Leaderboard parity uses `predictcsl-patchtst`: torch 2.8.0,
+  transformers 4.56.0, and Granite commit `e4d488689` with its legacy `inputs=`
+  API. As in IBM's published wrapper, those list tensors remain on CPU until the
+  model consumes them. Do not repair fully masked padded-query rows by changing
+  the attention mask: that defines a different forecast method. Inference recipe
+  v3 invalidates the earlier padding-safe-v2 forecasts. The dedicated env also
+  pins the official torch-2.8 wheels for causal-conv1d 1.5.4 and mamba-ssm 2.2.5,
+  so PatchTST runs both v4 Mamba predictor objectives rather than skipping them.
 - Variable-length models (chronos, timesfm, moirai, sundial, timemoe) get only
   the genuine (un-padded) suffix; short series flatten the label curve past
   `real_len`.
@@ -287,7 +290,7 @@ FlowState-R1, TiRex. Each has a `load_*` + `predict_*` wrapper in
   env (`transformers==4.40.1`); the main env's 4.56 breaks them. There's a
   `_patch_dynamic_cache_seen_tokens()` shim restoring removed `DynamicCache` APIs.
 - **Sundial** caps context at 2880; **TimeMoE** caps context+horizon at 4096.
-- **FlowState** needs `granite-tsfm>=0.3.6` (also serves PatchTST-FM): a git dev
+- **FlowState** needs `granite-tsfm>=0.3.6` in the main env: a git dev
   snapshot (0.3.4.dev9) silently random-initialized every `encoder.layers.*.out.*`
   weight of the r1.1 checkpoint → all-NaN forecasts → stage 3 writes nothing →
   opaque stage-4 "No records" crash. If FlowState metrics go NaN, check the
