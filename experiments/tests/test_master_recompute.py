@@ -391,6 +391,12 @@ class Chronos2IndependenceTest(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (2, 4))
         self.assertIs(pipeline.calls[0]["cross_learning"], False)
 
+    def test_stage1_returns_median_on_requested_device(self) -> None:
+        pipeline = self.FakePipeline()
+        out = build.predict_chronos2(
+            pipeline, torch.zeros((2, 32, 1)), horizon=4, device="meta")
+        self.assertEqual(out.device.type, "meta")
+
     def test_gifteval_ablation_disables_cross_learning(self) -> None:
         from experiments import test_window_ablation_gifteval_v5 as ablation
 

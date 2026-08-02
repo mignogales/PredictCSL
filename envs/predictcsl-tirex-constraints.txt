@@ -8,5 +8,8 @@ torch==2.8.0
 numpy==2.1.3
 pandas==2.2.3
 matplotlib==3.9.4
-datasets==2.17.1
+# 2.17.1 (GIFT-Eval's historical pin) uses np.array(..., copy=False) in its
+# Arrow formatter and crashes under TiRex2's required NumPy 2.x. 2.21.0 is the
+# first release containing Hugging Face's NumPy-2 compatibility fix (#6976).
+datasets==2.21.0
 tirex-2==0.1.1

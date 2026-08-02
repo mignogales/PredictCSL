@@ -607,10 +607,12 @@ def predict_chronos2(pipeline, x: torch.Tensor, horizon: int, device: str) -> to
         samples = torch.stack(samples, dim=0).squeeze(1)
     if samples.dim() == 4:
         samples = samples.squeeze(2)                   # (B, Q, H)
-    # Chronos2 deliberately returns predictions on CPU. Keep the tiny median
-    # reduction there instead of copying forecasts GPU -> CPU -> GPU -> CPU.
+    # Chronos2 deliberately returns predictions on CPU. Keep the quantile
+    # reduction there, then copy only the median back because forecast_window
+    # scatters every family result into a device-side output buffer.
     samples = samples.to(dtype=torch.float32)
-    return torch.median(samples, dim=1).values         # (B, H)
+    return torch.median(samples, dim=1).values.to(
+        device=device, non_blocking=True)              # (B, H)
 
 
 def load_chronos_bolt(model_id: str, device: str):

@@ -32,7 +32,8 @@ cannot collapse them into one:
 - **`predictcsl-tirex`** — standalone TiRex2 env. The `tirex-2` package imports as
   `tirex2` and currently requires torch>=2.8 plus numpy 2.1, so it is kept out
   of `main`. GiftEval is installed there with `--no-deps` because its declared
-  numpy/matplotlib pins conflict with TiRex2 but are not needed by this pipeline.
+  numpy/matplotlib pins conflict with TiRex2. Its historical `datasets` pin is
+  replaced by 2.21.0, the first release with the required NumPy-2 formatter fix.
 
 The per-cell on-disk cache is **shared across all envs**, so each just fills in
 its own families; stages 2/4/5 run in `main` over the merged cache.
@@ -140,7 +141,7 @@ bash envs/setup-tirex.sh      # predictcsl-tirex  (TiRex2 only)
 | `setup-patchtst.sh` | `predictcsl-patchtst` | clones main; torch 2.8.0+cu128 + published Granite `inputs=` API + torch-2.8 Mamba wheels |
 | `setup-legacy.sh` | `predictcsl-legacy` | clones main, re-pins `transformers`/`tokenizers`/`huggingface-hub` |
 | `setup-toto.sh`   | `predictcsl-toto`   | Python 3.12, torch 2.5.1+cu121, `toto-2` + `toto-models` |
-| `setup-tirex.sh`  | `predictcsl-tirex`  | Python 3.11, torch 2.8.0+cu126, `tirex-2` / `tirex2` |
+| `setup-tirex.sh`  | `predictcsl-tirex`  | Python 3.11, torch 2.8.0+cu126, `tirex-2` / `tirex2`, NumPy-2-compatible `datasets` |
 | `setup-all.sh`    | all five            | runs the above in order |
 
 > **Pins:** `main` is captured exactly from `TSFM_moirai`. `legacy` and `toto`

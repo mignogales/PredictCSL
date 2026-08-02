@@ -265,6 +265,20 @@ import numpy as np
 print("numpy", np.__version__)
 if not np.__version__.startswith("2.1.3"):
     raise SystemExit("predictcsl-tirex expects numpy==2.1.3 for tirex-2")
+from importlib.metadata import version
+datasets_version = version("datasets")
+print("datasets", datasets_version)
+if datasets_version != "2.21.0":
+    raise SystemExit(
+        "predictcsl-tirex expects datasets==2.21.0 for NumPy-2-compatible GIFT-Eval loading"
+    )
+import pyarrow as pa
+from datasets.formatting.formatting import NumpyArrowExtractor
+targets = NumpyArrowExtractor().extract_column(
+    pa.table({"target": [[1.0, 2.0], [3.0, 4.0]]})
+)
+if targets.shape != (2, 2):
+    raise SystemExit("predictcsl-tirex datasets NumPy formatter smoke test failed")
 from tirex2 import TimeseriesType, load_model
 print("tirex2 import OK")
 from gift_eval.data import Dataset
