@@ -275,10 +275,10 @@ class MasterRecomputeConfigTest(unittest.TestCase):
                     compare_dir,
                     "compare_M4-Yearly_tshort_Chronos2-Small.npz",
                 ),
-                window_grid=np.array([32, 64]),
-                real_curve_gluonts_real=np.array([9.0, 8.0]),
-                real_curve_gluonts=np.array([9.0, 8.0]),
-                predicted_mean=np.array([1.0, 0.0]),
+                window_grid=np.array([32, 64, 8192]),
+                real_curve_gluonts_real=np.array([9.0, 8.0, np.nan]),
+                real_curve_gluonts=np.array([9.0, 8.0, np.nan]),
+                predicted_mean=np.array([1.0, 0.0, 2.0]),
             )
 
             recipe = "chronos2_univariate_no_cross_learning_v1"
@@ -296,6 +296,19 @@ class MasterRecomputeConfigTest(unittest.TestCase):
                 os.makedirs(metric_dir)
                 with open(os.path.join(metric_dir, "metrics.json"), "w") as f:
                     json.dump({**common, "mase_gluonts_real": mase}, f)
+            # An obsolete unsupported-window file may remain on disk. The
+            # current Stage-3 curve marks it NaN, so Stage 4 must ignore it.
+            stale_dir = os.path.join(
+                run_dir, "datasets", "M4-Yearly", "Chronos2-Small",
+                "tshort", "w8192",
+            )
+            os.makedirs(stale_dir)
+            with open(os.path.join(stale_dir, "metrics.json"), "w") as f:
+                json.dump({
+                    **common,
+                    "_metric_suite_ver": 0,
+                    "mase_gluonts_real": 99.0,
+                }, f)
             native_dir = os.path.join(
                 run_dir, "datasets", "M4-Yearly", "Chronos2-Small",
                 "tshort", "wfull_native",
@@ -343,8 +356,9 @@ class MasterRecomputeConfigTest(unittest.TestCase):
             run_all_orchestrator.STRATEGY_SUBDIR = old_subdir
 
         cmd = run.call_args.args[0]
+        self.assertNotIn("--cache-root", cmd)
         self.assertEqual(
-            cmd[cmd.index("--cache-root") + 1],
+            cmd[cmd.index("--run-dir") + 1],
             "/tmp/ablation/general_v3",
         )
 

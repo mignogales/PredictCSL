@@ -500,6 +500,7 @@ def _sanity_mase_curve_from_cache(
     window_grid: np.ndarray,
     mase_metric: str,
     expected_recipe: Optional[str],
+    current_window_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Load the current per-window MASE values used by the sanity evaluator.
 
@@ -512,6 +513,12 @@ def _sanity_mase_curve_from_cache(
     """
     values = np.full(len(window_grid), np.nan, dtype=np.float64)
     for idx, window in enumerate(window_grid):
+        # Stage 3 leaves old files on disk when a window is now unsupported or
+        # unservable, but its freshly written comparison curve marks that window
+        # NaN. Ignore such leftovers; only current curve members can influence a
+        # strategy or need metric-version validation.
+        if current_window_mask is not None and not bool(current_window_mask[idx]):
+            continue
         metrics = _load_metrics(
             cache_root, dataset_display, model_short, term, int(window))
         if metrics is None:
@@ -762,6 +769,7 @@ def load_strategy_records(
     cache_root: str,
     patch_sizes: Dict[str, int],
     mase_metric: str = "mase_gluonts_real",
+    models: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
     For each row in compare_summary.csv, load the paired .npz and derive:
@@ -802,7 +810,10 @@ def load_strategy_records(
 
     records: List[dict] = []
 
+    wanted_models = set(models or [])
     for model_short_dir in sorted(os.listdir(models_root)):
+        if wanted_models and model_short_dir not in wanted_models:
+            continue
         compare_dir = os.path.join(models_root, model_short_dir, "compare_real_vs_predicted")
         summary_path = os.path.join(compare_dir, "compare_summary.csv")
         if not os.path.isfile(summary_path):
@@ -852,9 +863,19 @@ def load_strategy_records(
             # leaderboard run. The NPZ remains the source of predictor scores and
             # the aligned grid only; its copied MASE curves may predate a metric
             # correction and must not drive a headline bar.
+            curve_key = {
+                "mase_gluonts": "real_curve_gluonts",
+                "mase_gluonts_real": "real_curve_gluonts_real",
+            }[mase_metric]
+            if curve_key not in data.files:
+                raise RuntimeError(
+                    f"Missing current {curve_key} for "
+                    f"{dataset_display}/t{term}/{model_short}; rerun stage 3."
+                )
+            current_window_mask = np.isfinite(np.asarray(data[curve_key]))
             real_curve = _sanity_mase_curve_from_cache(
                 cache_root, dataset_display, model_short, term, window_grid,
-                mase_metric, expected_recipe)
+                mase_metric, expected_recipe, current_window_mask)
             pred_mean: np.ndarray = data["predicted_mean"]   # z-scored curve for argmin
 
             valid = ~np.isnan(real_curve)
@@ -3322,8 +3343,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--cache-root", type=str, default=None,
-        help="Directory containing datasets/ metric caches. Defaults to "
-             "--run-dir, which is the current general/general_v3 layout.",
+        help="Backward-compatible run discovery when --run-dir is omitted. "
+             "Metric records are always read from <run-dir>/datasets.",
     )
     p.add_argument("--run-dir",    type=str, default=None,
                    help="Specific v5 run dir; auto-picks latest if omitted.")
@@ -3397,12 +3418,14 @@ def main() -> None:
         print(Fore.CYAN + f"Patch sizes: {patch_sizes}" + Fore.RESET)
 
     run_dir = args.run_dir or find_latest_run(args.cache_root or CACHE_ROOT)
-    cache_root = args.cache_root or run_dir
+    # A run is one self-contained tree: models/ supplies predictor selections and
+    # datasets/ supplies the exact metrics. Never accept a second metrics root;
+    # allowing those paths to diverge caused the old/sanity MASE mismatch.
+    cache_root = run_dir
     if not os.path.isdir(os.path.join(cache_root, "datasets")):
         raise FileNotFoundError(
-            f"No datasets/ metric cache under --cache-root {cache_root!r}. "
-            f"Use the active run directory {run_dir!r}; passing its parent "
-            "would make the full-window bar diverge from the sanity result."
+            f"No datasets/ metric cache inside run directory {run_dir!r}. "
+            "Stage 4 requires the self-contained run tree used by Stage 3."
         )
     print(Fore.CYAN + f"Run directory: {run_dir}" + Fore.RESET)
     print(Fore.CYAN + f"Metric cache directory: {cache_root}" + Fore.RESET)
@@ -3411,7 +3434,8 @@ def main() -> None:
 
     # ---- Load all records ---------------------------------------------------
     df = load_strategy_records(run_dir, cache_root, patch_sizes,
-                               mase_metric=args.mase_metric)
+                               mase_metric=args.mase_metric,
+                               models=args.models)
 
     if args.models:
         wanted = set(args.models)
@@ -3431,7 +3455,8 @@ def main() -> None:
     df_g: Optional[pd.DataFrame] = None
     if args.mase_metric != "mase_gluonts" and run_has_gluonts_curve(run_dir):
         df_g = load_strategy_records(run_dir, cache_root, patch_sizes,
-                                     mase_metric="mase_gluonts")
+                                     mase_metric="mase_gluonts",
+                                     models=args.models)
         if args.models:
             df_g = df_g[df_g["model_short"].isin(set(args.models))].reset_index(drop=True)
         print(Fore.CYAN + "Ported GluonTS MASE available as the secondary metric; "
@@ -3443,7 +3468,8 @@ def main() -> None:
     df_gr: Optional[pd.DataFrame] = None
     if args.mase_metric != "mase_gluonts_real" and run_has_gluonts_real_curve(run_dir):
         df_gr = load_strategy_records(run_dir, cache_root, patch_sizes,
-                                      mase_metric="mase_gluonts_real")
+                                      mase_metric="mase_gluonts_real",
+                                      models=args.models)
         if args.models:
             df_gr = df_gr[df_gr["model_short"].isin(set(args.models))].reset_index(drop=True)
         print(Fore.CYAN + "Gluonts-real MASE available: adding "

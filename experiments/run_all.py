@@ -371,12 +371,6 @@ def stage_4_compare(display: str, family: str, extra: Sequence[str]) -> float:
     return _run(
         [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
          "--run-dir", ABLATION_GENERAL,
-         # The per-window/full-native metrics live inside the active run tree
-         # (general, general_v3, ...), not directly under ABLATION_ROOT.  Passing
-         # the parent made stage 4 silently miss wfull_native and fall back to
-         # the largest skip-mode grid window, so its Full bar could not match
-         # the sanity leaderboard evaluation.
-         "--cache-root", ABLATION_GENERAL,
          "--models", display,
          "--output-dir", out_dir, *extra],
         stage="4/compare", display=display,
@@ -393,7 +387,6 @@ def stage_4_rollup(extra: Sequence[str], out_dir: str = None) -> float:
     return _run(
         [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
          "--run-dir", ABLATION_GENERAL,
-         "--cache-root", ABLATION_GENERAL,
          "--output-dir", out_dir or ABLATION_GENERAL,
          "--rollup-only", *extra],
         stage="4/rollup", display="ALL",
