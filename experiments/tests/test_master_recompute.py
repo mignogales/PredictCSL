@@ -20,6 +20,7 @@ from experiments import master_run_all as master
 from experiments import models_config
 from experiments import predict_context_length as predictor
 from experiments import run_all as run_all_orchestrator
+from experiments import run_all_v3 as run_all_v3_orchestrator
 from experiments.compare_window_strategies_gifteval import (
     _geomean,
     _instance_oracle_from_cache,
@@ -521,6 +522,32 @@ class MasterRecomputeConfigTest(unittest.TestCase):
             cmd[cmd.index("--models") + 1:],
             ["Chronos2-Small"],
         )
+
+    def test_v3_output_root_configures_one_self_contained_tree(self) -> None:
+        old_dataset = run_all_orchestrator.DATASET_ROOT
+        old_ablation = run_all_orchestrator.ABLATION_ROOT
+        old_logs = run_all_orchestrator.RUN_LOG_ROOT
+        try:
+            with mock.patch.dict(os.environ, {}, clear=False):
+                root = run_all_v3_orchestrator._apply_output_root(
+                    "logs/experiments/master_recompute/")
+                self.assertEqual(root, "logs/experiments/master_recompute")
+                self.assertEqual(
+                    run_all_orchestrator.DATASET_ROOT,
+                    "logs/experiments/master_recompute/context_length_dataset",
+                )
+                self.assertEqual(
+                    run_all_orchestrator.ABLATION_ROOT,
+                    "logs/experiments/master_recompute/window_ablation_gifteval",
+                )
+                self.assertEqual(
+                    run_all_orchestrator.RUN_LOG_ROOT,
+                    "logs/experiments/master_recompute/run_all_logs",
+                )
+        finally:
+            run_all_orchestrator.DATASET_ROOT = old_dataset
+            run_all_orchestrator.ABLATION_ROOT = old_ablation
+            run_all_orchestrator.RUN_LOG_ROOT = old_logs
 
 
 class PerInstanceWindowEvaluationTest(unittest.TestCase):

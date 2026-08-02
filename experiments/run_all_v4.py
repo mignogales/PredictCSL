@@ -131,6 +131,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models", nargs="+", default=None,
                    help="Subset of display names from run_all.MODELS_TO_RUN to run.")
+    p.add_argument(
+        "--output-root", default=None,
+        help=("Use one self-contained master output tree and configure its "
+              "dataset, predictor, ablation, and run-log roots together. "
+              "Use this when resuming a master_run_all pipeline directly."),
+    )
     p.add_argument("--skip-stages", nargs="+", default=[], choices=list(ra.STAGES),
                    help="Stage numbers to skip (1=build, 2=predictor, 3=ablation, 4=compare).")
     p.add_argument("--only-stages", nargs="+", default=None, choices=list(ra.STAGES),
@@ -166,7 +172,8 @@ def main() -> None:
     # the stage-2 child and, in turn, to its spawned per-GPU trial workers.
     objective_suffix = "" if args.training_objective == "curve" else "_classification"
     test_mode = os.environ.get("PREDICTCSL_TEST") == "1"
-    master_root = os.environ.get("PREDICTCSL_MASTER_ROOT")
+    master_root = (ra_v3._apply_output_root(args.output_root) if args.output_root
+                   else os.environ.get("PREDICTCSL_MASTER_ROOT"))
     if master_root:
         predictor_base = os.path.join(master_root, "context_length_predictor_v4")
     else:

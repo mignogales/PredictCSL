@@ -104,12 +104,34 @@ def _link_shared_cells(general_v3: str, shared_general: str) -> None:
           + f"[v3] Linked shared GiftEval cells: {v3_cells} -> {rel}" + Fore.RESET)
 
 
+def _apply_output_root(output_root: str) -> str:
+    """Point every reused pipeline root at one self-contained master tree."""
+    root = os.path.normpath(output_root)
+    os.environ["PREDICTCSL_MASTER_ROOT"] = root
+    os.environ["PREDICTCSL_DATASET_ROOT"] = os.path.join(
+        root, "context_length_dataset")
+    os.environ["PREDICTCSL_ABLATION_ROOT"] = os.path.join(
+        root, "window_ablation_gifteval")
+    os.environ["PREDICTCSL_RUN_LOG_ROOT"] = os.path.join(
+        root, "run_all_logs")
+    ra.DATASET_ROOT = os.environ["PREDICTCSL_DATASET_ROOT"]
+    ra.ABLATION_ROOT = os.environ["PREDICTCSL_ABLATION_ROOT"]
+    ra.RUN_LOG_ROOT = os.environ["PREDICTCSL_RUN_LOG_ROOT"]
+    return root
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models", nargs="+", default=None,
                    help="Subset of display names from run_all.MODELS_TO_RUN to run.")
+    p.add_argument(
+        "--output-root", default=None,
+        help=("Use one self-contained master output tree and configure its "
+              "dataset, predictor, ablation, and run-log roots together. "
+              "Use this when resuming a master_run_all pipeline directly."),
+    )
     p.add_argument("--skip-stages", nargs="+", default=[], choices=list(ra.STAGES),
                    help="Stage numbers to skip (1=build, 2=predictor, 3=ablation, 4=compare).")
     p.add_argument("--only-stages", nargs="+", default=None, choices=list(ra.STAGES),
@@ -143,7 +165,8 @@ def main() -> None:
     # the stage-2 child and, in turn, to its spawned per-GPU trial workers.
     objective_suffix = "" if args.training_objective == "curve" else "_classification"
     test_mode = os.environ.get("PREDICTCSL_TEST") == "1"
-    master_root = os.environ.get("PREDICTCSL_MASTER_ROOT")
+    master_root = (_apply_output_root(args.output_root) if args.output_root
+                   else os.environ.get("PREDICTCSL_MASTER_ROOT"))
     if master_root:
         predictor_base = os.path.join(master_root, "context_length_predictor_v3")
     else:
