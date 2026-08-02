@@ -109,6 +109,7 @@ from experiments.gifteval_reference import (
     NORMALIZATION_REFERENCE, published_naive_by_display,
 )
 from experiments.gifteval_inference_recipes import inference_recipe
+from experiments.gifteval_metric_version import METRIC_SUITE_VER
 from experiments import models_config
 from experiments import datasets_config
 
@@ -491,6 +492,99 @@ def _load_metrics(
         return None
 
 
+def _sanity_mase_curve_from_cache(
+    cache_root: str,
+    dataset_display: str,
+    model_short: str,
+    term: str,
+    window_grid: np.ndarray,
+    mase_metric: str,
+    expected_recipe: Optional[str],
+) -> np.ndarray:
+    """Load the current per-window MASE values used by the sanity evaluator.
+
+    Stage 3 computes ``mase_gluonts_real`` with the same
+    ``cell_mase_gluonts_real`` path as ``sanity_gifteval_leaderboard``.  Read
+    those authoritative ``metrics.json`` records directly instead of trusting
+    a possibly stale copy embedded in a comparison NPZ.  Unsupported/unservable
+    windows legitimately have no record and remain NaN; a present but stale or
+    approximate record is an error rather than a silent metric fallback.
+    """
+    values = np.full(len(window_grid), np.nan, dtype=np.float64)
+    for idx, window in enumerate(window_grid):
+        metrics = _load_metrics(
+            cache_root, dataset_display, model_short, term, int(window))
+        if metrics is None:
+            continue
+        if metrics.get("_metric_suite_ver", 0) < METRIC_SUITE_VER:
+            raise RuntimeError(
+                f"Stale metric cache for {dataset_display}/t{term}/w{int(window)}; "
+                "rerun stage 3 before stage 4."
+            )
+        if (expected_recipe is not None
+                and metrics.get("_inference_recipe") != expected_recipe):
+            raise RuntimeError(
+                f"Stale model forecast for {dataset_display}/t{term}/w{int(window)}; "
+                "rerun stage 3 before stage 4."
+            )
+        if (mase_metric == "mase_gluonts_real"
+                and metrics.get("_mase_gluonts_real_standin", False)):
+            raise RuntimeError(
+                f"Approximate GluonTS MASE cache for "
+                f"{dataset_display}/t{term}/w{int(window)}; rerun stage 3 to "
+                "compute the exact sanity-evaluator metric."
+            )
+        value = metrics.get(mase_metric)
+        if value is not None and np.isfinite(float(value)):
+            values[idx] = float(value)
+    return values
+
+
+def _sanity_full_native_metric(
+    metrics: Optional[dict],
+    dataset_display: str,
+    term: str,
+    mase_metric: str,
+    expected_recipe: Optional[str],
+) -> float:
+    """Return the exact available-context baseline shared with the sanity run.
+
+    ``full_native`` is the cache label, not a demand that every series reach the
+    model's maximum context. Stage 3 caps it at the dataset maximum and serves
+    each instance ``min(available_history, model_cap)`` genuine observations.
+    """
+    if metrics is None:
+        raise RuntimeError(
+            f"Missing full-native cache for {dataset_display}/t{term}; stage 4 "
+            "must use the active run directory as --cache-root and stage 3 must "
+            "have completed the sanity-parity baseline."
+        )
+    if metrics.get("_metric_suite_ver", 0) < METRIC_SUITE_VER:
+        raise RuntimeError(
+            f"Stale full-native metric cache for {dataset_display}/t{term}; "
+            "rerun stage 3 before stage 4."
+        )
+    if (expected_recipe is not None
+            and metrics.get("_inference_recipe") != expected_recipe):
+        raise RuntimeError(
+            f"Stale full-native model forecast for {dataset_display}/t{term}; "
+            "rerun stage 3 before stage 4."
+        )
+    if (mase_metric == "mase_gluonts_real"
+            and metrics.get("_mase_gluonts_real_standin", False)):
+        raise RuntimeError(
+            f"Full-native {dataset_display}/t{term} only has a port-MASE "
+            "stand-in; rerun stage 3 to compute the exact sanity metric."
+        )
+    value = metrics.get(mase_metric)
+    if value is None or not np.isfinite(float(value)):
+        raise RuntimeError(
+            f"Full-native {dataset_display}/t{term} has no finite "
+            f"{mase_metric}; rerun stage 3."
+        )
+    return float(value)
+
+
 def _mean_theoretical_flops_for_contexts(
     model_id: str,
     contexts: np.ndarray,
@@ -743,36 +837,24 @@ def load_strategy_records(
                 continue
 
             window_grid: np.ndarray = data["window_grid"]
-            # Which MASE drives the comparison: the ported leaderboard
-            # `mase_gluonts` (real_curve_gluonts) or the gluonts-machinery
-            # `mase_gluonts_real` (real_curve_gluonts_real). NEVER fall back to the
-            # legacy project `real_curve` (custom D->7/W->52 mase) — silently mixing
-            # definitions is exactly what makes numbers stop lining up with the
-            # leaderboard. A `_real` request may stand in with the port curve
-            # (loudly); anything else missing skips the cell (loudly).
-            _curve_key = {
-                "mase_gluonts": "real_curve_gluonts",
-                "mase_gluonts_real": "real_curve_gluonts_real",
-            }[mase_metric]
+            model_family = next(
+                (spec.family for spec in models_config.CATALOG
+                 if model.lower() in {
+                     spec.model_id.lower(), spec.display.lower()
+                 }),
+                None,
+            )
+            expected_recipe = (
+                inference_recipe(model_family) if model_family is not None else None)
 
-            def _usable(key: str) -> bool:
-                return key in data.files and bool(np.any(~np.isnan(data[key])))
-
-            if _usable(_curve_key):
-                real_curve = data[_curve_key]                # requested MASE per window
-            elif mase_metric == "mase_gluonts_real" and _usable("real_curve_gluonts"):
-                print(Fore.YELLOW
-                      + f"  {dataset_display} t={term} {model_short}: no "
-                        "real_curve_gluonts_real — standing in with the port curve "
-                        "(re-run stage 3 to populate the machinery one)." + Fore.RESET)
-                real_curve = data["real_curve_gluonts"]
-            else:
-                print(Fore.YELLOW
-                      + f"  Skip {dataset_display} t={term} {model_short}: no "
-                        f"{_curve_key} in {os.path.basename(npz_path)} — re-run "
-                        "stage 3 (cheap backfill) to write the gluonts curves."
-                      + Fore.RESET)
-                continue
+            # Use the authoritative Stage-3 metric records. These are scored by
+            # the exact same cell_mase_gluonts_real implementation as the sanity
+            # leaderboard run. The NPZ remains the source of predictor scores and
+            # the aligned grid only; its copied MASE curves may predate a metric
+            # correction and must not drive a headline bar.
+            real_curve = _sanity_mase_curve_from_cache(
+                cache_root, dataset_display, model_short, term, window_grid,
+                mase_metric, expected_recipe)
             pred_mean: np.ndarray = data["predicted_mean"]   # z-scored curve for argmin
 
             valid = ~np.isnan(real_curve)
@@ -817,42 +899,16 @@ def load_strategy_records(
             full_native_width_groups = float("nan")
             full_native_metrics = _load_metrics(
                 cache_root, dataset_display, model_short, term, FULL_NATIVE_WINDOW)
-            if full_native_metrics is not None:
-                model_family = next(
-                    (spec.family for spec in models_config.CATALOG
-                     if model.lower() in {
-                         spec.model_id.lower(), spec.display.lower()
-                     }),
-                    None,
-                )
-                expected_recipe = (
-                    inference_recipe(model_family) if model_family is not None else None)
-                if (expected_recipe is not None
-                        and full_native_metrics.get("_inference_recipe")
-                        != expected_recipe):
-                    raise RuntimeError(
-                        "Stale model full-native cache for "
-                        f"{dataset_display}/t{term}: rerun stage 3 before stage 4. "
-                        "The cached forecast predates the current GiftEval "
-                        "inference recipe."
-                    )
-                native_mase = full_native_metrics.get(mase_metric)
-                native_standin = False
-                native_ok = native_mase is not None and np.isfinite(float(native_mase))
-                if not native_ok and mase_metric == "mase_gluonts_real":
-                    native_mase = full_native_metrics.get("mase_gluonts")
-                    native_standin = native_mase is not None
-                if native_mase is not None and np.isfinite(float(native_mase)):
-                    full_mase = float(native_mase)
-                    full_w = int(full_native_metrics.get("_context_cap", full_w))
-                    full_elapsed_key = FULL_NATIVE_WINDOW
-                    full_baseline_source = (
-                        "full_native_standin" if native_standin
-                        else "full_native")
-                    full_effective_context_mean = float(
-                        full_native_metrics.get("_mean_effective_context", float("nan")))
-                    full_native_width_groups = float(
-                        full_native_metrics.get("_n_width_groups", float("nan")))
+            full_mase = _sanity_full_native_metric(
+                full_native_metrics, dataset_display, term, mase_metric,
+                expected_recipe)
+            full_w = int(full_native_metrics.get("_context_cap", full_w))
+            full_elapsed_key = FULL_NATIVE_WINDOW
+            full_baseline_source = "full_native_sanity"
+            full_effective_context_mean = float(
+                full_native_metrics.get("_mean_effective_context", float("nan")))
+            full_native_width_groups = float(
+                full_native_metrics.get("_n_width_groups", float("nan")))
 
             # Published Seasonal Naive denominator for this official GiftEval
             # config. The local/reconstructed baseline is intentionally unused.
@@ -3264,7 +3320,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Compare MASE + time + complexity: full vs best vs predictor window."
     )
-    p.add_argument("--cache-root", type=str, default=CACHE_ROOT)
+    p.add_argument(
+        "--cache-root", type=str, default=None,
+        help="Directory containing datasets/ metric caches. Defaults to "
+             "--run-dir, which is the current general/general_v3 layout.",
+    )
     p.add_argument("--run-dir",    type=str, default=None,
                    help="Specific v5 run dir; auto-picks latest if omitted.")
     p.add_argument("--models", type=str, nargs="+", default=None,
@@ -3336,13 +3396,21 @@ def main() -> None:
     else:
         print(Fore.CYAN + f"Patch sizes: {patch_sizes}" + Fore.RESET)
 
-    run_dir = args.run_dir or find_latest_run(args.cache_root)
+    run_dir = args.run_dir or find_latest_run(args.cache_root or CACHE_ROOT)
+    cache_root = args.cache_root or run_dir
+    if not os.path.isdir(os.path.join(cache_root, "datasets")):
+        raise FileNotFoundError(
+            f"No datasets/ metric cache under --cache-root {cache_root!r}. "
+            f"Use the active run directory {run_dir!r}; passing its parent "
+            "would make the full-window bar diverge from the sanity result."
+        )
     print(Fore.CYAN + f"Run directory: {run_dir}" + Fore.RESET)
+    print(Fore.CYAN + f"Metric cache directory: {cache_root}" + Fore.RESET)
 
     print(Fore.CYAN + f"MASE metric: {args.mase_metric}" + Fore.RESET)
 
     # ---- Load all records ---------------------------------------------------
-    df = load_strategy_records(run_dir, args.cache_root, patch_sizes,
+    df = load_strategy_records(run_dir, cache_root, patch_sizes,
                                mase_metric=args.mase_metric)
 
     if args.models:
@@ -3362,19 +3430,19 @@ def main() -> None:
     # primary ones. No extra inference — a second pass over the cached npz.
     df_g: Optional[pd.DataFrame] = None
     if args.mase_metric != "mase_gluonts" and run_has_gluonts_curve(run_dir):
-        df_g = load_strategy_records(run_dir, args.cache_root, patch_sizes,
+        df_g = load_strategy_records(run_dir, cache_root, patch_sizes,
                                      mase_metric="mase_gluonts")
         if args.models:
             df_g = df_g[df_g["model_short"].isin(set(args.models))].reset_index(drop=True)
-        print(Fore.CYAN + "Gluonts MASE available: bar plot uses mase_gluonts; "
-              "adding model_strategy_overview_gluonts." + Fore.RESET)
+        print(Fore.CYAN + "Ported GluonTS MASE available as the secondary metric; "
+              "the primary bar remains on mase_gluonts_real." + Fore.RESET)
 
     # Same idea for the ACTUAL gluonts-machinery MASE (`mase_gluonts_real`): when
     # it isn't already the primary metric, score every strategy on it too so the
     # *_gluonts_real twin plots/CSVs get emitted beside the others.
     df_gr: Optional[pd.DataFrame] = None
     if args.mase_metric != "mase_gluonts_real" and run_has_gluonts_real_curve(run_dir):
-        df_gr = load_strategy_records(run_dir, args.cache_root, patch_sizes,
+        df_gr = load_strategy_records(run_dir, cache_root, patch_sizes,
                                       mase_metric="mase_gluonts_real")
         if args.models:
             df_gr = df_gr[df_gr["model_short"].isin(set(args.models))].reset_index(drop=True)

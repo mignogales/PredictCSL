@@ -18,9 +18,11 @@ from experiments import evaluate_instance_windows as instance_eval
 from experiments import master_run_all as master
 from experiments import models_config
 from experiments import predict_context_length as predictor
+from experiments import run_all as run_all_orchestrator
 from experiments.compare_window_strategies_gifteval import (
     _geomean,
     compute_summary_stats,
+    load_strategy_records,
 )
 from experiments.gifteval_mase import gluonts_leaderboard_mase
 from experiments.test_window_ablation_gifteval_v5 import (
@@ -248,6 +250,102 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertEqual(
             stats["inference_recipes"]["chronos2"],
             "chronos2_univariate_no_cross_learning_v1",
+        )
+
+    def test_strategy_comparison_uses_sanity_metrics_not_npz_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            run_dir = os.path.join(root, "general_v3")
+            compare_dir = os.path.join(
+                run_dir, "models", "Chronos2-Small",
+                "compare_real_vs_predicted",
+            )
+            os.makedirs(compare_dir)
+            pd.DataFrame([{
+                "dataset_display": "M4-Yearly",
+                "term": "short",
+                "model_short": "Chronos2-Small",
+                "model": "autogluon/chronos-2-small",
+                "horizon_real": 6,
+                "n_instances": 10,
+            }]).to_csv(os.path.join(compare_dir, "compare_summary.csv"), index=False)
+            # Deliberately stale embedded curves: stage 4 must ignore these MASE
+            # values while retaining predicted_mean as the window selector.
+            np.savez_compressed(
+                os.path.join(
+                    compare_dir,
+                    "compare_M4-Yearly_tshort_Chronos2-Small.npz",
+                ),
+                window_grid=np.array([32, 64]),
+                real_curve_gluonts_real=np.array([9.0, 8.0]),
+                real_curve_gluonts=np.array([9.0, 8.0]),
+                predicted_mean=np.array([1.0, 0.0]),
+            )
+
+            recipe = "chronos2_univariate_no_cross_learning_v1"
+            common = {
+                "_metric_suite_ver": 2,
+                "_mase_gluonts_real_standin": False,
+                "_inference_recipe": recipe,
+                "elapsed_seconds": 1.0,
+            }
+            for window, mase in ((32, 0.8), (64, 1.1)):
+                metric_dir = os.path.join(
+                    run_dir, "datasets", "M4-Yearly", "Chronos2-Small",
+                    "tshort", f"w{window}",
+                )
+                os.makedirs(metric_dir)
+                with open(os.path.join(metric_dir, "metrics.json"), "w") as f:
+                    json.dump({**common, "mase_gluonts_real": mase}, f)
+            native_dir = os.path.join(
+                run_dir, "datasets", "M4-Yearly", "Chronos2-Small",
+                "tshort", "wfull_native",
+            )
+            os.makedirs(native_dir)
+            with open(os.path.join(native_dir, "metrics.json"), "w") as f:
+                json.dump({
+                    **common,
+                    "mase_gluonts_real": 0.7,
+                    "_context_cap": 64,
+                    "_mean_effective_context": 48.0,
+                    "_n_width_groups": 2,
+                }, f)
+
+            result = load_strategy_records(
+                run_dir, run_dir, {}, mase_metric="mase_gluonts_real")
+
+        self.assertEqual(len(result), 1)
+        row = result.iloc[0]
+        self.assertAlmostEqual(row["full_mase"], 0.7)
+        self.assertAlmostEqual(row["best_mase"], 0.8)
+        self.assertAlmostEqual(row["pred_mase"], 1.1)
+        # The available dataset context (64) is retained; Chronos2's nominal
+        # 8192 limit must never make a short dataset pretend to have more history.
+        self.assertEqual(row["full_window"], 64)
+        self.assertEqual(row["best_window"], 32)
+        self.assertEqual(row["pred_window"], 64)
+        self.assertEqual(row["full_baseline_source"], "full_native_sanity")
+
+    def test_stage4_reads_metrics_from_active_run_tree(self) -> None:
+        old_root = run_all_orchestrator.ABLATION_ROOT
+        old_general = run_all_orchestrator.ABLATION_GENERAL
+        old_subdir = run_all_orchestrator.STRATEGY_SUBDIR
+        try:
+            run_all_orchestrator.ABLATION_ROOT = "/tmp/ablation"
+            run_all_orchestrator.ABLATION_GENERAL = "/tmp/ablation/general_v3"
+            run_all_orchestrator.STRATEGY_SUBDIR = "strategy_comparison_v3"
+            with mock.patch.object(
+                    run_all_orchestrator, "_run", return_value=0) as run:
+                run_all_orchestrator.stage_4_compare(
+                    "Chronos2-Small", "chronos2", [])
+        finally:
+            run_all_orchestrator.ABLATION_ROOT = old_root
+            run_all_orchestrator.ABLATION_GENERAL = old_general
+            run_all_orchestrator.STRATEGY_SUBDIR = old_subdir
+
+        cmd = run.call_args.args[0]
+        self.assertEqual(
+            cmd[cmd.index("--cache-root") + 1],
+            "/tmp/ablation/general_v3",
         )
 
 
