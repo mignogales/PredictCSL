@@ -681,20 +681,23 @@ def _sanity_mase_curve_from_cache(
             continue
         if metrics.get("_metric_suite_ver", 0) < METRIC_SUITE_VER:
             raise RuntimeError(
-                f"Stale metric cache for {dataset_display}/t{term}/w{int(window)}; "
+                f"Stale metric cache for {dataset_display}/{model_short}/"
+                f"t{term}/w{int(window)}; "
                 "rerun stage 3 before stage 4."
             )
         if (expected_recipe is not None
                 and metrics.get("_inference_recipe") != expected_recipe):
             raise RuntimeError(
-                f"Stale model forecast for {dataset_display}/t{term}/w{int(window)}; "
+                f"Stale model forecast for {dataset_display}/{model_short}/"
+                f"t{term}/w{int(window)}; "
                 "rerun stage 3 before stage 4."
             )
         if (mase_metric == "mase_gluonts_real"
                 and metrics.get("_mase_gluonts_real_standin", False)):
             raise RuntimeError(
                 f"Approximate GluonTS MASE cache for "
-                f"{dataset_display}/t{term}/w{int(window)}; rerun stage 3 to "
+                f"{dataset_display}/{model_short}/t{term}/w{int(window)}; "
+                "rerun stage 3 to "
                 "compute the exact sanity-evaluator metric."
             )
         value = metrics.get(mase_metric)

@@ -168,7 +168,10 @@ def main() -> None:
         ra.stage_4_compare(display, family, ["--use-robust-timing"])
 
     # Cross-model roll-up (overview figures + grand-total CSVs) with robust timing.
-    ra.stage_4_rollup(["--use-robust-timing"])
+    ra.stage_4_rollup(
+        ["--use-robust-timing"],
+        models=[display for _model_id, _family, display in selected],
+    )
 
     total = time.perf_counter() - t_start
     print(Fore.GREEN + f"\n[5] All done in {total/60:.1f} min." + Fore.RESET)

@@ -377,18 +377,23 @@ def stage_4_compare(display: str, family: str, extra: Sequence[str]) -> float:
     )
 
 
-def stage_4_rollup(extra: Sequence[str], out_dir: str = None) -> float:
+def stage_4_rollup(extra: Sequence[str], out_dir: str = None,
+                   models: Sequence[str] = None) -> float:
     """Cross-model final pass: one overview figure + flops_savings_all_models.csv
-    spanning every model present in the shared run dir. No --models filter.
+    spanning the requested models (or every model present when ``models`` is
+    omitted).
 
     ``out_dir`` defaults to the run dir itself (owned by the default
     `mase_gluonts_real`); a `mase_gluonts` run routes it to ``rollup_gluonts/`` so
-    the two metrics' run-level artefacts never overwrite each other."""
+    the two metrics' run-level artefacts never overwrite each other. Restricting
+    a subset run is important: unrelated stale model trees must not make a
+    successful ``--models ...`` pipeline fail during its final rollup."""
+    model_args = ["--models", *models] if models else []
     return _run(
         [sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
          "--run-dir", ABLATION_GENERAL,
          "--output-dir", out_dir or ABLATION_GENERAL,
-         "--rollup-only", *extra],
+         "--rollup-only", *model_args, *extra],
         stage="4/rollup", display="ALL",
     )
 
@@ -798,7 +803,10 @@ def main() -> None:
             _rollup_subdir = {"mase_gluonts": "rollup_gluonts"}
             rollup_dir = (os.path.join(ABLATION_GENERAL, _rollup_subdir[args.mase_metric])
                           if args.mase_metric in _rollup_subdir else ABLATION_GENERAL)
-            stage_4_rollup(extras_by_stage["4"], out_dir=rollup_dir)
+            stage_4_rollup(
+                extras_by_stage["4"], out_dir=rollup_dir,
+                models=[display for _model_id, _family, display in selected],
+            )
 
         total = time.perf_counter() - t_start
         print(Fore.GREEN + f"\nAll done in {total/60:.1f} min." + Fore.RESET)

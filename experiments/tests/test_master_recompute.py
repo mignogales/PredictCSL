@@ -509,6 +509,19 @@ class MasterRecomputeConfigTest(unittest.TestCase):
             "/tmp/ablation/general_v3",
         )
 
+    def test_stage4_rollup_is_restricted_to_selected_models(self) -> None:
+        with mock.patch.object(
+                run_all_orchestrator, "_run", return_value=0) as run:
+            run_all_orchestrator.stage_4_rollup(
+                [], models=["Chronos2-Small"])
+
+        cmd = run.call_args.args[0]
+        self.assertIn("--rollup-only", cmd)
+        self.assertEqual(
+            cmd[cmd.index("--models") + 1:],
+            ["Chronos2-Small"],
+        )
+
 
 class PerInstanceWindowEvaluationTest(unittest.TestCase):
     def test_comparable_curve_carries_forward_previous_window(self) -> None:

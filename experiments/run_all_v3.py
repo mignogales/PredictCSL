@@ -234,7 +234,10 @@ def main() -> None:
 
     # Cross-model roll-up (overview figure + grand-total CSV) over general_v3.
     if "4" in active:
-        ra.stage_4_rollup(extras["4"])
+        ra.stage_4_rollup(
+            extras["4"],
+            models=[display for _model_id, _family, display in selected],
+        )
 
     total = time.perf_counter() - t_start
     print(Fore.GREEN + f"\n[v3] All done in {total/60:.1f} min." + Fore.RESET)
