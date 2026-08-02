@@ -189,9 +189,9 @@ HP_SPACE_PATCHTST_CHEAP = {
 }
 
 # Mamba spaces. No attention heads; the SSM axes (d_state/d_conv/expand) take
-# their place. Because the bidirectional Mamba stack is linear in the token
-# count, the search can afford *smaller* patches (more tokens) than the
-# Transformer could — patch_length goes down to 16 even in the cheap corner.
+# their place. The unconstrained standalone search can explore smaller patches,
+# but the cheap corner deliberately matches cheap PatchTST's patch sizes, width,
+# and depth so the master recomputation compares like-sized predictors.
 HP_SPACE_MAMBA = {
     "patch_length":      [16, 32, 64, 128],
     "d_model":           [128, 256],
@@ -206,7 +206,7 @@ HP_SPACE_MAMBA = {
 }
 HP_SPACE_MAMBA_CHEAP = {
     **HP_SPACE_MAMBA,
-    "patch_length":      [32, 64, 128],
+    "patch_length":      [64, 128],
     "d_model":           [128],
     "num_hidden_layers": [2, 4],
     "d_state":           [16],
@@ -1384,6 +1384,29 @@ def _load_trial_result(run_label: str, trial_idx: int) -> Optional[Dict]:
     except (json.JSONDecodeError, OSError):
         return None
 
+
+def _cached_trial_is_compatible(
+    cached: Optional[Dict[str, Any]],
+    trial: TrialConfig,
+    label_inference_recipe: Optional[str],
+) -> bool:
+    """Only resume a trial produced by the exact same sampled configuration.
+
+    Trial files are named by index, while changing a search space changes which
+    configuration occupies that index. Checking the persisted config prevents
+    an unconstrained Mamba result from being silently reused by a later cheap
+    Mamba run (and likewise protects future search-space changes).
+    """
+    if cached is None:
+        return False
+    val_curve_mse = cached.get("val_curve_mse")
+    return (
+        cached.get("label_inference_recipe") == label_inference_recipe
+        and cached.get("cfg") == asdict(trial)
+        and val_curve_mse is not None
+        and not (isinstance(val_curve_mse, float) and math.isnan(val_curve_mse))
+    )
+
 def _save_trial_result(run_label: str, trial_idx: int, result: Dict) -> None:
     p = _trial_json_path(run_label, trial_idx)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -1564,11 +1587,8 @@ def main() -> None:
     pending: List[Tuple[int, TrialConfig]] = []
     for idx, trial in enumerate(trial_configs):
         cached = _load_trial_result(run_label, idx)
-        if (cached is not None
-                and cached.get("label_inference_recipe") == label_inference_recipe
-                and "val_curve_mse" in cached
-                and not (isinstance(cached["val_curve_mse"], float)
-                         and math.isnan(cached["val_curve_mse"]))):
+        if _cached_trial_is_compatible(
+                cached, trial, label_inference_recipe):
             # Re-attach the durable weights so this cached trial can still win
             # final selection on a resumed run (None if weights were pruned).
             bp = _trial_best_path(run_label, idx)
@@ -1666,6 +1686,7 @@ def main() -> None:
                 "horizon_grid":     horizon_grid,
                 "curve_metric":     CURVE_METRIC,
                 "training_objective": TRAINING_OBJECTIVE,
+                "cheap_search":      _CHEAP,
                 "soft_topk_weights": list(SOFT_TOPK_WEIGHTS),
                 "lambda_curve":     LAMBDA_CURVE,
                 "lambda_recon":     LAMBDA_RECON,

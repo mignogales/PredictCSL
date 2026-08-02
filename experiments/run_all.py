@@ -456,6 +456,22 @@ def _done_stage_2(family: str, display: str = "") -> Tuple[bool, str]:
         expected_recipe = inference_recipe(family)
         if cfg.get("label_inference_recipe") != expected_recipe:
             return False, "predictor was trained on stale inference labels"
+        expected_arch = os.environ.get(
+            "PREDICTCSL_PREDICTOR_ARCH", "patchtst").lower()
+        if cfg.get("arch", "patchtst") != expected_arch:
+            return False, "predictor architecture is stale"
+        expected_objective = os.environ.get(
+            "PREDICTCSL_TRAINING_OBJECTIVE", "curve").lower()
+        if cfg.get("training_objective", "curve") != expected_objective:
+            return False, "predictor training objective is stale"
+        # Old v4 artifacts predate this flag and came from the unconstrained
+        # search. Do not let them make a new master --cheap run skip stage 2.
+        expected_cheap_mamba = (
+            expected_arch == "mamba"
+            and os.environ.get("PREDICTCSL_CHEAP_PREDICTOR") == "1"
+        )
+        if expected_cheap_mamba and cfg.get("cheap_search") is not True:
+            return False, "predictor came from the old unconstrained Mamba search"
         return True, f"best_model.pt + {n_trials} trials"
     return False, (
         "missing best_model.pt/best_config.json "
@@ -588,10 +604,10 @@ def parse_args() -> argparse.Namespace:
               "only affects stage 4."),
     )
     p.add_argument(
-        "--short-context-mode", choices=["skip", "pad"], default="skip",
+        "--short-context-mode", choices=["skip", "pad"], default="pad",
         help=("Stage-3 handling of instances shorter than the ablation window. "
-              "'skip' (default): exclude them at that window (original behaviour). "
-              "'pad': never skip — feed each instance its available context "
+              "'skip': exclude them at that window (original behaviour). "
+              "'pad' (default): never skip — feed each instance its available context "
               "(PatchTST-FM NaN-padded to native context). Threaded to stage 3."),
     )
     p.add_argument(

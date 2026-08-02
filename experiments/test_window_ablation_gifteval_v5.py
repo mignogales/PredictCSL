@@ -1074,6 +1074,24 @@ def cell_mase_gluonts_real(fr, cache: "GiftEvalCache", served_indices) -> float:
         return float("nan")
 
 
+def _gluonts_point_05(forecast_result: ForecastResult) -> torch.Tensor:
+    """Return the point forecast exposed by GluonTS as ``forecast['0.5']``."""
+    point = forecast_result.median
+    if (forecast_result.quantiles is not None
+            and forecast_result.quantile_levels is not None):
+        matching = [
+            i for i, level in enumerate(forecast_result.quantile_levels)
+            if float(level) == 0.5
+        ]
+        if matching:
+            point = forecast_result.quantiles[:, matching[-1], :]
+    elif forecast_result.samples is not None:
+        sample_idx = int(np.round((forecast_result.samples.shape[1] - 1) * 0.5))
+        point = torch.kthvalue(
+            forecast_result.samples, sample_idx + 1, dim=1).values
+    return point
+
+
 def compute_per_sample_metrics(
     forecast_result: ForecastResult,
     targets: torch.Tensor,
@@ -1098,7 +1116,16 @@ def compute_per_sample_metrics(
     per_mse = per_mse_t.cpu().numpy()
     per_rmse = np.sqrt(per_mse)
     per_mase = per_mae / naive_seasonal_mae
-    out = {"mae": per_mae, "mse": per_mse, "rmse": per_rmse, "mase": per_mase}
+    out = {
+        "mae": per_mae,
+        "mse": per_mse,
+        "rmse": per_rmse,
+        "mase": per_mase,
+        # Needed to reconstruct GluonTS' axis=None aggregation exactly after a
+        # per-instance strategy has selected a potentially different window in
+        # every row.
+        "valid_count": n_valid.cpu().numpy().astype(np.int32, copy=False),
+    }
     if seasonal_errors is not None:
         se = np.asarray(seasonal_errors, dtype=np.float64)
         if se.shape[0] == per_mae.shape[0]:
@@ -1106,6 +1133,20 @@ def compute_per_sample_metrics(
             np.divide(per_mae, se, out=scaled,
                       where=np.isfinite(se) & (se != 0))
             out["mase_gluonts"] = scaled
+
+            # ``mase_gluonts_real`` can select a supplied 0.5 quantile or the
+            # upper-middle sample, which is not always ``ForecastResult.median``.
+            # Persist that exact per-row quantity so stage 4 can build a genuine
+            # instance oracle without mixing metric definitions.
+            point_05 = _gluonts_point_05(forecast_result)
+            point_safe = torch.where(valid, point_05, torch.zeros_like(point_05))
+            per_real_mae_t = (point_safe - y_safe).abs().sum(dim=1) / denom
+            per_real_mae_t[n_valid == 0] = torch.nan
+            per_real_mae = per_real_mae_t.detach().cpu().numpy()
+            scaled_real = np.full(per_real_mae.shape, np.nan, dtype=np.float64)
+            np.divide(per_real_mae, se, out=scaled_real,
+                      where=np.isfinite(se) & (se != 0))
+            out["mase_gluonts_real"] = scaled_real
 
     if forecast_result.samples is not None:
         S = forecast_result.samples
@@ -2706,11 +2747,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--predictor-batch-size", type=int, default=64,
                    help="Batch size used when running the predictor on test-instance contexts.")
-    p.add_argument("--short-context-mode", choices=["skip", "pad"], default="skip",
+    p.add_argument("--short-context-mode", choices=["skip", "pad"], default="pad",
                    help="How to handle instances whose context is shorter than the "
-                        "ablation window. 'skip' (default): exclude them at that window "
+                        "ablation window. 'skip': exclude them at that window "
                         "(original behaviour; the curve at window w averages only "
-                        "instances with >=w history). 'pad': never skip — feed each "
+                        "instances with >=w history). 'pad' (default): never skip — feed each "
                         "instance its min(w, context) genuine samples (PatchTST-FM is "
                         "NaN-padded to its native context), so every window averages the "
                         "same full instance set and the curve flattens past available context.")

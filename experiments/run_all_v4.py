@@ -7,15 +7,15 @@ PatchTST-Transformer. Where v3 makes the predictor cheap by *constraining the HP
 search* of the same O(N^2) Transformer, v4 attacks the cost at the architecture
 level: the bidirectional Mamba encoder is O(N) in the patch-token count, so the
 predictor's own per-series inference cost is much lower against the labeled
-TSFM — and the search can afford smaller patches (more tokens) for free. The
-``pred_window`` compute savings reported in stage 4 are therefore even more
-honest.
+TSFM. Its unconstrained standalone search can explore smaller patches, while
+the master passes ``--cheap`` for a like-sized comparison with v3. The
+``pred_window`` compute savings reported in stage 4 include the predictor cost.
 
 The arch switch is passed to stage 2 through an environment variable
 (PREDICTCSL_PREDICTOR_ARCH=mamba), resolved at import by
 predict_context_length.py so it also reaches its spawned per-GPU trial workers.
-Pass ``--cheap`` to *additionally* pin the constrained Mamba corner
-(PREDICTCSL_CHEAP_PREDICTOR=1), as v3 does for the Transformer.
+Pass ``--cheap`` to pin patch size, width, and depth to the same constrained
+corner used by v3 (PREDICTCSL_CHEAP_PREDICTOR=1).
 
 Requires the ``mamba-ssm`` package (and ``causal-conv1d``) on the GPU server:
     pip install mamba-ssm causal-conv1d
@@ -79,8 +79,8 @@ PREDICTOR_ROOT_V4   = "logs/experiments/context_length_predictor_v4"
 ABLATION_GENERAL_V4 = os.path.join(ra.ABLATION_ROOT, "general_v4")
 STRATEGY_SUBDIR_V4  = "strategy_comparison_v4"
 
-# Match v3's search: 30 trials for both requested predictor architectures, which
-# keeps stage-2 wall-clock directly comparable across the two variants.
+# Match v3's trial count. Passing --cheap additionally matches v3's patch sizes,
+# width, and depth, keeping stage-2 wall-clock meaningfully comparable.
 N_TRIALS_V4_DEFAULT = 30
 
 
@@ -143,8 +143,8 @@ def parse_args() -> argparse.Namespace:
                         "matching v3; override to widen/shorten the search).")
     p.add_argument("--cheap", action="store_true",
                    help="Also pin the constrained Mamba corner "
-                        "(PREDICTCSL_CHEAP_PREDICTOR=1): narrow d_model, shallow, "
-                        "larger patches — as v3 does for the Transformer.")
+                        "(PREDICTCSL_CHEAP_PREDICTOR=1): match v3's patch sizes, "
+                        "d_model, and layer counts.")
     p.add_argument("--training-objective", choices=["curve", "classification"],
                    default="curve",
                    help="Predict the curve shape (original) or classify the best "

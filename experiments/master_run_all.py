@@ -6,8 +6,8 @@ The requested predictor matrix is deliberately small:
 
   * constrained/cheap PatchTST, curve regression
   * constrained/cheap PatchTST, soft top-3 window classification
-  * bidirectional Mamba, curve regression
-  * bidirectional Mamba, soft top-3 window classification
+  * constrained/cheap bidirectional Mamba, curve regression
+  * constrained/cheap bidirectional Mamba, soft top-3 window classification
 
 The first pass computes full-native and window-ablation forecasts before any
 synthetic labeling or predictor training, and immediately reports leaderboard
@@ -110,12 +110,13 @@ VARIANTS: List[Variant] = [
             extra=["--training-objective", "classification"],
             label="cheap PatchTST · soft top-3 classification",
             ablation_tree="general_v3_classification"),
-    Variant("mamba", "experiments.run_all_v4", ["1"], needs_mamba=True,
-            label="Mamba · curve regression",
+    Variant("mamba", "experiments.run_all_v4", ["1"],
+            extra=["--cheap"], needs_mamba=True,
+            label="cheap Mamba · curve regression",
             ablation_tree="general_v4"),
     Variant("mamba_cls", "experiments.run_all_v4", ["1"], needs_mamba=True,
-            extra=["--training-objective", "classification"],
-            label="Mamba · soft top-3 classification",
+            extra=["--cheap", "--training-objective", "classification"],
+            label="cheap Mamba · soft top-3 classification",
             ablation_tree="general_v4_classification"),
 ]
 

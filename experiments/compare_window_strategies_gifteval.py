@@ -41,12 +41,14 @@ Outputs (written to <run_dir>/models/<model_short>/strategy_comparison/)
   time_savings.csv            total measured forward-pass time saved vs full + geomean
                               MASE drop, per strategy (Stage 6, twin of flops_savings)
 
-FIGURES — by default only TWO are emitted, both on the primary --mase-metric
+FIGURES — by default three are emitted on the primary --mase-metric
 (default `mase_gluonts_real`, the leaderboard machinery):
   bar_aggregate_mase_gluonts.png             absolute MASE bars per strategy
   bar_aggregate_mase_gluonts_normalized.png  each cell ÷ its same-definition
                                              Seasonal-Naive, then aggregated — the
                                              leaderboard-faithful figure (=1.0 line)
+  rel_impr_by_dataset.png                    dataset oracle / instance oracle /
+                                             predictor improvement by dataset
 Everything below only appears with --all-figures (note: in that mode the
 `_gluonts` suffix reverts to meaning the PORT twin, plain = primary):
 
@@ -84,7 +86,8 @@ npz lacks the gluonts curves are skipped loudly, never silently mixed.
   gain_histogram.png          distribution of relative MASE gain over full window
   gain_vs_best_histogram.png  distribution of regret vs oracle
   complexity_reduction.png    distribution of complexity ratio (pred vs full)
-  per_dataset_bars.png        grouped bars (full / best / pred) per dataset
+  per_dataset_bars/           grouped bars (full / dataset oracle /
+                              instance oracle / pred) for every dataset
   window_choice_scatter.png   predictor window vs oracle window
 """
 
@@ -492,6 +495,159 @@ def _load_metrics(
         return None
 
 
+def _load_aligned_instance_metric(
+    cache_root: str,
+    dataset_display: str,
+    model_short: str,
+    term: str,
+    window_size: WindowKey,
+    n_instances: int,
+    mase_metric: str,
+) -> Tuple[np.ndarray, np.ndarray, str]:
+    """Load a per-instance MASE vector aligned to original GiftEval row ids.
+
+    New caches carry both exact MASE definitions and ``valid_count``. Older
+    caches only carry the ported ``mase_gluonts`` value; retain that as an
+    explicitly labelled proxy for ``mase_gluonts_real`` so old runs remain
+    inspectable, while fresh runs are exact.
+    """
+    values_out = np.full(n_instances, np.nan, dtype=np.float64)
+    counts_out = np.zeros(n_instances, dtype=np.float64)
+    path = os.path.join(
+        _cache_dir(cache_root, dataset_display, model_short, term, window_size),
+        "per_sample_metrics.npz",
+    )
+    if not os.path.isfile(path):
+        return values_out, counts_out, "missing"
+    try:
+        with np.load(path) as data:
+            source = mase_metric
+            if source not in data.files:
+                if mase_metric == "mase_gluonts_real" and "mase_gluonts" in data.files:
+                    source = "mase_gluonts_proxy"
+                    values = np.asarray(data["mase_gluonts"], dtype=np.float64)
+                else:
+                    return values_out, counts_out, "missing"
+            else:
+                values = np.asarray(data[source], dtype=np.float64)
+            if "served_index" in data.files:
+                served = np.asarray(data["served_index"], dtype=np.int64)
+            elif values.shape == (n_instances,):
+                served = np.arange(n_instances, dtype=np.int64)
+            else:
+                return values_out, counts_out, "unaligned"
+            counts = (np.asarray(data["valid_count"], dtype=np.float64)
+                      if "valid_count" in data.files
+                      else np.ones(values.shape[0], dtype=np.float64))
+    except (OSError, ValueError):
+        return values_out, counts_out, "missing"
+    if values.shape != served.shape or counts.shape != served.shape:
+        return values_out, counts_out, "unaligned"
+    ok = (served >= 0) & (served < n_instances)
+    values_out[served[ok]] = values[ok]
+    counts_out[served[ok]] = counts[ok]
+    return values_out, counts_out, source
+
+
+def _aggregate_instance_mase(values: np.ndarray, valid_count: np.ndarray) -> float:
+    """Reproduce GluonTS' axis=None mean from selected per-instance MASEs."""
+    values = np.asarray(values, dtype=np.float64)
+    weights = np.asarray(valid_count, dtype=np.float64)
+    ok = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+    if not ok.any():
+        return float("nan")
+    return float(np.average(values[ok], weights=weights[ok]))
+
+
+def _instance_oracle_from_cache(
+    cache_root: str,
+    dataset_display: str,
+    model_short: str,
+    term: str,
+    window_grid: np.ndarray,
+    valid_window_mask: np.ndarray,
+    n_instances: int,
+    mase_metric: str,
+) -> Optional[dict]:
+    """Build comparable fixed-window curves and an instance-wise oracle.
+
+    A target window uses its own cached forecast when available for an instance;
+    otherwise it carries forward that instance's largest evaluated smaller
+    window. This turns legacy skip-mode caches into the same cumulative cohort
+    semantics as pad mode. Full-native is the fallback and is also an oracle
+    candidate, guaranteeing that an exact instance oracle cannot lose to it.
+    """
+    native, native_counts, native_source = _load_aligned_instance_metric(
+        cache_root, dataset_display, model_short, term, FULL_NATIVE_WINDOW,
+        n_instances, mase_metric)
+    if native_source in {"missing", "unaligned"} or not np.isfinite(native).any():
+        return None
+
+    direct = np.full((n_instances, len(window_grid)), np.nan, dtype=np.float64)
+    sources = {native_source}
+    for j, window in enumerate(window_grid):
+        if not bool(valid_window_mask[j]):
+            continue
+        values, _counts, source = _load_aligned_instance_metric(
+            cache_root, dataset_display, model_short, term, int(window),
+            n_instances, mase_metric)
+        if source == "unaligned":
+            raise RuntimeError(
+                f"Unaligned per-instance cache for {dataset_display}/t{term}/"
+                f"{model_short}/w{int(window)}; rerun stage 3 once to backfill "
+                "served_index."
+            )
+        direct[:, j] = values
+        sources.add(source)
+
+    # At target j, carry forward the largest directly evaluated window <= j.
+    cumulative = np.full_like(direct, np.nan)
+    for j in range(len(window_grid)):
+        prior = direct[:, :j + 1]
+        feasible = np.isfinite(prior)
+        last = np.where(feasible, np.arange(j + 1)[None, :], -1).max(axis=1)
+        rows = np.arange(n_instances)
+        has_prior = last >= 0
+        cumulative[:, j] = native
+        cumulative[has_prior, j] = prior[rows[has_prior], last[has_prior]]
+
+    counts = native_counts.copy()
+    if not np.any(counts > 0):
+        counts = np.ones(n_instances, dtype=np.float64)
+    curve = np.asarray([
+        (_aggregate_instance_mase(cumulative[:, j], counts)
+         if bool(valid_window_mask[j]) else float("nan"))
+        for j in range(len(window_grid))
+    ])
+
+    candidates = np.column_stack([direct, native])
+    finite = np.isfinite(candidates)
+    if not finite.any(axis=1).all():
+        return None
+    oracle_idx = np.argmin(np.where(finite, candidates, np.inf), axis=1)
+    rows = np.arange(n_instances)
+    oracle_values = candidates[rows, oracle_idx]
+    oracle_windows = np.where(
+        oracle_idx < len(window_grid),
+        window_grid[np.minimum(oracle_idx, len(window_grid) - 1)],
+        -1,
+    )
+    exact = "mase_gluonts_proxy" not in sources
+    return {
+        "comparable_curve": curve,
+        "cumulative_values": cumulative,
+        "native_aggregate": _aggregate_instance_mase(native, counts),
+        "instance_oracle_mase": _aggregate_instance_mase(oracle_values, counts),
+        "instance_oracle_window_mean": float(np.mean(oracle_windows[oracle_windows >= 0]))
+        if np.any(oracle_windows >= 0) else float("nan"),
+        "instance_oracle_window_median": float(np.median(oracle_windows[oracle_windows >= 0]))
+        if np.any(oracle_windows >= 0) else float("nan"),
+        "instance_oracle_native_count": int(np.sum(oracle_idx == len(window_grid))),
+        "instance_oracle_metric_exact": exact,
+        "instance_oracle_metric_source": mase_metric if exact else "mase_gluonts_proxy",
+    }
+
+
 def _sanity_mase_curve_from_cache(
     cache_root: str,
     dataset_display: str,
@@ -887,6 +1043,18 @@ def load_strategy_records(
                 )
                 continue
 
+            # Make every grid point comparable over the same instance cohort.
+            # In legacy skip-mode caches, a short row carries forward its largest
+            # available earlier window. Fresh pad-mode caches already contain all
+            # rows, so this is an identity operation. The same aligned matrix also
+            # supplies the genuine per-instance oracle.
+            instance_eval = _instance_oracle_from_cache(
+                cache_root, dataset_display, model_short, term, window_grid,
+                valid, n_instances, mase_metric)
+            if instance_eval is not None:
+                real_curve = instance_eval["comparable_curve"]
+                valid = ~np.isnan(real_curve)
+
             valid_indices = np.where(valid)[0]
 
             # --- Strategy indices ------------------------------------------------
@@ -913,6 +1081,7 @@ def load_strategy_records(
 
             full_mase = float(real_curve[full_idx])
             best_mase = float(real_curve[best_idx])
+            grid_best_mase = best_mase
             pred_mase = float(real_curve[pred_idx])
             full_elapsed_key: WindowKey = full_w
             full_baseline_source = "grid_largest_valid"
@@ -931,6 +1100,21 @@ def load_strategy_records(
             full_native_width_groups = float(
                 full_native_metrics.get("_n_width_groups", float("nan")))
 
+            # A dataset-shared oracle is allowed to retain native-full context.
+            # This makes its improvement nonnegative by construction. The
+            # instance oracle already includes native as a per-row candidate;
+            # also admit the authoritative aggregate native score for legacy
+            # caches whose per-row vector used the explicitly labelled port proxy.
+            best_is_full_native = bool(full_mase <= best_mase)
+            if best_is_full_native:
+                best_mase = full_mase
+                best_w = full_w
+            instance_oracle_mase = (
+                float(instance_eval["instance_oracle_mase"])
+                if instance_eval is not None else float("nan"))
+            if np.isfinite(instance_oracle_mase):
+                instance_oracle_mase = min(instance_oracle_mase, full_mase)
+
             # Published Seasonal Naive denominator for this official GiftEval
             # config. The local/reconstructed baseline is intentionally unused.
             naive_mase = float(
@@ -940,8 +1124,11 @@ def load_strategy_records(
             # --- Elapsed time (robust timing.json mean, else single-shot) --------
             full_elapsed, full_elapsed_std = _elapsed_and_std(
                 cache_root, dataset_display, model_short, term, full_elapsed_key)
-            best_elapsed, best_elapsed_std = _elapsed_and_std(
-                cache_root, dataset_display, model_short, term, best_w)
+            if best_is_full_native:
+                best_elapsed, best_elapsed_std = full_elapsed, full_elapsed_std
+            else:
+                best_elapsed, best_elapsed_std = _elapsed_and_std(
+                    cache_root, dataset_display, model_short, term, best_w)
             pred_elapsed, pred_elapsed_std = _elapsed_and_std(
                 cache_root, dataset_display, model_short, term, pred_w)
 
@@ -967,6 +1154,8 @@ def load_strategy_records(
             else:
                 full_flops = theoretical_flops(model, full_w, horizon, patch_sizes)
             best_flops = theoretical_flops(model, best_w, horizon, patch_sizes)
+            if best_is_full_native:
+                best_flops = full_flops
             pred_flops = theoretical_flops(model, pred_w, horizon, patch_sizes)
 
             complexity_ratio_pred = pred_flops / full_flops
@@ -1066,13 +1255,19 @@ def load_strategy_records(
             "best_window":     best_w,
             "pred_window":     pred_w,
             "full_baseline_source": full_baseline_source,
+            "grid_cohort_mode": (
+                "cumulative_all_instances" if instance_eval is not None
+                else "legacy_cell_aggregate"),
             "full_effective_context_mean": full_effective_context_mean,
             "full_native_width_groups": full_native_width_groups,
             "n_windows_valid": int(valid.sum()),
             "pred_clamped":    pred_clamped,   # True when pred window was unavailable
+            "best_is_full_native": best_is_full_native,
             # MASE values
             "full_mase":       full_mase,
             "best_mase":       best_mase,
+            "grid_best_mase":  grid_best_mase,
+            "instance_oracle_mase": instance_oracle_mase,
             "pred_mase":       pred_mase,
             # Seasonal-naive baseline for this cell (denominator of the
             # leaderboard-style normalised MASE; NaN if unavailable).
@@ -1080,10 +1275,29 @@ def load_strategy_records(
             # MASE deltas
             "delta_pred_vs_full": pred_mase - full_mase,
             "delta_best_vs_full": best_mase - full_mase,
+            "delta_instance_oracle_vs_full": instance_oracle_mase - full_mase,
             "delta_pred_vs_best": pred_mase - best_mase,
             "rel_gain_pred_over_full": (
                 (full_mase - pred_mase) / (abs(full_mase) + 1e-12)
             ),
+            "rel_gain_instance_oracle_over_full": (
+                (full_mase - instance_oracle_mase) / (abs(full_mase) + 1e-12)
+            ),
+            "instance_oracle_window_mean": (
+                instance_eval["instance_oracle_window_mean"]
+                if instance_eval is not None else float("nan")),
+            "instance_oracle_window_median": (
+                instance_eval["instance_oracle_window_median"]
+                if instance_eval is not None else float("nan")),
+            "instance_oracle_native_count": (
+                instance_eval["instance_oracle_native_count"]
+                if instance_eval is not None else 0),
+            "instance_oracle_metric_exact": (
+                instance_eval["instance_oracle_metric_exact"]
+                if instance_eval is not None else False),
+            "instance_oracle_metric_source": (
+                instance_eval["instance_oracle_metric_source"]
+                if instance_eval is not None else "missing"),
             # elapsed wall-clock time (seconds; NaN if not cached). *_elapsed_std_s
             # is the std across robust-timing repeats (NaN for single-shot timing).
             "full_elapsed_s":  full_elapsed,
@@ -1231,17 +1445,21 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
     # normalised geomean (geomean of MASE_strategy / MASE_seasonalnaive), over the
     # subset of rows that actually have a baseline.
     has_naive = "naive_mase" in r.columns and r["naive_mase"].notna().any()
-    for strategy in ("full_mase", "best_mase", "pred_mase"):
-        vals = r[strategy].values
+    strategies = ["full_mase", "best_mase", "pred_mase"]
+    if "instance_oracle_mase" in r.columns:
+        strategies.insert(2, "instance_oracle_mase")
+    for strategy in strategies:
+        vals = r[strategy].dropna().values
         stats[strategy] = {
-            "mean":    float(vals.mean()),
+            "mean":    float(vals.mean()) if vals.size else float("nan"),
             "geomean": _geomean(vals),
-            "median":  float(np.median(vals)),
-            "std":     float(vals.std()),
+            "median":  float(np.median(vals)) if vals.size else float("nan"),
+            "std":     float(vals.std()) if vals.size else float("nan"),
             "n":       int(len(vals)),
         }
         if has_naive:
-            m = r["naive_mase"].notna() & (r["naive_mase"] > 0)
+            m = (r["naive_mase"].notna() & (r["naive_mase"] > 0)
+                 & r[strategy].notna())
             if m.any():
                 ratio = (r.loc[m, strategy] / r.loc[m, "naive_mase"]).values
                 stats[strategy]["geomean_norm"] = _geomean(ratio)
@@ -1255,7 +1473,12 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
         "formula": "geomean(cell_MASE / published_seasonal_naive_MASE)",
         "reference": NORMALIZATION_REFERENCE,
         "full_window": stats.get("full_mase", {}).get("geomean_norm"),
+        # Backward-compatible alias: historically "oracle" meant one shared
+        # window per dataset/model/term cell.
         "oracle_window": stats.get("best_mase", {}).get("geomean_norm"),
+        "dataset_oracle_window": stats.get("best_mase", {}).get("geomean_norm"),
+        "instance_oracle_window": stats.get(
+            "instance_oracle_mase", {}).get("geomean_norm"),
         "predicted_window": stats.get("pred_mase", {}).get("geomean_norm"),
         "cells": stats.get("full_mase", {}).get("n_norm", 0),
     }
@@ -1265,6 +1488,15 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
     stats["pred_beats_full_count"] = pred_beats_full
     stats["pred_beats_full_rate"]  = pred_beats_full / max(len(r), 1)
     stats["pred_beats_best_count"] = int((r["pred_mase"] < r["best_mase"]).sum())
+    if "instance_oracle_mase" in r.columns:
+        ri = r.dropna(subset=["instance_oracle_mase"])
+        stats["instance_oracle_exact_cells"] = int(
+            ri.get("instance_oracle_metric_exact", pd.Series(False, index=ri.index)).sum())
+        stats["regret_pred_vs_instance_oracle"] = {
+            "mean": float((ri["pred_mase"] - ri["instance_oracle_mase"]).mean()),
+            "median": float(np.median(
+                ri["pred_mase"] - ri["instance_oracle_mase"])),
+        }
     stats["total_rows"] = int(len(r))
 
     gain = r["rel_gain_pred_over_full"].values
@@ -1920,7 +2152,19 @@ def compute_relative_improvement_tables(
 
     denom = r["full_mase"].clip(lower=1e-12)
     r["rel_impr_oracle_pct"] = (r["full_mase"] - r["best_mase"]) / denom * 100.0
+    r["rel_impr_instance_oracle_pct"] = (
+        (r["full_mase"] - r["instance_oracle_mase"]) / denom * 100.0)
     r["rel_impr_pred_pct"]   = (r["full_mase"] - r["pred_mase"]) / denom * 100.0
+    r["pred_regret_vs_dataset_oracle"] = r["pred_mase"] - r["best_mase"]
+    r["pred_regret_vs_instance_oracle"] = (
+        r["pred_mase"] - r["instance_oracle_mase"])
+    r["instance_adaptation_gain"] = (
+        r["best_mase"] - r["instance_oracle_mase"])
+    r["pred_beats_full"] = r["pred_mase"] < r["full_mase"]
+    if "best_is_full_native" not in r.columns:
+        r["best_is_full_native"] = False
+    if "instance_oracle_metric_exact" not in r.columns:
+        r["instance_oracle_metric_exact"] = False
     r["freq"] = r["dataset_display"].apply(infer_freq_from_display)
 
     # Frequency display order
@@ -1932,8 +2176,9 @@ def compute_relative_improvement_tables(
     # ------------------------------------------------------------------
     cols_ind = [
         "dataset_display", "freq", "model_short", "term", "horizon",
-        "full_mase", "best_mase", "pred_mase",
-        "rel_impr_oracle_pct", "rel_impr_pred_pct",
+        "full_mase", "best_mase", "instance_oracle_mase", "pred_mase",
+        "rel_impr_oracle_pct", "rel_impr_instance_oracle_pct", "rel_impr_pred_pct",
+        "instance_oracle_metric_exact", "instance_oracle_metric_source",
     ]
     ind = r[cols_ind].sort_values(["dataset_display", "model_short", "term"])
     ind_path = os.path.join(out_dir, "rel_improvement_individual.csv")
@@ -1949,11 +2194,20 @@ def compute_relative_improvement_tables(
             n_rows=("full_mase", "count"),
             full_mase_mean=("full_mase", "mean"),
             best_mase_mean=("best_mase", "mean"),
+            instance_oracle_mase_mean=("instance_oracle_mase", "mean"),
             pred_mase_mean=("pred_mase", "mean"),
             rel_impr_oracle_mean=("rel_impr_oracle_pct", "mean"),
+            rel_impr_instance_oracle_mean=("rel_impr_instance_oracle_pct", "mean"),
             rel_impr_pred_mean=("rel_impr_pred_pct", "mean"),
             rel_impr_oracle_median=("rel_impr_oracle_pct", "median"),
+            rel_impr_instance_oracle_median=("rel_impr_instance_oracle_pct", "median"),
             rel_impr_pred_median=("rel_impr_pred_pct", "median"),
+            pred_regret_vs_dataset_oracle_mean=("pred_regret_vs_dataset_oracle", "mean"),
+            pred_regret_vs_instance_oracle_mean=("pred_regret_vs_instance_oracle", "mean"),
+            instance_adaptation_gain_mean=("instance_adaptation_gain", "mean"),
+            pred_beats_full_rate=("pred_beats_full", "mean"),
+            dataset_oracle_native_rate=("best_is_full_native", "mean"),
+            instance_oracle_exact_rate=("instance_oracle_metric_exact", "mean"),
         )
         .reset_index()
     )
@@ -1970,10 +2224,13 @@ def compute_relative_improvement_tables(
             n_rows=("full_mase", "count"),
             full_mase_mean=("full_mase", "mean"),
             best_mase_mean=("best_mase", "mean"),
+            instance_oracle_mase_mean=("instance_oracle_mase", "mean"),
             pred_mase_mean=("pred_mase", "mean"),
             rel_impr_oracle_mean=("rel_impr_oracle_pct", "mean"),
+            rel_impr_instance_oracle_mean=("rel_impr_instance_oracle_pct", "mean"),
             rel_impr_pred_mean=("rel_impr_pred_pct", "mean"),
             rel_impr_oracle_median=("rel_impr_oracle_pct", "median"),
+            rel_impr_instance_oracle_median=("rel_impr_instance_oracle_pct", "median"),
             rel_impr_pred_median=("rel_impr_pred_pct", "median"),
         )
         .reset_index()
@@ -1996,10 +2253,13 @@ def compute_relative_improvement_tables(
             n_rows=("full_mase", "count"),
             full_mase_mean=("full_mase", "mean"),
             best_mase_mean=("best_mase", "mean"),
+            instance_oracle_mase_mean=("instance_oracle_mase", "mean"),
             pred_mase_mean=("pred_mase", "mean"),
             rel_impr_oracle_mean=("rel_impr_oracle_pct", "mean"),
+            rel_impr_instance_oracle_mean=("rel_impr_instance_oracle_pct", "mean"),
             rel_impr_pred_mean=("rel_impr_pred_pct", "mean"),
             rel_impr_oracle_median=("rel_impr_oracle_pct", "median"),
+            rel_impr_instance_oracle_median=("rel_impr_instance_oracle_pct", "median"),
             rel_impr_pred_median=("rel_impr_pred_pct", "median"),
         )
         .reset_index()
@@ -2021,10 +2281,13 @@ def compute_relative_improvement_tables(
             n_rows=("full_mase", "count"),
             full_mase_mean=("full_mase", "mean"),
             best_mase_mean=("best_mase", "mean"),
+            instance_oracle_mase_mean=("instance_oracle_mase", "mean"),
             pred_mase_mean=("pred_mase", "mean"),
             rel_impr_oracle_mean=("rel_impr_oracle_pct", "mean"),
+            rel_impr_instance_oracle_mean=("rel_impr_instance_oracle_pct", "mean"),
             rel_impr_pred_mean=("rel_impr_pred_pct", "mean"),
             rel_impr_oracle_median=("rel_impr_oracle_pct", "median"),
+            rel_impr_instance_oracle_median=("rel_impr_instance_oracle_pct", "median"),
             rel_impr_pred_median=("rel_impr_pred_pct", "median"),
         )
         .reset_index()
@@ -2053,12 +2316,14 @@ def compute_relative_improvement_tables(
 
     _fmt_table(
         ds_agg[["dataset_display", "freq", "n_rows",
-                "full_mase_mean", "best_mase_mean", "pred_mase_mean",
-                "rel_impr_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
+                "full_mase_mean", "best_mase_mean", "instance_oracle_mase_mean", "pred_mase_mean",
+                "rel_impr_oracle_mean", "rel_impr_instance_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
             "full_mase_mean": "full",
-            "best_mase_mean": "oracle",
+            "best_mase_mean": "dataset_oracle",
+            "instance_oracle_mase_mean": "instance_oracle",
             "pred_mase_mean": "pred",
-            "rel_impr_oracle_mean": "Δoracle%",
+            "rel_impr_oracle_mean": "Δdataset_oracle%",
+            "rel_impr_instance_oracle_mean": "Δinstance_oracle%",
             "rel_impr_pred_mean":   "Δpred%",
         }),
         "Relative improvement vs full window — by dataset (mean over models/terms)",
@@ -2066,12 +2331,14 @@ def compute_relative_improvement_tables(
 
     _fmt_table(
         freq_agg[["freq", "n_rows",
-                  "full_mase_mean", "best_mase_mean", "pred_mase_mean",
-                  "rel_impr_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
+                  "full_mase_mean", "best_mase_mean", "instance_oracle_mase_mean", "pred_mase_mean",
+                  "rel_impr_oracle_mean", "rel_impr_instance_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
             "full_mase_mean": "full",
-            "best_mase_mean": "oracle",
+            "best_mase_mean": "dataset_oracle",
+            "instance_oracle_mase_mean": "instance_oracle",
             "pred_mase_mean": "pred",
-            "rel_impr_oracle_mean": "Δoracle%",
+            "rel_impr_oracle_mean": "Δdataset_oracle%",
+            "rel_impr_instance_oracle_mean": "Δinstance_oracle%",
             "rel_impr_pred_mean":   "Δpred%",
         }),
         "Relative improvement vs full window — by sampling frequency",
@@ -2079,12 +2346,14 @@ def compute_relative_improvement_tables(
 
     _fmt_table(
         hor_agg[["term", "horizon", "n_rows",
-                 "full_mase_mean", "best_mase_mean", "pred_mase_mean",
-                 "rel_impr_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
+                 "full_mase_mean", "best_mase_mean", "instance_oracle_mase_mean", "pred_mase_mean",
+                 "rel_impr_oracle_mean", "rel_impr_instance_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
             "full_mase_mean": "full",
-            "best_mase_mean": "oracle",
+            "best_mase_mean": "dataset_oracle",
+            "instance_oracle_mase_mean": "instance_oracle",
             "pred_mase_mean": "pred",
-            "rel_impr_oracle_mean": "Δoracle%",
+            "rel_impr_oracle_mean": "Δdataset_oracle%",
+            "rel_impr_instance_oracle_mean": "Δinstance_oracle%",
             "rel_impr_pred_mean":   "Δpred%",
         }),
         "Relative improvement vs full window — by horizon",
@@ -2092,23 +2361,27 @@ def compute_relative_improvement_tables(
 
     _fmt_table(
         domain_agg[["domain", "n_rows",
-                    "full_mase_mean", "best_mase_mean", "pred_mase_mean",
-                    "rel_impr_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
+                    "full_mase_mean", "best_mase_mean", "instance_oracle_mase_mean", "pred_mase_mean",
+                    "rel_impr_oracle_mean", "rel_impr_instance_oracle_mean", "rel_impr_pred_mean"]].rename(columns={
             "full_mase_mean": "full",
-            "best_mase_mean": "oracle",
+            "best_mase_mean": "dataset_oracle",
+            "instance_oracle_mase_mean": "instance_oracle",
             "pred_mase_mean": "pred",
-            "rel_impr_oracle_mean": "Δoracle%",
+            "rel_impr_oracle_mean": "Δdataset_oracle%",
+            "rel_impr_instance_oracle_mean": "Δinstance_oracle%",
             "rel_impr_pred_mean":   "Δpred%",
         }),
         "Relative improvement vs full window — by domain",
     )
 
     # ------------------------------------------------------------------
-    # Plots (skipped in the default minimal-figures mode; CSVs above always
-    # written)
+    # Plots (the dataset overview is always written; broader breakdowns remain
+    # behind --all-figures; CSVs above are always written)
     # ------------------------------------------------------------------
+    # The per-dataset overview is a core diagnostic: it immediately exposes
+    # cells such as BizITObsL2C where an aggregate strategy behaves oddly.
+    _plot_rel_impr_by_dataset(ds_agg, out_dir)
     if figures:
-        _plot_rel_impr_by_dataset(ds_agg, out_dir)
         _plot_rel_impr_by_frequency(freq_agg, out_dir)
         _plot_rel_impr_by_horizon(hor_agg, out_dir)
         _plot_rel_impr_by_domain(domain_agg, out_dir)
@@ -2125,25 +2398,29 @@ def _plot_rel_impr_by_dataset(ds_agg: pd.DataFrame, out_dir: str) -> str:
         return ""
 
     n = len(data)
-    bar_h = 0.35
+    bar_h = 0.24
     fig_h = max(6, n * 0.55 + 2)
     fig, ax = plt.subplots(figsize=(12, fig_h))
 
     y = np.arange(n)
     oracle_vals = data["rel_impr_oracle_mean"].values
+    instance_vals = data["rel_impr_instance_oracle_mean"].values
     pred_vals   = data["rel_impr_pred_mean"].values
     labels      = data["dataset_display"].values
 
-    bars_oracle = ax.barh(y + bar_h / 2, oracle_vals, bar_h,
-                          label="Oracle (best window)", color="#ED7D31", alpha=0.85, edgecolor="white")
-    bars_pred   = ax.barh(y - bar_h / 2, pred_vals,   bar_h,
+    bars_oracle = ax.barh(y + bar_h, oracle_vals, bar_h,
+                          label="Dataset oracle", color="#ED7D31", alpha=0.85, edgecolor="white")
+    bars_instance = ax.barh(y, instance_vals, bar_h,
+                          label="Instance oracle", color="#8064A2", alpha=0.85, edgecolor="white")
+    bars_pred   = ax.barh(y - bar_h, pred_vals,   bar_h,
                           label="Predictor",            color="#70AD47", alpha=0.85, edgecolor="white")
 
     # Value annotations
-    x_range = max(np.abs(oracle_vals).max(), np.abs(pred_vals).max(), 1e-3)
+    x_range = max(np.abs(oracle_vals).max(), np.abs(instance_vals).max(),
+                  np.abs(pred_vals).max(), 1e-3)
     pad = x_range * 0.015
-    for bar, val in zip(list(bars_oracle) + list(bars_pred),
-                        list(oracle_vals) + list(pred_vals)):
+    for bar, val in zip(list(bars_oracle) + list(bars_instance) + list(bars_pred),
+                        list(oracle_vals) + list(instance_vals) + list(pred_vals)):
         w = bar.get_width()
         xpos = w + pad if w >= 0 else w - pad
         ha   = "left"   if w >= 0 else "right"
@@ -2181,30 +2458,38 @@ def _plot_rel_impr_by_frequency(freq_agg: pd.DataFrame, out_dir: str) -> str:
 
     n = len(data)
     x = np.arange(n)
-    w = 0.32
+    w = 0.24
     fig, ax = plt.subplots(figsize=(max(8, n * 1.1 + 2), 6))
 
     oracle_mean = data["rel_impr_oracle_mean"].values
+    instance_mean = data["rel_impr_instance_oracle_mean"].values
     pred_mean   = data["rel_impr_pred_mean"].values
     oracle_med  = data["rel_impr_oracle_median"].values
+    instance_med = data["rel_impr_instance_oracle_median"].values
     pred_med    = data["rel_impr_pred_median"].values
     freq_labels = data["freq"].values
 
-    b1 = ax.bar(x - w / 2, oracle_mean, w, label="Oracle — mean",
+    b1 = ax.bar(x - w, oracle_mean, w, label="Dataset oracle — mean",
                 color="#ED7D31", alpha=0.82, edgecolor="white")
-    b2 = ax.bar(x + w / 2, pred_mean,   w, label="Predictor — mean",
+    bi = ax.bar(x, instance_mean, w, label="Instance oracle — mean",
+                color="#8064A2", alpha=0.82, edgecolor="white")
+    b2 = ax.bar(x + w, pred_mean,   w, label="Predictor — mean",
                 color="#70AD47", alpha=0.82, edgecolor="white")
 
     # Median dots
-    ax.scatter(x - w / 2, oracle_med, s=45, color="#A84000", zorder=4,
-               label="Oracle — median", marker="D")
-    ax.scatter(x + w / 2, pred_med,   s=45, color="#2A6E10", zorder=4,
+    ax.scatter(x - w, oracle_med, s=40, color="#A84000", zorder=4,
+               label="Dataset oracle — median", marker="D")
+    ax.scatter(x, instance_med, s=40, color="#51356F", zorder=4,
+               label="Instance oracle — median", marker="D")
+    ax.scatter(x + w, pred_med,   s=40, color="#2A6E10", zorder=4,
                label="Predictor — median", marker="D")
 
     # Annotate mean bars
-    y_rng = max(np.abs(oracle_mean).max(), np.abs(pred_mean).max(), 1e-3)
+    y_rng = max(np.abs(oracle_mean).max(), np.abs(instance_mean).max(),
+                np.abs(pred_mean).max(), 1e-3)
     pad   = y_rng * 0.03
-    for b, val in zip(list(b1) + list(b2), list(oracle_mean) + list(pred_mean)):
+    for b, val in zip(list(b1) + list(bi) + list(b2),
+                      list(oracle_mean) + list(instance_mean) + list(pred_mean)):
         h = b.get_height()
         ypos = h + pad if h >= 0 else h - pad
         va   = "bottom" if h >= 0 else "top"
@@ -2242,31 +2527,39 @@ def _plot_rel_impr_by_domain(domain_agg: pd.DataFrame, out_dir: str) -> str:
 
     n = len(data)
     x = np.arange(n)
-    w = 0.32
+    w = 0.24
     fig, ax = plt.subplots(figsize=(max(8, n * 1.3 + 2), 6))
 
     oracle_mean = data["rel_impr_oracle_mean"].values
+    instance_mean = data["rel_impr_instance_oracle_mean"].values
     pred_mean   = data["rel_impr_pred_mean"].values
     oracle_med  = data["rel_impr_oracle_median"].values
+    instance_med = data["rel_impr_instance_oracle_median"].values
     pred_med    = data["rel_impr_pred_median"].values
     domain_labels = [f"{d}\n(n={int(nr)})" for d, nr in
                      zip(data["domain"].values, data["n_rows"].values)]
 
-    b1 = ax.bar(x - w / 2, oracle_mean, w, label="Oracle — mean",
+    b1 = ax.bar(x - w, oracle_mean, w, label="Dataset oracle — mean",
                 color="#ED7D31", alpha=0.82, edgecolor="white")
-    b2 = ax.bar(x + w / 2, pred_mean,   w, label="Predictor — mean",
+    bi = ax.bar(x, instance_mean, w, label="Instance oracle — mean",
+                color="#8064A2", alpha=0.82, edgecolor="white")
+    b2 = ax.bar(x + w, pred_mean,   w, label="Predictor — mean",
                 color="#70AD47", alpha=0.82, edgecolor="white")
 
     # Median dots
-    ax.scatter(x - w / 2, oracle_med, s=45, color="#A84000", zorder=4,
-               label="Oracle — median", marker="D")
-    ax.scatter(x + w / 2, pred_med,   s=45, color="#2A6E10", zorder=4,
+    ax.scatter(x - w, oracle_med, s=40, color="#A84000", zorder=4,
+               label="Dataset oracle — median", marker="D")
+    ax.scatter(x, instance_med, s=40, color="#51356F", zorder=4,
+               label="Instance oracle — median", marker="D")
+    ax.scatter(x + w, pred_med,   s=40, color="#2A6E10", zorder=4,
                label="Predictor — median", marker="D")
 
     # Annotate mean bars
-    y_rng = max(np.abs(oracle_mean).max(), np.abs(pred_mean).max(), 1e-3)
+    y_rng = max(np.abs(oracle_mean).max(), np.abs(instance_mean).max(),
+                np.abs(pred_mean).max(), 1e-3)
     pad   = y_rng * 0.03
-    for b, val in zip(list(b1) + list(b2), list(oracle_mean) + list(pred_mean)):
+    for b, val in zip(list(b1) + list(bi) + list(b2),
+                      list(oracle_mean) + list(instance_mean) + list(pred_mean)):
         h = b.get_height()
         ypos = h + pad if h >= 0 else h - pad
         va   = "bottom" if h >= 0 else "top"
@@ -2309,8 +2602,10 @@ def _plot_rel_impr_by_horizon(hor_agg: pd.DataFrame, out_dir: str) -> str:
         data.groupby("term", sort=False)
         .agg(
             oracle_mean=("rel_impr_oracle_mean", "mean"),
+            instance_mean=("rel_impr_instance_oracle_mean", "mean"),
             pred_mean=("rel_impr_pred_mean",   "mean"),
             oracle_med=("rel_impr_oracle_median", "mean"),
+            instance_med=("rel_impr_instance_oracle_median", "mean"),
             pred_med=("rel_impr_pred_median",   "mean"),
         )
         .reset_index()
@@ -2321,23 +2616,30 @@ def _plot_rel_impr_by_horizon(hor_agg: pd.DataFrame, out_dir: str) -> str:
 
     n_t = len(term_data)
     xt  = np.arange(n_t)
-    wt  = 0.32
-    b1 = ax_bar.bar(xt - wt / 2, term_data["oracle_mean"].values, wt,
-                    label="Oracle — mean", color="#ED7D31", alpha=0.82, edgecolor="white")
-    b2 = ax_bar.bar(xt + wt / 2, term_data["pred_mean"].values,   wt,
+    wt  = 0.24
+    b1 = ax_bar.bar(xt - wt, term_data["oracle_mean"].values, wt,
+                    label="Dataset oracle — mean", color="#ED7D31", alpha=0.82, edgecolor="white")
+    bi = ax_bar.bar(xt, term_data["instance_mean"].values, wt,
+                    label="Instance oracle — mean", color="#8064A2", alpha=0.82, edgecolor="white")
+    b2 = ax_bar.bar(xt + wt, term_data["pred_mean"].values,   wt,
                     label="Predictor — mean", color="#70AD47", alpha=0.82, edgecolor="white")
-    ax_bar.scatter(xt - wt / 2, term_data["oracle_med"].values, s=50,
-                   color="#A84000", zorder=4, label="Oracle — median", marker="D")
-    ax_bar.scatter(xt + wt / 2, term_data["pred_med"].values,   s=50,
+    ax_bar.scatter(xt - wt, term_data["oracle_med"].values, s=45,
+                   color="#A84000", zorder=4, label="Dataset oracle — median", marker="D")
+    ax_bar.scatter(xt, term_data["instance_med"].values, s=45,
+                   color="#51356F", zorder=4, label="Instance oracle — median", marker="D")
+    ax_bar.scatter(xt + wt, term_data["pred_med"].values,   s=45,
                    color="#2A6E10", zorder=4, label="Predictor — median", marker="D")
 
     y_rng = max(
         np.abs(term_data["oracle_mean"].values).max(),
+        np.abs(term_data["instance_mean"].values).max(),
         np.abs(term_data["pred_mean"].values).max(), 1e-3,
     )
     pad = y_rng * 0.04
-    for b, val in zip(list(b1) + list(b2),
-                      list(term_data["oracle_mean"].values) + list(term_data["pred_mean"].values)):
+    for b, val in zip(list(b1) + list(bi) + list(b2),
+                      list(term_data["oracle_mean"].values)
+                      + list(term_data["instance_mean"].values)
+                      + list(term_data["pred_mean"].values)):
         h = b.get_height()
         yp = h + pad if h >= 0 else h - pad
         ax_bar.text(b.get_x() + b.get_width() / 2, yp,
@@ -2355,7 +2657,10 @@ def _plot_rel_impr_by_horizon(hor_agg: pd.DataFrame, out_dir: str) -> str:
     # ---- Right: scatter Δ% vs actual horizon value -------------------------
     ax_sc.scatter(data["horizon"], data["rel_impr_oracle_mean"],
                   s=60, color="#ED7D31", alpha=0.80, edgecolors="white", linewidths=0.5,
-                  label="Oracle")
+                  label="Dataset oracle")
+    ax_sc.scatter(data["horizon"], data["rel_impr_instance_oracle_mean"],
+                  s=60, color="#8064A2", alpha=0.80, edgecolors="white", linewidths=0.5,
+                  marker="s", label="Instance oracle")
     ax_sc.scatter(data["horizon"], data["rel_impr_pred_mean"],
                   s=60, color="#70AD47", alpha=0.80, edgecolors="white", linewidths=0.5,
                   marker="^", label="Predictor")
@@ -2467,12 +2772,19 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
         v = r[col].values
         return v / r["naive_mase"].values if normalize else v
 
-    strategies = ["full_mase", "best_mase", "pred_mase"]
-    labels = ["Full Window", "Best Window\n(Oracle)", "Predictor\nWindow"]
+    strategies = ["full_mase", "best_mase"]
+    labels = ["Full Window", "Dataset Oracle"]
     # Per-strategy bar colors (geom = saturated, median = lighter). Base three are
     # fixed; period + variants append their registry color for both shades.
-    c_geom   = ["#264FA0", "#A9511B", "#3E7327"]
-    c_median = ["#7BA9D8", "#F0A86A", "#9ED67A"]
+    c_geom   = ["#264FA0", "#A9511B"]
+    c_median = ["#7BA9D8", "#F0A86A"]
+    if "instance_oracle_mase" in r.columns and r["instance_oracle_mase"].notna().any():
+        strategies.append("instance_oracle_mase")
+        labels.append("Instance Oracle")
+        c_geom.append("#624781"); c_median.append("#B7A2CC")
+    strategies.append("pred_mase")
+    labels.append("Predictor\nWindow")
+    c_geom.append("#3E7327"); c_median.append("#9ED67A")
     # Append the period-window strategy when sidecars supplied it (restricted to
     # the rows that actually have a period_mase, so bars stay comparable).
     # ``extra_strategies=False`` (the minimal-figures mode) keeps the bar on the
@@ -3236,9 +3548,16 @@ def plot_per_dataset_bars(df: pd.DataFrame, out_dir: str) -> List[str]:
     # Strategies to draw, in plot order. Period is appended only when the
     # sidecars supplied at least one period_mase, so the figure degrades to the
     # original three strategies when stage 5 was never run.
-    strat_cols = ["full_mase", "best_mase", "pred_mase"]
-    strat_lbls = ["Full window", "Best (oracle)", "Predictor"]
-    strat_cols_clrs = ["#4472C4", "#ED7D31", "#70AD47"]
+    strat_cols = ["full_mase", "best_mase"]
+    strat_lbls = ["Full window", "Dataset oracle"]
+    strat_cols_clrs = ["#4472C4", "#ED7D31"]
+    if "instance_oracle_mase" in r.columns and r["instance_oracle_mase"].notna().any():
+        strat_cols.append("instance_oracle_mase")
+        strat_lbls.append("Instance oracle")
+        strat_cols_clrs.append("#8064A2")
+    strat_cols.append("pred_mase")
+    strat_lbls.append("Predictor")
+    strat_cols_clrs.append("#70AD47")
     has_period = "period_mase" in r.columns and r["period_mase"].notna().any()
     if has_period:
         strat_cols.append("period_mase")
@@ -3395,8 +3714,8 @@ def parse_args() -> argparse.Namespace:
         "--all-figures", action=argparse.BooleanOptionalAction, default=False,
         help="Emit the full historical figure set (metric twins, scatters, "
              "histograms, per-dataset bars, rollup overviews/tables). Default "
-             "emits ONLY bar_aggregate_mase_gluonts[_normalized].png on the "
-             "primary metric; every CSV / summary_stats.json is unaffected.",
+             "emits the two aggregate MASE bars plus the per-dataset relative-"
+             "improvement overview; every CSV / summary_stats.json is unaffected.",
     )
     return p.parse_args()
 
@@ -3514,9 +3833,22 @@ def main() -> None:
             json.dump(stats, f, indent=2)
         print(Fore.GREEN + f"  Saved: {stats_path}" + Fore.RESET)
 
+        if "instance_oracle_metric_exact" in df_subset.columns:
+            exact = df_subset["instance_oracle_metric_exact"].fillna(False).astype(bool)
+            n_proxy = int((~exact).sum())
+            if n_proxy:
+                print(
+                    Fore.YELLOW
+                    + f"  Instance oracle: {n_proxy}/{len(df_subset)} cells use the "
+                      "legacy mase_gluonts per-row proxy. Re-running stage 3 "
+                      "writes exact mase_gluonts_real per-instance values."
+                    + Fore.RESET
+                )
+
         print(Fore.CYAN + "\n--- MASE summary ---" + Fore.RESET)
         mase_keys = [("full_mase", "Full window  "),
-                     ("best_mase", "Best (oracle)"),
+                     ("best_mase", "Dataset oracle"),
+                     ("instance_oracle_mase", "Instance oracle"),
                      ("pred_mase", "Predictor    ")]
         if "period_mase" in stats:
             mase_keys.append(("period_mase", "Period (2xP) "))
@@ -3636,13 +3968,13 @@ def main() -> None:
         primary_lbl = metric_lbls[args.mase_metric]
 
         # ---- Minimal figure set (the default) --------------------------------
-        # Exactly TWO figures, both on the PRIMARY metric (default
+        # Core figures on the PRIMARY metric (default
         # `mase_gluonts_real` = gluonts' own machinery, the leaderboard
         # definition): the absolute bars and the leaderboard-faithful
         # seasonal-naive-NORMALISED bars (each cell ÷ its same-definition
         # Seasonal-Naive; Seasonal Naive = 1.0). Fixed filenames regardless of
         # --mase-metric — the figure title carries the exact metric. Everything
-        # else (twins, scatters, histograms, per-dataset bars) is behind
+        # else (twins, scatters, histograms, detailed per-cell dataset bars) is behind
         # --all-figures; CSVs and summary_stats.json are always written.
         if not args.all_figures:
             # extra_strategies=False: core full/best/pred only, so partial

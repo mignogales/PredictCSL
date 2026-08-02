@@ -47,8 +47,9 @@ predictor-derived, so no TSFM re-inference):
   trials), so the predictor's own cost is negligible vs the labeled TSFM.
 - **`run_all_v4.py`** — swaps the Transformer encoder for a **bidirectional
   Mamba** (selective state-space) stack — O(N) in the patch-token count instead
-  of O(N²) — so the predictor is even cheaper and the search can afford smaller
-  patches. Selected via `PREDICTCSL_PREDICTOR_ARCH=mamba` (resolved at import in
+  of O(N²). Its standalone search can explore smaller patches; the master
+  recomputation passes `--cheap` to match v3's patch sizes, width, and depth.
+  Selected via `PREDICTCSL_PREDICTOR_ARCH=mamba` (resolved at import in
   `predict_context_length.py`, alongside `MambaContextLength` + the
   `build_predictor` factory). Requires `mamba-ssm` + `causal-conv1d` on the
   server (imported lazily, so the patchtst path needs neither).

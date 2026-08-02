@@ -21,6 +21,7 @@ from experiments import predict_context_length as predictor
 from experiments import run_all as run_all_orchestrator
 from experiments.compare_window_strategies_gifteval import (
     _geomean,
+    _instance_oracle_from_cache,
     compute_summary_stats,
     load_strategy_records,
 )
@@ -67,6 +68,74 @@ class MasterRecomputeConfigTest(unittest.TestCase):
                 "general_v4_classification",
             ],
         )
+        by_name = {v.name: v for v in master.VARIANTS}
+        self.assertIn("--cheap", by_name["mamba"].extra)
+        self.assertIn("--cheap", by_name["mamba_cls"].extra)
+        self.assertEqual(
+            predictor.HP_SPACE_MAMBA_CHEAP["patch_length"],
+            predictor.HP_SPACE_PATCHTST_CHEAP["patch_length"],
+        )
+        self.assertEqual(
+            predictor.HP_SPACE_MAMBA_CHEAP["d_model"],
+            predictor.HP_SPACE_PATCHTST_CHEAP["d_model"],
+        )
+        self.assertEqual(
+            predictor.HP_SPACE_MAMBA_CHEAP["num_hidden_layers"],
+            predictor.HP_SPACE_PATCHTST_CHEAP["num_hidden_layers"],
+        )
+
+    def test_trial_resume_rejects_changed_search_config(self) -> None:
+        current = predictor.TrialConfig(
+            patch_length=64,
+            d_model=128,
+            num_hidden_layers=2,
+            dropout=0.1,
+            mask_ratio=0.3,
+            learning_rate=1e-4,
+            weight_decay=1e-4,
+            arch="mamba",
+            d_state=16,
+            d_conv=4,
+            expand=2,
+        )
+        cached = {
+            "label_inference_recipe": "recipe-v1",
+            "val_curve_mse": 0.5,
+            "cfg": {**current.__dict__, "patch_length": 16},
+        }
+        self.assertFalse(predictor._cached_trial_is_compatible(
+            cached, current, "recipe-v1"))
+        cached["cfg"] = current.__dict__
+        self.assertTrue(predictor._cached_trial_is_compatible(
+            cached, current, "recipe-v1"))
+
+    def test_old_unconstrained_mamba_artifact_is_not_done(self) -> None:
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+                run_all_orchestrator, "PREDICTOR_ROOT", root), mock.patch.dict(
+                    os.environ,
+                    {
+                        "PREDICTCSL_PREDICTOR_ARCH": "mamba",
+                        "PREDICTCSL_PREDICTOR_ROOT": root,
+                        "PREDICTCSL_CHEAP_PREDICTOR": "1",
+                        "PREDICTCSL_TRAINING_OBJECTIVE": "curve",
+                    },
+                    clear=False):
+            run_dir = os.path.join(root, "Chronos2-Small")
+            os.makedirs(run_dir)
+            open(os.path.join(run_dir, "best_model.pt"), "wb").close()
+            with open(os.path.join(run_dir, "best_config.json"), "w") as f:
+                json.dump({
+                    "arch": "mamba",
+                    "training_objective": "curve",
+                    "label_inference_recipe": (
+                        "chronos2_univariate_no_cross_learning_v1"),
+                }, f)
+
+            done, reason = run_all_orchestrator._done_stage_2(
+                "chronos2", "Chronos2-Small")
+
+        self.assertFalse(done)
+        self.assertIn("unconstrained Mamba", reason)
 
     def test_model_aware_window_grids(self) -> None:
         self.assertEqual(build.window_grid_for_family("timesfm")[-2:],
@@ -283,7 +352,7 @@ class MasterRecomputeConfigTest(unittest.TestCase):
 
             recipe = "chronos2_univariate_no_cross_learning_v1"
             common = {
-                "_metric_suite_ver": 2,
+                "_metric_suite_ver": 3,
                 "_mase_gluonts_real_standin": False,
                 "_inference_recipe": recipe,
                 "elapsed_seconds": 1.0,
@@ -329,12 +398,15 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertEqual(len(result), 1)
         row = result.iloc[0]
         self.assertAlmostEqual(row["full_mase"], 0.7)
-        self.assertAlmostEqual(row["best_mase"], 0.8)
+        # The dataset oracle includes native-full as a candidate, so it cannot
+        # report a negative improvement merely because every grid point loses.
+        self.assertAlmostEqual(row["best_mase"], 0.7)
         self.assertAlmostEqual(row["pred_mase"], 1.1)
+        self.assertTrue(row["best_is_full_native"])
         # The available dataset context (64) is retained; Chronos2's nominal
         # 8192 limit must never make a short dataset pretend to have more history.
         self.assertEqual(row["full_window"], 64)
-        self.assertEqual(row["best_window"], 32)
+        self.assertEqual(row["best_window"], 64)
         self.assertEqual(row["pred_window"], 64)
         self.assertEqual(row["full_baseline_source"], "full_native_sanity")
 
@@ -364,6 +436,35 @@ class MasterRecomputeConfigTest(unittest.TestCase):
 
 
 class PerInstanceWindowEvaluationTest(unittest.TestCase):
+    def test_comparable_curve_carries_forward_previous_window(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            base = os.path.join(
+                root, "datasets", "Example", "Chronos2-Small", "tshort")
+
+            def save(window, values, served):
+                path = os.path.join(base, f"w{window}")
+                os.makedirs(path)
+                np.savez_compressed(
+                    os.path.join(path, "per_sample_metrics.npz"),
+                    mase_gluonts_real=np.asarray(values, dtype=float),
+                    valid_count=np.ones(len(values), dtype=np.int32),
+                    served_index=np.asarray(served, dtype=np.int32),
+                )
+
+            save(32, [3.0, 5.0], [0, 1])
+            save(64, [1.0], [0])
+            save("full_native", [2.0, 4.0], [0, 1])
+
+            result = _instance_oracle_from_cache(
+                root, "Example", "Chronos2-Small", "short",
+                np.array([32, 64]), np.array([True, True]), 2,
+                "mase_gluonts_real")
+
+        self.assertIsNotNone(result)
+        np.testing.assert_allclose(result["comparable_curve"], [4.0, 3.0])
+        self.assertAlmostEqual(result["instance_oracle_mase"], 2.5)
+        self.assertTrue(result["instance_oracle_metric_exact"])
+
     def test_discovery_includes_complete_gifteval_cohort(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             compare_dir = os.path.join(
@@ -437,6 +538,20 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
 
         np.testing.assert_allclose(metrics["mae"], [2.0, 3.0])
         np.testing.assert_allclose(metrics["mase_gluonts"], [1.0, 1.5])
+        np.testing.assert_allclose(metrics["mase_gluonts_real"], [1.0, 1.5])
+        np.testing.assert_array_equal(metrics["valid_count"], [1, 2])
+
+    def test_per_instance_real_mase_uses_gluonts_upper_middle_sample(self) -> None:
+        forecast = ForecastResult(
+            median=torch.tensor([[1.0]]),
+            samples=torch.tensor([[[0.0], [1.0], [2.0], [100.0]]]),
+        )
+        metrics = compute_per_sample_metrics(
+            forecast, torch.tensor([[2.0]]),
+            seasonal_errors=np.array([1.0]))
+
+        self.assertAlmostEqual(metrics["mase_gluonts"][0], 1.0)
+        self.assertAlmostEqual(metrics["mase_gluonts_real"][0], 0.0)
 
 
 class GluonTSMaseVectorizedTest(unittest.TestCase):
