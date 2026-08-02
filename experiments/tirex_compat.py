@@ -22,6 +22,27 @@ class TirexCheckpointAccessError(RuntimeError):
     """The authenticated Hugging Face account cannot read a TiRex checkpoint."""
 
 
+def _is_huggingface_access_denied(exc: BaseException) -> bool:
+    """Recognize gated 401/403 errors even when Hub wraps them as cache misses."""
+    from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
+
+    current: BaseException | None = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, GatedRepoError):
+            return True
+        if isinstance(current, HfHubHTTPError):
+            response = getattr(current, "response", None)
+            if getattr(response, "status_code", None) in {401, 403}:
+                return True
+            message = str(current).lower()
+            if "gated" in message and ("403" in message or "permission" in message):
+                return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def require_tirex_checkpoint_access(
     model_id: str = TIREX_GIFTEVAL_MODEL_ID,
 ) -> str:
@@ -32,7 +53,6 @@ def require_tirex_checkpoint_access(
     downloading the 330 MB model checkpoint during preflight.
     """
     from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import GatedRepoError
 
     try:
         return hf_hub_download(
@@ -40,16 +60,20 @@ def require_tirex_checkpoint_access(
             filename=TIREX_MODEL_CONFIG,
             repo_type="model",
         )
-    except GatedRepoError as exc:
+    except Exception as exc:
+        if not _is_huggingface_access_denied(exc):
+            raise
         raise TirexCheckpointAccessError(
             f"TiREX checkpoint access denied for {model_id}.\n"
             f"1. Sign in at https://huggingface.co/{model_id} and accept the "
             "access conditions.\n"
-            "2. On the server, verify that the same account is active with "
+            "2. In the token's fine-grained settings, enable access to public "
+            "gated repositories (or explicitly grant this model).\n"
+            "3. On the server, verify that the same account is active with "
             "`huggingface-cli whoami`; use `huggingface-cli login` if needed.\n"
             "   If HF_TOKEN is set in the shell or project .env, update it too; "
             "it overrides the saved login.\n"
-            "3. Rerun this command after access is granted.\n"
+            "4. Rerun this command after access is granted.\n"
             "Do not substitute NX-AI/TiRex-2 for this benchmark: that generic "
             "checkpoint is not the decontaminated GIFT-Eval zero-shot model."
         ) from exc

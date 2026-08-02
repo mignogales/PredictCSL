@@ -819,8 +819,10 @@ def load_strategy_records(
                 cache_root, dataset_display, model_short, term, FULL_NATIVE_WINDOW)
             if full_native_metrics is not None:
                 model_family = next(
-                    (family for model_id, family, display in models_config.CATALOG
-                     if model.lower() in {model_id.lower(), display.lower()}),
+                    (spec.family for spec in models_config.CATALOG
+                     if model.lower() in {
+                         spec.model_id.lower(), spec.display.lower()
+                     }),
                     None,
                 )
                 expected_recipe = (
@@ -1139,10 +1141,12 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
     if "model" in df.columns:
         active = {}
         model_values = set(df["model"].astype(str).str.lower())
-        for model_id, family, display in models_config.CATALOG:
-            recipe = inference_recipe(family)
-            if recipe is not None and ({model_id.lower(), display.lower()} & model_values):
-                active[family] = recipe
+        for spec in models_config.CATALOG:
+            recipe = inference_recipe(spec.family)
+            if recipe is not None and (
+                {spec.model_id.lower(), spec.display.lower()} & model_values
+            ):
+                active[spec.family] = recipe
         if active:
             stats["inference_recipes"] = active
 

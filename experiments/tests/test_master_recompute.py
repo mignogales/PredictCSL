@@ -10,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import pandas as pd
 import torch
 
 from experiments import build_context_length_dataset as build
@@ -17,7 +18,10 @@ from experiments import evaluate_instance_windows as instance_eval
 from experiments import master_run_all as master
 from experiments import models_config
 from experiments import predict_context_length as predictor
-from experiments.compare_window_strategies_gifteval import _geomean
+from experiments.compare_window_strategies_gifteval import (
+    _geomean,
+    compute_summary_stats,
+)
 from experiments.gifteval_mase import gluonts_leaderboard_mase
 from experiments.test_window_ablation_gifteval_v5 import (
     ForecastResult, compute_per_sample_metrics)
@@ -224,6 +228,27 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertAlmostEqual(_geomean(np.array([1.0, 4.0, np.nan])), 2.0)
         self.assertEqual(_geomean(np.array([0.0, 4.0])), 0.0)
         self.assertTrue(math.isnan(_geomean(np.array([-1.0, 4.0]))))
+
+    def test_summary_stats_accepts_current_model_specs(self) -> None:
+        stats = compute_summary_stats(pd.DataFrame([{
+            "model": "autogluon/chronos-2-small",
+            "full_mase": 1.0,
+            "best_mase": 0.8,
+            "pred_mase": 0.9,
+            "pred_clamped": False,
+            "rel_gain_pred_over_full": 0.1,
+            "delta_pred_vs_best": 0.1,
+            "full_elapsed_s": 2.0,
+            "best_elapsed_s": 1.0,
+            "pred_elapsed_s": 1.5,
+            "speedup_pred_vs_full": 4.0 / 3.0,
+            "complexity_ratio_pred_vs_full": 0.75,
+        }]))
+
+        self.assertEqual(
+            stats["inference_recipes"]["chronos2"],
+            "chronos2_univariate_no_cross_learning_v1",
+        )
 
 
 class PerInstanceWindowEvaluationTest(unittest.TestCase):
@@ -653,6 +678,37 @@ class TiRexCompatibilityTest(unittest.TestCase):
         self.assertIn("huggingface-cli whoami", message)
         self.assertIn("HF_TOKEN", message)
         self.assertIn("Do not substitute NX-AI/TiRex-2", message)
+
+    def test_checkpoint_preflight_unwraps_gated_403_cache_miss(self) -> None:
+        from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
+        from requests import Response
+        from experiments.tirex_compat import (
+            TirexCheckpointAccessError,
+            require_tirex_checkpoint_access,
+        )
+
+        response = Response()
+        response.status_code = 403
+        response.url = (
+            "https://huggingface.co/NX-AI/TiRex-2-gifteval-zs/"
+            "resolve/main/model-config.yaml"
+        )
+        forbidden = HfHubHTTPError(
+            "403: enable access to public gated repositories",
+            response=response,
+        )
+        cache_miss = LocalEntryNotFoundError("not in local cache")
+        cache_miss.__cause__ = forbidden
+
+        with mock.patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=cache_miss):
+            with self.assertRaises(TirexCheckpointAccessError) as raised:
+                require_tirex_checkpoint_access()
+
+        message = str(raised.exception)
+        self.assertIn("fine-grained settings", message)
+        self.assertIn("public gated repositories", message)
 
     def test_load_tirex_normalizes_indexed_cuda_device(self) -> None:
         calls = []
