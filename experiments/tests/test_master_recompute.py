@@ -620,6 +620,40 @@ class TiRexCompatibilityTest(unittest.TestCase):
                      if spec.family == "tirex")
         self.assertEqual(tirex.model_id, "NX-AI/TiRex-2-gifteval-zs")
 
+    def test_checkpoint_preflight_checks_only_the_small_config(self) -> None:
+        from experiments.tirex_compat import require_tirex_checkpoint_access
+
+        with mock.patch(
+                "huggingface_hub.hf_hub_download",
+                return_value="/cache/model-config.yaml") as download:
+            path = require_tirex_checkpoint_access()
+
+        self.assertEqual(path, "/cache/model-config.yaml")
+        download.assert_called_once_with(
+            repo_id="NX-AI/TiRex-2-gifteval-zs",
+            filename="model-config.yaml",
+            repo_type="model",
+        )
+
+    def test_checkpoint_preflight_explains_gated_access(self) -> None:
+        from huggingface_hub.errors import GatedRepoError
+        from experiments.tirex_compat import (
+            TirexCheckpointAccessError,
+            require_tirex_checkpoint_access,
+        )
+
+        with mock.patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=GatedRepoError("forbidden")):
+            with self.assertRaises(TirexCheckpointAccessError) as raised:
+                require_tirex_checkpoint_access()
+
+        message = str(raised.exception)
+        self.assertIn("TiREX checkpoint access denied", message)
+        self.assertIn("huggingface-cli whoami", message)
+        self.assertIn("HF_TOKEN", message)
+        self.assertIn("Do not substitute NX-AI/TiRex-2", message)
+
     def test_load_tirex_normalizes_indexed_cuda_device(self) -> None:
         calls = []
         fake_tirex2 = ModuleType("tirex2")

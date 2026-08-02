@@ -34,6 +34,13 @@ cannot collapse them into one:
   of `main`. GiftEval is installed there with `--no-deps` because its declared
   numpy/matplotlib pins conflict with TiRex2. Its historical `datasets` pin is
   replaced by 2.21.0, the first release with the required NumPy-2 formatter fix.
+  Leaderboard parity uses the gated, decontaminated
+  [`NX-AI/TiRex-2-gifteval-zs`](https://huggingface.co/NX-AI/TiRex-2-gifteval-zs)
+  checkpoint. Accept its access conditions with the same Hugging Face account
+  used by the server (`huggingface-cli whoami` / `huggingface-cli login`) before
+  setup or repair.
+  An `HF_TOKEN` set in the shell or project `.env` overrides the saved login and
+  must belong to that same authorized account.
 
 The per-cell on-disk cache is **shared across all envs**, so each just fills in
 its own families; stages 2/4/5 run in `main` over the merged cache.

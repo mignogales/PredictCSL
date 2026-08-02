@@ -1,6 +1,19 @@
 """Fail-fast validation for the dedicated TiRex2 environment."""
 
 from importlib.metadata import version
+from pathlib import Path
+import sys
+
+# Executing this file by path makes envs/ (rather than the repository root)
+# sys.path[0]. Add the root so the shared TiRex compatibility checks import
+# reliably even when setup-tirex.sh is launched from another directory.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from dotenv import load_dotenv
+
+load_dotenv(REPO_ROOT / ".env")
 
 import numpy as np
 import pyarrow as pa
@@ -8,6 +21,11 @@ import torch
 from datasets.formatting.formatting import NumpyArrowExtractor
 from gift_eval.data import Dataset  # noqa: F401
 from tirex2 import TimeseriesType, load_model  # noqa: F401
+
+from experiments.tirex_compat import (
+    TirexCheckpointAccessError,
+    require_tirex_checkpoint_access,
+)
 
 
 def require_version(distribution: str, expected: str) -> None:
@@ -41,3 +59,8 @@ if targets.shape != (2, 2) or not np.array_equal(
 print("tirex2 import OK")
 print("gift_eval import OK")
 print("datasets NumPy-2 formatter OK")
+try:
+    require_tirex_checkpoint_access()
+except TirexCheckpointAccessError as exc:
+    raise SystemExit(str(exc)) from exc
+print("TiRex GIFT-Eval checkpoint access OK")

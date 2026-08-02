@@ -257,6 +257,8 @@ print("toto2", toto2.__file__)
     "predictcsl-tirex": r"""
 import sys
 print("python", sys.executable)
+from dotenv import load_dotenv
+load_dotenv()
 import torch
 print("torch", torch.__version__, "cuda", getattr(torch.version, "cuda", None))
 if not torch.__version__.startswith("2.8.0"):
@@ -283,6 +285,15 @@ from tirex2 import TimeseriesType, load_model
 print("tirex2 import OK")
 from gift_eval.data import Dataset
 print("gift_eval import OK")
+from experiments.tirex_compat import (
+    TirexCheckpointAccessError,
+    require_tirex_checkpoint_access,
+)
+try:
+    require_tirex_checkpoint_access()
+except TirexCheckpointAccessError as exc:
+    raise SystemExit(str(exc)) from exc
+print("TiRex GIFT-Eval checkpoint access OK")
 """,
 }
 
@@ -307,6 +318,13 @@ def _preflight_env(env: Optional[str]) -> None:
         line for line in (proc.stdout + proc.stderr).strip().splitlines()
         if line.strip()
     )
+    if label == "predictcsl-tirex" and "TiREX checkpoint access denied" in details:
+        raise SystemExit(
+            Fore.RED
+            + f"Preflight failed for {label} before launching GPU workers.\n"
+            + details
+            + Fore.RESET
+        )
     repair = {
         "predictcsl-patchtst": "bash envs/setup-patchtst.sh",
         "predictcsl-toto": "bash envs/repair-toto.sh predictcsl-toto",

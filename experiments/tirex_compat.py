@@ -7,6 +7,8 @@ import torch
 
 
 TIREX_BACKEND_ENV = "PREDICTCSL_TIREX_BACKEND"
+TIREX_GIFTEVAL_MODEL_ID = "NX-AI/TiRex-2-gifteval-zs"
+TIREX_MODEL_CONFIG = "model-config.yaml"
 VALID_TIREX_BACKENDS = {
     "vanilla",
     "vanilla_fwbw",
@@ -14,6 +16,43 @@ VALID_TIREX_BACKENDS = {
     "cuda_fused",
     "triton_fused",
 }
+
+
+class TirexCheckpointAccessError(RuntimeError):
+    """The authenticated Hugging Face account cannot read a TiRex checkpoint."""
+
+
+def require_tirex_checkpoint_access(
+    model_id: str = TIREX_GIFTEVAL_MODEL_ID,
+) -> str:
+    """Resolve TiRex's small config file, failing with actionable gate guidance.
+
+    ``hf_hub_download`` reuses the normal Hugging Face token and cache. Checking
+    the config is enough to verify gated-repository authorization without
+    downloading the 330 MB model checkpoint during preflight.
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import GatedRepoError
+
+    try:
+        return hf_hub_download(
+            repo_id=model_id,
+            filename=TIREX_MODEL_CONFIG,
+            repo_type="model",
+        )
+    except GatedRepoError as exc:
+        raise TirexCheckpointAccessError(
+            f"TiREX checkpoint access denied for {model_id}.\n"
+            f"1. Sign in at https://huggingface.co/{model_id} and accept the "
+            "access conditions.\n"
+            "2. On the server, verify that the same account is active with "
+            "`huggingface-cli whoami`; use `huggingface-cli login` if needed.\n"
+            "   If HF_TOKEN is set in the shell or project .env, update it too; "
+            "it overrides the saved login.\n"
+            "3. Rerun this command after access is granted.\n"
+            "Do not substitute NX-AI/TiRex-2 for this benchmark: that generic "
+            "checkpoint is not the decontaminated GIFT-Eval zero-shot model."
+        ) from exc
 
 
 def tirex_backend_for_device(device: str) -> str:

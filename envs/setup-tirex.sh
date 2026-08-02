@@ -36,4 +36,4 @@ pip install --no-deps "git+https://github.com/SalesforceAIResearch/gift-eval.git
 
 echo
 python "$SCRIPT_DIR/check-tirex-env.py"
-echo "predictcsl-tirex ready. Make sure Hugging Face access to NX-AI/TiRex-2 is accepted and HF_TOKEN is available."
+echo "predictcsl-tirex ready, including access to the gated NX-AI/TiRex-2-gifteval-zs checkpoint."
