@@ -14,6 +14,7 @@ import pandas as pd
 import torch
 
 from experiments import build_context_length_dataset as build
+from experiments import datasets_config
 from experiments import evaluate_instance_windows as instance_eval
 from experiments import master_run_all as master
 from experiments import models_config
@@ -244,6 +245,74 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertIn("--test-datasets", cmd)
         self.assertNotIn("--predictor-dir", cmd)
 
+    def test_forecast_precompute_checkpoint_skips_completed_model(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            expected = len(datasets_config.datasets_to_run())
+            with open(os.path.join(
+                    root, "leaderboard_parity_summary.json"), "w") as f:
+                json.dump({
+                    "models": {
+                        "Chronos2-Small": {
+                            "complete": True,
+                            "cells": expected,
+                            "expected_cells": expected,
+                            "inference_recipe": (
+                                "chronos2_univariate_no_cross_learning_v1"),
+                        },
+                    },
+                }, f)
+
+            done, reason = master._forecast_precompute_done(
+                root, "Chronos2-Small")
+
+        self.assertTrue(done)
+        self.assertIn(f"{expected}/{expected} cells", reason)
+
+    def test_forecast_precompute_checkpoint_rejects_partial_model(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            expected = len(datasets_config.datasets_to_run())
+            with open(os.path.join(
+                    root, "leaderboard_parity_summary.json"), "w") as f:
+                json.dump({
+                    "models": {
+                        "Chronos2-Small": {
+                            "complete": False,
+                            "cells": expected - 1,
+                            "expected_cells": expected,
+                            "inference_recipe": (
+                                "chronos2_univariate_no_cross_learning_v1"),
+                        },
+                    },
+                }, f)
+
+            done, reason = master._forecast_precompute_done(
+                root, "Chronos2-Small")
+
+        self.assertFalse(done)
+        self.assertIn("incomplete/stale cohort", reason)
+
+    def test_forecast_precompute_checkpoint_rejects_stale_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            expected = len(datasets_config.datasets_to_run())
+            with open(os.path.join(
+                    root, "leaderboard_parity_summary.json"), "w") as f:
+                json.dump({
+                    "models": {
+                        "Chronos2-Small": {
+                            "complete": True,
+                            "cells": expected,
+                            "expected_cells": expected,
+                            "inference_recipe": "old-recipe",
+                        },
+                    },
+                }, f)
+
+            done, reason = master._forecast_precompute_done(
+                root, "Chronos2-Small")
+
+        self.assertFalse(done)
+        self.assertIn("stale model inference recipe", reason)
+
     def test_chronos2_precompute_reuses_one_dataset_cache(self) -> None:
         groups = master._precompute_model_groups([
             "Chronos2-Small",
@@ -294,6 +363,12 @@ class MasterRecomputeConfigTest(unittest.TestCase):
                 "--n-series", "1000",
             ],
         )
+
+    def test_master_force_targets_only_requested_stage(self) -> None:
+        self.assertFalse(master._stage_forced(None, "3"))
+        self.assertTrue(master._stage_forced([], "3"))
+        self.assertTrue(master._stage_forced(["3"], "3"))
+        self.assertFalse(master._stage_forced(["2"], "3"))
 
     def test_sanity_check_geomean_rules(self) -> None:
         self.assertAlmostEqual(_geomean(np.array([1.0, 4.0, np.nan])), 2.0)

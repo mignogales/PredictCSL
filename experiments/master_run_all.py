@@ -26,7 +26,9 @@ fixed windows, heuristics, and dataset/per-instance oracles.
 
 The default output root is a new self-contained tree
 ``logs/experiments/master_recompute`` so incompatible old 8k pools and cached
-checkpoints cannot be mixed into this recomputation.
+checkpoints cannot be mixed into this recomputation. Re-running Phase 1 skips
+models already marked complete in ``leaderboard_parity_summary.json``; pass
+``--force 3`` (or bare ``--force``) to launch their ablation again.
 
 Cross-env routing
 -----------------
@@ -66,6 +68,7 @@ Usage
     python -m experiments.master_run_all --pipeline-only       # reviewed: model-by-model pipeline
     python -m experiments.master_run_all --continue-after-ablation  # both without review stop
     python -m experiments.master_run_all --models Chronos2-Small
+    python -m experiments.master_run_all --force 3              # repeat cached ablation
     python -m experiments.master_run_all --models TiRex2 --stage1-batch-size 8 --stage1-shard-size 50
     python -m experiments.master_run_all --only-variants cheap mamba
     python -m experiments.master_run_all --test               # all selected variants, reduced
@@ -86,7 +89,8 @@ from typing import Dict, List, Optional
 
 from colorama import Fore
 
-from experiments import models_config
+from experiments import datasets_config, models_config
+from experiments.gifteval_inference_recipes import inference_recipe
 
 
 @dataclass
@@ -461,6 +465,11 @@ def _stage1_build_args(args: argparse.Namespace) -> List[str]:
     return extra
 
 
+def _stage_forced(force: Optional[List[str]], stage: str) -> bool:
+    """Whether master ``--force`` explicitly covers ``stage``."""
+    return force == [] or (force is not None and stage in force)
+
+
 def _stage1_cmd(
     env: Optional[str],
     displays: List[str],
@@ -500,6 +509,50 @@ def _forecast_precompute_cmd(
         # Match run_all_v3/v4's smoke subset so phase 4 is cache-only too.
         args += ["--test-datasets", "3", "--test-datasets-seed", "42"]
     return _py(env, *args)
+
+
+def _forecast_precompute_done(
+    cache_root: str,
+    display: str,
+    *,
+    test: bool = False,
+) -> tuple[bool, str]:
+    """Return whether Phase 1 already completed for one model.
+
+    The forecast-only ablation writes ``leaderboard_parity_summary.json`` only
+    after a model has traversed its complete dataset cohort.  Reusing that
+    durable checkpoint avoids starting the heavyweight stage-3 process merely
+    for it to discover that every individual cell is cached.
+    """
+    marker = os.path.join(cache_root, "leaderboard_parity_summary.json")
+    try:
+        with open(marker) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False, "no readable leaderboard parity checkpoint"
+
+    record = payload.get("models", {}).get(display)
+    if not isinstance(record, dict):
+        return False, "model absent from leaderboard parity checkpoint"
+
+    expected_cells = min(3, len(datasets_config.datasets_to_run())) \
+        if test else len(datasets_config.datasets_to_run())
+    cells = record.get("cells")
+    recorded_expected = record.get("expected_cells")
+    if (record.get("complete") is not True
+            or cells != expected_cells
+            or recorded_expected != expected_cells):
+        return False, f"incomplete/stale cohort ({cells}/{expected_cells} cells)"
+
+    family_by_display = dict(models_config.run_pairs())
+    family = family_by_display.get(display)
+    if family is None:
+        return False, "model absent from active catalog"
+    expected_recipe = inference_recipe(family)
+    if record.get("inference_recipe") != expected_recipe:
+        return False, "stale model inference recipe"
+
+    return True, f"leaderboard parity checkpoint ({cells}/{expected_cells} cells)"
 
 
 def _precompute_model_groups(displays: List[str]) -> List[List[str]]:
@@ -560,8 +613,8 @@ def main() -> None:
     # [...] -> --force <stages>. Passed to every subprocess verbatim; run_all only
     # acts on it for stages that are active (not in that variant's --skip-stages),
     # so forcing e.g. stage 3 is a no-op on variants that reuse it.
-    force_instance = args.force == [] or (
-        args.force is not None and "5" in args.force)
+    force_ablation = _stage_forced(args.force, "3")
+    force_instance = _stage_forced(args.force, "5")
     if args.force is None:
         fflag: List[str] = []
     elif args.force == []:
@@ -593,14 +646,33 @@ def main() -> None:
     # One model per invocation keeps its native window grid exact (no union of
     # unrelated family grids). Every model completes before the review gate.
     if not args.pipeline_only:
+        cache_root = os.path.join(
+            os.environ["PREDICTCSL_ABLATION_ROOT"], "general")
         for env, displays in groups.items():
             for model_group in _precompute_model_groups(displays):
+                pending: List[str] = []
+                for display in model_group:
+                    done, summary = _forecast_precompute_done(
+                        cache_root, display, test=args.test)
+                    if done and not force_ablation:
+                        print(Fore.WHITE
+                              + f"Phase 1 · {display} · cached ({summary}) — skipping"
+                              + Fore.RESET)
+                    else:
+                        if done:
+                            print(Fore.YELLOW
+                                  + f"Phase 1 · {display} · cached ({summary}) "
+                                    "but --force 3 given — re-running"
+                                  + Fore.RESET)
+                        pending.append(display)
+                if not pending:
+                    continue
                 precompute = _forecast_precompute_cmd(
-                    env, model_group, test=args.test)
+                    env, pending, test=args.test)
                 _run(
                     precompute,
                     f"Phase 1 — GIFT-Eval window ablation/parity "
-                    f"[{_env_label(env)}]: {model_group}",
+                    f"[{_env_label(env)}]: {pending}",
                 )
 
         # A real run deliberately stops here so leaderboard discrepancies are
