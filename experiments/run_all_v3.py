@@ -141,10 +141,12 @@ def parse_args() -> argparse.Namespace:
                         "with no arg to force every active stage.")
     p.add_argument("--n-trials", type=int, default=N_TRIALS_V3_DEFAULT,
                    help=f"Constrained-search trial count (default {N_TRIALS_V3_DEFAULT}).")
-    p.add_argument("--training-objective", choices=["curve", "classification"],
+    p.add_argument("--training-objective",
+                   choices=["curve", "classification", "risk"],
                    default="curve",
-                   help="Predict the curve shape (original) or classify the best "
-                        "window with soft top-3 labels.")
+                   help=("Predict the z-scored curve (original), classify the "
+                         "best window, or train calibrated risk-aware relative "
+                         "error with asymmetric harm versus full context."))
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Stream subprocess output instead of the quiet tqdm bars.")
     p.add_argument("--verbose-ablation", action="store_true",
@@ -163,7 +165,11 @@ def main() -> None:
     # ---- Constraint env vars (read at import by predict_context_length.py) ---
     # subprocess.Popen inherits os.environ, so setting these here propagates to
     # the stage-2 child and, in turn, to its spawned per-GPU trial workers.
-    objective_suffix = "" if args.training_objective == "curve" else "_classification"
+    objective_suffix = {
+        "curve": "",
+        "classification": "_classification",
+        "risk": "_risk",
+    }[args.training_objective]
     test_mode = os.environ.get("PREDICTCSL_TEST") == "1"
     master_root = (_apply_output_root(args.output_root) if args.output_root
                    else os.environ.get("PREDICTCSL_MASTER_ROOT"))

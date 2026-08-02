@@ -139,6 +139,8 @@ WindowKey = Union[int, str]
 PRED_VARIANTS: Dict[str, Tuple[str, str, str]] = {
     "_v3": ("pred_cheap", "Predictor (cheap)", "#1F77B4"),
     "_v4": ("pred_mamba", "Predictor Mamba",   "#9C27B0"),
+    "_v3_risk": (
+        "pred_risk", "Predictor (cheap, risk-aware)", "#FF7F0E"),
     "_v3_classification": (
         "pred_cheap_cls", "Predictor (cheap, cls)", "#17BECF"),
     "_v4_classification": (

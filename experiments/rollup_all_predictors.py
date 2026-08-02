@@ -3,8 +3,8 @@
 Combined cross-predictor overview — every requested predictor on one figure.
 
 The recomputation master uses ``general_v3`` (cheap curve regression) as the
-base run. Sibling discovery folds in Mamba and both soft-label classification
-trees against the same real GiftEval curves. Outputs go to ``general_all``;
+base run. Sibling discovery folds in Mamba, soft-label classification, and the
+risk-aware PatchTST tree against the same real GiftEval curves. Outputs go to ``general_all``;
 none of the source trees is modified.
 
 It is pure post-processing: no TSFM inference, no predictor training. It just

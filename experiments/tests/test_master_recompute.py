@@ -58,7 +58,7 @@ class MasterRecomputeConfigTest(unittest.TestCase):
     def test_requested_predictor_matrix(self) -> None:
         self.assertEqual(
             [v.name for v in master.VARIANTS],
-            ["cheap", "cheap_cls", "mamba", "mamba_cls"],
+            ["cheap", "cheap_cls", "risk", "mamba", "mamba_cls"],
         )
         self.assertTrue(all(v.skip_stages == ["1"] for v in master.VARIANTS))
         self.assertEqual(
@@ -66,6 +66,7 @@ class MasterRecomputeConfigTest(unittest.TestCase):
             [
                 "general_v3",
                 "general_v3_classification",
+                "general_v3_risk",
                 "general_v4",
                 "general_v4_classification",
             ],
@@ -624,6 +625,44 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
         np.testing.assert_array_equal(selected_w, [32, 32, -1])
         np.testing.assert_array_equal(fallback, [False, False, True])
 
+    def test_predictor_can_choose_native_full_for_each_instance(self) -> None:
+        windows = np.array([32, 64])
+        errors = np.array([
+            [2.0, 3.0],
+            [4.0, np.nan],
+        ])
+        scores = np.array([
+            [1.0, -2.0],  # largest-window score selects native full
+            [0.0, -3.0],  # unavailable 64 score still represents native full
+        ])
+        native = np.array([1.0, 2.0])
+        native_w = np.array([80, 48])
+
+        selected, selected_w, selected_native = (
+            instance_eval._choose_scores_with_native(
+                scores, errors, windows, native, native_w))
+
+        np.testing.assert_allclose(selected, [1.0, 2.0])
+        np.testing.assert_array_equal(selected_w, [80, 48])
+        np.testing.assert_array_equal(selected_native, [True, True])
+
+    def test_instance_record_uses_gifteval_valid_count_weights(self) -> None:
+        cell = instance_eval.Cell(
+            "Chronos2-Small", "Example", "short", "unused.npz")
+        record = instance_eval._record(
+            cell=cell,
+            method="predictor",
+            error=np.array([1.0, 3.0]),
+            window=np.array([32, 64]),
+            fallback=np.array([False, False]),
+            method_kind="predictor_instance",
+            valid_count=np.array([1.0, 3.0]),
+            metric_source="mase_gluonts_real",
+        )
+
+        self.assertAlmostEqual(record["mase_gluonts"], 2.5)
+        self.assertTrue(record["mase_metric_exact"])
+
     def test_fixed_window_is_capped_per_instance(self) -> None:
         windows = np.array([32, 64, 128])
         errors = np.array([
@@ -906,6 +945,41 @@ class SoftClassificationLossTest(unittest.TestCase):
 
             loss.backward()
             self.assertEqual(float(logits.grad[0, 3]), 0.0)
+        finally:
+            predictor.TRAINING_OBJECTIVE = old_objective
+
+
+class RiskAwareLossTest(unittest.TestCase):
+    def test_full_optimal_curve_penalizes_harmful_shortening(self) -> None:
+        raw = torch.tensor([[2.0, 1.5, 1.0]])
+        calibrated = torch.log(raw / raw[:, -1:]).requires_grad_()
+        unsafe = torch.tensor([[-2.0, 0.0, 1.0]], requires_grad=True)
+
+        safe_loss = predictor.risk_aware_task_loss(calibrated, raw)
+        unsafe_loss = predictor.risk_aware_task_loss(unsafe, raw)
+
+        self.assertGreater(
+            float(unsafe_loss.detach()), float(safe_loss.detach()))
+        unsafe_loss.backward()
+        self.assertTrue(torch.isfinite(unsafe.grad).all())
+
+    def test_risk_objective_accepts_missing_windows(self) -> None:
+        old_objective = predictor.TRAINING_OBJECTIVE
+        predictor.TRAINING_OBJECTIVE = "risk"
+        try:
+            pred = torch.zeros(2, 3, requires_grad=True)
+            raw = torch.tensor([
+                [1.0, 2.0, float("nan")],
+                [3.0, float("nan"), 2.0],
+            ])
+            recon = torch.zeros(2, 1, 1)
+            mask = torch.zeros(2, 1, dtype=torch.bool)
+            loss, task, _ = predictor.compute_dual_loss(
+                pred, recon, recon, mask, raw, 1.0, 0.0)
+
+            self.assertTrue(torch.isfinite(task))
+            loss.backward()
+            self.assertTrue(torch.isfinite(pred.grad).all())
         finally:
             predictor.TRAINING_OBJECTIVE = old_objective
 

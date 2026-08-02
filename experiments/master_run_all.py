@@ -6,12 +6,13 @@ The requested predictor matrix is deliberately small:
 
   * constrained/cheap PatchTST, curve regression
   * constrained/cheap PatchTST, soft top-3 window classification
+  * constrained/cheap PatchTST, calibrated asymmetric risk regression
   * constrained/cheap bidirectional Mamba, curve regression
   * constrained/cheap bidirectional Mamba, soft top-3 window classification
 
 The first pass computes full-native and window-ablation forecasts before any
 synthetic labeling or predictor training, and immediately reports leaderboard
-parity. All four predictor variants share that canonical GiftEval cell cache, so
+parity. All predictor variants share that canonical GiftEval cell cache, so
 only predictor inference and post-processing repeat. The default invocation
 stops after every model completes this first pass, providing an explicit review
 gate. ``--pipeline-only`` then runs the remaining work model-by-model: one model
@@ -114,6 +115,10 @@ VARIANTS: List[Variant] = [
             extra=["--training-objective", "classification"],
             label="cheap PatchTST · soft top-3 classification",
             ablation_tree="general_v3_classification"),
+    Variant("risk", "experiments.run_all_v3", ["1"],
+            extra=["--training-objective", "risk"],
+            label="cheap PatchTST · calibrated asymmetric risk",
+            ablation_tree="general_v3_risk"),
     Variant("mamba", "experiments.run_all_v4", ["1"],
             extra=["--cheap"], needs_mamba=True,
             label="cheap Mamba · curve regression",
@@ -761,6 +766,21 @@ def main() -> None:
         _run(
             instance_cmd,
             "Phase 6b — per-instance W_i evaluation (all predictor variants)",
+        )
+
+        failure_cmd = _py(
+            None, "experiments.analyze_instance_failures",
+            "--instance-dir", instance_out,
+            "--output-dir", os.path.join(
+                os.environ["PREDICTCSL_MASTER_ROOT"],
+                "instance_failure_analysis"),
+            "--top-cells", "50",
+        )
+        if args.models:
+            failure_cmd += ["--models", *args.models]
+        _run(
+            failure_cmd,
+            "Phase 6c — per-instance predictor failure diagnostics",
         )
 
     # ---- Final combined cross-predictor overview (pure post-processing). -----

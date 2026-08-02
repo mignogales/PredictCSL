@@ -5,10 +5,11 @@ predictor curves before choosing a window.  For every series i it:
 
 1. masks windows that were not evaluated for i,
 2. chooses W_i from that series' predictor scores,
-3. retrieves that exact row/window's cached ``mase_gluonts``, and
-4. averages the selected per-instance ratios (the GiftEval/GluonTS MASE rule).
+3. retrieves that exact row/window's cached ``mase_gluonts_real``, and
+4. aggregates selected ratios with their valid forecast counts (the exact
+   GiftEval/GluonTS axis=None MASE rule).
 
-The four master predictor variants are evaluated together.  Full-native
+All master predictor variants are evaluated together.  Full-native
 context, every fixed grid window, a 2x-horizon heuristic, the per-series
 GiftEval-cadence 2-period and 3-period heuristics (when their sidecars are
 present), dataset-shared
@@ -35,6 +36,7 @@ from experiments import datasets_config
 VARIANT_TREES: Dict[str, str] = {
     "cheap_curve": "general_v3",
     "cheap_classification": "general_v3_classification",
+    "patchtst_risk": "general_v3_risk",
     "mamba_curve": "general_v4",
     "mamba_classification": "general_v4_classification",
 }
@@ -84,14 +86,23 @@ def discover_cells(ablation_root: str, models: Optional[Iterable[str]]) -> List[
     return [found[key] for key in sorted(found)]
 
 
-def _load_vector(path: str, n: int, field: str = "mase_gluonts") -> Tuple[np.ndarray, dict]:
+def _load_vector(
+    path: str, n: int, field: str = "mase_gluonts_real",
+) -> Tuple[np.ndarray, np.ndarray, dict]:
     out = np.full(n, np.nan, dtype=np.float64)
+    counts_out = np.zeros(n, dtype=np.float64)
     if not os.path.isfile(path):
-        return out, {}
+        return out, counts_out, {"source": "missing"}
     with np.load(path) as data:
-        if field not in data.files:
-            return out, {}
-        values = np.asarray(data[field], dtype=np.float64)
+        source = field
+        if source not in data.files:
+            if field == "mase_gluonts_real" and "mase_gluonts" in data.files:
+                source = "mase_gluonts_proxy"
+                values = np.asarray(data["mase_gluonts"], dtype=np.float64)
+            else:
+                return out, counts_out, {"source": "missing"}
+        else:
+            values = np.asarray(data[source], dtype=np.float64)
         if "served_index" in data.files:
             index = np.asarray(data["served_index"], dtype=np.int64)
         elif values.shape[0] == n:
@@ -99,17 +110,24 @@ def _load_vector(path: str, n: int, field: str = "mase_gluonts") -> Tuple[np.nda
         else:
             # Old skip-mode caches cannot be aligned safely.  Stage 3 now
             # backfills served_index without TSFM inference.
-            return out, {"unaligned": True}
+            return out, counts_out, {"unaligned": True, "source": source}
         if values.shape[0] != index.shape[0]:
-            return out, {"unaligned": True}
+            return out, counts_out, {"unaligned": True, "source": source}
+        counts = (np.asarray(data["valid_count"], dtype=np.float64)
+                  if "valid_count" in data.files
+                  else np.ones(values.shape[0], dtype=np.float64))
+        if counts.shape != values.shape:
+            return out, counts_out, {"unaligned": True, "source": source}
         ok = (index >= 0) & (index < n)
         out[index[ok]] = values[ok]
+        counts_out[index[ok]] = counts[ok]
         extra = {
             key: np.asarray(data[key])
             for key in ("effective_context",)
             if key in data.files
         }
-    return out, extra
+        extra["source"] = source
+    return out, counts_out, extra
 
 
 def _ground_tree(ablation_root: str) -> Optional[str]:
@@ -155,6 +173,38 @@ def _choose_scores(
     return selected, selected_w, ~has_grid
 
 
+def _choose_scores_with_native(
+    scores: np.ndarray, errors: np.ndarray, windows: np.ndarray,
+    native: np.ndarray, native_w: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Choose per row while treating native-full as a real policy action.
+
+    Synthetic labels at the largest requested window are generated with all
+    genuine history (``min(window, real_length)``), so that output is the
+    predictor's native/full score.  Reusing it here avoids forcing short real
+    series onto the largest *grid* window below their non-grid native length.
+    """
+    # Prefer the real native action on an exact tie with the largest grid
+    # output. For full-length rows they are normally the same workload; for
+    # short rows only native can use the non-grid amount of genuine history.
+    native_score = np.nextafter(scores[:, -1], -np.inf)
+    candidate_scores = np.column_stack([scores, native_score])
+    candidate_errors = np.column_stack([errors, native])
+    feasible = np.isfinite(candidate_scores) & np.isfinite(candidate_errors)
+    masked = np.where(feasible, candidate_scores, np.inf)
+    idx = np.argmin(masked, axis=1)
+    has_choice = feasible.any(axis=1)
+    rows = np.arange(errors.shape[0])
+    selected = np.where(has_choice, candidate_errors[rows, idx], native)
+    selected_w = np.where(
+        idx < windows.size,
+        windows[np.minimum(idx, windows.size - 1)],
+        native_w,
+    )
+    selected_native = (~has_choice) | (idx == windows.size)
+    return selected, selected_w, selected_native
+
+
 def _choose_capped_fixed(
     target: int, errors: np.ndarray, windows: np.ndarray, native: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -171,9 +221,10 @@ def _choose_capped_fixed(
 
 def _record(
     cell: Cell, method: str, error: np.ndarray, window: np.ndarray,
-    fallback: np.ndarray, method_kind: str,
+    fallback: np.ndarray, method_kind: str, valid_count: np.ndarray,
+    metric_source: str,
 ) -> dict:
-    ok = np.isfinite(error)
+    ok = np.isfinite(error) & np.isfinite(valid_count) & (valid_count > 0)
     w = window[(window >= 0) & ok]
     return {
         "model": cell.model,
@@ -181,9 +232,13 @@ def _record(
         "term": cell.term,
         "method": method,
         "method_kind": method_kind,
-        "mase_gluonts": float(np.mean(error[ok])) if ok.any() else float("nan"),
+        "mase_gluonts": (float(np.average(error[ok], weights=valid_count[ok]))
+                          if ok.any() else float("nan")),
+        "mase_metric_source": metric_source,
+        "mase_metric_exact": metric_source != "mase_gluonts_proxy",
         "n_instances": int(ok.sum()),
         "n_native_fallback": int(np.sum(fallback & ok)),
+        "n_native_selected": int(np.sum(fallback & ok)),
         "window_mean": float(np.mean(w)) if w.size else float("nan"),
         "window_median": float(np.median(w)) if w.size else float("nan"),
     }
@@ -208,17 +263,20 @@ def _horizon_for_cell(ablation_root: str, cell: Cell) -> int:
 
 def evaluate_cell(
     cell: Cell, ablation_root: str, ground_tree: str,
-    period_run_dir: Optional[str],
+    period_run_dir: Optional[str], mase_field: str = "mase_gluonts_real",
 ) -> Tuple[List[dict], dict]:
     with np.load(cell.anchor_npz) as anchor:
         windows = np.asarray(anchor["window_grid"], dtype=np.int64)
         n = int(np.asarray(anchor["predicted_curves"]).shape[0])
 
     errors = np.full((n, windows.size), np.nan, dtype=np.float64)
+    error_counts = np.zeros((n, windows.size), dtype=np.float64)
+    metric_sources = set()
     unaligned: List[int] = []
     for j, window in enumerate(windows):
-        errors[:, j], meta = _load_vector(
-            _cell_metric_path(ground_tree, cell, int(window)), n)
+        errors[:, j], error_counts[:, j], meta = _load_vector(
+            _cell_metric_path(ground_tree, cell, int(window)), n, mase_field)
+        metric_sources.add(meta.get("source", "missing"))
         if meta.get("unaligned"):
             unaligned.append(int(window))
     if unaligned:
@@ -227,26 +285,41 @@ def evaluate_cell(
             f"lack served_index at windows {unaligned}. Re-run stage 3 once; "
             "cached forecasts will be backfilled without TSFM inference.")
 
-    native, native_meta = _load_vector(
-        _cell_metric_path(ground_tree, cell, "full_native"), n)
+    native, native_counts, native_meta = _load_vector(
+        _cell_metric_path(ground_tree, cell, "full_native"), n, mase_field)
+    metric_sources.add(native_meta.get("source", "missing"))
     if not np.isfinite(native).all():
         # Keep identical instance coverage even for older/no-native runs.
         fallback_grid = np.where(np.isfinite(errors), errors, np.inf)
-        best_available = np.min(fallback_grid, axis=1)
+        fallback_idx = np.argmin(fallback_grid, axis=1)
+        rows = np.arange(n)
+        best_available = fallback_grid[rows, fallback_idx]
         best_available[~np.isfinite(best_available)] = np.nan
-        native = np.where(np.isfinite(native), native, best_available)
+        missing_native = ~np.isfinite(native)
+        native = np.where(missing_native, best_available, native)
+        native_counts = np.where(
+            missing_native, error_counts[rows, fallback_idx], native_counts)
     native_w = np.asarray(
         native_meta.get("effective_context", np.full(n, -1)), dtype=np.int64)
     if native_w.shape != (n,):
         native_w = np.full(n, -1, dtype=np.int64)
+    metric_source = ("mase_gluonts_proxy"
+                     if "mase_gluonts_proxy" in metric_sources else mase_field)
 
     records: List[dict] = []
-    audit: Dict[str, np.ndarray] = {"window_grid": windows}
+    audit: Dict[str, np.ndarray] = {
+        "window_grid": windows,
+        "grid_mase": errors,
+        "native_mase": native,
+        "native_valid_count": native_counts,
+        "native_effective_context": native_w,
+    }
 
     def add(method: str, values: np.ndarray, chosen_w: np.ndarray,
             fallback: np.ndarray, kind: str) -> None:
         records.append(_record(
-            cell, method, values, chosen_w, fallback, kind))
+            cell, method, values, chosen_w, fallback, kind,
+            native_counts, metric_source))
         audit[f"{method}__mase"] = values
         audit[f"{method}__window"] = chosen_w
 
@@ -263,7 +336,15 @@ def evaluate_cell(
     add("heuristic_2xhorizon", values, chosen_w, fallback, "heuristic")
 
     # Dataset-shared oracle: one window from the mean curve, then cap it per row.
-    mean_error = np.nanmean(errors, axis=0)
+    oracle_weights = np.where(
+        np.isfinite(errors) & (native_counts[:, None] > 0),
+        native_counts[:, None], 0.0)
+    weight_per_window = oracle_weights.sum(axis=0)
+    mean_error = np.divide(
+        np.nansum(errors * oracle_weights, axis=0), weight_per_window,
+        out=np.full(windows.shape, np.nan, dtype=np.float64),
+        where=weight_per_window > 0,
+    )
     shared_oracle_w = int(windows[int(np.nanargmin(mean_error))])
     values, chosen_w, fallback = _choose_capped_fixed(
         shared_oracle_w, errors, windows, native)
@@ -293,7 +374,14 @@ def evaluate_cell(
             continue
         values, chosen_w, fallback = _choose_scores(
             scores, errors, windows, native)
-        add(f"{variant}_instance", values, chosen_w, fallback, "predictor_instance")
+        add(f"{variant}_instance_grid", values, chosen_w, fallback,
+            "predictor_instance_control")
+
+        values, chosen_w, selected_native = _choose_scores_with_native(
+            scores, errors, windows, native, native_w)
+        add(f"{variant}_instance", values, chosen_w, selected_native,
+            "predictor_instance")
+        audit[f"{variant}__scores"] = scores
 
         shared_w = int(windows[int(np.argmin(np.mean(scores, axis=0)))])
         values, chosen_w, fallback = _choose_capped_fixed(
@@ -305,7 +393,8 @@ def evaluate_cell(
             period_path = os.path.join(
                 period_run_dir, "models", cell.model, "compare_real_vs_predicted",
                 f"{prefix}_{cell.dataset}_t{cell.term}_{cell.model}_win.npz")
-            period_error, meta = _load_vector(period_path, n)
+            period_error, _period_counts, meta = _load_vector(
+                period_path, n, mase_field)
             if np.isfinite(period_error).any():
                 with np.load(period_path) as data:
                     period_w = np.asarray(data["windows"], dtype=np.int64)
@@ -340,7 +429,8 @@ def run(args: argparse.Namespace) -> None:
     all_records: List[dict] = []
     for cell in cells:
         records, audit = evaluate_cell(
-            cell, ablation_root, ground_tree, args.period_run_dir)
+            cell, ablation_root, ground_tree, args.period_run_dir,
+            args.mase_field)
         all_records.extend(records)
         np.savez_compressed(
             os.path.join(
@@ -394,7 +484,9 @@ def run(args: argparse.Namespace) -> None:
     summary.to_csv(os.path.join(args.output_dir, "summary.csv"), index=False)
 
     predictor_summary = summary[
-        summary["method_kind"].isin(["predictor_instance", "predictor_dataset"])]
+        summary["method_kind"].isin([
+            "predictor_instance", "predictor_instance_control",
+            "predictor_dataset"])]
     print(Fore.GREEN
           + f"Per-instance evaluation wrote {len(frame)} cell-method rows across "
             f"{len(cells)} cells to {args.output_dir}" + Fore.RESET)
@@ -409,6 +501,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--period-run-dir", default=None)
     parser.add_argument("--models", nargs="+", default=None)
+    parser.add_argument(
+        "--mase-field", choices=["mase_gluonts_real", "mase_gluonts"],
+        default="mase_gluonts_real",
+        help=("Per-instance metric stored by stage 3. The default reproduces "
+              "the leaderboard GluonTS MASE; old caches may explicitly fall "
+              "back to the proxy and are marked in the CSV."),
+    )
     return parser.parse_args()
 
 

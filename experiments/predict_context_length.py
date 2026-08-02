@@ -98,13 +98,22 @@ VAL_FRACTION   = 0.1           # held-out fraction of the labeled dataset
 # each supported input length as a class. Its multi-label soft target is literal:
 # best=1, second=1/2, third=1/4, every other valid window=0. Binary cross-entropy
 # is used so the best label remains exactly 1 rather than being normalised.
+# ``risk`` predicts calibrated log error relative to the full/native candidate
+# and adds a differentiable expected-regret term with extra weight on choices
+# that are worse than full context.
 TRAINING_OBJECTIVE = os.environ.get(
     "PREDICTCSL_TRAINING_OBJECTIVE", "curve").lower()
-if TRAINING_OBJECTIVE not in ("curve", "classification"):
+if TRAINING_OBJECTIVE not in ("curve", "classification", "risk"):
     raise ValueError(
         f"PREDICTCSL_TRAINING_OBJECTIVE={TRAINING_OBJECTIVE!r}; expected "
-        "'curve' or 'classification'.")
+        "'curve', 'classification', or 'risk'.")
 SOFT_TOPK_WEIGHTS = (1.0, 0.5, 0.25)
+RISK_POLICY_WEIGHT = float(os.environ.get(
+    "PREDICTCSL_RISK_POLICY_WEIGHT", "1.0"))
+RISK_FULL_HARM_WEIGHT = float(os.environ.get(
+    "PREDICTCSL_RISK_FULL_HARM_WEIGHT", "2.0"))
+RISK_SOFTMAX_TEMPERATURE = float(os.environ.get(
+    "PREDICTCSL_RISK_SOFTMAX_TEMPERATURE", "0.25"))
 
 # -- Random search / training loop --------------------------------------------
 N_TRIALS                = 60
@@ -295,7 +304,8 @@ def load_split_tensors(
         x_train:      (n_train, L, 1)
         y_train_norm: (n_train, n_windows, n_horizons)  z-scored target
         y_train_raw:  (n_train, n_windows, n_horizons)  raw error curve
-        x_val, y_val_norm, y_val_raw: validation counterparts.
+        length_train: (n_train,) genuine observed context lengths
+        x_val, y_val_norm, y_val_raw, length_val: validation counterparts.
     """
     # contexts.npy lives at the pool root (one level above the model family
     # subdir). Fall back to dataset_dir itself for flat layouts.
@@ -306,11 +316,22 @@ def load_split_tensors(
         raise FileNotFoundError(
             f"contexts.npy not found in {dataset_dir} or its parent.")
     contexts = np.load(_ctx_candidate)
+    _length_candidate = os.path.join(
+        os.path.dirname(_ctx_candidate), "real_lengths.npy")
+    real_lengths = (
+        np.load(_length_candidate)
+        if os.path.isfile(_length_candidate)
+        else np.full(contexts.shape[0], contexts.shape[1], dtype=np.int32)
+    )
     curves = np.load(os.path.join(dataset_dir, f"curves_{curve_metric}.npy"))
     if contexts.shape[0] != curves.shape[0]:
         raise ValueError(
             f"contexts ({contexts.shape[0]}) and curves ({curves.shape[0]}) "
             "row counts differ.")
+    if real_lengths.shape != (contexts.shape[0],):
+        raise ValueError(
+            f"real_lengths shape {real_lengths.shape} does not match "
+            f"contexts row count {contexts.shape[0]}.")
     if curves.ndim != 3:
         raise ValueError(
             f"Expected curves of shape (N, n_windows, n_horizons); got "
@@ -332,6 +353,8 @@ def load_split_tensors(
               f"({int((~ctx_ok).sum())} non-finite context, "
               f"{int((~surface_ok).sum())} all-NaN curve).")
     contexts = contexts[valid].astype(np.float32, copy=False)
+    real_lengths = np.minimum(
+        real_lengths[valid].astype(np.int64, copy=False), CONTEXT_LENGTH)
     if contexts.shape[1] < CONTEXT_LENGTH:
         raise ValueError(
             f"contexts.npy width {contexts.shape[1]} is shorter than predictor "
@@ -362,7 +385,9 @@ def load_split_tensors(
     x_val   = to_t(contexts[val_idx]).unsqueeze(-1)
     return (
         x_train, to_t(curves_norm[train_idx]), to_t(curves[train_idx]),
+        torch.from_numpy(np.ascontiguousarray(real_lengths[train_idx])).long(),
         x_val,   to_t(curves_norm[val_idx]),   to_t(curves[val_idx]),
+        torch.from_numpy(np.ascontiguousarray(real_lengths[val_idx])).long(),
     )
 
 
@@ -398,6 +423,7 @@ class PatchTSTContextLength(nn.Module):
         mask_ratio: float,
         n_windows: int,
         n_horizons: int,
+        use_length_embedding: bool = False,
     ) -> None:
         super().__init__()
         if context_length % patch_length != 0:
@@ -415,6 +441,7 @@ class PatchTSTContextLength(nn.Module):
         self.mask_ratio     = float(mask_ratio)
         self.n_windows      = int(n_windows)
         self.n_horizons     = int(n_horizons)
+        self.use_length_embedding = bool(use_length_embedding)
         self.num_patches    = self.context_length // self.patch_length
 
         # --- Embedding -------------------------------------------------------
@@ -425,6 +452,14 @@ class PatchTSTContextLength(nn.Module):
         # Per-horizon additive embedding routed into the CLS token. Conditioning
         # before the encoder lets attention vary with the requested horizon.
         self.horizon_embed = nn.Embedding(self.n_horizons, self.d_model)
+        self.length_embed = (
+            nn.Sequential(
+                nn.Linear(1, self.d_model),
+                nn.GELU(),
+                nn.Linear(self.d_model, self.d_model),
+            )
+            if self.use_length_embedding else None
+        )
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.horizon_embed.weight, std=0.02)
@@ -477,6 +512,7 @@ class PatchTSTContextLength(nn.Module):
         x: torch.Tensor,
         horizon_idx: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        valid_length: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns: curve_pred (B, n_windows), recon_pred (B, N, P),
         original_patches (B, N, P), mask (B, N).
@@ -498,6 +534,15 @@ class PatchTSTContextLength(nn.Module):
         cls = self.cls_token.expand(B, -1, -1)                       # (B, 1, D)
         h_emb = self.horizon_embed(horizon_idx).unsqueeze(1)         # (B, 1, D)
         cls = cls + h_emb
+        if self.length_embed is not None:
+            if valid_length is None:
+                valid_length = torch.full(
+                    (B,), self.context_length, device=x.device, dtype=x.dtype)
+            length_ratio = (
+                torch.log1p(valid_length.to(dtype=x.dtype))
+                / math.log1p(self.context_length)
+            ).clamp(0.0, 1.0).unsqueeze(1)
+            cls = cls + self.length_embed(length_ratio).unsqueeze(1)
         h = torch.cat([cls, h], dim=1)
         h = h + self.pos_embed
         h = self.encoder(h)
@@ -629,6 +674,7 @@ class MambaContextLength(nn.Module):
         x: torch.Tensor,
         horizon_idx: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        valid_length: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Same contract as PatchTSTContextLength.forward."""
         B = x.size(0)
@@ -667,6 +713,7 @@ def build_predictor(cfg: Any, n_windows: int, n_horizons: int) -> nn.Module:
     """
     cfg = cfg if isinstance(cfg, dict) else asdict(cfg)
     arch = str(cfg.get("arch", "patchtst")).lower()
+    objective = str(cfg.get("training_objective", TRAINING_OBJECTIVE)).lower()
     if arch == "mamba":
         return MambaContextLength(
             context_length    = cfg.get("context_length", CONTEXT_LENGTH),
@@ -691,6 +738,8 @@ def build_predictor(cfg: Any, n_windows: int, n_horizons: int) -> nn.Module:
         mask_ratio          = cfg["mask_ratio"],
         n_windows           = n_windows,
         n_horizons          = n_horizons,
+        use_length_embedding= bool(cfg.get(
+            "use_length_embedding", objective == "risk")),
     )
 
 
@@ -708,7 +757,9 @@ def compute_dual_loss(
     In curve mode the task loss is MSE over the z-scored curve. In
     classification mode ``curve_pred`` is interpreted as independent class
     logits and the target carries literal rank weights 1, 1/2, 1/4 for the best
-    three windows. Reconstruction remains the same masked-patch MSE.
+    three windows. Risk mode consumes the raw positive error curve and combines
+    calibrated log-relative-error regression with expected asymmetric regret.
+    Reconstruction remains the same masked-patch MSE.
     """
     curve_valid = ~torch.isnan(curve_target)
     if TRAINING_OBJECTIVE == "classification":
@@ -731,6 +782,8 @@ def compute_dual_loss(
             curve_mse = (bce * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
         else:
             curve_mse = curve_pred.sum() * 0.0
+    elif TRAINING_OBJECTIVE == "risk":
+        curve_mse = risk_aware_task_loss(curve_pred, curve_target)
     else:
         target_safe = torch.nan_to_num(curve_target, nan=0.0)
         sq = (curve_pred - target_safe).pow(2) * curve_valid.float()
@@ -746,6 +799,61 @@ def compute_dual_loss(
 
     total = lambda_curve * curve_mse + lambda_recon * recon_mse
     return total, curve_mse, recon_mse
+
+
+def risk_aware_task_loss(
+    curve_pred: torch.Tensor,
+    raw_error: torch.Tensor,
+) -> torch.Tensor:
+    """Calibrated, asymmetric decision loss for context selection.
+
+    The largest valid synthetic window represents full/native context because
+    the labeler serves ``min(window, real_length)`` genuine samples.  Predicting
+    ``log(error / full_error)`` preserves how costly a curve is—information
+    discarded by per-series z-scoring.  The policy term then minimizes soft
+    expected regret and charges additional cost whenever a choice is worse than
+    full context, which directly targets the catastrophic shortening failures.
+    """
+    valid = torch.isfinite(raw_error) & (raw_error > 0)
+    valid_rows = valid.any(dim=1)
+    if not valid_rows.any():
+        return curve_pred.sum() * 0.0
+
+    pred = curve_pred[valid_rows]
+    err = raw_error[valid_rows]
+    mask = valid[valid_rows]
+    n_windows = err.shape[1]
+    indices = torch.arange(n_windows, device=err.device).unsqueeze(0)
+    last_idx = torch.where(mask, indices, -1).max(dim=1).values
+    rows = torch.arange(err.shape[0], device=err.device)
+    full_error = err[rows, last_idx].clamp_min(1e-8)
+
+    log_relative = torch.log(
+        err.clamp_min(1e-8) / full_error.unsqueeze(1)).clamp(-4.0, 4.0)
+    huber = F.smooth_l1_loss(
+        pred, torch.nan_to_num(log_relative), reduction="none")
+    calibration = (
+        (huber * mask.float()).sum()
+        / mask.float().sum().clamp_min(1.0)
+    )
+
+    masked_error = torch.where(mask, err, torch.full_like(err, float("inf")))
+    best_error = masked_error.min(dim=1).values.clamp_min(1e-8)
+    regret = (err - best_error.unsqueeze(1)) / best_error.unsqueeze(1)
+    harm_vs_full = F.relu(
+        (err - full_error.unsqueeze(1)) / full_error.unsqueeze(1))
+    decision_cost = torch.where(
+        mask,
+        regret + RISK_FULL_HARM_WEIGHT * harm_vs_full,
+        torch.zeros_like(err),
+    )
+    logits = torch.where(
+        mask,
+        -pred / max(RISK_SOFTMAX_TEMPERATURE, 1e-6),
+        torch.full_like(pred, float("-inf")),
+    )
+    policy = (torch.softmax(logits, dim=1) * decision_cost).sum(dim=1).mean()
+    return calibration + RISK_POLICY_WEIGHT * policy
 
 
 # ==============================================================================
@@ -842,7 +950,9 @@ def _probe_vram(
             opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
             x = torch.randn(batch_size, CONTEXT_LENGTH, 1, device=device)
-            y = torch.randn(batch_size, n_windows, device=device)
+            y = (torch.rand(batch_size, n_windows, device=device) + 0.1
+                 if TRAINING_OBJECTIVE == "risk"
+                 else torch.randn(batch_size, n_windows, device=device))
             h_idx = torch.randint(0, n_horizons, (batch_size,), device=device)
 
             curve_pred, recon_pred, orig, mask = model(x, horizon_idx=h_idx)
@@ -888,6 +998,7 @@ def _evaluate(
     x_val: torch.Tensor,
     y_val_norm: torch.Tensor,
     y_val_raw: torch.Tensor,
+    length_val: torch.Tensor,
     batch_size: int,
     eval_seed: int,
 ) -> Dict[str, float]:
@@ -927,6 +1038,7 @@ def _evaluate(
             x  = x_val[start:end]
             yn_all = y_val_norm[start:end]                # (B, n_w, n_h)
             yr_all = y_val_raw[start:end]                 # (B, n_w, n_h)
+            lengths = length_val[start:end]
             B  = x.shape[0]
 
             # Mask is sampled once per batch and reused for every horizon: the
@@ -947,11 +1059,15 @@ def _evaluate(
                     (B,), h_idx_val, device=device, dtype=torch.long)
 
                 curve_pred, recon_pred, orig, used_mask = model(
-                    x, horizon_idx=h_idx_batch, mask=mask)
+                    x, horizon_idx=h_idx_batch, mask=mask,
+                    valid_length=lengths)
 
-                # Classification ranks the raw forecast errors; curve regression
-                # retains the per-series z-scored shape target.
-                task_target = yr if TRAINING_OBJECTIVE == "classification" else yn
+                # Classification and risk-aware regression consume raw forecast
+                # errors; original curve regression retains the per-series
+                # z-scored shape target.
+                task_target = (
+                    yr if TRAINING_OBJECTIVE in ("classification", "risk")
+                    else yn)
                 cvalid = ~torch.isnan(task_target)
                 if TRAINING_OBJECTIVE == "classification":
                     valid_rows = cvalid.any(dim=1)
@@ -974,6 +1090,13 @@ def _evaluate(
                             logits, soft, reduction="none")
                         curve_sum = curve_sum + (bce * valid_cls.float()).sum()
                         curve_count = curve_count + valid_cls.float().sum()
+                elif TRAINING_OBJECTIVE == "risk":
+                    valid_rows = cvalid.any(dim=1)
+                    if valid_rows.any():
+                        risk_loss = risk_aware_task_loss(curve_pred, task_target)
+                        n_rows = valid_rows.float().sum()
+                        curve_sum = curve_sum + risk_loss * n_rows
+                        curve_count = curve_count + n_rows
                 else:
                     yn_safe = torch.nan_to_num(task_target, nan=0.0)
                     curve_sum = curve_sum + (
@@ -1060,9 +1183,11 @@ def _run_single_trial(
     x_train: torch.Tensor,
     y_train: torch.Tensor,
     y_train_raw: torch.Tensor,
+    length_train: torch.Tensor,
     x_val: torch.Tensor,
     y_val: torch.Tensor,
     y_val_raw: torch.Tensor,
+    length_val: torch.Tensor,
     device: str,
     n_windows: int,
     n_horizons: int,
@@ -1109,9 +1234,12 @@ def _run_single_trial(
             for step in range(steps_per_epoch):
                 idx = perm[step * bs : (step + 1) * bs]
                 x = x_train.index_select(0, idx)
-                task_surface = (y_train_raw if TRAINING_OBJECTIVE == "classification"
-                                else y_train)
+                task_surface = (
+                    y_train_raw
+                    if TRAINING_OBJECTIVE in ("classification", "risk")
+                    else y_train)
                 y = task_surface.index_select(0, idx)         # (bs, n_w, n_h)
+                lengths = length_train.index_select(0, idx)
 
                 B = x.shape[0]
                 h_idx = torch.randint(
@@ -1119,7 +1247,8 @@ def _run_single_trial(
                 y_at_h = y[torch.arange(B, device=device), :, h_idx]  # (B, n_w)
 
                 optimizer.zero_grad(set_to_none=True)
-                curve_pred, recon_pred, orig, mask = model(x, horizon_idx=h_idx)
+                curve_pred, recon_pred, orig, mask = model(
+                    x, horizon_idx=h_idx, valid_length=lengths)
                 loss, l_curve, l_recon = compute_dual_loss(
                     curve_pred, recon_pred, orig, mask, y_at_h,
                     LAMBDA_CURVE, LAMBDA_RECON)
@@ -1139,7 +1268,7 @@ def _run_single_trial(
 
             if epoch % VAL_EVERY_N_EPOCHS == 0 or epoch == MAX_EPOCHS:
                 metrics = _evaluate(
-                    model, x_val, y_val, y_val_raw, bs,
+                    model, x_val, y_val, y_val_raw, length_val, bs,
                     eval_seed=SEED + 1000 * trial_idx)
                 history["val_combined"].append(metrics["val_combined"])
                 history["val_curve"].append(metrics["val_curve_mse"])
@@ -1233,15 +1362,18 @@ def gpu_worker(
     torch.set_float32_matmul_precision("high")
 
     try:
-        (x_tr, y_tr, y_tr_raw,
-         x_va, y_va, y_va_raw) = load_split_tensors(dataset_dir, seed=SEED)
+        (x_tr, y_tr, y_tr_raw, length_tr,
+         x_va, y_va, y_va_raw, length_va) = load_split_tensors(
+             dataset_dir, seed=SEED)
         x_train = x_tr.pin_memory().to(device, non_blocking=True)
         y_train = y_tr.pin_memory().to(device, non_blocking=True)
         y_train_raw = y_tr_raw.pin_memory().to(device, non_blocking=True)
+        length_train = length_tr.pin_memory().to(device, non_blocking=True)
         x_val   = x_va.pin_memory().to(device, non_blocking=True)
         y_val   = y_va.pin_memory().to(device, non_blocking=True)
         y_val_raw = y_va_raw.pin_memory().to(device, non_blocking=True)
-        del x_tr, y_tr, y_tr_raw, x_va, y_va, y_va_raw
+        length_val = length_va.pin_memory().to(device, non_blocking=True)
+        del x_tr, y_tr, y_tr_raw, length_tr, x_va, y_va, y_va_raw, length_va
         if device.startswith("cuda"):
             torch.cuda.synchronize(torch.device(device))
         print(Fore.CYAN
@@ -1274,7 +1406,8 @@ def gpu_worker(
             result = _run_single_trial(
                 trial_idx, trial, vram_budget_gb,
                 x_train, y_train, y_train_raw,
-                x_val, y_val, y_val_raw, device, n_windows, n_horizons,
+                length_train, x_val, y_val, y_val_raw, length_val,
+                device, n_windows, n_horizons,
                 run_label,
             )
         except Exception as exc:
@@ -1287,7 +1420,8 @@ def gpu_worker(
                 torch.cuda.empty_cache()
         result_queue.put(result)
 
-    del x_train, y_train, y_train_raw, x_val, y_val, y_val_raw
+    del x_train, y_train, y_train_raw, length_train
+    del x_val, y_val, y_val_raw, length_val
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
     print(Fore.CYAN + f"  [{device}] worker {worker_id} exited." + Fore.RESET)
@@ -1303,9 +1437,12 @@ def _plot_sweep_summary(trials_df: pd.DataFrame, save_path: str,
     df = trials_df.sort_values("trial_idx").reset_index(drop=True)
     panels = [
         ("val_regret",    "val regret (normalized)"),
-        ("val_curve_mse", ("val soft-label cross-entropy"
-                           if TRAINING_OBJECTIVE == "classification"
-                           else "val curve MSE (z-scored)")),
+        ("val_curve_mse", (
+            "val soft-label cross-entropy"
+            if TRAINING_OBJECTIVE == "classification"
+            else ("val calibrated asymmetric risk loss"
+                  if TRAINING_OBJECTIVE == "risk"
+                  else "val curve MSE (z-scored)"))),
         ("val_recon_mse", "val reconstruction MSE"),
     ]
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
@@ -1454,6 +1591,9 @@ def _select_final(results: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[s
         },
         "n_valid": len(valid), "n_total": len(results),
         "lambda_curve": LAMBDA_CURVE, "lambda_recon": LAMBDA_RECON,
+        "risk_policy_weight": RISK_POLICY_WEIGHT,
+        "risk_full_harm_weight": RISK_FULL_HARM_WEIGHT,
+        "risk_softmax_temperature": RISK_SOFTMAX_TEMPERATURE,
     }
     return chosen, report
 
@@ -1549,9 +1689,10 @@ def main() -> None:
     os.environ["PREDICTCSL_CONTEXT_LENGTH"] = str(context_length)
 
     # Probe split sizes once (workers reload independently).
-    x_tr, y_tr, _, x_va, _, _ = load_split_tensors(dataset_dir, seed=SEED)
+    x_tr, y_tr, _, length_tr, x_va, _, _, length_va = load_split_tensors(
+        dataset_dir, seed=SEED)
     n_train, n_val = x_tr.shape[0], x_va.shape[0]
-    del x_tr, y_tr, x_va
+    del x_tr, y_tr, length_tr, x_va, length_va
 
     print(Fore.CYAN + f"Devices: {devices}" + Fore.RESET)
     print(Fore.CYAN + f"VRAM budgets (GB): {dict(zip(devices, vram_budgets))}"
@@ -1686,8 +1827,13 @@ def main() -> None:
                 "horizon_grid":     horizon_grid,
                 "curve_metric":     CURVE_METRIC,
                 "training_objective": TRAINING_OBJECTIVE,
+                "use_length_embedding": bool(
+                    ARCH == "patchtst" and TRAINING_OBJECTIVE == "risk"),
                 "cheap_search":      _CHEAP,
                 "soft_topk_weights": list(SOFT_TOPK_WEIGHTS),
+                "risk_policy_weight": RISK_POLICY_WEIGHT,
+                "risk_full_harm_weight": RISK_FULL_HARM_WEIGHT,
+                "risk_softmax_temperature": RISK_SOFTMAX_TEMPERATURE,
                 "lambda_curve":     LAMBDA_CURVE,
                 "lambda_recon":     LAMBDA_RECON,
                 "dataset_dir":      dataset_dir,

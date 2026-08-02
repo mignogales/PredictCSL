@@ -2045,15 +2045,19 @@ def predict_curves_for_dataset(
     training_objective: str = "curve",
     batch_size: int = 64,
 ) -> np.ndarray:
-    """Per-instance predicted z-scored error curve.
+    """Per-instance predicted window-decision scores.
 
     Returns
     -------
-    np.ndarray of shape (n_instances, n_windows). Values are already z-scored
-    (the predictor is trained to output z-scored curves directly).
+    np.ndarray of shape (n_instances, n_windows). Curve mode returns z-scored
+    error; classification returns negative probability; risk mode returns
+    calibrated log error relative to full/native context. In every mode lower
+    is better.
     """
     x_np = _prepare_predictor_inputs(cache.contexts, context_length)
     x = torch.from_numpy(x_np).unsqueeze(-1)  # (N, L, 1)
+    valid_lengths = torch.from_numpy(
+        np.minimum(cache.context_lengths, context_length).astype(np.int64))
 
     preds: List[np.ndarray] = []
     with torch.no_grad():
@@ -2063,7 +2067,12 @@ def predict_curves_for_dataset(
             h_idx = torch.full(
                 (xb.shape[0],), horizon_idx, dtype=torch.long, device=device,
             )
-            curve_pred, _, _, _ = predictor(xb, horizon_idx=h_idx)
+            forward_kwargs = {}
+            if getattr(predictor, "use_length_embedding", False):
+                forward_kwargs["valid_length"] = valid_lengths[
+                    start:stop].to(device, non_blocking=True)
+            curve_pred, _, _, _ = predictor(
+                xb, horizon_idx=h_idx, **forward_kwargs)
             if training_objective == "classification":
                 # Downstream strategy code historically chooses argmin of a
                 # predicted cost curve. Convert class logits to negative
@@ -2123,6 +2132,15 @@ def plot_real_vs_predicted_curve(
     ws = np.asarray(window_grid)
 
     real_z, real_valid = _zscore_curve(np.asarray(real_curve, dtype=np.float64))
+    real_plot = real_z
+    real_label = f"Real (z-scored {curve_metric.upper()})"
+    if training_objective == "risk" and real_valid.any():
+        real_raw = np.asarray(real_curve, dtype=np.float64)
+        reference = real_raw[np.flatnonzero(real_valid)[-1]]
+        real_plot = np.full_like(real_raw, np.nan)
+        real_plot[real_valid] = np.log(
+            np.maximum(real_raw[real_valid], 1e-12) / max(reference, 1e-12))
+        real_label = f"Real log({curve_metric.upper()} / full)"
     pred_mean = predicted_curves.mean(axis=0)
     pred_std = predicted_curves.std(axis=0)
     n_inst = predicted_curves.shape[0]
@@ -2130,10 +2148,10 @@ def plot_real_vs_predicted_curve(
     fig, ax = plt.subplots(figsize=(11, 6.5))
 
     if real_valid.any():
-        ax.plot(ws[real_valid], real_z[real_valid],
+        ax.plot(ws[real_valid], real_plot[real_valid],
                 marker="o", linewidth=2.0, color="#2ca02c",
-                label=f"Real (z-scored {curve_metric.upper()})")
-        argmin_real = int(np.nanargmin(real_z))
+                label=real_label)
+        argmin_real = int(np.nanargmin(real_plot))
         ax.axvline(ws[argmin_real], color="#2ca02c",
                    linestyle=":", alpha=0.6,
                    label=f"Real argmin = {ws[argmin_real]}")
@@ -2141,9 +2159,12 @@ def plot_real_vs_predicted_curve(
         ax.text(0.5, 0.6, "no valid real-curve points",
                 ha="center", va="center", transform=ax.transAxes, color="#999")
 
-    pred_label = (f"Classifier decision score (mean over {n_inst} inst.)"
-                  if training_objective == "classification"
-                  else f"Predicted curve (mean over {n_inst} inst.)")
+    pred_label = (
+        f"Classifier decision score (mean over {n_inst} inst.)"
+        if training_objective == "classification"
+        else (f"Predicted log-error/full (mean over {n_inst} inst.)"
+              if training_objective == "risk"
+              else f"Predicted curve (mean over {n_inst} inst.)"))
     ax.plot(ws, pred_mean,
             marker="x", linewidth=2.0, color="#d62728",
             label=pred_label)
@@ -2163,7 +2184,9 @@ def plot_real_vs_predicted_curve(
     ax.set_ylabel(
         "Real z-score / classifier score (-probability)"
         if training_objective == "classification"
-        else f"Z-scored {curve_metric.upper()} along windows")
+        else ("Log error relative to full"
+              if training_objective == "risk"
+              else f"Z-scored {curve_metric.upper()} along windows"))
     ax.set_title(
         f"{dataset_display}  (term={term}, h_real={horizon_real}, "
         f"h_pred={horizon_pred})  --  {model_short}",
