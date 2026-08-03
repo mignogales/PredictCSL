@@ -268,6 +268,12 @@ Token-mapping / hook assumptions per family carry "verify on server" notes in
   Outputs default to the isolated `logs/experiments/master_recompute/` tree;
   `--test` runs the same matrix with reduced smoke settings and keeps its output
   for environment/debug inspection.
+- **`evaluate_topk_predictor_checkpoints.py`** — post-training robustness check.
+  Packages the top-k durable per-trial predictor weights, reuses the canonical
+  GiftEval `datasets/` cache, and reports cross-checkpoint normalized MASE plus
+  instance-weighted total FLOPs saved. It passes Stage 3 `--cached-only`, which
+  aborts on a missing/stale cell rather than loading a TSFM. PatchTST-only checks
+  can run on CPU; the supported Mamba path requires CUDA.
 
 ## Models labeled (the TSFMs under study)
 

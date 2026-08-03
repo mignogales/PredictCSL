@@ -2749,6 +2749,13 @@ def parse_args() -> argparse.Namespace:
                         "are still aggregated in memory into results.csv and the comparison "
                         "plots, so downstream stages work — but nothing is cached for resume. "
                         "Used by run_all.py --test smoke runs.")
+    p.add_argument(
+        "--cached-only", action="store_true",
+        help=("Never load or run the foundation model. Abort on the first "
+              "missing/stale forecast cell instead. Intended for cheap "
+              "re-evaluation of alternate predictor checkpoints against an "
+              "already-complete datasets/ cache."),
+    )
     p.add_argument("--test-datasets", type=int, default=None,
                    help="Smoke test: randomly sample this many (dataset, term) entries to "
                         "run, instead of the full grid. Applied after --datasets. The sample "
@@ -2994,6 +3001,13 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
 
         def ensure_handle():
             if not _handle_loaded[0]:
+                if args.cached_only:
+                    raise RuntimeError(
+                        "--cached-only encountered a missing or stale "
+                        f"{model_short} forecast cell. Refusing to load the "
+                        "foundation model; repair the canonical Stage-3 cache "
+                        "before evaluating alternate predictors."
+                    )
                 has_persistent_handle = model_family != "context_parroting"
                 if has_persistent_handle:
                     print(Fore.CYAN
