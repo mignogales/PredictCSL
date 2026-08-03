@@ -88,7 +88,11 @@ def main() -> None:
               + Fore.RESET)
 
     def _load(metric: str):
-        cache_root = os.path.dirname(run_dir)
+        # The run is self-contained: its metrics live under
+        # ``<run_dir>/datasets``.  Using the parent here makes every
+        # ``_load_metrics`` lookup miss and causes all cells to be reported as
+        # having no valid MASE, even though the comparison NPZs are present.
+        cache_root = run_dir
         try:
             df = load_strategy_records(
                 run_dir, cache_root, dict(DEFAULT_PATCH_SIZES),
