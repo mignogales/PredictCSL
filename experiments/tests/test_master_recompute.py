@@ -30,6 +30,7 @@ from experiments.compare_window_strategies_gifteval import (
     compute_flops_savings,
     compute_summary_stats,
     load_strategy_records,
+    discover_period_tree,
     theoretical_flops,
 )
 from experiments.gifteval_mase import gluonts_leaderboard_mase
@@ -38,6 +39,27 @@ from experiments.test_window_ablation_gifteval_v5 import (
 
 
 class MasterRecomputeConfigTest(unittest.TestCase):
+    def test_master_period_tree_is_discovered_for_each_predictor_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            period = os.path.join(root, "general_period", "models")
+            os.makedirs(period)
+            for variant in ("general_v3", "general_v3_classification", "general_v4"):
+                self.assertEqual(
+                    discover_period_tree(os.path.join(root, variant)),
+                    os.path.join(root, "general_period"),
+                )
+
+    def test_variant_period_tree_takes_precedence_over_shared_master_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            shared = os.path.join(root, "general_period", "models")
+            variant = os.path.join(root, "general_v3_period", "models")
+            os.makedirs(shared)
+            os.makedirs(variant)
+            self.assertEqual(
+                discover_period_tree(os.path.join(root, "general_v3")),
+                os.path.join(root, "general_v3_period"),
+            )
+
     def test_long_period_mixture_covers_near_context_cycles(self) -> None:
         draws = build._sample_periods(np.random.RandomState(7), size=20_000)
         long_rate = float((draws > build.PERIOD_CORE_MAX).mean())

@@ -197,7 +197,14 @@ def discover_pred_variants(run_dir: str) -> List[Tuple[str, str, str, str]]:
 
 
 def discover_period_tree(run_dir: str) -> Optional[str]:
-    """Return the dedicated sibling period-strategy tree when present."""
+    """Return the dedicated sibling period-strategy tree when present.
+
+    The standalone comparison convention is ``<variant>_period`` (for example
+    ``general_v3_period``), while ``master_run_all`` deliberately shares one
+    period-inference tree across all predictor variants as ``general_period``.
+    Accept both layouts: the latter is what lets Phase 7 fold Phase 6a's
+    already-computed MASE values into the cross-predictor rollup.
+    """
     run_dir = os.path.normpath(run_dir)
     parent = os.path.dirname(run_dir)
     base = os.path.basename(run_dir)
@@ -206,8 +213,14 @@ def discover_period_tree(run_dir: str) -> Optional[str]:
         if base.endswith(suf):
             stem = base[: -len(suf)]
             break
-    tree = os.path.join(parent, stem + "_period")
-    return tree if os.path.isdir(os.path.join(tree, "models")) else None
+    candidates = [
+        os.path.join(parent, stem + "_period"),
+        os.path.join(parent, "general_period"),
+    ]
+    for tree in candidates:
+        if os.path.isdir(os.path.join(tree, "models")):
+            return tree
+    return None
 
 
 def present_pred_variants(df: pd.DataFrame) -> List[Tuple[str, str, str]]:
