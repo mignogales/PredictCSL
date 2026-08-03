@@ -110,8 +110,8 @@ CATALOG: List[DatasetSpec] = [
     DatasetSpec("solar/H",                     "medium", "Solar-H",         False, True),
     DatasetSpec("solar/H",                     "long",   "Solar-H",         False, True),
     DatasetSpec("solar/D",                     "short",  "Solar-D",         False, True),
-    # Only W=32 fits, so this cell contributes one point rather than a context
-    # selection curve; retain it to keep the experiment cohort leaderboard-complete.
+    # Only W=32 fits, so there is no context-selection decision. It remains in
+    # the 97-cell MASE cohort; selector policies fall back to native/full.
     DatasetSpec("solar/W",                     "short",  "Solar-W",         False, True),
     DatasetSpec("hierarchical_sales/D",        "short",  "HierSales-D",     False, True),
     DatasetSpec("hierarchical_sales/W",        "short",  "HierSales-W",     False, True),
@@ -145,8 +145,8 @@ CATALOG: List[DatasetSpec] = [
     DatasetSpec("kdd_cup_2018_with_missing/H", "medium", "KDDCup2018-H",   False, True),
     DatasetSpec("kdd_cup_2018_with_missing/H", "long",   "KDDCup2018-H",   False, True),
     DatasetSpec("kdd_cup_2018_with_missing/D", "short",  "KDDCup2018-D",   False, True),
-    # As above, W=32 is the only selectable window; retain it for complete
-    # 97-cell GIFT-Eval coverage.
+    # As above, W=32 is the only selectable window; retain it for the 97-cell
+    # MASE cohort and use native/full for selector policies.
     DatasetSpec("car_parts_with_missing",      "short",  "CarParts",       False, True),
     DatasetSpec("temperature_rain_with_missing", "short", "TempRain",      False, True),
 ]

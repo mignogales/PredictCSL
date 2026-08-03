@@ -118,7 +118,10 @@ from experiments.gifteval_reference import (
     NORMALIZATION_REFERENCE, published_naive_by_display,
 )
 from experiments.gifteval_inference_recipes import inference_recipe
-from experiments.gifteval_metric_version import METRIC_SUITE_VER
+from experiments.gifteval_metric_version import (
+    COMPARISON_POLICY_VERSION,
+    METRIC_SUITE_VER,
+)
 from experiments import models_config
 from experiments import datasets_config
 
@@ -132,7 +135,6 @@ PERIOD_POLICY_VERSION = 2
 SAFE_GATE_Z = 1.645
 SAFE_GATE_MIN_ADVANTAGE = 0.10
 SAFE_GATE_VERSION = 1
-PREDICTOR_MIN_CONTEXT = 2048
 WindowKey = Union[int, str]
 
 # ==============================================================================
@@ -1133,6 +1135,7 @@ def load_strategy_records(
                 valid = ~np.isnan(real_curve)
 
             valid_indices = np.where(valid)[0]
+            selection_eligible = bool(valid.sum() >= 2)
 
             # --- Strategy indices ------------------------------------------------
             full_idx = int(valid_indices[-1])
@@ -1235,6 +1238,17 @@ def load_strategy_records(
                 best_flops = full_flops
             pred_flops = theoretical_flops(model, pred_w, horizon, patch_sizes)
 
+            # One-action cells still contribute their authoritative native/full
+            # MASE to the 97-cell headline, but they cannot evaluate a selector.
+            # Treat every predictor policy as a no-op on those cells.
+            if not selection_eligible:
+                pred_w = full_w
+                pred_mase = full_mase
+                pred_elapsed = full_elapsed
+                pred_elapsed_std = full_elapsed_std
+                pred_flops = full_flops
+                pred_clamped = False
+
             complexity_ratio_pred = pred_flops / full_flops
             complexity_ratio_best = best_flops / full_flops
 
@@ -1259,6 +1273,14 @@ def load_strategy_records(
                 safe_elapsed_std = full_elapsed_std
                 safe_flops = full_flops
                 safe_policy_scope = "instance_native"
+            if not selection_eligible:
+                safe_shortens = False
+                safe_w = full_w
+                safe_mase = full_mase
+                safe_elapsed = full_elapsed
+                safe_elapsed_std = full_elapsed_std
+                safe_flops = full_flops
+                safe_policy_scope = "instance_native"
             speedup_safe = (
                 full_elapsed / safe_elapsed
                 if safe_elapsed > 0 and np.isfinite(full_elapsed)
@@ -1266,32 +1288,6 @@ def load_strategy_records(
             )
             complexity_ratio_safe = (
                 safe_flops / full_flops if full_flops > 0 else float("nan"))
-
-            # --- Simple 2k eligibility strategy --------------------------------
-            # Kept separate from the confidence gate so the threshold hypothesis
-            # is directly measurable. The aggregate comparison only has one
-            # dataset-shared action, hence eligibility uses mean effective native
-            # context; the per-instance evaluator can apply the same threshold row-wise.
-            eligibility_context = (
-                full_effective_context_mean
-                if np.isfinite(full_effective_context_mean) else float(full_w))
-            ctx2k_uses_pred = bool(eligibility_context > PREDICTOR_MIN_CONTEXT)
-            if ctx2k_uses_pred:
-                ctx2k_w, ctx2k_mase = pred_w, pred_mase
-                ctx2k_elapsed, ctx2k_elapsed_std = pred_elapsed, pred_elapsed_std
-                ctx2k_flops = pred_flops
-                ctx2k_policy_scope = "dataset_shared_grid"
-            else:
-                ctx2k_w, ctx2k_mase = full_w, full_mase
-                ctx2k_elapsed, ctx2k_elapsed_std = full_elapsed, full_elapsed_std
-                ctx2k_flops = full_flops
-                ctx2k_policy_scope = "instance_native"
-            speedup_ctx2k = (
-                full_elapsed / ctx2k_elapsed
-                if ctx2k_elapsed > 0 and np.isfinite(full_elapsed)
-                else float("nan"))
-            complexity_ratio_ctx2k = (
-                ctx2k_flops / full_flops if full_flops > 0 else float("nan"))
 
             # --- GiftEval-cadence period strategies (2xP and 3xP; off-grid) ------
             # Each multiplier has its own sidecar. Missing sidecars are NaN-filled
@@ -1329,6 +1325,13 @@ def load_strategy_records(
              period_n_inst, period_flops, speedup_period) = _period_values(2)
             (period3_w, period3_mase, period3_elapsed, period3_w_med,
              period3_n_inst, period3_flops, speedup_period3) = _period_values(3)
+            if not selection_eligible:
+                period_w = period3_w = float(full_w)
+                period_w_med = period3_w_med = float(full_w)
+                period_mase = period3_mase = full_mase
+                period_elapsed = period3_elapsed = full_elapsed
+                period_flops = period3_flops = full_flops
+                speedup_period = speedup_period3 = 1.0
 
             # --- Predictor-variant strategies (v3 cheap, v4 Mamba, …) ------------
             # Each variant's curve picks a window; we score it on the SAME base
@@ -1363,10 +1366,21 @@ def load_strategy_records(
                         else float("nan")
                     )
                     var_complexity = var_flops / full_flops if full_flops > 0 else float("nan")
+                if not selection_eligible:
+                    var_w = full_w
+                    var_mase = full_mase
+                    var_elapsed = full_elapsed
+                    var_elapsed_std = full_elapsed_std
+                    var_flops = full_flops
+                    var_clamped = False
+                    speedup_var = 1.0
+                    var_complexity = 1.0
                 variant_cols.update({
                     f"{vkey}_window":   var_w,
                     f"{vkey}_mase":     var_mase,
-                    f"{vkey}_policy_scope": "dataset_shared_grid",
+                    f"{vkey}_policy_scope": (
+                        "dataset_shared_grid" if selection_eligible
+                        else "instance_native"),
                     f"{vkey}_clamped":  var_clamped,
                     f"delta_{vkey}_vs_full": var_mase - full_mase,
                     f"delta_{vkey}_vs_best": var_mase - best_mase,
@@ -1392,7 +1406,9 @@ def load_strategy_records(
                 variant_cols.update({
                     f"{own_key}_window": pred_w,
                     f"{own_key}_mase": pred_mase,
-                    f"{own_key}_policy_scope": "dataset_shared_grid",
+                    f"{own_key}_policy_scope": (
+                        "dataset_shared_grid" if selection_eligible
+                        else "instance_native"),
                     f"{own_key}_clamped": pred_clamped,
                     f"delta_{own_key}_vs_full": pred_mase - full_mase,
                     f"delta_{own_key}_vs_best": pred_mase - best_mase,
@@ -1421,16 +1437,13 @@ def load_strategy_records(
             "best_window":     best_w,
             "pred_window":     pred_w,
             "safe_window":     safe_w,
-            "ctx2k_window":    ctx2k_w,
             "full_policy_scope": "instance_native",
             "best_policy_scope": (
                 "dataset_shared_native" if best_is_full_native
                 else "dataset_shared_grid"),
-            "pred_policy_scope": "dataset_shared_grid",
+            "pred_policy_scope": (
+                "dataset_shared_grid" if selection_eligible else "instance_native"),
             "safe_policy_scope": safe_policy_scope,
-            "ctx2k_policy_scope": ctx2k_policy_scope,
-            "ctx2k_threshold": PREDICTOR_MIN_CONTEXT,
-            "ctx2k_uses_predictor": ctx2k_uses_pred,
             "safe_gate_version": SAFE_GATE_VERSION,
             "safe_gate_shortens": safe_shortens,
             "safe_gate_advantage": safe_advantage,
@@ -1446,9 +1459,9 @@ def load_strategy_records(
             "full_native_width_groups": full_native_width_groups,
             "n_windows_valid": int(valid.sum()),
             # A selector cannot win or fail when only one action is available.
-            # Keep these cells in the official benchmark, but expose a clean
-            # selector-analysis cohort instead of silently dropping datasets.
-            "selection_eligible": bool(valid.sum() >= 2),
+            # Preserve the marker for filtered/custom cohorts even though the
+            # canonical run set excludes the known one-action cells.
+            "selection_eligible": selection_eligible,
             "pred_clamped":    pred_clamped,   # True when pred window was unavailable
             "best_is_full_native": best_is_full_native,
             # MASE values
@@ -1458,7 +1471,6 @@ def load_strategy_records(
             "instance_oracle_mase": instance_oracle_mase,
             "pred_mase":       pred_mase,
             "safe_mase":       safe_mase,
-            "ctx2k_mase":      ctx2k_mase,
             # Seasonal-naive baseline for this cell (denominator of the
             # leaderboard-style normalised MASE; NaN if unavailable).
             "naive_mase":      naive_mase,
@@ -1472,11 +1484,6 @@ def load_strategy_records(
             "delta_safe_vs_pred": safe_mase - pred_mase,
             "rel_gain_safe_over_full": (
                 (full_mase - safe_mase) / (abs(full_mase) + 1e-12)),
-            "delta_ctx2k_vs_full": ctx2k_mase - full_mase,
-            "delta_ctx2k_vs_best": ctx2k_mase - best_mase,
-            "delta_ctx2k_vs_pred": ctx2k_mase - pred_mase,
-            "rel_gain_ctx2k_over_full": (
-                (full_mase - ctx2k_mase) / (abs(full_mase) + 1e-12)),
             "rel_gain_pred_over_full": (
                 (full_mase - pred_mase) / (abs(full_mase) + 1e-12)
             ),
@@ -1504,25 +1511,20 @@ def load_strategy_records(
             "best_elapsed_s":  best_elapsed,
             "pred_elapsed_s":  pred_elapsed,
             "safe_elapsed_s":  safe_elapsed,
-            "ctx2k_elapsed_s": ctx2k_elapsed,
             "full_elapsed_std_s": full_elapsed_std,
             "best_elapsed_std_s": best_elapsed_std,
             "pred_elapsed_std_s": pred_elapsed_std,
             "safe_elapsed_std_s": safe_elapsed_std,
-            "ctx2k_elapsed_std_s": ctx2k_elapsed_std,
             "speedup_pred_vs_full": speedup_pred,
             "speedup_safe_vs_full": speedup_safe,
-            "speedup_ctx2k_vs_full": speedup_ctx2k,
             "speedup_best_vs_full": speedup_best,
             # theoretical complexity (unnormalized FLOPs proxy)
             "full_flops":      full_flops,
             "best_flops":      best_flops,
             "pred_flops":      pred_flops,
             "safe_flops":      safe_flops,
-            "ctx2k_flops":     ctx2k_flops,
             "complexity_ratio_pred_vs_full": complexity_ratio_pred,
             "complexity_ratio_safe_vs_full": complexity_ratio_safe,
-            "complexity_ratio_ctx2k_vs_full": complexity_ratio_ctx2k,
             "complexity_ratio_best_vs_full": complexity_ratio_best,
             # period-window strategy (per-series max(2*period, horizon); off-grid)
             "period_window":   period_w,        # mean per-series window (representative)
@@ -1630,6 +1632,7 @@ def _wgeomean(vals: np.ndarray, weights: np.ndarray) -> float:
 def compute_summary_stats(df: pd.DataFrame) -> dict:
     r = df.dropna(subset=["full_mase", "best_mase", "pred_mase"])
     stats: dict = {
+        "comparison_policy_version": COMPARISON_POLICY_VERSION,
         "headline_aggregation": {
             "formula": "geomean(cell_MASE / cell_seasonal_naive_MASE)",
             "cell_weighting": "unweighted",
@@ -1653,6 +1656,39 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
         if active:
             stats["inference_recipes"] = active
 
+    # Context selection is undefined when a cell exposes only one valid action.
+    # The canonical run set excludes known one-action cells; retain this nested
+    # cohort for custom/legacy comparison CSVs that may still contain them.
+    if "selection_eligible" in r.columns:
+        eligible_mask = r["selection_eligible"].fillna(False).astype(bool)
+        sr = r.loc[eligible_mask]
+        excluded = r.loc[~eligible_mask]
+        selector_stats = {
+            "cohort_size": int(len(sr)),
+            "excluded_count": int(len(excluded)),
+            "excluded_cells": sorted(
+                f"{row.dataset_display}/{row.term}"
+                for row in excluded[["dataset_display", "term"]]
+                .drop_duplicates().itertuples(index=False)
+            ),
+            "criterion": "selection_eligible == True (at least two valid windows)",
+        }
+        for strategy in ("best_mase", "pred_mase", "safe_mase"):
+            if strategy not in sr.columns:
+                continue
+            m = sr[strategy].notna() & sr["full_mase"].notna()
+            if not m.any():
+                continue
+            ratio = (sr.loc[m, strategy] / sr.loc[m, "full_mase"]).values
+            selector_stats[strategy] = {
+                "geomean_ratio_vs_full": _geomean(ratio),
+                "relative_gain_vs_full": 1.0 - _geomean(ratio),
+                "wins": int((sr.loc[m, strategy] < sr.loc[m, "full_mase"]).sum()),
+                "losses": int((sr.loc[m, strategy] > sr.loc[m, "full_mase"]).sum()),
+                "n": int(m.sum()),
+            }
+        stats["selector_analysis"] = selector_stats
+
     # Seasonal-naive normaliser present? Then also report the leaderboard-style
     # normalised geomean (geomean of MASE_strategy / MASE_seasonalnaive), over the
     # subset of rows that actually have a baseline.
@@ -1660,8 +1696,6 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
     strategies = ["full_mase", "best_mase", "pred_mase"]
     if "safe_mase" in r.columns:
         strategies.append("safe_mase")
-    if "ctx2k_mase" in r.columns:
-        strategies.append("ctx2k_mase")
     if "instance_oracle_mase" in r.columns:
         strategies.insert(2, "instance_oracle_mase")
     for strategy in strategies:
@@ -1697,7 +1731,6 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
             "instance_oracle_mase", {}).get("geomean_norm"),
         "predicted_window": stats.get("pred_mase", {}).get("geomean_norm"),
         "safe_native_gate": stats.get("safe_mase", {}).get("geomean_norm"),
-        "predictor_above_2k": stats.get("ctx2k_mase", {}).get("geomean_norm"),
         "cells": stats.get("full_mase", {}).get("n_norm", 0),
     }
 
@@ -1736,14 +1769,6 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
                 "median": float(np.median(safe_speed)),
                 "pct_faster": float((safe_speed > 1).mean()),
             }
-    if "ctx2k_mase" in r.columns:
-        ctx2k = r.dropna(subset=["ctx2k_mase"])
-        stats["ctx2k_uses_predictor_count"] = int(
-            ctx2k.get("ctx2k_uses_predictor", pd.Series(False, index=ctx2k.index)).sum())
-        stats["ctx2k_beats_full_count"] = int(
-            (ctx2k["ctx2k_mase"] < ctx2k["full_mase"]).sum())
-        stats["ctx2k_beats_full_rate"] = (
-            stats["ctx2k_beats_full_count"] / max(len(ctx2k), 1))
     if "instance_oracle_mase" in r.columns:
         ri = r.dropna(subset=["instance_oracle_mase"])
         stats["instance_oracle_exact_cells"] = int(
@@ -1939,7 +1964,6 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
             primary_name = primary_values[0]
     strat_specs = [(primary_name, "pred_flops", "pred_mase"),
                    ("safe", "safe_flops", "safe_mase"),
-                   ("ctx2k", "ctx2k_flops", "ctx2k_mase"),
                    ("best", "best_flops", "best_mase")]
     if "period_flops" in df.columns:
         strat_specs.append(("period", "period_flops", "period_mase"))
@@ -2162,7 +2186,6 @@ def compute_time_savings(df: pd.DataFrame) -> pd.DataFrame:
             primary_name = primary_values[0]
     strat_specs = [(primary_name, "pred_elapsed_s", "pred_mase"),
                    ("safe", "safe_elapsed_s", "safe_mase"),
-                   ("ctx2k", "ctx2k_elapsed_s", "ctx2k_mase"),
                    ("best", "best_elapsed_s", "best_mase")]
     if "period_elapsed_s" in df.columns:
         strat_specs.append(("period", "period_elapsed_s", "period_mase"))
@@ -3064,7 +3087,7 @@ def plot_bar_aggregate_mase(df: pd.DataFrame, out_dir: str,
     # ``extra_strategies=False`` (the minimal-figures mode) keeps the bar on the
     # core full/best/pred trio: each extra strategy dropna's `r` to ITS coverage,
     # so partial period/v3/v4 trees would silently shrink n below the run's true
-    # cell count (e.g. 97 -> 80) — exactly the kind of headline distortion the
+    # cell count (e.g. 95 -> 80) — exactly the kind of headline distortion the
     # minimal figures exist to avoid.
     if extra_strategies and "period_mase" in r.columns and r["period_mase"].notna().any():
         r = r.dropna(subset=["period_mase"]).copy()
@@ -3466,7 +3489,6 @@ def plot_complexity_vs_mase_gain(df: pd.DataFrame, out_dir: str) -> str:
 _STRATEGY_STYLE = {
     "pred":       ("Predictor (dataset-grid)", "#70AD47"),
     "safe":       ("Predictor + native safety gate", "#2E7D32"),
-    "ctx2k":      ("Predictor only above 2k", "#00897B"),
     # predictor variants (auto-discovered sibling trees); see PRED_VARIANTS
     "pred_cheap": ("Predictor (cheap; dataset-grid)", "#1F77B4"),
     "pred_mamba": ("Predictor Mamba (dataset-grid)",  "#9C27B0"),
@@ -4084,6 +4106,14 @@ def main() -> None:
         df_subset.to_csv(csv_path, index=False)
         print(Fore.GREEN + f"  Saved: {csv_path}" + Fore.RESET)
 
+        if "selection_eligible" in df_subset.columns:
+            selector_df = df_subset.loc[
+                df_subset["selection_eligible"].fillna(False).astype(bool)]
+            selector_csv_path = os.path.join(
+                out_dir, "selector_analysis_comparison.csv")
+            selector_df.to_csv(selector_csv_path, index=False)
+            print(Fore.GREEN + f"  Saved: {selector_csv_path}" + Fore.RESET)
+
         stats = compute_summary_stats(df_subset)
         checkpoint = stats["official_gifteval_checkpoint"]
         model_names = list(df_subset["model_short"].dropna().unique())
@@ -4130,8 +4160,7 @@ def main() -> None:
                      ("best_mase", "Dataset oracle"),
                      ("instance_oracle_mase", "Instance oracle"),
                      ("pred_mase", "Predictor    "),
-                     ("safe_mase", "Safe native  "),
-                     ("ctx2k_mase", "Predict >2k  ")]
+                     ("safe_mase", "Safe native  ")]
         if "period_mase" in stats:
             mase_keys.append(("period_mase", "Period (2xP) "))
         if "period3_mase" in stats:

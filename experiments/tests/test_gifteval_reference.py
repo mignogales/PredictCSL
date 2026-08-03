@@ -24,6 +24,7 @@ class GiftEvalReferenceTest(unittest.TestCase):
         self.assertEqual(len(run_set), 97)
         self.assertIn("Solar-W", {row[2] for row in run_set})
         self.assertIn("CarParts", {row[2] for row in run_set})
+        self.assertEqual(len(datasets_config.catalog()), 97)
 
     def test_dataset_aliases_match_leaderboard_csv_keys(self) -> None:
         self.assertEqual(

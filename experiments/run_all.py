@@ -76,7 +76,10 @@ from experiments import models_config
 from experiments import datasets_config
 from experiments.gifteval_reference import NORMALIZATION_REFERENCE
 from experiments.gifteval_inference_recipes import inference_recipe
-from experiments.gifteval_metric_version import METRIC_SUITE_VER
+from experiments.gifteval_metric_version import (
+    COMPARISON_POLICY_VERSION,
+    METRIC_SUITE_VER,
+)
 
 
 # Master run set: (model_id, family, display), sourced from the single config in
@@ -577,6 +580,8 @@ def _done_stage_4(family: str, display: str = "") -> Tuple[bool, str]:
         except (OSError, json.JSONDecodeError):
             return False, "summary_stats.json unreadable"
         if reference == NORMALIZATION_REFERENCE:
+            if stats.get("comparison_policy_version") != COMPARISON_POLICY_VERSION:
+                return False, "summary_stats.json uses stale comparison policy"
             expected_size = len(datasets_config.datasets_to_run())
             if cohort_size != expected_size:
                 return False, (

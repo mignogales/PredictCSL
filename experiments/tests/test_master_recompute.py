@@ -1053,12 +1053,10 @@ class ConservativeStrategyTest(unittest.TestCase):
             "full_flops": [100.0],
             "pred_flops": [40.0],
             "safe_flops": [100.0],
-            "ctx2k_flops": [100.0],
             "best_flops": [30.0],
             "full_mase": [1.0],
             "pred_mase": [0.9],
             "safe_mase": [1.0],
-            "ctx2k_mase": [1.0],
             "best_mase": [0.8],
             # Own canonical columns also exist in comparison.csv; savings must
             # not duplicate the primary row.
@@ -1068,7 +1066,7 @@ class ConservativeStrategyTest(unittest.TestCase):
         rows = compute_flops_savings(frame)
         self.assertEqual(
             rows["strategy"].tolist(),
-            ["pred_mamba_cls", "safe", "ctx2k", "best"],
+            ["pred_mamba_cls", "safe", "best"],
         )
 
 
