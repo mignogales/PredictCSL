@@ -56,11 +56,14 @@ class TopKPredictorCheckpointTest(unittest.TestCase):
     def test_stage3_overlay_preserves_canonical_short_context_mode(self):
         cmd = _stage3_command(
             "python", "Chronos2-Small", Path("package"), Path("run"),
-            "cuda", 64, "skip",
+            Path("canonical"), "cuda", 64, "skip",
         )
         mode_idx = cmd.index("--short-context-mode")
         self.assertEqual(cmd[mode_idx + 1], "skip")
         self.assertIn("--cached-only", cmd)
+        self.assertIn("--preloaded-results-csv", cmd)
+        self.assertIn("canonical/results.csv", cmd)
+        self.assertIn("--no-full-native-baseline", cmd)
 
 
 if __name__ == "__main__":

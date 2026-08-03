@@ -8,7 +8,8 @@ requested predictor objective it:
    validation metric used by training (keeping the selected winner first);
 2. packages each trial as a normal ``best_model.pt + best_config.json`` run;
 3. runs only the predictor overlay against a symlinked canonical ``datasets/``
-   cache, with ``--cached-only`` preventing accidental TSFM inference;
+   cache, trusting its preloaded ``results.csv`` index instead of revalidating
+   every cell, with ``--cached-only`` preventing accidental TSFM inference;
 4. runs the normal Stage-4 comparison and writes a cross-trial consistency CSV
    and JSON summary.
 
@@ -176,21 +177,23 @@ def _stage3_command(
     model: str,
     package: Path,
     run_dir: Path,
+    canonical_cache: Path,
     device: str,
     predictor_batch_size: int,
     short_context_mode: str,
 ) -> List[str]:
-    """Build the cache-only overlay command using the canonical cache mode."""
+    """Build an overlay command that trusts the precomputed canonical index."""
     return [
         python, "-m", "experiments.test_window_ablation_gifteval_v5",
         "--models", model,
         "--predictor-dir", str(package),
         "--cache-root", str(run_dir),
+        "--preloaded-results-csv", str(canonical_cache / "results.csv"),
         "--device", device,
         "--num-gpus", "1",
         "--predictor-batch-size", str(predictor_batch_size),
         "--short-context-mode", short_context_mode,
-        "--no-plots", "--cached-only",
+        "--no-plots", "--cached-only", "--no-full-native-baseline",
     ]
 
 
@@ -316,7 +319,8 @@ def main() -> None:
                   f"{variant.selection_metric}={float(trial[variant.selection_metric]):.6f}")
 
             stage3 = _stage3_command(
-                sys.executable, args.model, package, run_dir, args.device,
+                sys.executable, args.model, package, run_dir, canonical,
+                args.device,
                 args.predictor_batch_size, args.short_context_mode,
             )
             stage4 = [

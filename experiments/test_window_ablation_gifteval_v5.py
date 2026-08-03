@@ -2756,6 +2756,13 @@ def parse_args() -> argparse.Namespace:
               "re-evaluation of alternate predictor checkpoints against an "
               "already-complete datasets/ cache."),
     )
+    p.add_argument(
+        "--preloaded-results-csv", type=str, default=None,
+        help=("Trust this Stage-3 results.csv as the complete numeric-window "
+              "cache index. Skips the resume scan, per-cell metrics.json "
+              "validation, and cache backfills. Requires --cached-only and is "
+              "intended for repeated predictor-checkpoint overlays."),
+    )
     p.add_argument("--test-datasets", type=int, default=None,
                    help="Smoke test: randomly sample this many (dataset, term) entries to "
                         "run, instead of the full grid. Applied after --datasets. The sample "
@@ -2797,7 +2804,10 @@ def parse_args() -> argparse.Namespace:
                    help=argparse.SUPPRESS)
     p.add_argument("--num-shards", type=int, default=1,
                    help=argparse.SUPPRESS)
-    return p.parse_args()
+    args = p.parse_args()
+    if args.preloaded_results_csv and not args.cached_only:
+        p.error("--preloaded-results-csv requires --cached-only")
+    return args
 
 
 def _run_coordinator(args, device: str, n_gpus: int, n_visible: int) -> None:
@@ -2950,6 +2960,41 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
     run_dir = CACHE_ROOT
     os.makedirs(run_dir, exist_ok=True)
 
+    # Repeated predictor-checkpoint overlays all consume the same immutable
+    # forecast grid. Load its aggregate once instead of reopening and
+    # semantically validating every metrics.json in every subprocess.
+    preloaded_results: Dict[Tuple[str, str, str, int], dict] = {}
+    use_preloaded_results = args.preloaded_results_csv is not None
+    if use_preloaded_results:
+        try:
+            preloaded_df = pd.read_csv(args.preloaded_results_csv)
+        except (OSError, pd.errors.ParserError) as exc:
+            raise RuntimeError(
+                f"Could not load preloaded cache index "
+                f"{args.preloaded_results_csv}: {exc}") from exc
+        required = {"model_short", "dataset_display", "term", "window_size"}
+        missing_columns = required.difference(preloaded_df.columns)
+        if missing_columns:
+            raise RuntimeError(
+                f"Preloaded cache index {args.preloaded_results_csv} is missing "
+                f"columns: {sorted(missing_columns)}")
+        for row in preloaded_df.to_dict(orient="records"):
+            try:
+                key = (
+                    str(row["model_short"]), str(row["dataset_display"]),
+                    str(row["term"]), int(row["window_size"]),
+                )
+            except (TypeError, ValueError):
+                continue
+            if key in preloaded_results:
+                raise RuntimeError(
+                    f"Duplicate row in preloaded cache index for {key}")
+            preloaded_results[key] = row
+        print(Fore.CYAN
+              + f"Preloaded cache index: {args.preloaded_results_csv} "
+                f"({len(preloaded_results)} rows; trusted without revalidation)"
+              + Fore.RESET)
+
     # ---- Resume estimate: how many (model, dataset, window) cells are already
     # on disk. This is deliberately a file-stat-only scan: each JSON is parsed
     # and recipe-validated once, when its cell is actually visited. The
@@ -2959,27 +3004,33 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                            and not args.no_full_native_baseline)
     n_planned = len(models) * len(datasets) * (
         len(window_sizes) + (1 if include_full_native else 0))
-    n_cached = sum(
-        1
-        for _, model_family, model_short in models
-        for _, term, dataset_display, _ in datasets
-        for window_size in window_sizes
-        if _result_file_exists(
-            dataset_display, model_short, term, window_size)
-    )
-    if include_full_native:
-        n_cached += sum(
+    if use_preloaded_results:
+        n_cached = n_planned
+        print(Fore.CYAN
+              + f"Resume: trusting preloaded index for {n_planned} planned cells"
+              + Fore.RESET)
+    else:
+        n_cached = sum(
             1
             for _, model_family, model_short in models
             for _, term, dataset_display, _ in datasets
+            for window_size in window_sizes
             if _result_file_exists(
-                dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+                dataset_display, model_short, term, window_size)
         )
-    pct_cached = 100.0 * n_cached / n_planned if n_planned else 100.0
-    print(Fore.CYAN
-          + f"Resume: {n_cached}/{n_planned} cell files present "
-            f"({pct_cached:.1f}%; validated lazily)"
-          + Fore.RESET)
+        if include_full_native:
+            n_cached += sum(
+                1
+                for _, model_family, model_short in models
+                for _, term, dataset_display, _ in datasets
+                if _result_file_exists(
+                    dataset_display, model_short, term, FULL_NATIVE_WINDOW)
+            )
+        pct_cached = 100.0 * n_cached / n_planned if n_planned else 100.0
+        print(Fore.CYAN
+              + f"Resume: {n_cached}/{n_planned} cell files present "
+                f"({pct_cached:.1f}%; validated lazily)"
+              + Fore.RESET)
 
     ge_cache: Dict[Tuple[str, str], GiftEvalCache] = {}
     naive_baseline_cache: Dict[Tuple[str, str], dict] = {}
@@ -3097,11 +3148,30 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                           + Fore.RESET)
                     continue
 
-                cached = _load_cached_result_for_family(
-                    dataset_display, model_short, term, window_size,
-                    model_family,
-                )
+                if use_preloaded_results:
+                    preload_key = (
+                        model_short, dataset_display, str(term), int(window_size))
+                    cached = preloaded_results.get(preload_key)
+                    if cached is None:
+                        raise RuntimeError(
+                            "--preloaded-results-csv is missing required cached "
+                            f"cell {preload_key}; refusing to run foundation-model "
+                            "inference in --cached-only mode")
+                else:
+                    cached = _load_cached_result_for_family(
+                        dataset_display, model_short, term, window_size,
+                        model_family,
+                    )
                 if cached is not None:
+                    if use_preloaded_results:
+                        all_results.append({
+                            "model": model_id, "model_short": model_short,
+                            "model_family": model_family, "dataset": ge_name,
+                            "dataset_display": dataset_display, "term": term,
+                            "horizon": horizon, "window_size": window_size,
+                            **cached,
+                        })
+                        continue
                     _backfill_served_index(
                         dataset_display, model_short, term, window_size,
                         cache, short_mode)
