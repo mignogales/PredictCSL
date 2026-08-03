@@ -20,7 +20,7 @@ so use ``--device cuda`` whenever ``mamba`` or ``mamba_cls`` is requested.
 Example (run on the GPU server later)::
 
     python -m experiments.evaluate_topk_predictor_checkpoints \
-      --model Chronos2-Small --variants mamba mamba_cls --top-k 3
+      --model Chronos2-Small --variants cheap mamba --top-k 5
 
 Use ``--prepare-only`` to rank/package checkpoints and print the commands without
 executing predictor inference.
@@ -261,9 +261,15 @@ def _aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Chronos2-Small")
-    parser.add_argument("--variants", nargs="+", choices=sorted(VARIANTS),
-                        default=list(VARIANTS))
-    parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument(
+        "--variants", nargs="+", choices=sorted(VARIANTS),
+        default=["cheap", "mamba"],
+        help="Predictor variants to evaluate (default: cheap mamba).",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=5,
+        help="Number of durable checkpoints per variant (default: 5).",
+    )
     parser.add_argument("--master-root",
                         default="logs/experiments/master_recompute")
     parser.add_argument("--canonical-cache", default=None,
