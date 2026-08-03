@@ -477,6 +477,29 @@ def _done_stage_2(family: str, display: str = "") -> Tuple[bool, str]:
         )
         if expected_cheap_mamba and cfg.get("cheap_search") is not True:
             return False, "predictor came from the old unconstrained Mamba search"
+        expected_grid = window_grid_for_family(family)
+        if cfg.get("window_grid") != expected_grid:
+            return False, "predictor output grid is stale"
+        if (expected_objective == "risk"
+                and cfg.get("risk_selection_version") != 1):
+            return False, "risk predictor predates tail-aware model selection"
+        if expected_objective == "risk":
+            expected_policy = float(os.environ.get(
+                "PREDICTCSL_RISK_POLICY_WEIGHT", "1.0"))
+            expected_harm = float(os.environ.get(
+                "PREDICTCSL_RISK_FULL_HARM_WEIGHT", "2.0"))
+            expected_temperature = float(os.environ.get(
+                "PREDICTCSL_RISK_SOFTMAX_TEMPERATURE", "0.25"))
+            expected_p90 = float(os.environ.get(
+                "PREDICTCSL_RISK_SELECTION_P90_WEIGHT", "0.5"))
+            expected_rate = float(os.environ.get(
+                "PREDICTCSL_RISK_SELECTION_HARM_RATE_WEIGHT", "0.25"))
+            if (cfg.get("risk_policy_weight") != expected_policy
+                    or cfg.get("risk_full_harm_weight") != expected_harm
+                    or cfg.get("risk_softmax_temperature") != expected_temperature
+                    or cfg.get("risk_selection_p90_weight") != expected_p90
+                    or cfg.get("risk_selection_harm_rate_weight") != expected_rate):
+                return False, "risk predictor uses stale risk/selection weights"
         return True, f"best_model.pt + {n_trials} trials"
     return False, (
         "missing best_model.pt/best_config.json "

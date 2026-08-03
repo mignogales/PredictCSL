@@ -114,6 +114,25 @@ RISK_FULL_HARM_WEIGHT = float(os.environ.get(
     "PREDICTCSL_RISK_FULL_HARM_WEIGHT", "2.0"))
 RISK_SOFTMAX_TEMPERATURE = float(os.environ.get(
     "PREDICTCSL_RISK_SOFTMAX_TEMPERATURE", "0.25"))
+# The default risk sweep is selected on mean oracle regret plus explicit tail
+# harm versus native/full context.  This prevents a low mean from hiding a small
+# set of catastrophic shortening decisions.
+RISK_SELECTION_P90_WEIGHT = float(os.environ.get(
+    "PREDICTCSL_RISK_SELECTION_P90_WEIGHT", "0.5"))
+RISK_SELECTION_HARM_RATE_WEIGHT = float(os.environ.get(
+    "PREDICTCSL_RISK_SELECTION_HARM_RATE_WEIGHT", "0.25"))
+RISK_SELECTION_VERSION = 1
+
+
+def risk_selection_signature() -> Dict[str, float]:
+    return {
+        "version": RISK_SELECTION_VERSION,
+        "policy_weight": RISK_POLICY_WEIGHT,
+        "full_harm_weight": RISK_FULL_HARM_WEIGHT,
+        "softmax_temperature": RISK_SOFTMAX_TEMPERATURE,
+        "p90_weight": RISK_SELECTION_P90_WEIGHT,
+        "harm_rate_weight": RISK_SELECTION_HARM_RATE_WEIGHT,
+    }
 
 # -- Random search / training loop --------------------------------------------
 N_TRIALS                = 60
@@ -1029,6 +1048,8 @@ def _evaluate(
     acc_sum   = torch.zeros((), device=device)
     top3_acc_sum = torch.zeros((), device=device)
     n_recon   = 0
+    n_arg = 0
+    harm_values: List[torch.Tensor] = []
 
     generator = torch.Generator(device="cpu").manual_seed(eval_seed)
 
@@ -1111,6 +1132,9 @@ def _evaluate(
                 # Restrict argmin to servable windows: invalid points get +inf so
                 # neither the oracle nor the predictor can select them.
                 rvalid = ~torch.isnan(yr)
+                valid_rows = rvalid.any(dim=1)
+                if not valid_rows.any():
+                    continue
                 yr_inf = torch.where(rvalid, yr, torch.full_like(yr, float("inf")))
                 if TRAINING_OBJECTIVE == "classification":
                     pred_score = torch.where(
@@ -1125,22 +1149,48 @@ def _evaluate(
                 true_arg = yr_inf.argmin(dim=1)
                 best_err   = yr_inf[idx_b, true_arg]
                 chosen_err = yr_inf[idx_b, pred_arg]
-                regret_sum = regret_sum + (
-                    (chosen_err - best_err) / best_err.clamp_min(1e-8)).sum()
-                acc_sum = acc_sum + (pred_arg - true_arg).abs().le(1).float().sum()
+                regret = ((chosen_err - best_err)
+                          / best_err.clamp_min(1e-8))
+                regret_sum = regret_sum + regret[valid_rows].sum()
+                acc_sum = acc_sum + (
+                    (pred_arg - true_arg).abs().le(1).float()[valid_rows].sum())
                 true_top3 = yr_inf.argsort(dim=1)[:, :min(3, n_windows)]
                 top3_acc_sum = top3_acc_sum + (
-                    true_top3 == pred_arg.unsqueeze(1)).any(dim=1).float().sum()
+                    (true_top3 == pred_arg.unsqueeze(1)).any(dim=1)
+                    .float()[valid_rows].sum())
 
-    n_arg   = max(n_val * n_horizons, 1)
+                # Harm is measured against the row's native/full label: the last
+                # valid output is guaranteed to be the registered family cap.
+                indices = torch.arange(n_windows, device=device).unsqueeze(0)
+                full_idx = torch.where(rvalid, indices, -1).max(dim=1).values
+                full_err = yr_inf[idx_b, full_idx.clamp_min(0)]
+                harm = F.relu(
+                    (chosen_err - full_err) / full_err.clamp_min(1e-8))
+                harm_values.append(harm[valid_rows].detach().cpu())
+                n_arg += int(valid_rows.sum().item())
+
+    n_arg = max(n_arg, 1)
     curve_mse = (curve_sum / curve_count.clamp_min(1.0)).item()
     recon_mse = (recon_sum / max(n_recon, 1)).item()
     combined  = LAMBDA_CURVE * curve_mse + LAMBDA_RECON * recon_mse
+    all_harm = (torch.cat(harm_values) if harm_values
+                else torch.zeros(1, dtype=torch.float32))
+    harm_p90 = float(torch.quantile(all_harm, 0.90).item())
+    harmed_rate = float((all_harm > 1e-12).float().mean().item())
+    mean_regret = (regret_sum / n_arg).item()
+    risk_selection = (
+        mean_regret
+        + RISK_SELECTION_P90_WEIGHT * harm_p90
+        + RISK_SELECTION_HARM_RATE_WEIGHT * harmed_rate
+    )
     return {
         "val_curve_mse": curve_mse,
         "val_recon_mse": recon_mse,
         "val_combined":  combined,
-        "val_regret":    (regret_sum / n_arg).item(),
+        "val_regret":    mean_regret,
+        "val_harm_p90":  harm_p90,
+        "val_harmed_rate": harmed_rate,
+        "val_risk_score": risk_selection,
         "val_win_acc":   (acc_sum / n_arg).item(),
         "val_top3_acc":  (top3_acc_sum / n_arg).item(),
     }
@@ -1148,7 +1198,9 @@ def _evaluate(
 
 def _selection_score(metrics: Dict[str, float]) -> float:
     if SELECTION_METRIC == "regret":
-        return metrics["val_regret"]
+        return (metrics["val_risk_score"]
+                if TRAINING_OBJECTIVE == "risk"
+                else metrics["val_regret"])
     if SELECTION_METRIC == "curve":
         return metrics["val_curve_mse"]
     if SELECTION_METRIC == "recon":
@@ -1168,11 +1220,15 @@ def _failed_result(trial_idx: int, device: str, trial: TrialConfig,
         "trial_idx": trial_idx, "device": device,
         "val_curve_mse": float("nan"), "val_recon_mse": float("nan"),
         "val_combined": float("nan"), "val_regret": float("nan"),
+        "val_harm_p90": float("nan"), "val_harmed_rate": float("nan"),
+        "val_risk_score": float("nan"),
         "val_win_acc": float("nan"), "val_top3_acc": float("nan"),
         "history": {}, "best_state_path": None,
         "failed": True, "skip_reason": reason,
         "auto_batch_size": None, "auto_lr": None, "peak_vram_gb": None,
         "elapsed_seconds": 0.0, "cfg": asdict(trial),
+        "risk_selection_version": RISK_SELECTION_VERSION,
+        "risk_selection_signature": risk_selection_signature(),
     }
 
 
@@ -1220,6 +1276,7 @@ def _run_single_trial(
         "val_combined": [], "val_curve": [], "val_recon": [],
         "val_regret": [], "val_win_acc": [], "val_epochs": [],
         "val_top3_acc": [],
+        "val_harm_p90": [], "val_harmed_rate": [], "val_risk_score": [],
     }
 
     try:
@@ -1274,6 +1331,9 @@ def _run_single_trial(
                 history["val_curve"].append(metrics["val_curve_mse"])
                 history["val_recon"].append(metrics["val_recon_mse"])
                 history["val_regret"].append(metrics["val_regret"])
+                history["val_harm_p90"].append(metrics["val_harm_p90"])
+                history["val_harmed_rate"].append(metrics["val_harmed_rate"])
+                history["val_risk_score"].append(metrics["val_risk_score"])
                 history["val_win_acc"].append(metrics["val_win_acc"])
                 history["val_top3_acc"].append(metrics["val_top3_acc"])
                 history["val_epochs"].append(epoch)
@@ -1283,6 +1343,8 @@ def _run_single_trial(
                       + f"val: curve={metrics['val_curve_mse']:.4f} "
                       + f"recon={metrics['val_recon_mse']:.4f} "
                       + f"regret={metrics['val_regret']:.4f} "
+                      + f"harm_p90={metrics['val_harm_p90']:.4f} "
+                      + f"harmed={metrics['val_harmed_rate']:.1%} "
                       + f"win_acc={metrics['val_win_acc']:.3f}"
                       + f" top3_acc={metrics['val_top3_acc']:.3f}"
                       + Fore.RESET)
@@ -1327,6 +1389,9 @@ def _run_single_trial(
         "val_recon_mse": best_metrics.get("val_recon_mse", float("nan")),
         "val_combined":  best_metrics.get("val_combined",  float("nan")),
         "val_regret":    best_metrics.get("val_regret",    float("nan")),
+        "val_harm_p90":  best_metrics.get("val_harm_p90",  float("nan")),
+        "val_harmed_rate": best_metrics.get("val_harmed_rate", float("nan")),
+        "val_risk_score": best_metrics.get("val_risk_score", float("nan")),
         "val_win_acc":   best_metrics.get("val_win_acc",   float("nan")),
         "val_top3_acc":  best_metrics.get("val_top3_acc",  float("nan")),
         "history": history,
@@ -1337,6 +1402,8 @@ def _run_single_trial(
         "peak_vram_gb": round(peak, 3),
         "elapsed_seconds": round(elapsed, 2),
         "cfg": asdict(trial),
+        "risk_selection_version": RISK_SELECTION_VERSION,
+        "risk_selection_signature": risk_selection_signature(),
     }
 
 
@@ -1436,7 +1503,9 @@ def _plot_sweep_summary(trials_df: pd.DataFrame, save_path: str,
     """Three-panel scatter: val_regret, val_curve_mse, val_recon_mse."""
     df = trials_df.sort_values("trial_idx").reset_index(drop=True)
     panels = [
-        ("val_regret",    "val regret (normalized)"),
+        (("val_risk_score", "val tail-aware risk score")
+         if TRAINING_OBJECTIVE == "risk"
+         else ("val_regret", "val regret (normalized)")),
         ("val_curve_mse", (
             "val soft-label cross-entropy"
             if TRAINING_OBJECTIVE == "classification"
@@ -1537,9 +1606,18 @@ def _cached_trial_is_compatible(
     if cached is None:
         return False
     val_curve_mse = cached.get("val_curve_mse")
+    risk_metrics_current = (
+        TRAINING_OBJECTIVE != "risk"
+        or (
+            cached.get("risk_selection_signature") == risk_selection_signature()
+            and cached.get("val_risk_score") is not None
+            and np.isfinite(float(cached["val_risk_score"]))
+        )
+    )
     return (
         cached.get("label_inference_recipe") == label_inference_recipe
         and cached.get("cfg") == asdict(trial)
+        and risk_metrics_current
         and val_curve_mse is not None
         and not (isinstance(val_curve_mse, float) and math.isnan(val_curve_mse))
     )
@@ -1564,15 +1642,21 @@ _METRIC_KEY = {
 }
 
 
+def _active_selection_metric_key() -> str:
+    if TRAINING_OBJECTIVE == "risk" and SELECTION_METRIC == "regret":
+        return "val_risk_score"
+    return _METRIC_KEY[SELECTION_METRIC]
+
+
 def _select_final(results: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Pick the final trial by SELECTION_METRIC over those with a checkpoint."""
-    metric_key = _METRIC_KEY[SELECTION_METRIC]
+    metric_key = _active_selection_metric_key()
     valid = [r for r in results
              if not r.get("failed", False)
              and r.get("best_state_path")
              and os.path.isfile(r["best_state_path"])
-             and not (isinstance(r.get(metric_key), float)
-                      and math.isnan(r[metric_key]))]
+             and r.get(metric_key) is not None
+             and np.isfinite(float(r[metric_key]))]
     if not valid:
         return {}, {"selection_metric": metric_key,
                     "note": "no_valid_trials_with_checkpoints"}
@@ -1586,6 +1670,9 @@ def _select_final(results: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[s
             "val_recon_mse": chosen.get("val_recon_mse"),
             "val_combined":  chosen.get("val_combined"),
             "val_regret":    chosen.get("val_regret"),
+            "val_harm_p90": chosen.get("val_harm_p90"),
+            "val_harmed_rate": chosen.get("val_harmed_rate"),
+            "val_risk_score": chosen.get("val_risk_score"),
             "val_win_acc":   chosen.get("val_win_acc"),
             "val_top3_acc":  chosen.get("val_top3_acc"),
         },
@@ -1594,6 +1681,9 @@ def _select_final(results: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[s
         "risk_policy_weight": RISK_POLICY_WEIGHT,
         "risk_full_harm_weight": RISK_FULL_HARM_WEIGHT,
         "risk_softmax_temperature": RISK_SOFTMAX_TEMPERATURE,
+        "risk_selection_version": RISK_SELECTION_VERSION,
+        "risk_selection_p90_weight": RISK_SELECTION_P90_WEIGHT,
+        "risk_selection_harm_rate_weight": RISK_SELECTION_HARM_RATE_WEIGHT,
     }
     return chosen, report
 
@@ -1609,7 +1699,8 @@ def _persist_artifacts(results: List[Dict[str, Any]], run_label: str) -> None:
         flat = {"trial_idx": r["trial_idx"]}
         flat.update(r.get("cfg", {}))
         for key in ("val_curve_mse", "val_recon_mse", "val_combined",
-                    "val_regret", "val_win_acc", "val_top3_acc",
+                    "val_regret", "val_harm_p90", "val_harmed_rate",
+                    "val_risk_score", "val_win_acc", "val_top3_acc",
                     "auto_batch_size", "auto_lr",
                     "peak_vram_gb", "device", "elapsed_seconds",
                     "skip_reason", "failed"):
@@ -1617,7 +1708,8 @@ def _persist_artifacts(results: List[Dict[str, Any]], run_label: str) -> None:
                 flat[key] = r[key]
         rows.append(flat)
     df = pd.DataFrame(rows)
-    keep = ["trial_idx", "val_regret", "val_win_acc", "val_curve_mse",
+    keep = ["trial_idx", "val_regret", "val_harm_p90", "val_harmed_rate",
+            "val_risk_score", "val_win_acc", "val_curve_mse",
             "val_recon_mse", "val_combined", "arch",
             "patch_length", "d_model", "num_hidden_layers",
             "num_attention_heads", "d_state", "d_conv", "expand",
@@ -1671,6 +1763,14 @@ def main() -> None:
     label_inference_recipe = meta.get("inference_recipe")
     window_grid = meta["window_grid"]
     n_windows = len(window_grid)
+    if TRAINING_OBJECTIVE == "risk":
+        native_cap = int(meta.get("model_context_limit", window_grid[-1]))
+        if int(window_grid[-1]) != native_cap:
+            raise ValueError(
+                "Risk training requires the final label action to be the true "
+                f"native cap ({native_cap}), but window_grid ends at "
+                f"{window_grid[-1]}. Re-run stage 1 with the native cap included."
+            )
     if "horizon_grid" not in meta:
         raise ValueError(
             "Dataset meta.json is missing 'horizon_grid' — re-run "
@@ -1815,6 +1915,9 @@ def main() -> None:
                 "val_recon_mse":    chosen.get("val_recon_mse"),
                 "val_combined":     chosen.get("val_combined"),
                 "val_regret":       chosen.get("val_regret"),
+                "val_harm_p90":     chosen.get("val_harm_p90"),
+                "val_harmed_rate":  chosen.get("val_harmed_rate"),
+                "val_risk_score":   chosen.get("val_risk_score"),
                 "val_win_acc":      chosen.get("val_win_acc"),
                 "val_top3_acc":     chosen.get("val_top3_acc"),
                 "selection_metric": report["selection_metric"],
@@ -1834,6 +1937,10 @@ def main() -> None:
                 "risk_policy_weight": RISK_POLICY_WEIGHT,
                 "risk_full_harm_weight": RISK_FULL_HARM_WEIGHT,
                 "risk_softmax_temperature": RISK_SOFTMAX_TEMPERATURE,
+                "risk_selection_version": RISK_SELECTION_VERSION,
+                "risk_selection_p90_weight": RISK_SELECTION_P90_WEIGHT,
+                "risk_selection_harm_rate_weight": (
+                    RISK_SELECTION_HARM_RATE_WEIGHT),
                 "lambda_curve":     LAMBDA_CURVE,
                 "lambda_recon":     LAMBDA_RECON,
                 "dataset_dir":      dataset_dir,

@@ -8,7 +8,13 @@ context-selection strategies per (model, dataset, term):
   full_window   -- native full-context baseline (wfull_native) when present;
                    otherwise largest valid window in the ablation grid
   best_window   -- argmin of real MASE curve (oracle; best achievable from grid)
-  pred_window   -- argmin of the predictor's mean curve (zero-shot recommendation)
+  pred_window   -- one dataset-shared grid action: argmin of the predictor's
+                   mean curve (zero-shot recommendation)
+
+Period strategies are per-series native-capped policies.  Predictor variants in
+this file remain dataset-shared grid policies; their separate per-series/native
+evaluation is produced by ``evaluate_instance_windows.py``.  ``comparison.csv``
+stores explicit ``*_policy_scope`` columns so these policies cannot be conflated.
 
 No model inference is performed -- all numbers come from the v5 cache and the
 compare_real_vs_predicted/*.npz files.
@@ -118,6 +124,15 @@ from experiments import datasets_config
 
 CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
 FULL_NATIVE_WINDOW = "full_native"
+PERIOD_POLICY_VERSION = 2
+# Conservative post-hoc strategy: shorten only when the predictor's paired
+# per-instance score advantage over the largest valid grid action clears a
+# one-sided confidence bound plus a small practical margin. Otherwise it uses
+# the authoritative per-instance native/full baseline.
+SAFE_GATE_Z = 1.645
+SAFE_GATE_MIN_ADVANTAGE = 0.10
+SAFE_GATE_VERSION = 1
+PREDICTOR_MIN_CONTEXT = 2048
 WindowKey = Union[int, str]
 
 # ==============================================================================
@@ -137,14 +152,14 @@ WindowKey = Union[int, str]
 # base run_dir's OWN predictor is always "pred"; any *other* tree present as a
 # sibling is auto-discovered and added (no CLI flag, graceful when absent).
 PRED_VARIANTS: Dict[str, Tuple[str, str, str]] = {
-    "_v3": ("pred_cheap", "Predictor (cheap)", "#1F77B4"),
-    "_v4": ("pred_mamba", "Predictor Mamba",   "#9C27B0"),
+    "_v3": ("pred_cheap", "Predictor (cheap; dataset-grid)", "#1F77B4"),
+    "_v4": ("pred_mamba", "Predictor Mamba (dataset-grid)",  "#9C27B0"),
     "_v3_risk": (
-        "pred_risk", "Predictor (cheap, risk-aware)", "#FF7F0E"),
+        "pred_risk", "Predictor (cheap, risk-aware; dataset-grid)", "#FF7F0E"),
     "_v3_classification": (
-        "pred_cheap_cls", "Predictor (cheap, cls)", "#17BECF"),
+        "pred_cheap_cls", "Predictor (cheap, cls; dataset-grid)", "#17BECF"),
     "_v4_classification": (
-        "pred_mamba_cls", "Predictor Mamba (cls)", "#E377C2"),
+        "pred_mamba_cls", "Predictor Mamba (cls; dataset-grid)", "#E377C2"),
 }
 
 
@@ -192,6 +207,45 @@ def present_pred_variants(df: pd.DataFrame) -> List[Tuple[str, str, str]]:
         if col in df.columns and df[col].notna().any():
             out.append((key, label, color))
     return out
+
+
+def primary_variant_for_run_dir(
+    run_dir: str,
+) -> Optional[Tuple[str, str, str]]:
+    """Canonical key/label/color for the predictor owned by ``run_dir``."""
+    base = os.path.basename(os.path.normpath(run_dir))
+    for suffix in sorted(PRED_VARIANTS, key=len, reverse=True):
+        if base.endswith(suffix):
+            return PRED_VARIANTS[suffix]
+    return None
+
+
+def conservative_native_gate(
+    predicted_curves: np.ndarray,
+    pred_idx: int,
+    full_idx: int,
+    *,
+    z_value: float = SAFE_GATE_Z,
+    min_advantage: float = SAFE_GATE_MIN_ADVANTAGE,
+) -> Tuple[bool, float, float, float]:
+    """Return whether shortening is supported by a paired confidence bound.
+
+    Scores are losses (curve regression) or negative probabilities
+    (classification), so ``full - candidate > 0`` favors the candidate.
+    The paired construction preserves correlation across the same instances.
+    """
+    curves = np.asarray(predicted_curves, dtype=np.float64)
+    if curves.ndim != 2 or pred_idx == full_idx:
+        return False, 0.0, float("nan"), float("-inf")
+    advantage = curves[:, full_idx] - curves[:, pred_idx]
+    advantage = advantage[np.isfinite(advantage)]
+    if advantage.size == 0:
+        return False, float("nan"), float("nan"), float("nan")
+    mean = float(advantage.mean())
+    se = (float(advantage.std(ddof=1) / math.sqrt(advantage.size))
+          if advantage.size > 1 else float("inf"))
+    lower = mean - z_value * se
+    return bool(lower > min_advantage), mean, se, lower
 
 # ==============================================================================
 #  COMPLEXITY MODEL
@@ -861,9 +915,9 @@ def _load_period_record(
 ) -> Optional[dict]:
     """Load the period_window_eval.py sidecar for this (dataset, term, model), if any.
 
-    Returns the parsed JSON (period_mase / window stats / elapsed) or None when the
-    period-window strategy was not evaluated -- in which case the period_* columns
-    stay NaN and the comparison degrades gracefully to the original 3 strategies.
+    Returns the parsed JSON plus the aligned per-series ``_windows`` vector when
+    its NPZ sidecar is available.  Keeping the vector lets complexity be averaged
+    over the actual policy actions instead of evaluated at a nonlinear mean width.
     """
     prefix = "period" if period_multiple == 2 else f"period{period_multiple}"
     path = os.path.join(
@@ -872,7 +926,21 @@ def _load_period_record(
         return None
     try:
         with open(path) as f:
-            return json.load(f)
+            record = json.load(f)
+        if record.get("period_policy_version") != PERIOD_POLICY_VERSION:
+            print(Fore.YELLOW
+                  + f"  Stale period policy sidecar {path}; rerun period stage."
+                  + Fore.RESET)
+            return None
+        npz_path = os.path.join(
+            compare_dir,
+            f"{prefix}_{dataset_display}_t{term}_{model_short}_win.npz",
+        )
+        if os.path.isfile(npz_path):
+            with np.load(npz_path) as data:
+                if "windows" in data.files:
+                    record["_windows"] = np.asarray(data["windows"], dtype=np.int64)
+        return record
     except Exception as exc:
         print(Fore.YELLOW + f"  Could not read period sidecar {path}: {exc}" + Fore.RESET)
         return None
@@ -1038,6 +1106,10 @@ def load_strategy_records(
                 cache_root, dataset_display, model_short, term, window_grid,
                 mase_metric, expected_recipe, current_window_mask)
             pred_mean: np.ndarray = data["predicted_mean"]   # z-scored curve for argmin
+            predicted_curves = np.asarray(
+                data["predicted_curves"]
+                if "predicted_curves" in data.files
+                else pred_mean[None, :])
 
             valid = ~np.isnan(real_curve)
             if valid.sum() < 1:
@@ -1166,6 +1238,61 @@ def load_strategy_records(
             complexity_ratio_pred = pred_flops / full_flops
             complexity_ratio_best = best_flops / full_flops
 
+            # --- Conservative native-context gate ------------------------------
+            # This remains a separate strategy: the original predictor action is
+            # untouched. The fallback is genuine per-instance native context,
+            # not merely the largest common grid window.
+            (safe_shortens, safe_advantage, safe_advantage_se,
+             safe_advantage_lower) = conservative_native_gate(
+                predicted_curves, pred_idx, full_idx)
+            if safe_shortens:
+                safe_w = pred_w
+                safe_mase = pred_mase
+                safe_elapsed = pred_elapsed
+                safe_elapsed_std = pred_elapsed_std
+                safe_flops = pred_flops
+                safe_policy_scope = "dataset_shared_grid"
+            else:
+                safe_w = full_w
+                safe_mase = full_mase
+                safe_elapsed = full_elapsed
+                safe_elapsed_std = full_elapsed_std
+                safe_flops = full_flops
+                safe_policy_scope = "instance_native"
+            speedup_safe = (
+                full_elapsed / safe_elapsed
+                if safe_elapsed > 0 and np.isfinite(full_elapsed)
+                else float("nan")
+            )
+            complexity_ratio_safe = (
+                safe_flops / full_flops if full_flops > 0 else float("nan"))
+
+            # --- Simple 2k eligibility strategy --------------------------------
+            # Kept separate from the confidence gate so the threshold hypothesis
+            # is directly measurable. The aggregate comparison only has one
+            # dataset-shared action, hence eligibility uses mean effective native
+            # context; the per-instance evaluator can apply the same threshold row-wise.
+            eligibility_context = (
+                full_effective_context_mean
+                if np.isfinite(full_effective_context_mean) else float(full_w))
+            ctx2k_uses_pred = bool(eligibility_context > PREDICTOR_MIN_CONTEXT)
+            if ctx2k_uses_pred:
+                ctx2k_w, ctx2k_mase = pred_w, pred_mase
+                ctx2k_elapsed, ctx2k_elapsed_std = pred_elapsed, pred_elapsed_std
+                ctx2k_flops = pred_flops
+                ctx2k_policy_scope = "dataset_shared_grid"
+            else:
+                ctx2k_w, ctx2k_mase = full_w, full_mase
+                ctx2k_elapsed, ctx2k_elapsed_std = full_elapsed, full_elapsed_std
+                ctx2k_flops = full_flops
+                ctx2k_policy_scope = "instance_native"
+            speedup_ctx2k = (
+                full_elapsed / ctx2k_elapsed
+                if ctx2k_elapsed > 0 and np.isfinite(full_elapsed)
+                else float("nan"))
+            complexity_ratio_ctx2k = (
+                ctx2k_flops / full_flops if full_flops > 0 else float("nan"))
+
             # --- GiftEval-cadence period strategies (2xP and 3xP; off-grid) ------
             # Each multiplier has its own sidecar. Missing sidecars are NaN-filled
             # so old/partial runs still compare full/best/pred normally.
@@ -1182,8 +1309,15 @@ def load_strategy_records(
                 pe = float(prec.get("period_elapsed_s", float("nan")))
                 pwm = float(prec.get("window_median", float("nan")))
                 pni = int(prec.get("n_instances", n_instances))
-                pf = theoretical_flops(
-                    model, max(1, int(round(pw))), horizon, patch_sizes)
+                per_series_windows = np.asarray(
+                    prec.get("_windows", []), dtype=np.int64)
+                pf = _mean_theoretical_flops_for_contexts(
+                    model, per_series_windows, horizon, patch_sizes)
+                if not np.isfinite(pf):
+                    # Old JSON-only sidecars remain inspectable, but are clearly
+                    # a compatibility approximation until the period stage is rerun.
+                    pf = theoretical_flops(
+                        model, max(1, int(round(pw))), horizon, patch_sizes)
                 ps = (
                     full_elapsed / pe
                     if pe > 0 and not math.isnan(pe) and not math.isnan(full_elapsed)
@@ -1232,6 +1366,7 @@ def load_strategy_records(
                 variant_cols.update({
                     f"{vkey}_window":   var_w,
                     f"{vkey}_mase":     var_mase,
+                    f"{vkey}_policy_scope": "dataset_shared_grid",
                     f"{vkey}_clamped":  var_clamped,
                     f"delta_{vkey}_vs_full": var_mase - full_mase,
                     f"delta_{vkey}_vs_best": var_mase - best_mase,
@@ -1246,6 +1381,31 @@ def load_strategy_records(
                     f"complexity_ratio_{vkey}_vs_full": var_complexity,
                 })
 
+            # A variant folder owns its primary predictor under the historical
+            # generic ``pred`` columns. Also emit the canonical alias so its own
+            # strategy appears by name in comparison/FLOP/time CSVs.
+            primary_variant = primary_variant_for_run_dir(run_dir)
+            primary_strategy_key = "pred"
+            if primary_variant is not None:
+                own_key, _own_label, _own_color = primary_variant
+                primary_strategy_key = own_key
+                variant_cols.update({
+                    f"{own_key}_window": pred_w,
+                    f"{own_key}_mase": pred_mase,
+                    f"{own_key}_policy_scope": "dataset_shared_grid",
+                    f"{own_key}_clamped": pred_clamped,
+                    f"delta_{own_key}_vs_full": pred_mase - full_mase,
+                    f"delta_{own_key}_vs_best": pred_mase - best_mase,
+                    f"delta_{own_key}_vs_pred": 0.0,
+                    f"rel_gain_{own_key}_over_full": (
+                        (full_mase - pred_mase) / (abs(full_mase) + 1e-12)),
+                    f"{own_key}_elapsed_s": pred_elapsed,
+                    f"{own_key}_elapsed_std_s": pred_elapsed_std,
+                    f"speedup_{own_key}_vs_full": speedup_pred,
+                    f"{own_key}_flops": pred_flops,
+                    f"complexity_ratio_{own_key}_vs_full": complexity_ratio_pred,
+                })
+
             records.append({
             # identity
             "model":           model,
@@ -1255,10 +1415,29 @@ def load_strategy_records(
             "term":            term,
             "horizon":         horizon,
             "n_instances":     n_instances,
+            "primary_strategy": primary_strategy_key,
             # windows chosen
             "full_window":     full_w,
             "best_window":     best_w,
             "pred_window":     pred_w,
+            "safe_window":     safe_w,
+            "ctx2k_window":    ctx2k_w,
+            "full_policy_scope": "instance_native",
+            "best_policy_scope": (
+                "dataset_shared_native" if best_is_full_native
+                else "dataset_shared_grid"),
+            "pred_policy_scope": "dataset_shared_grid",
+            "safe_policy_scope": safe_policy_scope,
+            "ctx2k_policy_scope": ctx2k_policy_scope,
+            "ctx2k_threshold": PREDICTOR_MIN_CONTEXT,
+            "ctx2k_uses_predictor": ctx2k_uses_pred,
+            "safe_gate_version": SAFE_GATE_VERSION,
+            "safe_gate_shortens": safe_shortens,
+            "safe_gate_advantage": safe_advantage,
+            "safe_gate_advantage_se": safe_advantage_se,
+            "safe_gate_advantage_lower": safe_advantage_lower,
+            "safe_gate_z": SAFE_GATE_Z,
+            "safe_gate_min_advantage": SAFE_GATE_MIN_ADVANTAGE,
             "full_baseline_source": full_baseline_source,
             "grid_cohort_mode": (
                 "cumulative_all_instances" if instance_eval is not None
@@ -1266,6 +1445,10 @@ def load_strategy_records(
             "full_effective_context_mean": full_effective_context_mean,
             "full_native_width_groups": full_native_width_groups,
             "n_windows_valid": int(valid.sum()),
+            # A selector cannot win or fail when only one action is available.
+            # Keep these cells in the official benchmark, but expose a clean
+            # selector-analysis cohort instead of silently dropping datasets.
+            "selection_eligible": bool(valid.sum() >= 2),
             "pred_clamped":    pred_clamped,   # True when pred window was unavailable
             "best_is_full_native": best_is_full_native,
             # MASE values
@@ -1274,6 +1457,8 @@ def load_strategy_records(
             "grid_best_mase":  grid_best_mase,
             "instance_oracle_mase": instance_oracle_mase,
             "pred_mase":       pred_mase,
+            "safe_mase":       safe_mase,
+            "ctx2k_mase":      ctx2k_mase,
             # Seasonal-naive baseline for this cell (denominator of the
             # leaderboard-style normalised MASE; NaN if unavailable).
             "naive_mase":      naive_mase,
@@ -1282,6 +1467,16 @@ def load_strategy_records(
             "delta_best_vs_full": best_mase - full_mase,
             "delta_instance_oracle_vs_full": instance_oracle_mase - full_mase,
             "delta_pred_vs_best": pred_mase - best_mase,
+            "delta_safe_vs_full": safe_mase - full_mase,
+            "delta_safe_vs_best": safe_mase - best_mase,
+            "delta_safe_vs_pred": safe_mase - pred_mase,
+            "rel_gain_safe_over_full": (
+                (full_mase - safe_mase) / (abs(full_mase) + 1e-12)),
+            "delta_ctx2k_vs_full": ctx2k_mase - full_mase,
+            "delta_ctx2k_vs_best": ctx2k_mase - best_mase,
+            "delta_ctx2k_vs_pred": ctx2k_mase - pred_mase,
+            "rel_gain_ctx2k_over_full": (
+                (full_mase - ctx2k_mase) / (abs(full_mase) + 1e-12)),
             "rel_gain_pred_over_full": (
                 (full_mase - pred_mase) / (abs(full_mase) + 1e-12)
             ),
@@ -1308,19 +1503,30 @@ def load_strategy_records(
             "full_elapsed_s":  full_elapsed,
             "best_elapsed_s":  best_elapsed,
             "pred_elapsed_s":  pred_elapsed,
+            "safe_elapsed_s":  safe_elapsed,
+            "ctx2k_elapsed_s": ctx2k_elapsed,
             "full_elapsed_std_s": full_elapsed_std,
             "best_elapsed_std_s": best_elapsed_std,
             "pred_elapsed_std_s": pred_elapsed_std,
+            "safe_elapsed_std_s": safe_elapsed_std,
+            "ctx2k_elapsed_std_s": ctx2k_elapsed_std,
             "speedup_pred_vs_full": speedup_pred,
+            "speedup_safe_vs_full": speedup_safe,
+            "speedup_ctx2k_vs_full": speedup_ctx2k,
             "speedup_best_vs_full": speedup_best,
             # theoretical complexity (unnormalized FLOPs proxy)
             "full_flops":      full_flops,
             "best_flops":      best_flops,
             "pred_flops":      pred_flops,
+            "safe_flops":      safe_flops,
+            "ctx2k_flops":     ctx2k_flops,
             "complexity_ratio_pred_vs_full": complexity_ratio_pred,
+            "complexity_ratio_safe_vs_full": complexity_ratio_safe,
+            "complexity_ratio_ctx2k_vs_full": complexity_ratio_ctx2k,
             "complexity_ratio_best_vs_full": complexity_ratio_best,
             # period-window strategy (per-series max(2*period, horizon); off-grid)
             "period_window":   period_w,        # mean per-series window (representative)
+            "period_policy_scope": "instance_native",
             "period_window_median": period_w_med,
             "period_n_instances":   period_n_inst,
             "period_mase":     period_mase,
@@ -1339,6 +1545,7 @@ def load_strategy_records(
             ),
             # Same detected GiftEval cadence, but retain three complete cycles.
             "period3_window": period3_w,
+            "period3_policy_scope": "instance_native",
             "period3_window_median": period3_w_med,
             "period3_n_instances": period3_n_inst,
             "period3_mase": period3_mase,
@@ -1451,6 +1658,10 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
     # subset of rows that actually have a baseline.
     has_naive = "naive_mase" in r.columns and r["naive_mase"].notna().any()
     strategies = ["full_mase", "best_mase", "pred_mase"]
+    if "safe_mase" in r.columns:
+        strategies.append("safe_mase")
+    if "ctx2k_mase" in r.columns:
+        strategies.append("ctx2k_mase")
     if "instance_oracle_mase" in r.columns:
         strategies.insert(2, "instance_oracle_mase")
     for strategy in strategies:
@@ -1485,6 +1696,8 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
         "instance_oracle_window": stats.get(
             "instance_oracle_mase", {}).get("geomean_norm"),
         "predicted_window": stats.get("pred_mase", {}).get("geomean_norm"),
+        "safe_native_gate": stats.get("safe_mase", {}).get("geomean_norm"),
+        "predictor_above_2k": stats.get("ctx2k_mase", {}).get("geomean_norm"),
         "cells": stats.get("full_mase", {}).get("n_norm", 0),
     }
 
@@ -1493,6 +1706,44 @@ def compute_summary_stats(df: pd.DataFrame) -> dict:
     stats["pred_beats_full_count"] = pred_beats_full
     stats["pred_beats_full_rate"]  = pred_beats_full / max(len(r), 1)
     stats["pred_beats_best_count"] = int((r["pred_mase"] < r["best_mase"]).sum())
+    if "safe_mase" in r.columns:
+        safe = r.dropna(subset=["safe_mase"])
+        safe_beats = int((safe["safe_mase"] < safe["full_mase"]).sum())
+        stats["safe_beats_full_count"] = safe_beats
+        stats["safe_beats_full_rate"] = safe_beats / max(len(safe), 1)
+        stats["safe_uses_short_count"] = int(
+            safe.get("safe_gate_shortens", pd.Series(False, index=safe.index)).sum())
+        stats["regret_safe_vs_best"] = {
+            "mean": float((safe["safe_mase"] - safe["best_mase"]).mean()),
+            "median": float(np.median(safe["safe_mase"] - safe["best_mase"])),
+        }
+        safe_gain = safe["rel_gain_safe_over_full"].values
+        stats["rel_gain_safe_over_full"] = {
+            "mean": float(safe_gain.mean()),
+            "median": float(np.median(safe_gain)),
+            "pct_positive": float((safe_gain > 0).mean()),
+        }
+        safe_complexity = safe["complexity_ratio_safe_vs_full"].dropna().values
+        if safe_complexity.size:
+            stats["complexity_ratio_safe_vs_full"] = {
+                "mean": float(safe_complexity.mean()),
+                "median": float(np.median(safe_complexity)),
+            }
+        safe_speed = safe["speedup_safe_vs_full"].dropna().values
+        if safe_speed.size:
+            stats["speedup_safe_vs_full"] = {
+                "mean": float(safe_speed.mean()),
+                "median": float(np.median(safe_speed)),
+                "pct_faster": float((safe_speed > 1).mean()),
+            }
+    if "ctx2k_mase" in r.columns:
+        ctx2k = r.dropna(subset=["ctx2k_mase"])
+        stats["ctx2k_uses_predictor_count"] = int(
+            ctx2k.get("ctx2k_uses_predictor", pd.Series(False, index=ctx2k.index)).sum())
+        stats["ctx2k_beats_full_count"] = int(
+            (ctx2k["ctx2k_mase"] < ctx2k["full_mase"]).sum())
+        stats["ctx2k_beats_full_rate"] = (
+            stats["ctx2k_beats_full_count"] / max(len(ctx2k), 1))
     if "instance_oracle_mase" in r.columns:
         ri = r.dropna(subset=["instance_oracle_mase"])
         stats["instance_oracle_exact_cells"] = int(
@@ -1681,12 +1932,21 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
     elsewhere.  ``theoretical_flops`` is unnormalized (comparable only as a ratio
     within a model+horizon), so ``pct_flops_saved`` is the portable FLOPs number.
     """
-    strat_specs = [("pred", "pred_flops", "pred_mase"),
+    primary_name = "pred"
+    if "primary_strategy" in df.columns:
+        primary_values = df["primary_strategy"].dropna().astype(str).unique()
+        if len(primary_values) == 1:
+            primary_name = primary_values[0]
+    strat_specs = [(primary_name, "pred_flops", "pred_mase"),
+                   ("safe", "safe_flops", "safe_mase"),
+                   ("ctx2k", "ctx2k_flops", "ctx2k_mase"),
                    ("best", "best_flops", "best_mase")]
     if "period_flops" in df.columns:
         strat_specs.append(("period", "period_flops", "period_mase"))
+    if "period3_flops" in df.columns:
+        strat_specs.append(("period3", "period3_flops", "period3_mase"))
     for vkey, _vlbl, _vclr in present_pred_variants(df):
-        if f"{vkey}_flops" in df.columns:
+        if vkey != primary_name and f"{vkey}_flops" in df.columns:
             strat_specs.append((vkey, f"{vkey}_flops", f"{vkey}_mase"))
 
     rows = []
@@ -1895,12 +2155,21 @@ def compute_time_savings(df: pd.DataFrame) -> pd.DataFrame:
     (dataset, term) rows as ``compute_flops_savings`` uses, so ``rel_mase_drop_pct``
     is identical to the FLOPs figure's y-axis (only the cost axis differs).
     """
-    strat_specs = [("pred", "pred_elapsed_s", "pred_mase"),
+    primary_name = "pred"
+    if "primary_strategy" in df.columns:
+        primary_values = df["primary_strategy"].dropna().astype(str).unique()
+        if len(primary_values) == 1:
+            primary_name = primary_values[0]
+    strat_specs = [(primary_name, "pred_elapsed_s", "pred_mase"),
+                   ("safe", "safe_elapsed_s", "safe_mase"),
+                   ("ctx2k", "ctx2k_elapsed_s", "ctx2k_mase"),
                    ("best", "best_elapsed_s", "best_mase")]
     if "period_elapsed_s" in df.columns:
         strat_specs.append(("period", "period_elapsed_s", "period_mase"))
+    if "period3_elapsed_s" in df.columns:
+        strat_specs.append(("period3", "period3_elapsed_s", "period3_mase"))
     for vkey, _vlbl, _vclr in present_pred_variants(df):
-        if f"{vkey}_elapsed_s" in df.columns:
+        if vkey != primary_name and f"{vkey}_elapsed_s" in df.columns:
             strat_specs.append((vkey, f"{vkey}_elapsed_s", f"{vkey}_mase"))
 
     rows = []
@@ -3195,12 +3464,18 @@ def plot_complexity_vs_mase_gain(df: pd.DataFrame, out_dir: str) -> str:
 
 # Strategy display names + palette, shared with the other complexity plots.
 _STRATEGY_STYLE = {
-    "pred":       ("Predictor",         "#70AD47"),
+    "pred":       ("Predictor (dataset-grid)", "#70AD47"),
+    "safe":       ("Predictor + native safety gate", "#2E7D32"),
+    "ctx2k":      ("Predictor only above 2k", "#00897B"),
     # predictor variants (auto-discovered sibling trees); see PRED_VARIANTS
-    "pred_cheap": ("Predictor (cheap)", "#1F77B4"),
-    "pred_mamba": ("Predictor Mamba",   "#9C27B0"),
+    "pred_cheap": ("Predictor (cheap; dataset-grid)", "#1F77B4"),
+    "pred_mamba": ("Predictor Mamba (dataset-grid)",  "#9C27B0"),
+    "pred_risk":  ("Predictor (risk; dataset-grid)",   "#FF7F0E"),
+    "pred_cheap_cls": ("Predictor (cheap cls; dataset-grid)", "#17BECF"),
+    "pred_mamba_cls": ("Predictor (Mamba cls; dataset-grid)", "#E377C2"),
     "best":       ("Oracle best",       "#ED7D31"),
     "period":     ("Period (2×P)",      "#6A1B9A"),
+    "period3":    ("Period (3×P)",      "#8E5BB7"),
 }
 _MODEL_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "p"]
 
@@ -3854,7 +4129,9 @@ def main() -> None:
         mase_keys = [("full_mase", "Full window  "),
                      ("best_mase", "Dataset oracle"),
                      ("instance_oracle_mase", "Instance oracle"),
-                     ("pred_mase", "Predictor    ")]
+                     ("pred_mase", "Predictor    "),
+                     ("safe_mase", "Safe native  "),
+                     ("ctx2k_mase", "Predict >2k  ")]
         if "period_mase" in stats:
             mase_keys.append(("period_mase", "Period (2xP) "))
         if "period3_mase" in stats:
@@ -3881,6 +4158,11 @@ def main() -> None:
                   f"mean window={stats.get('mean_period3_window', float('nan')):.0f}")
         print(f"  Pred beats full: {stats['pred_beats_full_count']}/{stats['total_rows']} "
               f"({100*stats['pred_beats_full_rate']:.1f}%)")
+        if "safe_beats_full_count" in stats:
+            print(f"  Safe gate shortens: {stats['safe_uses_short_count']}/"
+                  f"{stats['total_rows']}  | beats full: "
+                  f"{stats['safe_beats_full_count']}/{stats['total_rows']} "
+                  f"({100*stats['safe_beats_full_rate']:.1f}%)")
         for vkey, vlbl, _vclr in present_pred_variants(df_subset):
             if f"{vkey}_beats_full_count" in stats:
                 print(f"  {vlbl} beats full: {stats[f'{vkey}_beats_full_count']}/{stats['total_rows']} "

@@ -24,8 +24,13 @@ from experiments import run_all_v3 as run_all_v3_orchestrator
 from experiments.compare_window_strategies_gifteval import (
     _geomean,
     _instance_oracle_from_cache,
+    _load_period_record,
+    _mean_theoretical_flops_for_contexts,
+    conservative_native_gate,
+    compute_flops_savings,
     compute_summary_stats,
     load_strategy_records,
+    theoretical_flops,
 )
 from experiments.gifteval_mase import gluonts_leaderboard_mase
 from experiments.test_window_ablation_gifteval_v5 import (
@@ -33,6 +38,27 @@ from experiments.test_window_ablation_gifteval_v5 import (
 
 
 class MasterRecomputeConfigTest(unittest.TestCase):
+    def test_long_period_mixture_covers_near_context_cycles(self) -> None:
+        draws = build._sample_periods(np.random.RandomState(7), size=20_000)
+        long_rate = float((draws > build.PERIOD_CORE_MAX).mean())
+        self.assertAlmostEqual(long_rate, build.LONG_PERIOD_PROB, delta=0.02)
+        self.assertGreater(draws.max(), 8_640)
+        self.assertGreater(float((draws < 512).mean()), 0.4)
+        self.assertEqual(
+            build.synthetic_pool_signature()["period_max"], build.MAX_WINDOW)
+
+    def test_master_force_stage1_regenerates_versioned_pool(self) -> None:
+        args = SimpleNamespace(
+            stage1_batch_size=None,
+            stage1_shard_size=None,
+            stage1_windows=None,
+            stage1_n_series=None,
+        )
+        build_args = master._stage1_build_args(args)
+        if master._stage_forced(["1"], "1"):
+            build_args.append("--regenerate-pool")
+        self.assertIn("--regenerate-pool", build_args)
+
     def test_all_chronos2_variants_share_independent_recipe(self) -> None:
         chronos2 = {
             spec.display: spec.family
@@ -141,12 +167,45 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertIn("unconstrained Mamba", reason)
 
     def test_model_aware_window_grids(self) -> None:
+        self.assertEqual(
+            build.WINDOW_GRID[:len(build.BASE_WINDOW_GRID)],
+            build.BASE_WINDOW_GRID,
+        )
         self.assertEqual(build.window_grid_for_family("timesfm")[-2:],
                          [12288, 15360])
         self.assertEqual(build.window_grid_for_family("chronos2")[-1], 8192)
         self.assertEqual(build.window_grid_for_family("chronos_bolt")[-1], 2048)
-        self.assertEqual(build.window_grid_for_family("sundial")[-1], 2560)
+        self.assertEqual(build.window_grid_for_family("sundial")[-1], 2880)
+        self.assertNotIn(2880, build.window_grid_for_family("chronos2"))
         self.assertEqual(build.window_grid_for_family("tirex")[-1], 8192)
+
+    def test_off_grid_cap_union_reuses_unaffected_old_shards(self) -> None:
+        family = "chronos2"
+        grid = build.window_grid_for_family(family)
+        indices = [build.WINDOW_GRID.index(window) for window in grid]
+        with tempfile.TemporaryDirectory() as model_dir:
+            shard_dir = os.path.join(model_dir, "shards", "shard_000")
+            os.makedirs(shard_dir)
+            shape = (2, len(build.BASE_WINDOW_GRID), len(build.HORIZON_GRID))
+            np.save(os.path.join(shard_dir, "curves_mae.npy"), np.ones(shape))
+            np.save(os.path.join(shard_dir, "curves_mse.npy"), np.ones(shape) * 2)
+            with open(os.path.join(shard_dir, "done.json"), "w") as handle:
+                json.dump({
+                    "start": 0,
+                    "end": 2,
+                    "window_indices": indices,
+                    "horizon_grid": build.HORIZON_GRID,
+                    "inference_recipe": build.inference_recipe(family),
+                    "synthetic_pool_signature": build.synthetic_pool_signature(),
+                }, handle)
+
+            mae, mse, n_done = build.merge_shards(
+                model_dir, 2, indices, family)
+
+        self.assertEqual(n_done, 1)
+        self.assertEqual(mae.shape, (2, len(grid), len(build.HORIZON_GRID)))
+        np.testing.assert_allclose(mae, 1.0)
+        np.testing.assert_allclose(mse, 2.0)
 
     def test_tirex2_uses_dedicated_env(self) -> None:
         self.assertEqual(master.FAMILY_ENV["tirex"], "predictcsl-tirex")
@@ -662,6 +721,7 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
 
         self.assertAlmostEqual(record["mase_gluonts"], 2.5)
         self.assertTrue(record["mase_metric_exact"])
+        self.assertEqual(record["policy_scope"], "instance_native")
 
     def test_fixed_window_is_capped_per_instance(self) -> None:
         windows = np.array([32, 64, 128])
@@ -924,6 +984,94 @@ class AblationDynamicBatchTest(unittest.TestCase):
         self.assertEqual(calls, [8, 4])
         self.assertEqual(size, 4)
 
+class PeriodStrategyAccountingTest(unittest.TestCase):
+    def test_period_sidecar_exposes_per_series_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as compare_dir:
+            stem = "period_Example_tshort_ExampleModel"
+            with open(os.path.join(compare_dir, stem + ".json"), "w") as handle:
+                json.dump({
+                    "window_mean": 80.0,
+                    "period_policy_version": 2,
+                }, handle)
+            np.savez_compressed(
+                os.path.join(compare_dir, stem + "_win.npz"),
+                windows=np.array([32, -1, 128], dtype=np.int64),
+            )
+
+            record = _load_period_record(
+                compare_dir, "Example", "short", "ExampleModel", 2)
+
+        np.testing.assert_array_equal(record["_windows"], [32, -1, 128])
+
+    def test_period_flops_average_actions_not_mean_window(self) -> None:
+        model = "autogluon/chronos-2-small"
+        contexts = np.array([32, 8192], dtype=np.int64)
+        actual = _mean_theoretical_flops_for_contexts(
+            model, contexts, horizon=64, patch_sizes={})
+        expected = np.mean([
+            theoretical_flops(model, int(w), 64, {}) for w in contexts
+        ])
+        at_mean_window = theoretical_flops(
+            model, int(contexts.mean()), 64, {})
+
+        self.assertAlmostEqual(actual, expected)
+        self.assertNotAlmostEqual(actual, at_mean_window)
+
+    def test_period_uses_full_native_model_caps(self) -> None:
+        from experiments.period_window_eval import _family_cap
+
+        self.assertEqual(_family_cap("sundial", 128), 2880)
+        self.assertEqual(_family_cap("toto", 128), 4096)
+        self.assertLess(_family_cap("moirai", 1024), 8192)
+
+
+class ConservativeStrategyTest(unittest.TestCase):
+    def test_native_gate_requires_confident_practical_advantage(self) -> None:
+        # Candidate index 0 is consistently one score unit better than full.
+        curves = np.array([
+            [0.0, 1.0],
+            [0.1, 1.1],
+            [-0.1, 0.9],
+        ])
+        shorten, mean, _se, lower = conservative_native_gate(
+            curves, pred_idx=0, full_idx=1)
+        self.assertTrue(shorten)
+        self.assertAlmostEqual(mean, 1.0)
+        self.assertGreater(lower, 0.1)
+
+        uncertain = np.array([
+            [0.0, 1.0],
+            [2.0, 1.0],
+        ])
+        self.assertFalse(conservative_native_gate(
+            uncertain, pred_idx=0, full_idx=1)[0])
+
+    def test_flops_csv_names_own_primary_strategy_and_safe_row(self) -> None:
+        frame = pd.DataFrame({
+            "primary_strategy": ["pred_mamba_cls"],
+            "n_instances": [2],
+            "full_flops": [100.0],
+            "pred_flops": [40.0],
+            "safe_flops": [100.0],
+            "ctx2k_flops": [100.0],
+            "best_flops": [30.0],
+            "full_mase": [1.0],
+            "pred_mase": [0.9],
+            "safe_mase": [1.0],
+            "ctx2k_mase": [1.0],
+            "best_mase": [0.8],
+            # Own canonical columns also exist in comparison.csv; savings must
+            # not duplicate the primary row.
+            "pred_mamba_cls_flops": [40.0],
+            "pred_mamba_cls_mase": [0.9],
+        })
+        rows = compute_flops_savings(frame)
+        self.assertEqual(
+            rows["strategy"].tolist(),
+            ["pred_mamba_cls", "safe", "ctx2k", "best"],
+        )
+
+
 class SoftClassificationLossTest(unittest.TestCase):
     def test_top3_rank_weights_and_invalid_class_mask(self) -> None:
         old_objective = predictor.TRAINING_OBJECTIVE
@@ -950,6 +1098,72 @@ class SoftClassificationLossTest(unittest.TestCase):
 
 
 class RiskAwareLossTest(unittest.TestCase):
+    def test_risk_trial_cache_tracks_loss_and_selection_signature(self) -> None:
+        trial = predictor.TrialConfig(
+            patch_length=64,
+            d_model=128,
+            num_hidden_layers=2,
+            dropout=0.1,
+            mask_ratio=0.3,
+            learning_rate=1e-4,
+            weight_decay=1e-4,
+            num_attention_heads=4,
+        )
+        cached = {
+            "label_inference_recipe": "recipe",
+            "cfg": predictor.asdict(trial),
+            "val_curve_mse": 1.0,
+            "val_risk_score": 1.0,
+            "risk_selection_signature": {"version": 0},
+        }
+        old_objective = predictor.TRAINING_OBJECTIVE
+        predictor.TRAINING_OBJECTIVE = "risk"
+        try:
+            self.assertFalse(predictor._cached_trial_is_compatible(
+                cached, trial, "recipe"))
+            cached["risk_selection_signature"] = (
+                predictor.risk_selection_signature())
+            self.assertTrue(predictor._cached_trial_is_compatible(
+                cached, trial, "recipe"))
+        finally:
+            predictor.TRAINING_OBJECTIVE = old_objective
+
+    def test_risk_validation_selection_penalizes_tail_harm(self) -> None:
+        class UnsafeModel(torch.nn.Module):
+            mask_ratio = 0.0
+            num_patches = 1
+
+            def forward(self, x, horizon_idx, mask=None, valid_length=None):
+                batch = x.shape[0]
+                scores = torch.tensor([[-1.0, 0.0]], device=x.device).repeat(
+                    batch, 1)
+                patches = torch.zeros(batch, 1, 1, device=x.device)
+                used_mask = torch.zeros(
+                    batch, 1, dtype=torch.bool, device=x.device)
+                return scores, patches, patches, used_mask
+
+        old_objective = predictor.TRAINING_OBJECTIVE
+        predictor.TRAINING_OBJECTIVE = "risk"
+        try:
+            metrics = predictor._evaluate(
+                UnsafeModel(),
+                x_val=torch.zeros(1, 1, 1),
+                y_val_norm=torch.zeros(1, 2, 1),
+                y_val_raw=torch.tensor([[[2.0], [1.0]]]),
+                length_val=torch.ones(1, dtype=torch.long),
+                batch_size=1,
+                eval_seed=1,
+            )
+
+            self.assertAlmostEqual(metrics["val_regret"], 1.0)
+            self.assertAlmostEqual(metrics["val_harm_p90"], 1.0)
+            self.assertAlmostEqual(metrics["val_harmed_rate"], 1.0)
+            self.assertGreater(metrics["val_risk_score"], metrics["val_regret"])
+            self.assertEqual(
+                predictor._active_selection_metric_key(), "val_risk_score")
+        finally:
+            predictor.TRAINING_OBJECTIVE = old_objective
+
     def test_full_optimal_curve_penalizes_harmful_shortening(self) -> None:
         raw = torch.tensor([[2.0, 1.5, 1.0]])
         calibrated = torch.log(raw / raw[:, -1:]).requires_grad_()

@@ -67,7 +67,12 @@ def run(args: argparse.Namespace) -> None:
             full = np.asarray(data["full_native__mase"], dtype=float)
             full_w = np.asarray(data["full_native__window"], dtype=int)
             oracle = np.asarray(data["oracle_instance__mase"], dtype=float)
-            counts = np.asarray(data["native_valid_count"], dtype=float)
+            count_key = f"{cell.method}__valid_count"
+            counts = np.asarray(
+                data[count_key] if count_key in data.files
+                else data["native_valid_count"],
+                dtype=float,
+            )
             context = np.asarray(data["native_effective_context"], dtype=int)
             grid = np.asarray(data["window_grid"], dtype=int)
             grid_error = np.asarray(data["grid_mase"], dtype=float)
@@ -88,12 +93,18 @@ def run(args: argparse.Namespace) -> None:
         margin = np.full(selected.shape, np.nan)
         full_score_gap = np.full(selected.shape, np.nan)
         if scores is not None and scores.shape == grid_error.shape:
-            feasible = np.isfinite(grid_error) & np.isfinite(scores)
-            candidate = np.where(feasible, scores, np.inf)
+            # Match the deployed instance-native policy exactly: native/full is
+            # an explicit action carrying the final synthetic score, including
+            # rows where that numeric grid window was not directly evaluated.
+            native_score = np.nextafter(scores[:, -1], -np.inf)
+            candidate_scores = np.column_stack([scores, native_score])
+            candidate_errors = np.column_stack([grid_error, full])
+            feasible = np.isfinite(candidate_errors) & np.isfinite(candidate_scores)
+            candidate = np.where(feasible, candidate_scores, np.inf)
             ordered = np.sort(candidate, axis=1)
             enough = np.isfinite(ordered[:, 1])
             margin[enough] = ordered[enough, 1] - ordered[enough, 0]
-            full_score_gap = scores[:, -1] - np.nanmin(candidate, axis=1)
+            full_score_gap = native_score - np.min(candidate, axis=1)
 
         summaries.append({
             "model": cell.model,

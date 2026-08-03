@@ -14,6 +14,8 @@ samples at the dataset's sampling rate.  The context is split into consecutive
 non-overlapping chunks of that size and the candidate with the greatest mean
 correlation between adjacent, per-chunk-normalised windows wins.  We report both
 two-cycle and three-cycle contexts, never shorter than the forecast horizon.
+Every requested width is capped by that model/horizon's true full-native limit,
+not by the largest numeric ablation-grid point.
 
 Because each instance gets its OWN window, ``L_i`` is generally NOT one of the
 ablation-grid windows -- so we cannot just read a cached cell.  We evaluate the
@@ -49,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import glob
 import json
 import os
 import time
@@ -85,9 +88,91 @@ from experiments.test_window_ablation_gifteval_v5 import (
     load_toto,
     load_flowstate,
     load_tirex,
-    SUNDIAL_MAX_CONTEXT,
-    TIMEMOE_MAX_TOTAL,
+    _full_native_context_cap,
 )
+
+
+PERIOD_POLICY_VERSION = 2  # v2 uses full-native caps, never a grid ceiling
+PERIOD_DETECTION_CACHE_VERSION = 1
+
+
+def _detection_cache_path(run_dir: str, dataset_display: str, term: str) -> str:
+    """Model-independent cadence cache shared by 2xP, 3xP, and all models."""
+    return os.path.join(
+        run_dir, "period_detection_cache",
+        f"periods_{dataset_display}_t{term}.npz")
+
+
+def _load_aligned_detection(path: str, cache: GiftEvalCache):
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            periods = np.asarray(data["periods"], dtype=np.float64)
+            labels = np.asarray(data["period_labels"]).astype(str)
+            similarities = np.asarray(data["period_similarity"], dtype=np.float64)
+            lengths = np.asarray(data["context_lengths"], dtype=np.int64)
+            version = int(data["cache_version"])
+            freq = str(data["sampling_frequency"])
+        if (version != PERIOD_DETECTION_CACHE_VERSION
+                or freq != str(cache.freq)
+                or periods.shape != (cache.n_total,)
+                or labels.shape != (cache.n_total,)
+                or similarities.shape != (cache.n_total,)
+                or not np.array_equal(lengths, cache.context_lengths.astype(np.int64))):
+            return None
+        return periods, labels.tolist(), similarities
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _get_period_detections(cache: GiftEvalCache, run_dir: str, term: str):
+    """Load aligned detections, seed from old sidecars, or compute exactly once."""
+    cache_path = _detection_cache_path(run_dir, cache.dataset_display, term)
+    loaded = _load_aligned_detection(cache_path, cache)
+    if loaded is not None:
+        print(Fore.WHITE + f"    cadence cache: {cache_path}" + Fore.RESET)
+        return loaded
+
+    # Completed 2xP/3xP sidecars already contain the same model-independent
+    # detection.  Promote one rather than repeating work after an upgrade.
+    pattern = os.path.join(
+        run_dir, "models", "*", "compare_real_vs_predicted",
+        f"period*_{cache.dataset_display}_t{term}_*_win.npz")
+    for old_path in glob.glob(pattern):
+        try:
+            with np.load(old_path, allow_pickle=False) as data:
+                periods = np.asarray(data["periods"], dtype=np.float64)
+                labels = np.asarray(data["period_labels"]).astype(str)
+                similarities = np.asarray(data["period_similarity"], dtype=np.float64)
+            if all(a.shape == (cache.n_total,) for a in
+                   (periods, labels, similarities)):
+                loaded = (periods, labels.tolist(), similarities)
+                print(Fore.WHITE + f"    cadence reuse: {old_path}" + Fore.RESET)
+                break
+        except (OSError, ValueError, KeyError):
+            continue
+    else:
+        periods = np.empty(cache.n_total, dtype=np.float64)
+        labels = []
+        similarities = np.full(cache.n_total, np.nan, dtype=np.float64)
+        for i, context in enumerate(cache.contexts_raw):
+            p, method, scores = detect_period(
+                context, sampling_freq=cache.freq,
+                season_fallback=cache.season)
+            periods[i] = p
+            labels.append(method)
+            if method in scores and np.isfinite(scores[method]):
+                similarities[i] = scores[method]
+        loaded = (periods, labels, similarities)
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        cache_version=np.asarray(PERIOD_DETECTION_CACHE_VERSION),
+        sampling_frequency=np.asarray(str(cache.freq)),
+        context_lengths=cache.context_lengths.astype(np.int64),
+        periods=loaded[0], period_labels=np.asarray(loaded[1]),
+        period_similarity=loaded[2])
+    return loaded
 
 
 # ==============================================================================
@@ -125,11 +210,10 @@ def quantize_windows(L: np.ndarray, mode: str, n_buckets: int) -> np.ndarray:
 
 def _family_cap(model_family: str, horizon: int) -> int:
     """Largest context this family can serve for the given horizon (inclusive)."""
-    if model_family == "sundial":
-        return SUNDIAL_MAX_CONTEXT
-    if model_family == "timemoe":
-        return max(0, TIMEMOE_MAX_TOTAL - horizon)
-    return 1 << 30  # effectively unbounded; real_len is the real limit
+    # Keep the period policy on exactly the same native serving limits as the
+    # full-native baseline, including horizon-dependent Moirai/TimeMoE caps and
+    # the registered Toto/FlowState/TiRex limits.
+    return _full_native_context_cap(model_family, horizon, 1 << 30)
 
 
 # ==============================================================================
@@ -156,13 +240,11 @@ def _sidecar_paths(
 def _full_window_cap(
     run_dir: str, dataset_display: str, term: str, model_short: str
 ) -> Optional[int]:
-    """Largest VALID ablation-grid window for this (model, dataset, term).
+    """Largest valid grid window, used only to verify comparison-cell presence.
 
-    This is the same quantity ``compare_window_strategies_gifteval.py`` treats as
-    the ``full`` strategy (largest grid window with a non-NaN real MASE), read
-    from v5's ``compare_<dataset>_t<term>_<model>.npz``.  The period strategy is
-    capped at this so the model is never given more context than the full window
-    — keeping the methods comparable and the period/full FLOPs ratio <= 1.
+    The authoritative baseline is now ``full_native``.  This legacy grid ceiling
+    remains useful as a cheap existence/scope check, but must not cap a series:
+    doing so can truncate below the native baseline when a model cap is off-grid.
 
     Returns None when the v5 npz is absent/unreadable (no cap can be derived).
     """
@@ -193,6 +275,7 @@ def evaluate_one(
     args,
     device: str,
     full_window: Optional[int] = None,
+    period_detections=None,
 ) -> Tuple[dict, np.ndarray, np.ndarray, dict]:
     """Run the period-window strategy for one (model, dataset, term).
 
@@ -201,39 +284,35 @@ def evaluate_one(
     (e.g. TimeMoE when horizon alone exhausts its budget) are dropped from the
     aggregate.
 
-    ``full_window`` (when given) is the largest valid ablation-grid window; the
-    per-series period window is never allowed to exceed it, because the model is
-    never fed more context than the full-window strategy uses.
+    ``full_window`` is retained as comparison metadata for compatibility.  The
+    serving ceiling is the model's true native cap, not the largest numeric grid
+    point, so off-grid native capacity remains available to the period policy.
     """
     horizon = cache.horizon
     n_total = cache.n_total
     cap = _family_cap(model_family, horizon)
 
-    periods = np.empty(n_total, dtype=np.float64)
-    methods: List[str] = []
-    similarities = np.full(n_total, np.nan, dtype=np.float64)
+    if period_detections is None:
+        periods = np.empty(n_total, dtype=np.float64)
+        methods: List[str] = []
+        similarities = np.full(n_total, np.nan, dtype=np.float64)
+        for i in range(n_total):
+            p, method, scores = detect_period(
+                cache.contexts_raw[i], sampling_freq=cache.freq,
+                season_fallback=cache.season)
+            periods[i] = p
+            methods.append(method)
+            if method in scores and np.isfinite(scores[method]):
+                similarities[i] = scores[method]
+    else:
+        periods, methods, similarities = period_detections
     raw_L = np.empty(n_total, dtype=np.int64)
     for i in range(n_total):
-        p, method, scores = detect_period(
-            cache.contexts_raw[i],
-            sampling_freq=cache.freq,
-            season_fallback=cache.season,
-        )
-        periods[i] = p
-        methods.append(method)
-        if method in scores and np.isfinite(scores[method]):
-            similarities[i] = scores[method]
-        raw_L[i] = max(int(round(args.period_multiple * p)), horizon)
+        raw_L[i] = max(int(round(args.period_multiple * periods[i])), horizon)
 
     # Clamp to each instance's genuine context and the family's serving cap.
     eff_L = np.minimum(raw_L, cache.context_lengths.astype(np.int64))
     eff_L = np.minimum(eff_L, cap)
-    # Never exceed the full-window grid ceiling: the model cannot ingest more
-    # than the full strategy does, so capping here keeps period comparable and
-    # bounds its FLOPs ratio vs full at <= 1.
-    if full_window is not None and full_window > 0:
-        eff_L = np.minimum(eff_L, np.int64(full_window))
-
     valid = eff_L >= 1
     valid_idx = np.flatnonzero(valid)
     if valid_idx.size == 0:
@@ -301,6 +380,7 @@ def evaluate_one(
         method_counts[m] = method_counts.get(m, 0) + 1
 
     summary = {
+        "period_policy_version": PERIOD_POLICY_VERSION,
         "dataset_display": cache.dataset_display,
         "term": None,                      # filled by caller (term not on cache)
         "model_short": model_short,
@@ -312,7 +392,9 @@ def evaluate_one(
         "period_candidates": list(GIFT_EVAL_PERIOD_LABELS),
         "n_total": int(n_total),
         "n_instances": int(valid_idx.size),
-        "full_window_cap": (int(full_window) if full_window else None),
+        "full_window_cap": int(cap),  # compatibility: now the true native cap
+        "comparison_grid_ceiling": (int(full_window) if full_window else None),
+        "native_context_cap": int(cap),
         "period_mae": float(metrics.get("mae", float("nan"))),
         "period_mase": float(metrics.get("mase", float("nan"))),
         "period_elapsed_s": float(elapsed),
@@ -398,11 +480,15 @@ def run(args, device: str) -> None:
                 per_instance_cached = False
                 if os.path.isfile(json_path) and os.path.isfile(npz_path):
                     try:
+                        with open(json_path) as handle:
+                            cached_meta = json.load(handle)
                         with np.load(npz_path) as cached:
                             per_instance_cached = {
                                 "windows", "periods", "period_labels",
                                 "period_similarity", "mase_gluonts", "served_index",
-                            }.issubset(cached.files)
+                            }.issubset(cached.files) and (
+                                cached_meta.get("period_policy_version")
+                                == PERIOD_POLICY_VERSION)
                     except (OSError, ValueError):
                         per_instance_cached = False
                 if per_instance_cached and not args.force:
@@ -428,10 +514,11 @@ def run(args, device: str) -> None:
                 ge_cache[ds_key] = GiftEvalCache(ge_dataset, dataset_display)
             cache = ge_cache[ds_key]
 
-            # Full-window ceiling (largest valid grid window) from v5's npz, so
-            # period never feeds the model more context than the full strategy.
-            full_w = _full_window_cap(args.run_dir, dataset_display, term, model_short)
-            if full_w is None:
+            # The grid ceiling is only a comparison-cell presence check/metadata
+            # field. evaluate_one applies the authoritative native model cap.
+            comparison_ceiling = _full_window_cap(
+                args.run_dir, dataset_display, term, model_short)
+            if comparison_ceiling is None:
                 if args.require_comparison:
                     print(Fore.WHITE
                           + f"  SKIP  {model_short} | {dataset_display} | t={term}: "
@@ -439,19 +526,24 @@ def run(args, device: str) -> None:
                     continue
                 print(Fore.YELLOW
                       + f"    WARN: no v5 npz for {dataset_display} t={term}; "
-                        "period window left uncapped by full window."
+                        "running with the native model cap only."
                       + Fore.RESET)
+
+            period_detections = _get_period_detections(cache, args.run_dir, term)
 
             for multiple, json_path, npz_path in pending:
                 args.period_multiple = multiple
                 tag = (f"{model_short} | {dataset_display} | t={term} | "
                        f"h={cache.horizon} | {multiple}xP")
                 print(Fore.YELLOW + f"\n  > {tag}  (n={cache.n_total}"
-                      + (f", full_cap={full_w}" if full_w else "") + ")" + Fore.RESET)
+                      + (f", grid_ceiling={comparison_ceiling}"
+                         if comparison_ceiling else "") + ")" + Fore.RESET)
                 try:
                     summary, windows, periods, per_sample = evaluate_one(
                         cache, model_id, model_family, model_short,
-                        ensure_handle, args, device, full_window=full_w)
+                        ensure_handle, args, device,
+                        full_window=comparison_ceiling,
+                        period_detections=period_detections)
                 except RuntimeError as exc:
                     print(Fore.RED + f"    SKIP: {exc}" + Fore.RESET)
                     continue

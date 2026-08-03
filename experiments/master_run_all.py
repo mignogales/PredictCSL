@@ -614,6 +614,8 @@ def main() -> None:
     if args.verbose_ablation:
         vflag.append("--verbose-ablation")
     stage1_build_args = _stage1_build_args(args)
+    if _stage_forced(args.force, "1"):
+        stage1_build_args.append("--regenerate-pool")
     # --force forwarding: None -> no flag; [] -> bare --force (all active stages);
     # [...] -> --force <stages>. Passed to every subprocess verbatim; run_all only
     # acts on it for stages that are active (not in that variant's --skip-stages),

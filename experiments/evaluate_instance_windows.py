@@ -226,16 +226,30 @@ def _record(
 ) -> dict:
     ok = np.isfinite(error) & np.isfinite(valid_count) & (valid_count > 0)
     w = window[(window >= 0) & ok]
+    if method == "full_native" or method.startswith("period"):
+        policy_scope = "instance_native"
+    elif method_kind == "predictor_instance":
+        policy_scope = "instance_native"
+    elif method_kind == "predictor_instance_control":
+        policy_scope = "instance_grid"
+    elif method_kind in {"predictor_dataset", "oracle_control", "fixed"}:
+        policy_scope = "dataset_shared_grid_capped_per_instance"
+    elif method_kind == "oracle":
+        policy_scope = "instance_native"
+    else:
+        policy_scope = "heuristic_capped_per_instance"
     return {
         "model": cell.model,
         "dataset_display": cell.dataset,
         "term": cell.term,
         "method": method,
         "method_kind": method_kind,
+        "policy_scope": policy_scope,
         "mase_gluonts": (float(np.average(error[ok], weights=valid_count[ok]))
                           if ok.any() else float("nan")),
         "mase_metric_source": metric_source,
-        "mase_metric_exact": metric_source != "mase_gluonts_proxy",
+        "mase_metric_exact": metric_source not in {
+            "mase_gluonts_proxy", "missing"},
         "n_instances": int(ok.sum()),
         "n_native_fallback": int(np.sum(fallback & ok)),
         "n_native_selected": int(np.sum(fallback & ok)),
@@ -315,25 +329,42 @@ def evaluate_cell(
         "native_effective_context": native_w,
     }
 
+    def counts_for_choice(
+        chosen_w: np.ndarray, native_selected: np.ndarray,
+    ) -> np.ndarray:
+        counts = native_counts.copy()
+        for j, window in enumerate(windows):
+            use = (~native_selected) & (chosen_w == int(window))
+            counts[use] = error_counts[use, j]
+        return counts
+
     def add(method: str, values: np.ndarray, chosen_w: np.ndarray,
-            fallback: np.ndarray, kind: str) -> None:
+            fallback: np.ndarray, kind: str,
+            selected_counts: Optional[np.ndarray] = None,
+            selected_source: Optional[str] = None) -> None:
+        counts_used = (native_counts if selected_counts is None
+                       else selected_counts)
         records.append(_record(
             cell, method, values, chosen_w, fallback, kind,
-            native_counts, metric_source))
+            counts_used,
+            metric_source if selected_source is None else selected_source))
         audit[f"{method}__mase"] = values
         audit[f"{method}__window"] = chosen_w
+        audit[f"{method}__valid_count"] = counts_used
 
     add("full_native", native, native_w, np.zeros(n, dtype=bool), "baseline")
 
     for target in windows:
         values, chosen_w, fallback = _choose_capped_fixed(
             int(target), errors, windows, native)
-        add(f"fixed_{int(target)}", values, chosen_w, fallback, "fixed")
+        add(f"fixed_{int(target)}", values, chosen_w, fallback, "fixed",
+            counts_for_choice(chosen_w, fallback))
 
     horizon = _horizon_for_cell(ablation_root, cell)
     values, chosen_w, fallback = _choose_capped_fixed(
         2 * horizon, errors, windows, native)
-    add("heuristic_2xhorizon", values, chosen_w, fallback, "heuristic")
+    add("heuristic_2xhorizon", values, chosen_w, fallback, "heuristic",
+        counts_for_choice(chosen_w, fallback))
 
     # Dataset-shared oracle: one window from the mean curve, then cap it per row.
     oracle_weights = np.where(
@@ -348,7 +379,8 @@ def evaluate_cell(
     shared_oracle_w = int(windows[int(np.nanargmin(mean_error))])
     values, chosen_w, fallback = _choose_capped_fixed(
         shared_oracle_w, errors, windows, native)
-    add("oracle_dataset", values, chosen_w, fallback, "oracle_control")
+    add("oracle_dataset", values, chosen_w, fallback, "oracle_control",
+        counts_for_choice(chosen_w, fallback))
 
     # Genuine per-instance oracle, including full-native as a candidate.
     candidates = np.column_stack([errors, native])
@@ -359,7 +391,8 @@ def evaluate_cell(
     oracle_w = np.where(oracle_idx < windows.size, windows[
         np.minimum(oracle_idx, windows.size - 1)], native_w)
     add("oracle_instance", oracle_values, oracle_w,
-        oracle_idx == windows.size, "oracle")
+        oracle_idx == windows.size, "oracle",
+        counts_for_choice(oracle_w, oracle_idx == windows.size))
 
     for variant, tree in VARIANT_TREES.items():
         path = _variant_prediction_path(ablation_root, tree, cell)
@@ -375,31 +408,34 @@ def evaluate_cell(
         values, chosen_w, fallback = _choose_scores(
             scores, errors, windows, native)
         add(f"{variant}_instance_grid", values, chosen_w, fallback,
-            "predictor_instance_control")
+            "predictor_instance_control", counts_for_choice(chosen_w, fallback))
 
         values, chosen_w, selected_native = _choose_scores_with_native(
             scores, errors, windows, native, native_w)
         add(f"{variant}_instance", values, chosen_w, selected_native,
-            "predictor_instance")
+            "predictor_instance",
+            counts_for_choice(chosen_w, selected_native))
         audit[f"{variant}__scores"] = scores
 
         shared_w = int(windows[int(np.argmin(np.mean(scores, axis=0)))])
         values, chosen_w, fallback = _choose_capped_fixed(
             shared_w, errors, windows, native)
-        add(f"{variant}_dataset", values, chosen_w, fallback, "predictor_dataset")
+        add(f"{variant}_dataset", values, chosen_w, fallback,
+            "predictor_dataset", counts_for_choice(chosen_w, fallback))
 
     if period_run_dir:
         for multiple, prefix in ((2, "period"), (3, "period3")):
             period_path = os.path.join(
                 period_run_dir, "models", cell.model, "compare_real_vs_predicted",
                 f"{prefix}_{cell.dataset}_t{cell.term}_{cell.model}_win.npz")
-            period_error, _period_counts, meta = _load_vector(
+            period_error, period_counts, meta = _load_vector(
                 period_path, n, mase_field)
             if np.isfinite(period_error).any():
                 with np.load(period_path) as data:
                     period_w = np.asarray(data["windows"], dtype=np.int64)
                 add(f"period{multiple}_instance", period_error, period_w,
-                    ~np.isfinite(period_error), "heuristic")
+                    ~np.isfinite(period_error), "heuristic", period_counts,
+                    str(meta.get("source", "missing")))
             elif meta.get("unaligned"):
                 print(Fore.YELLOW
                       + f"Old {multiple}x-period sidecar lacks served_index: "

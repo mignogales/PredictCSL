@@ -80,8 +80,10 @@ predictor-derived, so no TSFM re-inference):
 
 4. **`compare_window_strategies_gifteval.py`** — *strategy comparison*. Pure
    post-processing (no inference): compares MASE + wall-clock + theoretical
-   FLOPs across strategies: `full_window` (max context), `best_window` (oracle
-   argmin), `pred_window` (predictor zero-shot). Emits CSVs, summary stats, and
+   FLOPs across strategies: `full_window` (per-series native context),
+   `best_window` (dataset-shared oracle), `pred_window` (dataset-shared predictor
+   grid action). Per-series predictor/native policies are reported separately by
+   `evaluate_instance_windows.py`. Emits CSVs, summary stats, and
    many plots. The wall-clock ("clock-wise") path (Stage 6 / `*_time` outputs)
    defaults to the **robust** forward-pass timing (`timing.json` mean ± std from
    the timing stage below), falling back per-cell to the single-shot
@@ -93,7 +95,8 @@ predictor-derived, so no TSFM re-inference):
   official GiftEval frequency labels to samples at each dataset's sampling
   rate, split each context into candidate-sized windows, and choose the cadence
   with maximum adjacent-window correlation. Evaluates both
-  `L_i=max(2×period,horizon)` and `L_i=max(3×period,horizon)` directly (off-grid);
+  `L_i=max(2×period,horizon)` and `L_i=max(3×period,horizon)` directly (off-grid),
+  capped by each model/horizon's true full-native limit;
   stage 4 folds their sidecars into `period` and `period3` columns.
 - **`run_all_v2.py`** — reuses stages 1–3 from `run_all.py`, inserts the period
   stage, re-runs the comparison.

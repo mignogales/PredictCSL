@@ -88,15 +88,44 @@ from experiments.patchtst_gifteval import forecast_patchtst_quantiles_official
 # -- Series geometry ----------------------------------------------------------
 MAX_WINDOW   = 15360         # shared pool; TimesFM official GiftEval cap
 PERIOD_MIN   = 16            # seasonal period bounds (samples)
-PERIOD_MAX   = 2048
+# Preserve dense coverage of the historical 16..2,048 range while explicitly
+# teaching every predictor about partial-cycle / almost-full-context cases such
+# as BizITObs Application and Service (daily period = 8,640 ten-second samples).
+# A single log-uniform 16..15,360 draw would starve the old short-period regime,
+# so periods are sampled from a two-component mixture instead.
+PERIOD_CORE_MAX = 2048
+PERIOD_MAX   = MAX_WINDOW
+LONG_PERIOD_PROB = 0.25
+SYNTHETIC_POOL_VERSION = 2
+
+
+def synthetic_pool_signature() -> dict:
+    """Versioned generator fields that make cached pools/labels incompatible."""
+    return {
+        "version": SYNTHETIC_POOL_VERSION,
+        "period_min": PERIOD_MIN,
+        "period_core_max": PERIOD_CORE_MAX,
+        "period_max": PERIOD_MAX,
+        "long_period_probability": LONG_PERIOD_PROB,
+    }
 
 # -- Ablation grid (suffix lengths of the context pool) -----------------------
-# Identical to test_window_ablation_gifteval_v4.py so the predictor's output
-# is directly comparable to real GiftEval ablation curves.
-WINDOW_GRID = [
+# The shared union includes every historical ablation point plus any registered
+# family cap that falls off that grid.  A family only receives its own off-grid
+# cap (not another family's), which makes the final synthetic action a genuine
+# native/full-context label without adding irrelevant classes to other models.
+BASE_WINDOW_GRID = [
     32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
     1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192, 12288, 15360,
 ]
+_OFF_GRID_FAMILY_CAPS = {
+    int(cap) for cap in models_config.FAMILY_CONTEXT_LIMIT.values()
+    if 1 <= int(cap) <= MAX_WINDOW and int(cap) not in BASE_WINDOW_GRID
+}
+# Append instead of inserting so the load-bearing global indices of every
+# historical window remain stable in existing shard done-markers.  Per-family
+# public grids are sorted below.
+WINDOW_GRID = BASE_WINDOW_GRID + sorted(_OFF_GRID_FAMILY_CAPS)
 
 # Smoke-test mode (PREDICTCSL_TEST=1, set by experiments/run_all.py --test):
 # collapse the ablation grid to just its smallest and largest window so the
@@ -109,13 +138,16 @@ TEST_MODE = os.environ.get("PREDICTCSL_TEST") == "1"
 def window_grid_for_family(family: str) -> List[int]:
     """Candidate windows supported by ``family``.
 
-    The historical grid is unchanged through 8,192.  Only families whose
-    registered context limit exceeds 8,192 receive the two long-context points
-    (12,288 and the official 15,360 GiftEval cap).  Smaller models therefore do
-    not carry all-NaN output classes that they can never select.
+    Historical points are retained up to the registered cap.  When the cap is
+    off-grid (currently Sundial at 2,880), it is appended only for that family.
+    Therefore the last output always represents the model's native cap, while
+    smaller models do not carry classes they can never select.
     """
     cap = models_config.context_limit(family)
-    grid = [w for w in WINDOW_GRID if w <= cap]
+    grid = [w for w in BASE_WINDOW_GRID if w <= cap]
+    if cap <= MAX_WINDOW and cap not in grid:
+        grid.append(cap)
+        grid.sort()
     if not grid:
         raise ValueError(f"No WINDOW_GRID point is <= context cap {cap} for {family}.")
     if TEST_MODE:
@@ -279,6 +311,23 @@ def resolve_devices(force: Optional[str]) -> List[str]:
 #  SYNTHETIC GENERATOR
 # ==============================================================================
 
+def _sample_periods(
+    rng: np.random.RandomState, size: Optional[int] = None,
+) -> np.ndarray:
+    """Draw seasonal periods without losing the historical short-cycle density.
+
+    ``LONG_PERIOD_PROB`` of draws cover 2,048..MAX_WINDOW, including the
+    one-cycle/partial-cycle cases absent from the original generator.  The
+    remaining draws retain the exact original log-uniform 16..2,048 support.
+    """
+    shape = () if size is None else (size,)
+    use_long = rng.uniform(size=shape) < LONG_PERIOD_PROB
+    core = np.exp(rng.uniform(
+        math.log(PERIOD_MIN), math.log(PERIOD_CORE_MAX), size=shape))
+    long = np.exp(rng.uniform(
+        math.log(PERIOD_CORE_MAX), math.log(PERIOD_MAX), size=shape))
+    return np.where(use_long, long, core)
+
 def _sample_ar_coefficients(rng: np.random.RandomState) -> Optional[np.ndarray]:
     """
     Sample AR(p) coefficients with diverse behavior.
@@ -379,8 +428,7 @@ def _generate_segment(
 
     # -- Periodic components --------------------------------------------------
     n_periodic = int(rng.randint(1, 4))
-    log_lo, log_hi = math.log(PERIOD_MIN), math.log(PERIOD_MAX)
-    periods = np.exp(rng.uniform(log_lo, log_hi, size=n_periodic))
+    periods = _sample_periods(rng, size=n_periodic)
     if force_period is not None:
         periods[0] = force_period   # dominant period is caller-controlled
     amplitudes = rng.uniform(0.5, 2.0, size=n_periodic)
@@ -480,8 +528,7 @@ def _generate_synthetic_series(
         bounds = [0] + cuts + [total_length]
 
         # Initial dominant period; may shift at each boundary.
-        dominant_period = float(
-            np.exp(rng.uniform(math.log(PERIOD_MIN), math.log(PERIOD_MAX))))
+        dominant_period = float(_sample_periods(rng))
 
         parts: List[np.ndarray] = []
         level = 0.0
@@ -492,8 +539,7 @@ def _generate_synthetic_series(
             if i > 0:
                 level += float(rng.normal(0.0, LEVEL_SHIFT_STD))
                 if rng.uniform() < SEASONAL_SHIFT_PROB:
-                    dominant_period = float(
-                        np.exp(rng.uniform(math.log(PERIOD_MIN), math.log(PERIOD_MAX))))
+                    dominant_period = float(_sample_periods(rng))
             parts.append((seg + level).astype(np.float32))
 
         # Gradual transitions: smear the level jump at each regime boundary.
@@ -1187,6 +1233,7 @@ def gpu_worker(
                 json.dump({"shard_id": shard_id, "start": start, "end": end,
                            "window_indices": win_indices,
                            "horizon_grid": HORIZON_GRID,
+                           "synthetic_pool_signature": synthetic_pool_signature(),
                            "inference_recipe": inference_recipe(family)}, f)
 
             elapsed = time.perf_counter() - t0
@@ -1242,15 +1289,27 @@ def merge_shards(
                 d = json.load(f)
             if (d.get("window_indices") != window_indices
                     or d.get("horizon_grid") != HORIZON_GRID
+                    or d.get("synthetic_pool_signature")
+                    != synthetic_pool_signature()
                     or d.get("inference_recipe") != inference_recipe(family)):
                 continue
             s, e = d["start"], d["end"]
             shard_mae = np.load(os.path.join(sdir, name, "curves_mae.npy"))
             shard_mse = np.load(os.path.join(sdir, name, "curves_mse.npy"))
-            if shard_mae.shape[1:] != (n_win, n_h):
+            if shard_mae.shape[1:] == (n_win, n_h):
+                cm[s:e] = shard_mae
+                cs[s:e] = shard_mse
+            elif (shard_mae.shape[1:] == (len(BASE_WINDOW_GRID), n_h)
+                  and shard_mse.shape == shard_mae.shape
+                  and all(idx < len(BASE_WINDOW_GRID) for idx in window_indices)):
+                # The off-grid native-cap union was appended without shifting any
+                # historical index. Reuse pre-union shards for families that do
+                # not request the appended action; Sundial's changed win_indices
+                # deliberately fail this branch and are recomputed.
+                cm[s:e, :len(BASE_WINDOW_GRID)] = shard_mae
+                cs[s:e, :len(BASE_WINDOW_GRID)] = shard_mse
+            else:
                 continue
-            cm[s:e] = shard_mae
-            cs[s:e] = shard_mse
             n_done += 1
 
     # Shards use the global union grid so their schema is spawn-stable.  The
@@ -1320,6 +1379,12 @@ def parse_args() -> argparse.Namespace:
                        "Default: run all models in sequence. "
                        f"Available: {[f'{i}={m[2]}' for i, m in enumerate(MODELS)]}"
                    ))
+    p.add_argument(
+        "--regenerate-pool", action="store_true",
+        help=("Overwrite an incompatible cached synthetic pool and invalidate "
+              "all labeling shards through the versioned pool signature. "
+              "master_run_all forwards this when stage 1 is forced."),
+    )
     return p.parse_args()
 
 
@@ -1348,8 +1413,30 @@ def main() -> None:
     targets_path  = os.path.join(OUTPUT_ROOT, "targets.npy")
     nseg_path     = os.path.join(OUTPUT_ROOT, "n_segments.npy")
     rlen_path     = os.path.join(OUTPUT_ROOT, "real_lengths.npy")
+    pool_meta_path = os.path.join(OUTPUT_ROOT, "meta.json")
 
-    if os.path.isfile(contexts_path):
+    cached_signature = None
+    if os.path.isfile(pool_meta_path):
+        try:
+            with open(pool_meta_path) as handle:
+                cached_signature = json.load(handle).get(
+                    "synthetic_pool_signature")
+        except (OSError, json.JSONDecodeError):
+            cached_signature = None
+    pool_compatible = cached_signature == synthetic_pool_signature()
+    if os.path.isfile(contexts_path) and not pool_compatible:
+        if not args.regenerate_pool:
+            raise RuntimeError(
+                "Existing synthetic pool predates the long-period generator "
+                f"{synthetic_pool_signature()}. Re-run stage 1 with "
+                "--regenerate-pool (or master_run_all --force 1). Labeling "
+                "shards will be recomputed automatically."
+            )
+        print(Fore.YELLOW
+              + "Regenerating synthetic pool: generator signature changed."
+              + Fore.RESET)
+
+    if os.path.isfile(contexts_path) and pool_compatible:
         pool_shape = np.load(contexts_path, mmap_mode="r").shape
         if len(pool_shape) != 2 or pool_shape[1] != MAX_WINDOW:
             raise RuntimeError(
@@ -1370,12 +1457,16 @@ def main() -> None:
         np.save(rlen_path, real_lengths)
         n_padded = int((real_lengths < MAX_WINDOW).sum())
         del contexts, targets
-        with open(os.path.join(OUTPUT_ROOT, "meta.json"), "w") as f:
+        with open(pool_meta_path, "w") as f:
             json.dump({
                 "n_series": int(n_series), "seed": SEED,
                 "max_window": MAX_WINDOW, "max_horizon": MAX_HORIZON,
                 "window_grid": WINDOW_GRID, "horizon_grid": HORIZON_GRID,
-                "period_min": PERIOD_MIN, "period_max": PERIOD_MAX,
+                "period_min": PERIOD_MIN,
+                "period_core_max": PERIOD_CORE_MAX,
+                "period_max": PERIOD_MAX,
+                "long_period_probability": LONG_PERIOD_PROB,
+                "synthetic_pool_signature": synthetic_pool_signature(),
                 "n_segment_choices": N_SEGMENT_CHOICES,
                 "min_segment_len": MIN_SEGMENT_LEN,
                 "level_shift_std": LEVEL_SHIFT_STD,
@@ -1428,6 +1519,8 @@ def main() -> None:
                     cached_ok = (
                         done_meta.get("window_indices") == win_indices
                         and done_meta.get("horizon_grid") == HORIZON_GRID
+                        and done_meta.get("synthetic_pool_signature")
+                        == synthetic_pool_signature()
                         and done_meta.get("inference_recipe") == inference_recipe(family)
                     )
                 except (OSError, json.JSONDecodeError):
@@ -1495,6 +1588,7 @@ def main() -> None:
             json.dump({
                 "model_id": model_id, "model_family": family, "model_display": display,
                 "inference_recipe": inference_recipe(family),
+                "synthetic_pool_signature": synthetic_pool_signature(),
                 "window_indices": win_indices,
                 "shards_done": n_done, "shards_total": total_shards,
                 "devices": devices, "shard_size": args.shard_size,
