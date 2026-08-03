@@ -736,13 +736,15 @@ def main() -> None:
     # the same per-family conda routing. The final evaluator only reads caches.
     if not args.no_instance_eval:
         ablation_root = os.environ["PREDICTCSL_ABLATION_ROOT"]
-        period_run_dir = os.path.join(ablation_root, variants[0].ablation_tree)
+        comparison_run_dir = os.path.join(ablation_root, variants[0].ablation_tree)
+        period_run_dir = os.path.join(ablation_root, "general_period")
         if not args.no_period_heuristic:
             for env, displays in groups.items():
                 period_cmd = _py(
                     env, "experiments.period_window_eval",
                     "--models", *displays,
                     "--run-dir", period_run_dir,
+                    "--comparison-run-dir", comparison_run_dir,
                     "--require-comparison",
                 )
                 if force_instance:

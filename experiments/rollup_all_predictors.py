@@ -91,7 +91,8 @@ def main() -> None:
         cache_root = os.path.dirname(run_dir)
         try:
             df = load_strategy_records(
-                run_dir, cache_root, dict(DEFAULT_PATCH_SIZES), mase_metric=metric)
+                run_dir, cache_root, dict(DEFAULT_PATCH_SIZES),
+                mase_metric=metric, models=args.models)
         except RuntimeError as exc:
             if str(exc) != "No valid records found — check the run directory.":
                 raise
@@ -132,9 +133,12 @@ def main() -> None:
                          suffix="_gluonts", metric_label="MASE (gluonts)")
 
     if df_gr is None and df_g is None:
-        raise SystemExit(
-            f"No valid gluonts-real or gluonts records found in {run_dir}"
-            + (f" for models {sorted(args.models)}" if args.models else "") + ".")
+        print(Fore.YELLOW
+              + f"No valid gluonts-real or gluonts records found in {run_dir}"
+              + (f" for models {sorted(args.models)}" if args.models else "")
+              + "; no combined overview was written."
+              + Fore.RESET)
+        return
 
     # Timing columns are metric-independent. Prefer the leaderboard-faithful
     # frame, but retain the overview when only the port metric is usable.

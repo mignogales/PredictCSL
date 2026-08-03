@@ -196,6 +196,20 @@ def discover_pred_variants(run_dir: str) -> List[Tuple[str, str, str, str]]:
     return found
 
 
+def discover_period_tree(run_dir: str) -> Optional[str]:
+    """Return the dedicated sibling period-strategy tree when present."""
+    run_dir = os.path.normpath(run_dir)
+    parent = os.path.dirname(run_dir)
+    base = os.path.basename(run_dir)
+    stem = base
+    for suf in sorted(PRED_VARIANTS, key=len, reverse=True):
+        if base.endswith(suf):
+            stem = base[: -len(suf)]
+            break
+    tree = os.path.join(parent, stem + "_period")
+    return tree if os.path.isdir(os.path.join(tree, "models")) else None
+
+
 def present_pred_variants(df: pd.DataFrame) -> List[Tuple[str, str, str]]:
     """Return ``(key, label, color)`` for each variant whose ``{key}_mase`` column
     is present in ``df`` and has at least one non-NaN value, in registry order.
@@ -1039,6 +1053,12 @@ def load_strategy_records(
                           for key, _lbl, _clr, tree in variants)
               + Fore.RESET)
 
+    period_tree = discover_period_tree(run_dir)
+    if period_tree:
+        print(Fore.CYAN
+              + f"  Period strategy discovered: {os.path.basename(period_tree)}"
+              + Fore.RESET)
+
     records: List[dict] = []
 
     wanted_models = set(models or [])
@@ -1293,9 +1313,21 @@ def load_strategy_records(
             # Each multiplier has its own sidecar. Missing sidecars are NaN-filled
             # so old/partial runs still compare full/best/pred normally.
             def _period_values(period_multiple: int):
-                prec = _load_period_record(
-                    compare_dir, dataset_display, term, model_short,
-                    period_multiple=period_multiple)
+                prec = None
+                if period_tree:
+                    candidate = os.path.join(
+                        period_tree, "models", model_short,
+                        "compare_real_vs_predicted")
+                    if os.path.isdir(candidate):
+                        prec = _load_period_record(
+                            candidate, dataset_display, term, model_short,
+                            period_multiple=period_multiple)
+                # Backward compatibility for runs produced before period became
+                # its own sibling strategy tree.
+                if prec is None:
+                    prec = _load_period_record(
+                        compare_dir, dataset_display, term, model_short,
+                        period_multiple=period_multiple)
                 if prec is None:
                     return (float("nan"), float("nan"), float("nan"),
                             float("nan"), 0, float("nan"), float("nan"))

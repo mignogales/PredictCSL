@@ -25,9 +25,9 @@ aggregate one MASE per (model, dataset, term) -- directly comparable to the grid
 strategies' aggregate MASE (same instances, same naive-seasonal MASE
 denominator).
 
-Outputs (one per (model, dataset, term)) are written as sidecars NEXT TO v5's
-comparison artefacts, so ``compare_window_strategies_gifteval.py`` can pick them
-up and surface ``period`` as a fourth strategy:
+Outputs (one per (model, dataset, term)) are written to a dedicated strategy
+tree, so ``compare_window_strategies_gifteval.py`` can pick them up and surface
+``period`` as a first-class strategy:
 
     <run_dir>/models/<model_short>/compare_real_vs_predicted/
         period_<dataset>_t<term>_<model_short>.json      2-cycle strategy
@@ -54,6 +54,7 @@ import gc
 import glob
 import json
 import os
+import shutil
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -477,6 +478,23 @@ def run(args, device: str) -> None:
             for multiple in args.period_multiples:
                 json_path, npz_path = _sidecar_paths(
                     args.run_dir, dataset_display, term, model_short, multiple)
+                # One-time migration from the historical layout where period
+                # sidecars lived inside the base predictor tree.
+                if (os.path.normpath(args.comparison_run_dir)
+                        != os.path.normpath(args.run_dir)
+                        and not os.path.exists(json_path)
+                        and not os.path.exists(npz_path)):
+                    legacy_json, legacy_npz = _sidecar_paths(
+                        args.comparison_run_dir, dataset_display, term,
+                        model_short, multiple)
+                    if os.path.isfile(legacy_json) and os.path.isfile(legacy_npz):
+                        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+                        shutil.copy2(legacy_json, json_path)
+                        shutil.copy2(legacy_npz, npz_path)
+                        print(Fore.WHITE
+                              + f"  MIGRATED {model_short} | {dataset_display} | "
+                                f"t={term} | {multiple}xP -> {args.run_dir}"
+                              + Fore.RESET)
                 per_instance_cached = False
                 if os.path.isfile(json_path) and os.path.isfile(npz_path):
                     try:
@@ -517,7 +535,7 @@ def run(args, device: str) -> None:
             # The grid ceiling is only a comparison-cell presence check/metadata
             # field. evaluate_one applies the authoritative native model cap.
             comparison_ceiling = _full_window_cap(
-                args.run_dir, dataset_display, term, model_short)
+                args.comparison_run_dir, dataset_display, term, model_short)
             if comparison_ceiling is None:
                 if args.require_comparison:
                     print(Fore.WHITE
@@ -584,8 +602,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--datasets", type=str, nargs="+", default=None,
                    help="Restrict to these dataset_display names (default: all).")
     p.add_argument("--run-dir", type=str, required=True,
-                   help="v5 run dir (the 'general' folder). Sidecars are written under "
+                   help="Dedicated period-strategy output tree. Sidecars are written under "
                         "<run-dir>/models/<model>/compare_real_vs_predicted/.")
+    p.add_argument("--comparison-run-dir", type=str, default=None,
+                   help="Base v5 tree used to verify matching comparison cells "
+                        "(default: --run-dir, for backward compatibility).")
     p.add_argument("--device", type=str, default=None, choices=[None, "cuda", "cpu"])
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--force", action="store_true",
@@ -602,6 +623,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-buckets", type=int, default=48,
                    help="Number of log-spaced window buckets when --quantize log.")
     args = p.parse_args()
+    if args.comparison_run_dir is None:
+        args.comparison_run_dir = args.run_dir
     if any(k < 1 for k in args.period_multiples):
         p.error("--period-multiples values must be positive integers")
     args.period_multiples = list(dict.fromkeys(args.period_multiples))
