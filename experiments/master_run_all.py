@@ -5,10 +5,7 @@ predictor overlay -> compare -> per-instance window evaluation.
 The requested predictor matrix is deliberately small:
 
   * constrained/cheap PatchTST, curve regression
-  * constrained/cheap PatchTST, soft top-3 window classification
-  * constrained/cheap PatchTST, calibrated asymmetric risk regression
   * constrained/cheap bidirectional Mamba, curve regression
-  * constrained/cheap bidirectional Mamba, soft top-3 window classification
 
 The first pass computes full-native and window-ablation forecasts before any
 synthetic labeling or predictor training, and immediately reports leaderboard
@@ -20,10 +17,10 @@ finishes labels, predictor training, overlay, and comparison before the next
 model starts. The full/base predictor and robust-timing-only v5 pass are not
 part of this master.
 
-Phase 6 evaluates every predictor both ways: the historical dataset-shared
-choice and a genuine per-instance W_i choice. It retrieves each selected
-instance's cached leaderboard MASE and compares against full-native context,
-fixed windows, heuristics, and dataset/per-instance oracles.
+Phase 6 evaluates both predictors using the historical dataset-shared choice and
+a genuine per-instance W_i choice. It retrieves each selected instance's cached
+leaderboard MASE and compares against full-native context, fixed windows,
+non-period heuristics, and dataset/per-instance oracles.
 
 The default output root is a new self-contained tree
 ``logs/experiments/master_recompute`` so incompatible old 8k pools and cached
@@ -71,8 +68,7 @@ Usage
     python -m experiments.master_run_all --models Chronos2-Small
     python -m experiments.master_run_all --force 3              # repeat cached ablation
     python -m experiments.master_run_all --models TiRex2 --stage1-batch-size 8 --stage1-shard-size 50
-    python -m experiments.master_run_all --only-variants cheap mamba
-    python -m experiments.master_run_all --test               # all selected variants, reduced
+    python -m experiments.master_run_all --test               # both predictors, reduced
 """
 
 from __future__ import annotations
@@ -111,22 +107,10 @@ VARIANTS: List[Variant] = [
     Variant("cheap", "experiments.run_all_v3", ["1"],
             label="cheap PatchTST · curve regression",
             ablation_tree="general_v3"),
-    Variant("cheap_cls", "experiments.run_all_v3", ["1"],
-            extra=["--training-objective", "classification"],
-            label="cheap PatchTST · soft top-3 classification",
-            ablation_tree="general_v3_classification"),
-    Variant("risk", "experiments.run_all_v3", ["1"],
-            extra=["--training-objective", "risk"],
-            label="cheap PatchTST · calibrated asymmetric risk",
-            ablation_tree="general_v3_risk"),
     Variant("mamba", "experiments.run_all_v4", ["1"],
             extra=["--cheap"], needs_mamba=True,
             label="cheap Mamba · curve regression",
             ablation_tree="general_v4"),
-    Variant("mamba_cls", "experiments.run_all_v4", ["1"], needs_mamba=True,
-            extra=["--cheap", "--training-objective", "classification"],
-            label="cheap Mamba · soft top-3 classification",
-            ablation_tree="general_v4_classification"),
 ]
 
 
@@ -427,11 +411,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-rollup", action="store_true",
                    help="Skip the final cross-predictor rollup_all_predictors pass.")
     p.add_argument("--no-instance-eval", action="store_true",
-                   help="Skip Phase 6 (period heuristic + genuine per-instance "
-                        "window evaluation).")
-    p.add_argument("--no-period-heuristic", action="store_true",
-                   help="In Phase 6, evaluate cached grid methods but do not run "
-                        "the additional per-series 2x-period TSFM forecasts.")
+                   help="Skip Phase 6 genuine per-instance window evaluation.")
     p.add_argument("--stage1-batch-size", type=int, default=None,
                    help="Forwarded to build_context_length_dataset --batch-size. "
                         "Useful for slow/heavy labelers such as TiRex.")
@@ -621,7 +601,6 @@ def main() -> None:
     # acts on it for stages that are active (not in that variant's --skip-stages),
     # so forcing e.g. stage 3 is a no-op on variants that reuse it.
     force_ablation = _stage_forced(args.force, "3")
-    force_instance = _stage_forced(args.force, "5")
     if args.force is None:
         fflag: List[str] = []
     elif args.force == []:
@@ -732,29 +711,10 @@ def main() -> None:
                 )
 
     # ---- Phase 6: genuine per-instance context choice. -----------------------
-    # The period heuristic performs additional TSFM inference and therefore uses
-    # the same per-family conda routing. The final evaluator only reads caches.
+    # This master intentionally excludes the period policy. The evaluator reads
+    # only the fixed-grid and predictor caches produced above.
     if not args.no_instance_eval:
         ablation_root = os.environ["PREDICTCSL_ABLATION_ROOT"]
-        comparison_run_dir = os.path.join(ablation_root, variants[0].ablation_tree)
-        period_run_dir = os.path.join(ablation_root, "general_period")
-        if not args.no_period_heuristic:
-            for env, displays in groups.items():
-                period_cmd = _py(
-                    env, "experiments.period_window_eval",
-                    "--models", *displays,
-                    "--run-dir", period_run_dir,
-                    "--comparison-run-dir", comparison_run_dir,
-                    "--require-comparison",
-                )
-                if force_instance:
-                    period_cmd.append("--force")
-                _run(
-                    period_cmd,
-                    f"Phase 6a — per-instance period heuristic "
-                    f"[{_env_label(env)}]: {displays}",
-                )
-
         instance_out = os.path.join(
             os.environ["PREDICTCSL_MASTER_ROOT"],
             "instance_window_evaluation")
@@ -763,13 +723,11 @@ def main() -> None:
             "--ablation-root", ablation_root,
             "--output-dir", instance_out,
         )
-        if not args.no_period_heuristic:
-            instance_cmd += ["--period-run-dir", period_run_dir]
         if args.models:
             instance_cmd += ["--models", *args.models]
         _run(
             instance_cmd,
-            "Phase 6b — per-instance W_i evaluation (all predictor variants)",
+            "Phase 6a — per-instance W_i evaluation (cheap PatchTST + Mamba)",
         )
 
         failure_cmd = _py(
@@ -784,7 +742,7 @@ def main() -> None:
             failure_cmd += ["--models", *args.models]
         _run(
             failure_cmd,
-            "Phase 6c — per-instance predictor failure diagnostics",
+            "Phase 6b — per-instance predictor failure diagnostics",
         )
 
     # ---- Final combined cross-predictor overview (pure post-processing). -----
@@ -793,7 +751,8 @@ def main() -> None:
         rollup = _py(None, "experiments.rollup_all_predictors")
         ablation_root = os.environ["PREDICTCSL_ABLATION_ROOT"]
         rollup += ["--run-dir", os.path.join(ablation_root, "general_v3"),
-                   "--output-dir", os.path.join(ablation_root, "general_all")]
+                   "--output-dir", os.path.join(ablation_root, "general_all"),
+                   "--plot-strategies", "pred_cheap", "pred_mamba"]
         if args.models:
             rollup += ["--models", *args.models]
         _run(rollup, "Phase 7 — combined cross-predictor overview")

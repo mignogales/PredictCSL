@@ -106,22 +106,18 @@ class MasterRecomputeConfigTest(unittest.TestCase):
     def test_requested_predictor_matrix(self) -> None:
         self.assertEqual(
             [v.name for v in master.VARIANTS],
-            ["cheap", "cheap_cls", "risk", "mamba", "mamba_cls"],
+            ["cheap", "mamba"],
         )
         self.assertTrue(all(v.skip_stages == ["1"] for v in master.VARIANTS))
         self.assertEqual(
             [v.ablation_tree for v in master.VARIANTS],
             [
                 "general_v3",
-                "general_v3_classification",
-                "general_v3_risk",
                 "general_v4",
-                "general_v4_classification",
             ],
         )
         by_name = {v.name: v for v in master.VARIANTS}
         self.assertIn("--cheap", by_name["mamba"].extra)
-        self.assertIn("--cheap", by_name["mamba_cls"].extra)
         self.assertEqual(
             predictor.HP_SPACE_MAMBA_CHEAP["patch_length"],
             predictor.HP_SPACE_PATCHTST_CHEAP["patch_length"],

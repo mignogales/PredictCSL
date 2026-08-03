@@ -261,10 +261,11 @@ Token-mapping / hook assumptions per family carry "verify on server" notes in
 
 **Master orchestrator:**
 - **`master_run_all.py`** — clean recomputation entry point. Stage 1 runs once;
-  then cheap PatchTST and Mamba are trained under both curve regression and
-  soft-top-3 classification (30 HP trials each). All four variants reuse one
+  then cheap PatchTST and Mamba are trained under curve regression (30 HP
+  trials each). Both variants reuse one
   canonical GiftEval cell cache, then `rollup_all_predictors` compares them.
-  The historical full predictor / period / timing-only variants are excluded.
+  Classification, risk, historical full predictor, period, and timing-only
+  variants are excluded.
   Outputs default to the isolated `logs/experiments/master_recompute/` tree;
   `--test` runs the same matrix with reduced smoke settings and keeps its output
   for environment/debug inspection.
@@ -346,8 +347,7 @@ python -m experiments.run_all --skip-stages 1 2
 # values (only matters for exactness on NaN-label *_with_missing cells):
 python -m experiments.run_all --skip-stages 1 2 --force 3
 python -m experiments.run_all --skip-stages 1 2 3 --mase-metric mase_gluonts  # port-scored compare -> *_gluonts dirs
-python -m experiments.master_run_all              # requested cheap/Mamba recomputation matrix
-python -m experiments.master_run_all --only-variants cheap mamba
+python -m experiments.master_run_all              # cheap PatchTST + cheap Mamba only
 python -m experiments.master_run_all --test       # reduced end-to-end env/smoke check
 python -m experiments.synth_param_sweeps          # single-factor sweeps, run set
 python -m experiments.synth_param_sweeps --models Sundial-Base-128M TimeMoE-200M  # legacy env
