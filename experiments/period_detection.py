@@ -60,20 +60,38 @@ def cadence_candidates(
 def window_similarity(x: np.ndarray, window: int) -> float:
     """Mean Pearson correlation of consecutive, non-overlapping tail chunks."""
     n_chunks = x.size // window
-    if n_chunks < 2:
+    # Pearson correlation is undefined for scalar chunks.  Returning immediately
+    # is especially important for datasets sampled at one of the candidate
+    # cadences (for example LOOP_SEATTLE/5T): otherwise we would walk every
+    # adjacent sample only to reject every pair below.
+    if window < 2 or n_chunks < 2:
         return float("-inf")
+
     chunks = x[-n_chunks * window:].reshape(n_chunks, window)
-    scores: List[float] = []
-    for left, right in zip(chunks[:-1], chunks[1:]):
-        finite = np.isfinite(left) & np.isfinite(right)
-        if finite.sum() < 2:
-            continue
-        a = left[finite] - np.mean(left[finite])
-        b = right[finite] - np.mean(right[finite])
-        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-        if denom > 1e-12:
-            scores.append(float(np.dot(a, b) / denom))
-    return float(np.mean(scores)) if scores else float("-inf")
+    left, right = chunks[:-1], chunks[1:]
+    finite = np.isfinite(left) & np.isfinite(right)
+    counts = finite.sum(axis=1)
+    usable = counts >= 2
+    if not np.any(usable):
+        return float("-inf")
+
+    # Compute all adjacent-chunk correlations in NumPy.  This retains the old
+    # pairwise missing-value policy: each pair is centred using only positions
+    # that are finite in both chunks, and constant pairs are discarded.
+    left = left[usable]
+    right = right[usable]
+    finite = finite[usable]
+    counts = counts[usable]
+    left_mean = np.sum(left, axis=1, where=finite) / counts
+    right_mean = np.sum(right, axis=1, where=finite) / counts
+    a = np.where(finite, left - left_mean[:, None], 0.0)
+    b = np.where(finite, right - right_mean[:, None], 0.0)
+    numerator = np.sum(a * b, axis=1)
+    denominator = np.sqrt(np.sum(a * a, axis=1) * np.sum(b * b, axis=1))
+    nonconstant = denominator > 1e-12
+    if not np.any(nonconstant):
+        return float("-inf")
+    return float(np.mean(numerator[nonconstant] / denominator[nonconstant]))
 
 
 def detect_period(
