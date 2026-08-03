@@ -89,8 +89,16 @@ def main() -> None:
 
     def _load(metric: str):
         cache_root = os.path.dirname(run_dir)
-        df = load_strategy_records(run_dir, cache_root, dict(DEFAULT_PATCH_SIZES),
-                                   mase_metric=metric)
+        try:
+            df = load_strategy_records(
+                run_dir, cache_root, dict(DEFAULT_PATCH_SIZES), mase_metric=metric)
+        except RuntimeError as exc:
+            if str(exc) != "No valid records found — check the run directory.":
+                raise
+            print(Fore.YELLOW
+                  + f"No valid {metric} records found — skipping that rollup."
+                  + Fore.RESET)
+            return None
         if args.models:
             wanted = set(args.models)
             available = sorted(df["model_short"].unique())
@@ -100,28 +108,38 @@ def main() -> None:
                                  f"Available: {available}")
         return df
 
-    # Exactly two metrics, both emitted as suffixed sets so nothing ambiguous is
-    # written: `mase_gluonts_real` (gluonts machinery — the leaderboard-faithful
-    # one, also driving the wall-clock overview) and `mase_gluonts` (numpy port).
-    # The legacy project `mase` is gone from this rollup entirely.
+    # Emit each available metric as an unambiguous suffixed set:
+    # `mase_gluonts_real` (gluonts machinery — the leaderboard-faithful one) and
+    # `mase_gluonts` (numpy port).  The legacy project `mase` is not consumed.
     if not run_has_gluonts_real_curve(run_dir) and not run_has_gluonts_curve(run_dir):
         raise SystemExit(
             f"No gluonts curves (real_curve_gluonts[_real]) found in {run_dir} — "
             "re-run stage 3 (cheap backfill, no TSFM re-inference) first.")
 
     df_gr = _load("mase_gluonts_real")
-    write_run_rollup(df_gr, out_dir, plot_strategies=args.plot_strategies,
-                     suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
-    write_run_time_rollup(df_gr, out_dir, plot_strategies=args.plot_strategies)
-    if not run_has_gluonts_real_curve(run_dir):
-        print(Fore.YELLOW + "Note: no real_curve_gluonts_real anywhere in the run — "
-              "the _gluonts_real set above was scored on the port stand-in curves. "
-              "Re-run stage 3 (--force 3 for cached cells) to populate the machinery "
-              "values." + Fore.RESET)
+    if df_gr is not None:
+        write_run_rollup(df_gr, out_dir, plot_strategies=args.plot_strategies,
+                         suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
+        if not run_has_gluonts_real_curve(run_dir):
+            print(Fore.YELLOW + "Note: no real_curve_gluonts_real anywhere in the run — "
+                  "the _gluonts_real set above was scored on the port stand-in curves. "
+                  "Re-run stage 3 (--force 3 for cached cells) to populate the machinery "
+                  "values." + Fore.RESET)
 
     df_g = _load("mase_gluonts")
-    write_run_rollup(df_g, out_dir, plot_strategies=args.plot_strategies,
-                     suffix="_gluonts", metric_label="MASE (gluonts)")
+    if df_g is not None:
+        write_run_rollup(df_g, out_dir, plot_strategies=args.plot_strategies,
+                         suffix="_gluonts", metric_label="MASE (gluonts)")
+
+    if df_gr is None and df_g is None:
+        raise SystemExit(
+            f"No valid gluonts-real or gluonts records found in {run_dir}"
+            + (f" for models {sorted(args.models)}" if args.models else "") + ".")
+
+    # Timing columns are metric-independent. Prefer the leaderboard-faithful
+    # frame, but retain the overview when only the port metric is usable.
+    write_run_time_rollup(df_gr if df_gr is not None else df_g, out_dir,
+                          plot_strategies=args.plot_strategies)
 
     print(Fore.GREEN + f"\nCombined overview written to: {out_dir}" + Fore.RESET)
 
