@@ -3152,11 +3152,6 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     preload_key = (
                         model_short, dataset_display, str(term), int(window_size))
                     cached = preloaded_results.get(preload_key)
-                    if cached is None:
-                        raise RuntimeError(
-                            "--preloaded-results-csv is missing required cached "
-                            f"cell {preload_key}; refusing to run foundation-model "
-                            "inference in --cached-only mode")
                 else:
                     cached = _load_cached_result_for_family(
                         dataset_display, model_short, term, window_size,
@@ -3252,6 +3247,16 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
                     print(Fore.RED + f"  SKIP    {tag}  (TiRex max context={TIREX_MAX_CONTEXT} < ws)"
                           + Fore.RESET)
                     continue
+
+                # A complete skip-mode cache legitimately has no row for a
+                # window that no instance (or model family) can serve. Only
+                # classify an absent preloaded row as a real cache gap after all
+                # of those supported-coverage checks have had a chance to skip.
+                if use_preloaded_results:
+                    raise RuntimeError(
+                        "--preloaded-results-csv is missing required cached "
+                        f"cell {preload_key}; refusing to run foundation-model "
+                        "inference in --cached-only mode")
 
                 print(Fore.YELLOW + f"\n  > {tag}" + Fore.RESET)
 
