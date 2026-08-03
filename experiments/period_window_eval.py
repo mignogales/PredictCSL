@@ -480,8 +480,8 @@ def run(args, device: str) -> None:
                 per_instance_cached = False
                 if os.path.isfile(json_path) and os.path.isfile(npz_path):
                     try:
-                        with open(json_path) as handle:
-                            cached_meta = json.load(handle)
+                        with open(json_path) as metadata_file:
+                            cached_meta = json.load(metadata_file)
                         with np.load(npz_path) as cached:
                             per_instance_cached = {
                                 "windows", "periods", "period_labels",
