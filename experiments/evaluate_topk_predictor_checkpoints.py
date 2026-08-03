@@ -171,6 +171,29 @@ def _run(cmd: Sequence[str], dry_run: bool) -> None:
         subprocess.run(list(cmd), check=True)
 
 
+def _stage3_command(
+    python: str,
+    model: str,
+    package: Path,
+    run_dir: Path,
+    device: str,
+    predictor_batch_size: int,
+    short_context_mode: str,
+) -> List[str]:
+    """Build the cache-only overlay command using the canonical cache mode."""
+    return [
+        python, "-m", "experiments.test_window_ablation_gifteval_v5",
+        "--models", model,
+        "--predictor-dir", str(package),
+        "--cache-root", str(run_dir),
+        "--device", device,
+        "--num-gpus", "1",
+        "--predictor-batch-size", str(predictor_batch_size),
+        "--short-context-mode", short_context_mode,
+        "--no-plots", "--cached-only",
+    ]
+
+
 def _read_result(result_dir: Path, variant: str, rank: int,
                  trial: Dict[str, Any]) -> Dict[str, Any]:
     summary = _read_json(result_dir / "summary_stats.json")
@@ -245,6 +268,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--predictor-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--short-context-mode", choices=("skip", "pad"), default="skip",
+        help=("Must match the canonical Stage-3 cache. The master recompute "
+              "pipeline uses 'skip' (default)."),
+    )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true",
@@ -287,16 +315,10 @@ def main() -> None:
             print(f"  rank {rank}: trial {idx:03d} "
                   f"{variant.selection_metric}={float(trial[variant.selection_metric]):.6f}")
 
-            stage3 = [
-                sys.executable, "-m", "experiments.test_window_ablation_gifteval_v5",
-                "--models", args.model,
-                "--predictor-dir", str(package),
-                "--cache-root", str(run_dir),
-                "--device", args.device,
-                "--num-gpus", "1",
-                "--predictor-batch-size", str(args.predictor_batch_size),
-                "--no-plots", "--cached-only",
-            ]
+            stage3 = _stage3_command(
+                sys.executable, args.model, package, run_dir, args.device,
+                args.predictor_batch_size, args.short_context_mode,
+            )
             stage4 = [
                 sys.executable, "-m", "experiments.compare_window_strategies_gifteval",
                 "--run-dir", str(run_dir),

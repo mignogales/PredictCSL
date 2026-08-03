@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from experiments.evaluate_topk_predictor_checkpoints import (
+    _stage3_command,
     package_trial,
     rank_trials,
 )
@@ -51,6 +52,15 @@ class TopKPredictorCheckpointTest(unittest.TestCase):
         self.assertEqual(cfg["trial_idx"], 2)
         self.assertEqual(cfg["d_model"], 34)
         self.assertEqual(cfg["val_regret"], 0.2)
+
+    def test_stage3_overlay_preserves_canonical_short_context_mode(self):
+        cmd = _stage3_command(
+            "python", "Chronos2-Small", Path("package"), Path("run"),
+            "cuda", 64, "skip",
+        )
+        mode_idx = cmd.index("--short-context-mode")
+        self.assertEqual(cmd[mode_idx + 1], "skip")
+        self.assertIn("--cached-only", cmd)
 
 
 if __name__ == "__main__":
