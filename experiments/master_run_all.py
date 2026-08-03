@@ -423,6 +423,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stage1-n-series", type=int, default=None,
                    help="Forwarded to build_context_length_dataset --n-series "
                         "when creating a fresh synthetic pool.")
+    p.add_argument("--stage1-device", choices=["cuda", "cpu"], default="cuda",
+                   help=("Device required for synthetic TSFM labeling. Defaults "
+                         "to cuda and fails fast when CUDA is unavailable; pass "
+                         "cpu only for an intentional CPU run."))
     p.add_argument("--output-root", default="logs/experiments/master_recompute",
                    help="Fresh self-contained root for all datasets, predictors, "
                         "GiftEval cells, and comparisons (default: "
@@ -438,7 +442,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def _stage1_build_args(args: argparse.Namespace) -> List[str]:
-    extra: List[str] = []
+    # Master recomputations are production-sized. Make their device requirement
+    # explicit so a broken CUDA environment cannot silently turn Stage 1 into a
+    # multi-hour CPU job. The standalone builder retains its auto-device mode.
+    extra: List[str] = ["--device", args.stage1_device]
     if args.stage1_batch_size is not None:
         extra += ["--batch-size", str(args.stage1_batch_size)]
     if args.stage1_shard_size is not None:

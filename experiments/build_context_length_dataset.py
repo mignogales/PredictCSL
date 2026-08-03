@@ -299,6 +299,14 @@ def _physical_gpu_id(device: str) -> str:
 def resolve_devices(force: Optional[str]) -> List[str]:
     if force == "cpu":
         return ["cpu"]
+    if force == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was explicitly requested for Stage 1, but PyTorch reports "
+            "torch.cuda.is_available() == False. Refusing to silently run the "
+            "50,000-series TSFM labeling workload on CPU. Check the active "
+            "conda environment, CUDA_VISIBLE_DEVICES, NVIDIA driver, and the "
+            "installed PyTorch CUDA build; use --device cpu only intentionally."
+        )
     if not torch.cuda.is_available():
         return ["cpu"]
     if DEVICES is not None:
@@ -1356,8 +1364,10 @@ def _print_data_sanity(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Synthetic context-length ablation dataset.")
-    p.add_argument("--device", type=str, default=None, choices=[None, "cuda", "cpu"],
-                   help="Force device. Default: all CUDA devices, else CPU.")
+    p.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"],
+                   help=("Force device. --device cuda fails fast if CUDA is not "
+                         "available; without this option the standalone builder "
+                         "uses all CUDA devices and otherwise falls back to CPU."))
     p.add_argument("--n-series", type=int, default=N_SERIES,
                    help="Number of synthetic series.")
     p.add_argument("--batch-size", type=int, default=BATCH_SIZE,

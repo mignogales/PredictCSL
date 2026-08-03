@@ -71,6 +71,7 @@ class MasterRecomputeConfigTest(unittest.TestCase):
 
     def test_master_force_stage1_regenerates_versioned_pool(self) -> None:
         args = SimpleNamespace(
+            stage1_device="cuda",
             stage1_batch_size=None,
             stage1_shard_size=None,
             stage1_windows=None,
@@ -80,6 +81,13 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         if master._stage_forced(["1"], "1"):
             build_args.append("--regenerate-pool")
         self.assertIn("--regenerate-pool", build_args)
+
+    def test_stage1_explicit_cuda_does_not_fall_back_to_cpu(self) -> None:
+        with mock.patch.object(build.torch.cuda, "is_available", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "Refusing to silently run"):
+                build.resolve_devices("cuda")
+        with mock.patch.object(build.torch.cuda, "is_available", return_value=False):
+            self.assertEqual(build.resolve_devices(None), ["cpu"])
 
     def test_all_chronos2_variants_share_independent_recipe(self) -> None:
         chronos2 = {
@@ -428,6 +436,7 @@ class MasterRecomputeConfigTest(unittest.TestCase):
 
     def test_master_stage1_build_args(self) -> None:
         args = SimpleNamespace(
+            stage1_device="cuda",
             stage1_batch_size=8,
             stage1_shard_size=50,
             stage1_windows=[32, 64, 128],
@@ -436,6 +445,7 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertEqual(
             master._stage1_build_args(args),
             [
+                "--device", "cuda",
                 "--batch-size", "8",
                 "--shard-size", "50",
                 "--windows", "32", "64", "128",
