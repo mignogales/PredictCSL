@@ -9,7 +9,7 @@
 # Select only independent parts if a prerequisite is not yet available:
 #
 #   bash scripts/run_paper_followups.sh oracle interpretability
-#   bash scripts/run_paper_followups.sh transfer timing
+#   bash scripts/run_paper_followups.sh backfill transfer timing
 #
 # Every Python command writes resumable output in LOG_ROOT.  Re-running a task
 # is safe: the underlying stages skip their completed cache cells/checkpoints.
@@ -59,6 +59,37 @@ require_file() {
   fi
 }
 
+do_backfill() {
+  echo "== Inference-free legacy cache alignment backfill ==" | tee -a "$LOG_FILE"
+  require_dir "$CANONICAL_CACHE/datasets"
+
+  local cached_models=()
+  while IFS= read -r model; do
+    [[ -n "$model" ]] && cached_models+=("$model")
+  done < <(
+    find "$CANONICAL_CACHE/datasets" -mindepth 2 -maxdepth 2 -type d \
+      -exec basename {} \; | sort -u
+  )
+  if [[ ${#cached_models[@]} -eq 0 ]]; then
+    echo "No cached models found under $CANONICAL_CACHE/datasets" >&2
+    exit 2
+  fi
+
+  echo "Cached models: ${cached_models[*]}" | tee -a "$LOG_FILE"
+  # This visits cached Stage-3 cells and adds served_index where possible.
+  # --cached-only is the safety fuse: a missing/stale cell aborts instead of
+  # loading a foundation model. --forecast-only avoids predictor inference.
+  # Run one model at a time so each family uses its own canonical context grid;
+  # a multi-family forecast-only call would construct their grid union.
+  local model
+  for model in "${cached_models[@]}"; do
+    run_main -m experiments.test_window_ablation_gifteval_v5 \
+      --models "$model" --cache-root "$CANONICAL_CACHE" \
+      --cached-only --forecast-only --short-context-mode skip \
+      --device "$CUDA_DEVICE" --num-gpus 1 --no-plots
+  done
+}
+
 do_oracle() {
   echo "== Oracle-distribution analysis ==" | tee -a "$LOG_FILE"
   require_dir "$CANONICAL_CACHE/datasets"
@@ -100,7 +131,7 @@ do_interpretability() {
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/run_paper_followups.sh {all|oracle|transfer|timing|interpretability} [...]
+Usage: bash scripts/run_paper_followups.sh {all|backfill|oracle|transfer|timing|interpretability} [...]
 
 Environment overrides: MAIN_ENV, LOG_ROOT, CANONICAL_CACHE, GPU_ID,
 TRANSFER_SOURCE, TRANSFER_TARGETS, TIMING_MODELS, CUDA_DEVICE.
@@ -115,11 +146,13 @@ fi
 for task in "$@"; do
   case "$task" in
     all)
+      do_backfill
       do_oracle
       do_transfer
       do_timing
       do_interpretability
       ;;
+    backfill) do_backfill ;;
     oracle) do_oracle ;;
     transfer) do_transfer ;;
     timing) do_timing ;;

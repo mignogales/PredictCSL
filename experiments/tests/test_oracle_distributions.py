@@ -1,8 +1,16 @@
+import tempfile
 import unittest
+import warnings
+from pathlib import Path
 
 import numpy as np
 
-from experiments.analyze_oracle_distributions import jensen_shannon, select_oracles
+from experiments.analyze_oracle_distributions import (
+    _cell_size,
+    _metric_vector,
+    jensen_shannon,
+    select_oracles,
+)
 
 
 class OracleDistributionTests(unittest.TestCase):
@@ -37,6 +45,30 @@ class OracleDistributionTests(unittest.TestCase):
         right = np.asarray([0.0, 0.0, 1.0])
         self.assertEqual(jensen_shannon(left, left), 0.0)
         self.assertAlmostEqual(jensen_shannon(left, right), 1.0)
+
+    def test_unaligned_legacy_action_is_ignored(self):
+        with tempfile.TemporaryDirectory() as root:
+            aligned = Path(root) / "aligned.npz"
+            legacy = Path(root) / "legacy.npz"
+            np.savez_compressed(
+                aligned,
+                mase_gluonts_real=np.asarray([0.2, 0.3]),
+                served_index=np.asarray([0, 1]),
+            )
+            np.savez_compressed(
+                legacy,
+                mase_gluonts_real=np.asarray([0.1]),
+            )
+
+            self.assertEqual(_cell_size([legacy, aligned]), 2)
+            with warnings.catch_warnings(record=True) as caught:
+                values, counts, effective, source = _metric_vector(
+                    legacy, 2, "mase_gluonts_real")
+            self.assertEqual(source, "unaligned")
+            self.assertTrue(np.isnan(values).all())
+            self.assertTrue((counts == 0).all())
+            self.assertTrue(np.isnan(effective).all())
+            self.assertEqual(len(caught), 1)
 
 
 if __name__ == "__main__":

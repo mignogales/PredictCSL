@@ -40,6 +40,7 @@ import argparse
 import itertools
 import math
 import re
+import warnings
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -89,10 +90,13 @@ def _metric_vector(
                 return values, counts, effective, "missing"
         raw = np.asarray(data[source], dtype=np.float64)
         if "served_index" not in data.files:
-            raise RuntimeError(
-                f"{path} lacks served_index. Re-run Stage 3 once to backfill "
-                "alignment without TSFM inference."
+            warnings.warn(
+                f"Ignoring unaligned legacy oracle action {path}; run the "
+                "inference-free Stage-3 backfill to recover it if it is still "
+                "a supported cell.",
+                RuntimeWarning,
             )
+            return values, counts, effective, "unaligned"
         index = np.asarray(data["served_index"], dtype=np.int64)
         if raw.shape != index.shape:
             raise RuntimeError(f"Misaligned values/served_index in {path}")
@@ -119,12 +123,15 @@ def _cell_size(paths: Sequence[Path]) -> int:
     for path in paths:
         with np.load(path) as data:
             if "served_index" not in data.files:
-                raise RuntimeError(
-                    f"{path} lacks served_index. Re-run Stage 3 once to backfill it."
-                )
+                continue
             index = np.asarray(data["served_index"], dtype=np.int64)
             if index.size:
                 largest = max(largest, int(index.max()))
+    if largest < 0:
+        raise RuntimeError(
+            "No aligned per-instance action remains in this cell. Run the "
+            "inference-free Stage-3 served_index backfill first."
+        )
     return largest + 1
 
 
