@@ -63,7 +63,9 @@ import torch
 from colorama import Fore
 
 from gift_eval.data import Dataset as GiftEvalDataset
-from experiments.period_detection import GIFT_EVAL_PERIOD_LABELS, detect_period
+from experiments.archive.heuristics.period_detection import (
+    GIFT_EVAL_PERIOD_LABELS, detect_period,
+)
 
 # Reuse v5's catalog + machinery verbatim so this method evaluates models exactly
 # the way the grid ablation does (same loaders, same forward passes, same metric

@@ -128,6 +128,10 @@ from experiments import datasets_config
 CACHE_ROOT = "logs/experiments/window_ablation_gifteval"
 FULL_NATIVE_WINDOW = "full_native"
 PERIOD_POLICY_VERSION = 2
+# Signal heuristics are retained under experiments/archive/heuristics for
+# reproducing old exploratory runs, but are deliberately excluded from all
+# active comparisons even if legacy sidecars happen to be present.
+ENABLE_LEGACY_HEURISTICS = False
 # Conservative post-hoc strategy: shorten only when the predictor's paired
 # per-instance score advantage over the largest valid grid action clears a
 # one-sided confidence bound plus a small practical margin. Otherwise it uses
@@ -942,7 +946,7 @@ def _load_period_record(
     model_short: str,
     period_multiple: int = 2,
 ) -> Optional[dict]:
-    """Load the period_window_eval.py sidecar for this (dataset, term, model), if any.
+    """Load a retired period-heuristic sidecar only for legacy reproduction.
 
     Returns the parsed JSON plus the aligned per-series ``_windows`` vector when
     its NPZ sidecar is available.  Keeping the vector lets complexity be averaged
@@ -1326,6 +1330,9 @@ def load_strategy_records(
             # Each multiplier has its own sidecar. Missing sidecars are NaN-filled
             # so old/partial runs still compare full/best/pred normally.
             def _period_values(period_multiple: int):
+                if not ENABLE_LEGACY_HEURISTICS:
+                    return (float("nan"), float("nan"), float("nan"),
+                            float("nan"), 0, float("nan"), float("nan"))
                 prec = None
                 if period_tree:
                     candidate = os.path.join(

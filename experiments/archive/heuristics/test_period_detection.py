@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from experiments.period_detection import (
+from experiments.archive.heuristics.period_detection import (
     cadence_candidates,
     detect_period,
     window_similarity,

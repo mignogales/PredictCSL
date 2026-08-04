@@ -1046,7 +1046,7 @@ class PeriodStrategyAccountingTest(unittest.TestCase):
         self.assertNotAlmostEqual(actual, at_mean_window)
 
     def test_period_uses_full_native_model_caps(self) -> None:
-        from experiments.period_window_eval import _family_cap
+        from experiments.archive.heuristics.period_window_eval import _family_cap
 
         self.assertEqual(_family_cap("sundial", 128), 2880)
         self.assertEqual(_family_cap("toto", 128), 4096)

@@ -29,7 +29,10 @@ for only the windows the strategy comparison actually consumes:
 
 Output: a ``timing.json`` sidecar written into the SAME per-cell directory as the
 ablation's ``metrics.json`` (``_cache_dir``), holding
-``{n_warmup, n_repeats, samples_s, mean_s, std_s, min_s, median_s, cv}``. Because
+``{batch_size, n_warmup, n_repeats, samples_s, mean_s, std_s, min_s, median_s,
+cv, cuda_*_gb}``. CUDA memory fields report the post-warmup peak allocated and
+reserved memory (including resident weights and prepared inputs), the baseline
+immediately before timed forwards, and the incremental allocated peak. Because
 the v3/v4 variant trees symlink their ``datasets/`` cell cache to the shared
 ``general/datasets/``, writing here means every variant's comparison sees the
 robust timing for free — the TSFM forward pass is predictor-independent, so it is
@@ -142,14 +145,20 @@ def _timing_path(dataset_display: str, model_short: str, term: str, window_size:
 
 
 def _timing_done(dataset_display: str, model_short: str, term: str,
-                 window_size: int, repeats: int) -> bool:
+                 window_size: int, repeats: int, require_memory: bool) -> bool:
     p = _timing_path(dataset_display, model_short, term, window_size)
     if not os.path.isfile(p):
         return False
     try:
         with open(p) as f:
             d = json.load(f)
-        return int(d.get("n_repeats", 0)) >= repeats
+        enough_repeats = int(d.get("n_repeats", 0)) >= repeats
+        has_memory = not require_memory or (
+            "cuda_peak_allocated_gb" in d
+            and "cuda_peak_reserved_gb" in d
+            and "cuda_incremental_peak_allocated_gb" in d
+        )
+        return enough_repeats and has_memory
     except (OSError, json.JSONDecodeError, ValueError):
         return False
 
@@ -162,11 +171,13 @@ def _save_timing(dataset_display: str, model_short: str, term: str,
         json.dump(payload, f, indent=2)
 
 
-def _summarize(times: List[float], warmup: int) -> dict:
+def _summarize(times: List[float], warmup: int, batch_size: int,
+               memory: Optional[dict] = None) -> dict:
     arr = np.asarray(times, dtype=np.float64)
     mean = float(arr.mean())
     std = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
     return {
+        "batch_size": int(batch_size),
         "n_warmup":  int(warmup),
         "n_repeats": int(arr.size),
         "samples_s": [round(t, 6) for t in times],
@@ -175,7 +186,7 @@ def _summarize(times: List[float], warmup: int) -> dict:
         "min_s":     round(float(arr.min()), 6),
         "median_s":  round(float(np.median(arr)), 6),
         "cv":        round(std / mean, 6) if mean > 0 else float("nan"),
-    }
+    } | (memory or {})
 
 
 # ==============================================================================
@@ -203,7 +214,8 @@ def _model_cap_skip(model_family: str, window_size: int, horizon: int,
 
 def _measure_window(cache: GiftEvalCache, model_family: str, ensure_handle,
                     model_id: str, window_size: int, horizon: int, device: str,
-                    batch_size: int, warmup: int, repeats: int) -> List[float]:
+                    batch_size: int, warmup: int, repeats: int
+                    ) -> Tuple[List[float], dict]:
     """Time ``repeats`` PURE forward passes (after ``warmup`` discarded ones) for
     one window, each GPU-synced.
 
@@ -224,15 +236,37 @@ def _measure_window(cache: GiftEvalCache, model_family: str, ensure_handle,
             forward()
         _sync(device)
 
+        memory: dict = {}
+        if device == "cuda":
+            # Exclude checkpoint loading and compilation transients. The current
+            # allocation remains the baseline, so the peak includes resident
+            # weights and prepared inputs while the incremental value isolates
+            # additional forward-pass workspace/activations.
+            torch.cuda.reset_peak_memory_stats()
+            baseline_allocated = torch.cuda.memory_allocated()
+            baseline_reserved = torch.cuda.memory_reserved()
+
         times: List[float] = []
         for _ in range(repeats):
             t0 = time.perf_counter()
             forward()
             _sync(device)
             times.append(time.perf_counter() - t0)
+        if device == "cuda":
+            peak_allocated = torch.cuda.max_memory_allocated()
+            peak_reserved = torch.cuda.max_memory_reserved()
+            gib = float(1024 ** 3)
+            memory = {
+                "cuda_baseline_allocated_gb": round(baseline_allocated / gib, 6),
+                "cuda_baseline_reserved_gb": round(baseline_reserved / gib, 6),
+                "cuda_peak_allocated_gb": round(peak_allocated / gib, 6),
+                "cuda_peak_reserved_gb": round(peak_reserved / gib, 6),
+                "cuda_incremental_peak_allocated_gb": round(
+                    max(0, peak_allocated - baseline_allocated) / gib, 6),
+            }
     finally:
         teardown()
-    return times
+    return times, memory
 
 
 # ==============================================================================
@@ -262,6 +296,7 @@ def _write_summary(models, selected_by_model: Dict[str, Dict[Tuple[str, str], Se
                     "term":            term,
                     "horizon":         horizons.get((dataset_display, term), -1),
                     "window_size":     window_size,
+                    "batch_size":      d.get("batch_size"),
                     "n_warmup":        d.get("n_warmup"),
                     "n_repeats":       d.get("n_repeats"),
                     "mean_s":          d.get("mean_s"),
@@ -269,6 +304,12 @@ def _write_summary(models, selected_by_model: Dict[str, Dict[Tuple[str, str], Se
                     "min_s":           d.get("min_s"),
                     "median_s":        d.get("median_s"),
                     "cv":              d.get("cv"),
+                    "cuda_baseline_allocated_gb": d.get("cuda_baseline_allocated_gb"),
+                    "cuda_baseline_reserved_gb": d.get("cuda_baseline_reserved_gb"),
+                    "cuda_peak_allocated_gb": d.get("cuda_peak_allocated_gb"),
+                    "cuda_peak_reserved_gb": d.get("cuda_peak_reserved_gb"),
+                    "cuda_incremental_peak_allocated_gb": d.get(
+                        "cuda_incremental_peak_allocated_gb"),
                 })
     out = os.path.join(cache_root, "timing_summary.csv")
     os.makedirs(cache_root, exist_ok=True)
@@ -335,7 +376,8 @@ def run_timing(args, device: str, shard_id: Optional[int] = None,
             # Skip the whole dataset load if every selected window is already timed.
             pending = [w for w in windows
                        if args.force or not _timing_done(
-                           dataset_display, model_short, term, w, repeats)]
+                           dataset_display, model_short, term, w, repeats,
+                           require_memory=(device == "cuda"))]
             if not pending:
                 print(Fore.WHITE
                       + f"  CACHED  {model_short} | {dataset_display} | t={term} "
@@ -359,18 +401,20 @@ def run_timing(args, device: str, shard_id: Optional[int] = None,
                     print(Fore.RED + f"  SKIP    {tag}  ({reason})" + Fore.RESET)
                     continue
                 try:
-                    times = _measure_window(
+                    times, memory = _measure_window(
                         cache, model_family, ensure_handle, model_id, window_size,
                         horizon, device, args.batch_size, warmup, repeats)
                 except RuntimeError as exc:
                     print(Fore.RED + f"  SKIP    {tag}  ({exc})" + Fore.RESET)
                     continue
-                payload = _summarize(times, warmup)
+                payload = _summarize(times, warmup, args.batch_size, memory)
                 _save_timing(dataset_display, model_short, term, window_size, payload)
                 print(Fore.MAGENTA
                       + f"  TIMED   {tag}  mean={payload['mean_s']:.4f}s "
                         f"std={payload['std_s']:.4f}s "
                         f"min={payload['min_s']:.4f}s cv={payload['cv']:.3f}"
+                        + (f" peak={payload['cuda_peak_allocated_gb']:.3f}GiB"
+                           if 'cuda_peak_allocated_gb' in payload else "")
                       + Fore.RESET)
 
     # Only the single-process run or the coordinator's aggregation pass writes the

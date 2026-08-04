@@ -5,7 +5,7 @@ Same four stages as ``run_all.py`` (build -> predictor -> ablation -> compare),
 but with a fifth stage inserted before the comparison that evaluates an
 alternative, off-grid context-length strategy:
 
-    Stage 5 (period) -- experiments.period_window_eval
+    Stage 5 (period) -- experiments.archive.heuristics.period_window_eval
         For every test instance, translate the official GiftEval cadences to
         sample counts, choose the cadence whose adjacent non-overlapping chunks
         are most similar, then evaluate max(2P, horizon) and max(3P, horizon).
@@ -23,11 +23,7 @@ itself resumes per (model, dataset, term), so re-running is safe.
 
 Usage
 -----
-    python -m experiments.run_all_v2                      # all models, reuse v1 caches
-    python -m experiments.run_all_v2 --models Chronos2-Small
-    python -m experiments.run_all_v2 --skip-stages 1 2 3  # only period + compare
-    python -m experiments.run_all_v2 --quantize none      # exact per-series widths
-    python -m experiments.run_all_v2 --force-period       # recompute period sidecars
+    python -m experiments.archive.heuristics.run_all_v2
 """
 
 from __future__ import annotations
@@ -56,7 +52,7 @@ def stage_5_period(display: str, quantize: str, n_buckets: int, extra) -> float:
     then folds into the comparison. The script resumes per (dataset, term), so
     re-runs only fill gaps unless --force-period is passed (threaded via extra).
     """
-    cmd = [sys.executable, "-m", "experiments.period_window_eval",
+    cmd = [sys.executable, "-m", "experiments.archive.heuristics.period_window_eval",
            "--models", display,
            "--run-dir", ra.ABLATION_GENERAL,
            "--quantize", quantize,

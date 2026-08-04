@@ -7,3 +7,5 @@ and are kept only for reference. Nothing under `experiments/` imports them.
   (v4 is the prior ablation without the predictor-curve overlay). Stage 3 uses v5.
 - `_diag_decode_steps.py` — one-off decode-step diagnostic.
 - `_selftest_embsat.py` — self-test for `embedding_saturation.py`.
+- `heuristics/` — retired period-detection, period-regression, and
+  horizon/period window-selection baselines.

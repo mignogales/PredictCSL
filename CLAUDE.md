@@ -32,8 +32,7 @@ reproduce the measurement zero-shot.
 
 ## The pipeline (4 stages + extras), all under `experiments/`
 
-Orchestrated by **`run_all.py`** (and **`run_all_v2.py`**, which adds a period
-strategy). Each stage caches its work and has a done-marker so re-runs only do
+Orchestrated by **`run_all.py`**. Each stage caches its work and has a done-marker so re-runs only do
 what's missing. Per-family deterministic output paths under
 `logs/experiments/` (on the server).
 
@@ -65,7 +64,7 @@ predictor-derived, so no TSFM re-inference):
    `contexts.npy`, `targets.npy`, `curves_{mae,mse}.npy`, etc.
 
 2. **`predict_context_length.py`** — *predictor training*. A Patch-Transformer
-   (sibling of `predict_period.py`) trained on the synthetic labels with a
+   trained on the synthetic labels with a
    dual objective: `L = λ_curve·MSE_curve + λ_recon·MSE_reconstruction`. Predicts
    the per-series error-vs-context curve (z-scored — it learns curve *shape*);
    argmin of the predicted curve = recommended context length. Horizon is a
@@ -90,27 +89,21 @@ predictor-derived, so no TSFM re-inference):
    `elapsed_seconds` and drawing std error bars when available
    (`--use-robust-timing` / `--no-use-robust-timing`).
 
-**Extras / v2 path:**
-- **`period_window_eval.py`** — cadence-constrained strategies: translate the
-  official GiftEval frequency labels to samples at each dataset's sampling
-  rate, split each context into candidate-sized windows, and choose the cadence
-  with maximum adjacent-window correlation. Evaluates both
-  `L_i=max(2×period,horizon)` and `L_i=max(3×period,horizon)` directly (off-grid),
-  capped by each model/horizon's true full-native limit;
-  stage 4 folds their sidecars into `period` and `period3` columns.
-- **`run_all_v2.py`** — reuses stages 1–3 from `run_all.py`, inserts the period
-  stage, re-runs the comparison.
-- **`predict_period.py`** — the original period-regression Patch-Transformer that
-  `predict_context_length.py` is modeled on.
+**Retired heuristics:** Period-detection and horizon/period selection baselines
+live under `experiments/archive/heuristics/`. They are excluded from the active
+pipeline and paper; retain them only to reproduce exploratory runs.
 
 **Robust timing stage (run_all_5 path):**
 - **`benchmark_window_timing_gifteval.py`** — *robust wall-clock timing*. Reads
   each model's `comparison.csv`, collects the on-grid windows the strategies
-  actually use (`full`/`best`/`pred`/variant `*_window`; period is off-grid so it
-  keeps its single-shot timing), and times each one with `--warmup` discarded +
-  `--repeats` timed forward passes, every pass `cuda.synchronize()`-bracketed and
-  batch-build excluded. Writes `timing.json` (mean/std/min/median/cv) into the
-  same per-cell dir as `metrics.json` — and because v3/v4 symlink their
+  actually use (`full`/`best`/`pred`/variant `*_window`), and times each one with
+  `--warmup` discarded + `--repeats` timed forward passes, every pass
+  `cuda.synchronize()`-bracketed and batch-build excluded. Writes `timing.json`
+  (mean/std/min/median/cv) into the same per-cell dir as `metrics.json`. The
+  sidecar also records benchmark batch
+  size and post-warmup CUDA baseline/peak allocated/reserved memory (plus
+  incremental forward peak), so memory requires rerunning only the selected
+  strategy windows, not the full ablation grid. Because v3/v4 symlink their
   `datasets/`, the predictor-independent TSFM timing is measured once on
   `general/` and reused everywhere. Multi-GPU dataset-sharding like the ablation;
   resumes per cell.
@@ -156,7 +149,7 @@ predictor-derived, so no TSFM re-inference):
 - **`gifteval_mase.py`** — the one auditable home for both definitions:
   seasonality map + per-instance `seasonal_error` (port) and
   `gluonts_leaderboard_mase(...)` / `_build_gluonts_forecasts` (machinery; lazy
-  gluonts import). Shared by stage 3, `period_window_eval.py` and
+  gluonts import). Shared by stage 3 and `compare_mase_variants.py`.
   `compare_mase_variants.py`.
 - **Stage 3** (`test_window_ablation_gifteval_v5.py`) — computes both columns per
   cell. Seasonal errors come from **raw contexts (NaNs preserved)** — `GiftEvalCache`
@@ -275,6 +268,13 @@ Token-mapping / hook assumptions per family carry "verify on server" notes in
   instance-weighted total FLOPs saved. It passes Stage 3 `--cached-only`, which
   aborts on a missing/stale cell rather than loading a TSFM. PatchTST-only checks
   can run on CPU; the supported Mamba path requires CUDA.
+- **`analyze_oracle_distributions.py`** — inference-free analysis of the cached
+  per-instance GiftEval window curves. Selects a genuine per-instance oracle
+  including native/full, summarizes each model/dataset distribution, measures
+  same-instance cross-model rank/exact/factor-of-two agreement, and estimates
+  within-dataset distribution stability with repeated random half-split
+  Jensen-Shannon distances. It reads ``general/datasets`` directly, so it does
+  not require trained predictor checkpoints.
 
 ## Models labeled (the TSFMs under study)
 
@@ -333,7 +333,6 @@ python -m experiments.run_all                    # full pipeline, all models
 python -m experiments.run_all --models Chronos2-Small
 python -m experiments.run_all --skip-stages 1 2  # only ablation + compare
 python -m experiments.run_all --test             # tiny end-to-end smoke run
-python -m experiments.run_all_v2                 # + the 2×period strategy
 python -m experiments.run_all_v3                 # constrained (cheap) PatchTST predictor
 python -m experiments.run_all_v4                 # Mamba predictor (needs mamba-ssm)
 python -m experiments.run_all_v4 --cheap         # + pin the cheap Mamba corner

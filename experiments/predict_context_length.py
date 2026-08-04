@@ -3,10 +3,9 @@ Context-length predictor — dual-objective Patch-Transformer training pipeline.
 
 Pipeline overview
 -----------------
-Sibling of predict_period.py. Same Patch-Transformer backbone and multi-GPU
+Uses a Patch-Transformer backbone and multi-GPU
 random search, but the regression target changes:
 
-    predict_period.py        : scalar log-period of a synthetic series.
     predict_context_length.py: the error-vs-context curve of a TS foundation
                                model — one error value per ablation window.
 
@@ -43,7 +42,7 @@ time we sweep all horizons and average regret / curve MSE across them.
 
 Multi-GPU execution
 -------------------
-Process-per-GPU parallelism (preserved from predict_period.py): one worker per
+Process-per-GPU parallelism: one worker per
 device drains trials from a shared queue; per-device VRAM budgets; auto
 batch-size selection; sqrt LR scaling. All workers load the same fixed labeled
 dataset and the same train/val split.

@@ -10,9 +10,7 @@ predictor curves before choosing a window.  For every series i it:
    GiftEval/GluonTS axis=None MASE rule).
 
 All master predictor variants are evaluated together.  Full-native
-context, every fixed grid window, a 2x-horizon heuristic, the per-series
-GiftEval-cadence 2-period and 3-period heuristics (when their sidecars are
-present), dataset-shared
+context, an optional single globally fixed window, dataset-shared
 predictor controls, and dataset/per-instance oracles are included as baselines.
 """
 
@@ -277,7 +275,8 @@ def _horizon_for_cell(ablation_root: str, cell: Cell) -> int:
 
 def evaluate_cell(
     cell: Cell, ablation_root: str, ground_tree: str,
-    period_run_dir: Optional[str], mase_field: str = "mase_gluonts_real",
+    fixed_window: Optional[int] = None,
+    mase_field: str = "mase_gluonts_real",
 ) -> Tuple[List[dict], dict]:
     with np.load(cell.anchor_npz) as anchor:
         windows = np.asarray(anchor["window_grid"], dtype=np.int64)
@@ -354,17 +353,11 @@ def evaluate_cell(
 
     add("full_native", native, native_w, np.zeros(n, dtype=bool), "baseline")
 
-    for target in windows:
+    if fixed_window is not None:
         values, chosen_w, fallback = _choose_capped_fixed(
-            int(target), errors, windows, native)
-        add(f"fixed_{int(target)}", values, chosen_w, fallback, "fixed",
+            int(fixed_window), errors, windows, native)
+        add(f"fixed_{int(fixed_window)}", values, chosen_w, fallback, "fixed",
             counts_for_choice(chosen_w, fallback))
-
-    horizon = _horizon_for_cell(ablation_root, cell)
-    values, chosen_w, fallback = _choose_capped_fixed(
-        2 * horizon, errors, windows, native)
-    add("heuristic_2xhorizon", values, chosen_w, fallback, "heuristic",
-        counts_for_choice(chosen_w, fallback))
 
     # Dataset-shared oracle: one window from the mean curve, then cap it per row.
     oracle_weights = np.where(
@@ -423,25 +416,6 @@ def evaluate_cell(
         add(f"{variant}_dataset", values, chosen_w, fallback,
             "predictor_dataset", counts_for_choice(chosen_w, fallback))
 
-    if period_run_dir:
-        for multiple, prefix in ((2, "period"), (3, "period3")):
-            period_path = os.path.join(
-                period_run_dir, "models", cell.model, "compare_real_vs_predicted",
-                f"{prefix}_{cell.dataset}_t{cell.term}_{cell.model}_win.npz")
-            period_error, period_counts, meta = _load_vector(
-                period_path, n, mase_field)
-            if np.isfinite(period_error).any():
-                with np.load(period_path) as data:
-                    period_w = np.asarray(data["windows"], dtype=np.int64)
-                add(f"period{multiple}_instance", period_error, period_w,
-                    ~np.isfinite(period_error), "heuristic", period_counts,
-                    str(meta.get("source", "missing")))
-            elif meta.get("unaligned"):
-                print(Fore.YELLOW
-                      + f"Old {multiple}x-period sidecar lacks served_index: "
-                        f"{period_path}; rerun the period stage to include it."
-                      + Fore.RESET)
-
     return records, audit
 
 
@@ -465,7 +439,7 @@ def run(args: argparse.Namespace) -> None:
     all_records: List[dict] = []
     for cell in cells:
         records, audit = evaluate_cell(
-            cell, ablation_root, ground_tree, args.period_run_dir,
+            cell, ablation_root, ground_tree, args.fixed_window,
             args.mase_field)
         all_records.extend(records)
         np.savez_compressed(
@@ -535,7 +509,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ablation-root", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--period-run-dir", default=None)
+    parser.add_argument(
+        "--fixed-window", type=int, default=None,
+        help=("One global fixed context baseline, capped per instance. Omit until "
+              "a value is selected from a separate development analysis."),
+    )
     parser.add_argument("--models", nargs="+", default=None)
     parser.add_argument(
         "--mase-field", choices=["mase_gluonts_real", "mase_gluonts"],
