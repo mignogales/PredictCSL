@@ -26,6 +26,7 @@ GPU_ID="${GPU_ID:-}"
 TRANSFER_SOURCE="${TRANSFER_SOURCE:-$LOG_ROOT/context_length_predictor_v3/Chronos2-Small}"
 TRANSFER_TARGETS="${TRANSFER_TARGETS:-Chronos2-Synth Chronos2-Base}"
 TIMING_MODELS="${TIMING_MODELS:-Chronos2-Small}"
+TIMING_STRATEGY_SUBDIRS="${TIMING_STRATEGY_SUBDIRS:-strategy_comparison_v3 strategy_comparison_v4}"
 CUDA_DEVICE="${CUDA_DEVICE:-cuda}"
 
 # Pin the whole launcher to one physical GPU when requested.  CUDA remaps that
@@ -86,6 +87,7 @@ do_timing() {
   # resulting timing.json includes CUDA baseline/peak allocated/reserved GB.
   run_main -m experiments.benchmark_window_timing_gifteval \
     --run-dir "$CANONICAL_CACHE" --models $TIMING_MODELS \
+    --strategy-subdirs $TIMING_STRATEGY_SUBDIRS \
     --device "$CUDA_DEVICE" --warmup 3 --repeats 10 --num-gpus 1
 }
 
@@ -103,7 +105,8 @@ usage() {
 Usage: bash scripts/run_paper_followups.sh {all|oracle|transfer|timing|interpretability} [...]
 
 Environment overrides: MAIN_ENV, LOG_ROOT, CANONICAL_CACHE, GPU_ID,
-TRANSFER_SOURCE, TRANSFER_TARGETS, TIMING_MODELS, CUDA_DEVICE.
+TRANSFER_SOURCE, TRANSFER_TARGETS, TIMING_MODELS, TIMING_STRATEGY_SUBDIRS,
+CUDA_DEVICE.
 EOF
 }
 

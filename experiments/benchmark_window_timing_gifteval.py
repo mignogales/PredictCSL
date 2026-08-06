@@ -91,7 +91,10 @@ from experiments.test_window_ablation_gifteval_v5 import (
     TIREX_MAX_CONTEXT,
 )
 
-STRATEGY_SUBDIR = "strategy_comparison"
+DEFAULT_STRATEGY_SUBDIRS = [
+    "strategy_comparison_v3",
+    "strategy_comparison_v4",
+]
 
 
 def _sync(device: str) -> None:
@@ -104,34 +107,47 @@ def _sync(device: str) -> None:
 #  SELECTED-WINDOW DISCOVERY  (from the strategy comparison)
 # ==============================================================================
 
-def _selected_windows(comparison_root: str, display: str
+def _selected_windows(comparison_root: str, display: str,
+                      strategy_subdirs: List[str]
                       ) -> Dict[Tuple[str, str], Set[int]]:
-    """Read <comparison_root>/<display>/strategy_comparison/comparison.csv and
-    return {(dataset_display, term): {on-grid windows chosen by any strategy}}.
+    """Union selected windows from one or more strategy-comparison variants.
 
     Collects every ``*_window`` column except the period ones (period is
-    per-series / off-grid and not a single grid window). Empty dict when the
-    comparison has not been produced for this model yet.
+    per-series / off-grid and not a single grid window). Empty dict when none of
+    the requested comparisons has been produced for this model yet.
     """
-    csv_path = os.path.join(comparison_root, display, STRATEGY_SUBDIR, "comparison.csv")
-    if not os.path.isfile(csv_path):
-        print(Fore.YELLOW
-              + f"  [{display}] no comparison.csv at {csv_path} — run stage 4 first; "
-                "nothing to time." + Fore.RESET)
-        return {}
-    df = pd.read_csv(csv_path)
-    win_cols = [c for c in df.columns
-                if c.endswith("_window") and not c.startswith("period")]
     out: Dict[Tuple[str, str], Set[int]] = {}
-    for _, row in df.iterrows():
-        key = (str(row["dataset_display"]), str(row["term"]))
-        wins: Set[int] = set()
-        for c in win_cols:
-            v = row[c]
-            if pd.notna(v):
-                wins.add(int(round(float(v))))
-        if wins:
-            out.setdefault(key, set()).update(wins)
+    found: List[str] = []
+    missing: List[str] = []
+    for subdir in strategy_subdirs:
+        csv_path = os.path.join(
+            comparison_root, display, subdir, "comparison.csv")
+        if not os.path.isfile(csv_path):
+            missing.append(csv_path)
+            continue
+        found.append(subdir)
+        df = pd.read_csv(csv_path)
+        win_cols = [
+            c for c in df.columns
+            if c.endswith("_window") and not c.startswith("period")
+        ]
+        for _, row in df.iterrows():
+            key = (str(row["dataset_display"]), str(row["term"]))
+            wins: Set[int] = set()
+            for column in win_cols:
+                value = row[column]
+                if pd.notna(value):
+                    wins.add(int(round(float(value))))
+            if wins:
+                out.setdefault(key, set()).update(wins)
+    if found:
+        print(Fore.CYAN
+              + f"  [{display}] strategy comparisons: {', '.join(found)}"
+              + Fore.RESET)
+    else:
+        print(Fore.YELLOW
+              + f"  [{display}] none of the requested comparison files exists:\n    "
+              + "\n    ".join(missing) + Fore.RESET)
     return out
 
 
@@ -337,7 +353,14 @@ def run_timing(args, device: str, shard_id: Optional[int] = None,
 
     # Per-model selected windows from the strategy comparison.
     selected_by_model: Dict[str, Dict[Tuple[str, str], Set[int]]] = {
-        m[2]: _selected_windows(comparison_root, m[2]) for m in models}
+        m[2]: _selected_windows(
+            comparison_root, m[2], args.strategy_subdirs) for m in models}
+    if not any(selected_by_model.values()):
+        raise SystemExit(
+            "No selected strategy windows were found; refusing to write an "
+            "empty timing summary. Check --comparison-root and "
+            "--strategy-subdirs."
+        )
 
     horizons: Dict[Tuple[str, str], int] = {}
     ge_cache: Dict[Tuple[str, str], GiftEvalCache] = {}
@@ -463,8 +486,14 @@ def parse_args() -> argparse.Namespace:
                    help="Alias for --run-dir (the cell cache root). One of "
                         "--run-dir / --cache-root must resolve.")
     p.add_argument("--comparison-root", type=str, default=None,
-                   help="Root holding <display>/strategy_comparison/comparison.csv "
+                   help="Root holding <display>/<strategy-subdir>/comparison.csv "
                         "(default: parent dir of the cache root).")
+    p.add_argument(
+        "--strategy-subdirs", nargs="+", default=DEFAULT_STRATEGY_SUBDIRS,
+        help=("Strategy comparison variants whose selected windows are unioned "
+              "for timing (default: strategy_comparison_v3 "
+              "strategy_comparison_v4)."),
+    )
     p.add_argument("--models", type=str, nargs="+", default=None,
                    help="Restrict to these model_short names (default: all known).")
     p.add_argument("--batch-size", type=int, default=32)
