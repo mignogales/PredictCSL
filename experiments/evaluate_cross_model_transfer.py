@@ -14,7 +14,7 @@ Example (run on the server after target window grids are complete)::
 
     python -m experiments.evaluate_cross_model_transfer \\
       --canonical-run-dir logs/experiments/master_recompute/window_ablation_gifteval/general \\
-      --source-predictor-dir logs/experiments/master_recompute/context_length_predictor/Chronos2-Small \\
+      --source-predictor-dir logs/experiments/master_recompute/context_length_predictor_v3/Chronos2-Small \\
       --targets Chronos2-Synth Chronos2-Base
 """
 
@@ -83,6 +83,10 @@ def compare_command(tree: Path, target: str) -> List[str]:
 def run(args: argparse.Namespace) -> None:
     canonical = Path(args.canonical_run_dir).resolve()
     source = Path(args.source_predictor_dir).resolve()
+    if not (canonical / "datasets").is_dir():
+        raise FileNotFoundError(
+            f"Canonical run must contain the completed datasets cache: "
+            f"{canonical / 'datasets'}")
     if not (source / "best_model.pt").is_file() or not (source / "best_config.json").is_file():
         raise FileNotFoundError(
             f"Source predictor must contain best_model.pt + best_config.json: {source}")
@@ -131,7 +135,11 @@ def parse_args() -> argparse.Namespace:
                         help="Default: <canonical parent>/cross_model_transfer.")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda",
                         help="Only used for predictor inference; target TSFM inference is forbidden.")
-    parser.add_argument("--short-context-mode", choices=["skip", "pad"], default="pad")
+    parser.add_argument(
+        "--short-context-mode", choices=["skip", "pad"], default="skip",
+        help=("Must match the canonical Stage-3 cache. The master-recompute "
+              "general tree uses skip (default)."),
+    )
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

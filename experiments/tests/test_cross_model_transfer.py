@@ -28,11 +28,12 @@ class CrossModelTransferTests(unittest.TestCase):
             self.assertTrue((tree / "datasets").is_symlink())
             args = argparse.Namespace(
                 source_predictor_dir=str(source), canonical_run_dir=str(canonical),
-                short_context_mode="pad", device="cpu", no_plots=True,
+                short_context_mode="skip", device="cpu", no_plots=True,
             )
             overlay = overlay_command(args, tree, "Chronos2-Base")
             self.assertIn("--cached-only", overlay)
             self.assertIn("--preloaded-results-csv", overlay)
+            self.assertEqual(overlay[overlay.index("--short-context-mode") + 1], "skip")
             self.assertIn("Chronos2-Base", overlay)
             self.assertIn("Chronos2-Base", compare_command(tree, "Chronos2-Base"))
 

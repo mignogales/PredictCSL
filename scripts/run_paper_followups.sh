@@ -25,6 +25,7 @@ GPU_ID="${GPU_ID:-}"
 
 TRANSFER_SOURCE="${TRANSFER_SOURCE:-$LOG_ROOT/context_length_predictor_v3/Chronos2-Small}"
 TRANSFER_TARGETS="${TRANSFER_TARGETS:-Chronos2-Synth Chronos2-Base}"
+TRANSFER_SHORT_CONTEXT_MODE="${TRANSFER_SHORT_CONTEXT_MODE:-skip}"
 TIMING_MODELS="${TIMING_MODELS:-Chronos2-Small}"
 TIMING_STRATEGY_SUBDIRS="${TIMING_STRATEGY_SUBDIRS:-strategy_comparison_v3 strategy_comparison_v4}"
 CUDA_DEVICE="${CUDA_DEVICE:-cuda}"
@@ -77,7 +78,8 @@ do_transfer() {
   run_main -m experiments.evaluate_cross_model_transfer \
     --canonical-run-dir "$CANONICAL_CACHE" \
     --source-predictor-dir "$TRANSFER_SOURCE" \
-    --targets $TRANSFER_TARGETS --device "$CUDA_DEVICE"
+    --targets $TRANSFER_TARGETS --short-context-mode "$TRANSFER_SHORT_CONTEXT_MODE" \
+    --device "$CUDA_DEVICE"
 }
 
 do_timing() {
@@ -105,8 +107,8 @@ usage() {
 Usage: bash scripts/run_paper_followups.sh {all|oracle|transfer|timing|interpretability} [...]
 
 Environment overrides: MAIN_ENV, LOG_ROOT, CANONICAL_CACHE, GPU_ID,
-TRANSFER_SOURCE, TRANSFER_TARGETS, TIMING_MODELS, TIMING_STRATEGY_SUBDIRS,
-CUDA_DEVICE.
+TRANSFER_SOURCE, TRANSFER_TARGETS, TRANSFER_SHORT_CONTEXT_MODE, TIMING_MODELS,
+TIMING_STRATEGY_SUBDIRS, CUDA_DEVICE.
 EOF
 }
 
