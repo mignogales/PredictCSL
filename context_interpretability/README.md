@@ -4,6 +4,59 @@ The unified runner exposes nine experiments (`exp0`–`exp8`). See
 `configs/experiments.yaml` for the complete grid. The two most recent additions
 are below.
 
+## Multi-model long-lag follow-up
+
+`configs/experiments_long_lag.yaml` is the isolated follow-up to the initial
+Chronos2-Small suite. It inherits the standard configuration but writes to
+`logs/experiments/context_interpretability_long_lag`, uses planted lags
+128/512/1,024/2,048, and extends both the generator and context grid to 8,192
+timesteps. The separate output root is deliberate: resumable cells from the
+earlier 32--256 lag experiment must not be mistaken for fresh long-lag cells.
+The default launcher uses Chronos2-Small as the reference and compares it with
+Moirai2-Small, TimesFM2.5-200M, PatchTST-FM-R1, Sundial-Base-128M, and
+Toto-2.0-313m. These models span distinct architectures while retaining Exp7
+masking support.
+
+Launch the full run set through the environment-routing master:
+
+```bash
+bash scripts/run_interpretability_multimodel.sh
+```
+
+Override the space-separated model list when a smaller pilot is appropriate:
+
+```bash
+INTERPRETABILITY_MODELS="Chronos2-Small PatchTST-FM-R1 Moirai2-Small" \
+  bash scripts/run_interpretability_multimodel.sh
+```
+
+Exp1 and Exp4 apply to every forecaster. Exp7 is capability-gated: FlowState
+and TiRex are retained in the default comparison for perturbation and planted
+lags, but their masking decomposition is recorded as unsupported rather than
+treated as a null result.
+
+### Plot map for the causal tests
+
+- `00_exp1_temporal_perturbation_test.png`: exact clean-versus-one-block
+  intervention used by Exp1.
+- `03d_perturbation_heatmaps_by_type_abs_dloss.png`: one raw triangular
+  W-by-lookback matrix per intervention type; columns fix input length, rows fix
+  the perturbed block, and color is mean absolute loss change. White cells are
+  structurally unavailable or omitted by the configured geometric block
+  thinning, not zero effects.
+- `03e_perturbation_block_sweep_raw.png`: the earlier one-panel-per-input-length
+  view on raw loss units. Each point is one perturbed block; no per-column
+  normalization is applied.
+- `03c_perturbation_profiles*.png`: the original normalized block profiles,
+  retained because their shapes are easy to compare even when effect scales
+  differ by input length.
+- `00_exp4_long_dependency_test.png`: oracle, context-curve, and intervention
+  logic for the planted long-lag test.
+- `07_sufficient_context_vs_lag_all_models.png`: cross-model recovery of
+  planted dependency reach.
+- `03e_perturbation_recency_all_models.png`: cross-model block-mean sensitivity
+  profile at each model's largest supported input.
+
 ## Exp6 — predictor contrast saliency
 
 Exp6 explains the learned context-length predictor using the scalar target

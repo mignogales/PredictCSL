@@ -177,6 +177,11 @@ class TestAnalysis(unittest.TestCase):
         self.assertIn("02b_masking_loss_vs_lookback.png", names)
         self.assertTrue(any(n.startswith("03a_perturbation") for n in names))
         self.assertIn("03c_perturbation_profiles_log_y.png", names)
+        self.assertIn(
+            "03d_perturbation_heatmaps_by_type_abs_dloss.png", names)
+        self.assertIn("03e_perturbation_block_sweep_raw.png", names)
+        self.assertIn("00_exp1_temporal_perturbation_test.png", names)
+        self.assertIn("00_exp4_long_dependency_test.png", names)
         self.assertTrue(any(n.startswith("05_lens") for n in names))
         self.assertTrue(any(n.startswith("06_ig") for n in names))
         self.assertTrue(any(n.startswith("09_cross_method") for n in names))
@@ -193,6 +198,9 @@ class TestAnalysis(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(
             root, "figures",
             "02b_masking_loss_vs_lookback_all_models.png")))
+        self.assertTrue(os.path.exists(os.path.join(
+            root, "figures",
+            "03e_perturbation_recency_all_models.png")))
 
     def test_hypotheses_report(self):
         report = hypotheses.evaluate(self.run_dir)

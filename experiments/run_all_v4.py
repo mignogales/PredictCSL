@@ -53,6 +53,7 @@ Usage
     python -m experiments.run_all_v4 --force 2            # re-run the Mamba search
     python -m experiments.run_all_v4 --cheap              # pin the cheap Mamba corner
     python -m experiments.run_all_v4 --n-trials 40        # override the trial count
+    python -m experiments.run_all_v4 --cached-only-ablation # never run the TSFM in stage 3
 """
 
 from __future__ import annotations
@@ -155,6 +156,13 @@ def parse_args() -> argparse.Namespace:
                    default="curve",
                    help="Predict the curve shape (original) or classify the best "
                         "window with soft top-3 labels.")
+    p.add_argument(
+        "--cached-only-ablation", action="store_true",
+        help=("Pass --cached-only to stage 3, refusing to load the foundation "
+              "model if a native forecast cell is missing or stale. Used by "
+              "master_run_all when predictor work runs outside the model's "
+              "dedicated environment."),
+    )
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Stream subprocess output instead of the quiet tqdm bars.")
     return p.parse_args()
@@ -224,6 +232,8 @@ def main() -> None:
     # so no extra args are required beyond the short-context mode (skip, to match
     # v3 — short instances are excluded at each window rather than padded).
     extras = {"1": [], "2": [], "3": ["--short-context-mode", "skip"], "4": []}
+    if args.cached_only_ablation:
+        extras["3"].append("--cached-only")
     if test_mode:
         extras["1"] += ["--n-series", str(ra.TEST_N_SERIES)]
         extras["3"] += ["--no-plots",

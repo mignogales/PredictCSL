@@ -236,6 +236,10 @@ class MasterRecomputeConfigTest(unittest.TestCase):
     def test_tirex2_uses_dedicated_env(self) -> None:
         self.assertEqual(master.FAMILY_ENV["tirex"], "predictcsl-tirex")
         self.assertIn("predictcsl-tirex", master.ENVS_WITHOUT_MAMBA)
+        self.assertEqual(
+            master.MAMBA_PREDICTOR_ENV_OVERRIDES["predictcsl-tirex"],
+            master.MAIN_ENV,
+        )
 
     def test_patchtst_uses_leaderboard_compatible_env(self) -> None:
         self.assertEqual(
@@ -255,6 +259,39 @@ class MasterRecomputeConfigTest(unittest.TestCase):
         self.assertEqual(
             master._resolve_groups(["Toto-2.0-313m"]),
             {"predictcsl-toto": ["Toto-2.0-313m"]},
+        )
+        self.assertEqual(
+            master.MAMBA_PREDICTOR_ENV_OVERRIDES["predictcsl-toto"],
+            master.MAIN_ENV,
+        )
+
+    def test_toto_mamba_route_uses_main_env_and_cached_only_guard(self) -> None:
+        mamba = next(v for v in master.VARIANTS if v.name == "mamba")
+        route = master._variant_route("predictcsl-toto", mamba)
+        self.assertEqual(
+            route,
+            (master.MAIN_ENV, ["--cached-only-ablation"]),
+        )
+        predictor_env, route_extra = route
+        cmd = master._variant_cmd(
+            predictor_env,
+            mamba,
+            ["Toto-2.0-313m"],
+            [],
+            route_extra,
+        )
+
+        self.assertEqual(cmd[0], sys.executable)
+        self.assertIn("experiments.run_all_v4", cmd)
+        self.assertIn("--cheap", cmd)
+        self.assertIn("--cached-only-ablation", cmd)
+        self.assertIn("Toto-2.0-313m", cmd)
+
+    def test_tirex_mamba_route_uses_main_env_and_cached_only_guard(self) -> None:
+        mamba = next(v for v in master.VARIANTS if v.name == "mamba")
+        self.assertEqual(
+            master._variant_route("predictcsl-tirex", mamba),
+            (master.MAIN_ENV, ["--cached-only-ablation"]),
         )
 
     def test_dedicated_envs_use_conda_activation(self) -> None:

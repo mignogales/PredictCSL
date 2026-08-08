@@ -1,4 +1,5 @@
 /logs
+/reports/
 */__pycache__/
 *.pyc
 /model saved

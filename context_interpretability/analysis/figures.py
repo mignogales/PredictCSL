@@ -17,7 +17,9 @@ from typing import Dict, List, Optional
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
+from matplotlib.patches import FancyArrowPatch, Rectangle
 import numpy as np
 import pandas as pd
 
@@ -29,10 +31,11 @@ DPI = 130
 
 
 def _save(fig, out_dir: str, name: str,
-          tight_rect=None) -> str:
+          tight_rect=None, use_tight_layout: bool = True) -> str:
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
-    fig.tight_layout(rect=tight_rect)
+    if use_tight_layout:
+        fig.tight_layout(rect=tight_rect)
     fig.savefig(path, dpi=DPI)
     plt.close(fig)
     print(f"[figures] wrote {path}")
@@ -341,6 +344,222 @@ def fig_block_heatmaps(df: pd.DataFrame, out_dir: str) -> None:
               f"{method}: signed-log effect / column max |effect|",
               center_zero=True if center else False)
         _save(fig, out_dir, f"{name}.png")
+
+
+def _sparse_axis_labels(ax, values, axis: str, max_ticks: int = 10) -> None:
+    """Label a dense categorical heatmap without producing an unreadable wall."""
+    n = len(values)
+    if n <= max_ticks:
+        positions = np.arange(n)
+    else:
+        positions = np.unique(np.linspace(0, n - 1, max_ticks).round().astype(int))
+    labels = [str(values[i]) for i in positions]
+    if axis == "x":
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels, rotation=90, fontsize=7)
+    else:
+        ax.set_yticks(positions)
+        ax.set_yticklabels(labels, fontsize=7)
+
+
+def fig_perturbation_heatmaps_by_type(df: pd.DataFrame,
+                                      out_dir: str) -> None:
+    """Raw Exp1 block sweeps: one triangular heatmap per perturbation type.
+
+    Columns fix the input length W; rows fix the perturbed block's lookback.
+    Each cell is the sample-mean absolute loss change, after stochastic seeds
+    have first been averaged within sample. Unlike the legacy headline heatmap,
+    this view never pools intervention types or normalizes columns.
+    """
+    d = df[df["method"] == "perturbation"]
+    if d.empty:
+        return
+    collapsed = agg.collapse_seeds(d)
+    collapsed = collapsed.assign(abs_loss_delta=collapsed["loss_delta"].abs())
+    matrices = {}
+    positives = []
+    for ptype, group in collapsed.groupby("perturbation_type"):
+        piv = group.pivot_table(
+            index="lookback_start", columns="context_length",
+            values="abs_loss_delta", aggfunc="mean")
+        if not piv.empty:
+            matrices[str(ptype)] = piv
+            vals = piv.to_numpy(dtype=float)
+            positives.extend(vals[np.isfinite(vals) & (vals > 0)].tolist())
+    if not matrices or not positives:
+        return
+    vmin = max(float(np.nanpercentile(positives, 2)), np.finfo(float).tiny)
+    vmax = max(float(np.nanpercentile(positives, 98)), vmin * 1.01)
+    names = sorted(matrices)
+    ncols = 2
+    nrows = int(math.ceil(len(names) / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(7.2 * ncols, 5.2 * nrows), squeeze=False)
+    image = None
+    cmap = plt.get_cmap("magma").copy()
+    cmap.set_bad("white")
+    for ax, name in zip(axes.flat, names):
+        piv = matrices[name]
+        image = ax.imshow(
+            np.ma.masked_invalid(piv.to_numpy(dtype=float)), aspect="auto",
+            origin="lower", interpolation="nearest", cmap=cmap,
+            norm=LogNorm(vmin=vmin, vmax=vmax))
+        _sparse_axis_labels(ax, list(piv.columns), "x", max_ticks=12)
+        _sparse_axis_labels(ax, list(piv.index), "y", max_ticks=11)
+        ax.set_xlabel("fixed input length W (timesteps)")
+        ax.set_ylabel("perturbed-block lookback (timesteps)")
+        suffix = " (all configured severities)" if name == "noise" else ""
+        ax.set_title(f"{name}{suffix}", fontsize=10)
+    for ax in axes.flat[len(names):]:
+        ax.set_visible(False)
+    fig.subplots_adjust(
+        left=0.07, right=0.88, bottom=0.08, top=0.91,
+        hspace=0.30, wspace=0.20)
+    if image is not None:
+        cax = fig.add_axes([0.91, 0.20, 0.018, 0.60])
+        cbar = fig.colorbar(image, cax=cax)
+        cbar.set_label("mean |loss(perturbed block) − loss(clean)|")
+    fig.suptitle(
+        "Exp1 block-by-block temporal perturbation — raw effect by input length",
+        fontsize=14)
+    _save(
+        fig, out_dir, "03d_perturbation_heatmaps_by_type_abs_dloss.png",
+        use_tight_layout=False)
+
+
+def fig_perturbation_block_sweep_raw(df: pd.DataFrame, out_dir: str,
+                                     dataset: Optional[str] = None) -> None:
+    """One panel per W; every point is one block intervention on raw scale."""
+    d = df[(df["method"] == "perturbation")
+           & (df["perturbation_type"] != "noise")]
+    if dataset is not None:
+        d = d[d["dataset"] == dataset]
+    if d.empty:
+        return
+    ctxs, nrows, ncols = _perturbation_grid_layout(
+        d["context_length"].unique())
+    if not ctxs:
+        return
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(4 * ncols, 3.6 * nrows), squeeze=False,
+        sharey=True)
+    for ax, W in zip(axes.flat, ctxs):
+        g = agg.collapse_seeds(d[d["context_length"] == W])
+        for ptype, gg in g.groupby("perturbation_type"):
+            prof = gg.groupby("lookback_start")["loss_delta"].apply(
+                lambda s: float(np.nanmean(np.abs(s.to_numpy(dtype=float)))))
+            prof = prof[prof > 0]
+            if not prof.empty:
+                xvals = np.maximum(prof.index.to_numpy(dtype=float), 1.0)
+                ax.plot(xvals, prof.values, "o-", ms=3, label=str(ptype))
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+        ax.set_xlim(left=1)
+        ax.set_xlabel("block lookback (0 = most recent)")
+        ax.set_title(f"fixed input W={W}", fontsize=9)
+        ax.legend(fontsize=6)
+        ax.grid(True, which="both", alpha=0.25)
+    for ax in axes.flat[len(ctxs):]:
+        ax.set_visible(False)
+    for ax in axes[:, 0]:
+        if ax.get_visible():
+            ax.set_ylabel("mean |Δ loss| (raw units)")
+    suffix = "" if dataset is None else "_" + "".join(
+        c if c.isalnum() or c in "-_" else "_" for c in str(dataset))
+    fig.suptitle(
+        "Exp1: fix input length, perturb one block at a time, measure error change",
+        fontsize=14)
+    _save(
+        fig, out_dir, f"03e_perturbation_block_sweep_raw{suffix}.png",
+        tight_rect=(0, 0, 1, 0.97))
+
+
+def fig_perturbation_test_schematic(out_dir: str) -> None:
+    """Data-independent visual definition of the Exp1 intervention."""
+    fig, axes = plt.subplots(2, 1, figsize=(11, 5.4), height_ratios=[1, 1.05])
+    for ax in axes:
+        ax.set_xlim(0, 14)
+        ax.set_ylim(0, 2.2)
+        ax.axis("off")
+    colors = {"clean": "#9ecae1", "perturbed": "#f28e2b",
+              "edge": "#334155", "forecast": "#2e74b5"}
+    for row, (ax, perturbed) in enumerate(zip(axes, [False, True])):
+        for i in range(10):
+            fill = colors["clean"]
+            hatch = None
+            if perturbed and i == 6:
+                fill, hatch = colors["perturbed"], "///"
+            ax.add_patch(Rectangle(
+                (0.6 + i * 0.72, 0.9), 0.65, 0.55, facecolor=fill,
+                edgecolor=colors["edge"], linewidth=0.8, hatch=hatch))
+        ax.text(0.6, 1.68, "older history", fontsize=9, ha="left")
+        ax.text(7.75, 1.68, "forecast origin", fontsize=9, ha="right")
+        ax.annotate("lookback = 0", xy=(7.75, 0.84), xytext=(7.75, 0.42),
+                    ha="right", fontsize=8,
+                    arrowprops={"arrowstyle": "->", "color": colors["edge"]})
+        ax.add_patch(FancyArrowPatch(
+            (8.1, 1.18), (9.5, 1.18), arrowstyle="-|>", mutation_scale=14,
+            color=colors["edge"], linewidth=1.2))
+        ax.text(8.8, 1.38, "same model", ha="center", fontsize=8)
+        ax.add_patch(Rectangle(
+            (9.65, 0.85), 1.5, 0.68, facecolor="#dbeafe",
+            edgecolor=colors["forecast"], linewidth=1.2))
+        ax.text(10.4, 1.19, "forecast", ha="center", va="center", fontsize=9)
+        loss = "E_clean" if not perturbed else "E_block"
+        ax.text(11.45, 1.18, f"→  {loss}", fontsize=11, va="center")
+        label = "A. clean input" if not perturbed else (
+            "B. replace exactly one block; width, positions, and all other blocks stay fixed")
+        ax.text(0.1, 2.02, label, fontsize=10, weight="bold")
+        if perturbed:
+            ax.annotate(
+                "selected block", xy=(0.6 + 6 * 0.72 + 0.32, 1.47),
+                xytext=(5.0, 1.92), ha="center", fontsize=8,
+                arrowprops={"arrowstyle": "->", "color": colors["perturbed"]})
+            ax.text(11.45, 0.68, "Δerror = E_block − E_clean", fontsize=10,
+                    color="#9a3412")
+    fig.suptitle(
+        "Temporal perturbation test: repeat B for every block and every input length W",
+        fontsize=14, weight="bold")
+    _save(fig, out_dir, "00_exp1_temporal_perturbation_test.png",
+          tight_rect=(0, 0, 1, 0.94))
+
+
+def fig_long_lag_control_schematic(out_dir: str) -> None:
+    """Data-independent visual definition of the long-lag Exp4 control."""
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    ax.set_xlim(0, 100)
+    ax.set_ylim(-0.6, 8)
+    ax.axis("off")
+    ax.plot([5, 93], [3.7, 3.7], color="#334155", lw=1.5)
+    ax.scatter([90], [3.7], s=90, color="#2e74b5", zorder=3)
+    ax.text(90, 4.2, "target y(t)", ha="center", weight="bold")
+    ax.add_patch(Rectangle((82, 3.2), 7, 1.0, facecolor="#bfdbfe",
+                           edgecolor="#2e74b5"))
+    ax.text(85.5, 2.75, "local lags 1…8", ha="center", fontsize=9)
+    ax.scatter([40], [3.7], s=90, color="#f28e2b", zorder=3)
+    ax.text(40, 4.2, "planted x(t−d)", ha="center", weight="bold",
+            color="#9a3412")
+    ax.annotate("verified incremental signal", xy=(40, 3.85), xytext=(57, 6.4),
+                ha="center", fontsize=9,
+                arrowprops={"arrowstyle": "->", "color": "#f28e2b"})
+    ax.add_patch(FancyArrowPatch(
+        (41, 4.0), (88, 4.0), arrowstyle="-|>", connectionstyle="arc3,rad=-.22",
+        mutation_scale=14, color="#f28e2b", lw=1.6))
+    ax.plot([55, 90], [1.65, 1.65], lw=5, color="#94a3b8")
+    ax.text(72.5, 1.0, "short W < d: distant cause excluded", ha="center")
+    ax.plot([20, 90], [0.35, 0.35], lw=5, color="#2e74b5")
+    ax.text(55, -0.3, "long W ≥ d: distant cause available", ha="center")
+    ax.text(5, 7.25, "1  Oracle check", weight="bold", color="#0b2545")
+    ax.text(5, 6.72, "recent-only ridge vs recent + lag-d ridge", fontsize=9)
+    ax.text(38, 7.25, "2  Context curve", weight="bold", color="#0b2545")
+    ax.text(38, 6.72, "does sufficient W grow with d?", fontsize=9)
+    ax.text(70, 7.25, "3  Block intervention", weight="bold", color="#0b2545")
+    ax.text(70, 6.72, "does sensitivity peak near lag d?", fontsize=9)
+    fig.suptitle(
+        "Long-dependency control: distinguish adaptive reach from inability to use history",
+        fontsize=14, weight="bold")
+    _save(fig, out_dir, "00_exp4_long_dependency_test.png",
+          tight_rect=(0, 0.03, 1, 0.94))
 
 
 def fig_perturbation_profiles(df: pd.DataFrame, out_dir: str,
@@ -711,11 +930,20 @@ def fig_tsfm_contrast_saliency(df: pd.DataFrame, out_dir: str) -> None:
 
 def generate_all(run_dir: str, tolerance: float = 0.05) -> None:
     out_dir = os.path.join(run_dir, "figures")
+    fig_perturbation_test_schematic(out_dir)
+    fig_long_lag_control_schematic(out_dir)
     df = load_results(run_dir)
     if not df.empty:
         fig_masking_effect(df, out_dir)
         fig_masking_loss(df, out_dir)
         fig_block_heatmaps(df, out_dir)
+        # The shared run tree also contains Exp4's many nested perturbation
+        # datasets. Keep the exact W-by-block Exp1 view scoped to the ordinary
+        # evaluation pool; control datasets have their own per-dataset plots.
+        dataset_names = df["dataset"].astype(str)
+        exp1_rows = df[~dataset_names.str.match(r"^fam[ABC]_")]
+        fig_perturbation_heatmaps_by_type(exp1_rows, out_dir)
+        fig_perturbation_block_sweep_raw(exp1_rows, out_dir)
         fig_perturbation_profiles(df, out_dir)
         fig_perturbation_profiles(df, out_dir, log_y=True)
         # The pooled plot is useful for the headline result, but can conceal
@@ -746,6 +974,83 @@ def generate_all(run_dir: str, tolerance: float = 0.05) -> None:
     fig_control_sweeps(ctrl, out_dir)
 
 
+def fig_control_sweeps_all_models(output_root: str, models: List[str],
+                                  out_dir: str) -> None:
+    """Compare long-lag sufficient-context tracking across model families."""
+    series = {}
+    all_lags = set()
+    for model in models:
+        path = os.path.join(
+            output_root, model, "exp4_synthetic_controls",
+            "controls_summary.json")
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            rows = json.load(f).get("controls", [])
+        core = [r for r in rows if r.get("design_role") == "core"
+                and not r.get("config_broken")]
+        if not core:
+            continue
+        max_strength = max(float(r["spec"]["strength"]) for r in core)
+        points = sorted(
+            (int(r["spec"]["distant_lag"]), int(r["sufficient_context"]))
+            for r in core
+            if float(r["spec"]["strength"]) == max_strength)
+        if points:
+            series[model] = points
+            all_lags.update(x for x, _y in points)
+    if not series:
+        return
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for model, points in series.items():
+        ax.plot(*zip(*points), "o-", label=model)
+    ref = sorted(all_lags)
+    ax.plot(ref, ref, "k--", alpha=0.5, label="sufficient context = lag")
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log", base=2)
+    ax.set_xlabel("planted dependency lag d (timesteps)")
+    ax.set_ylabel("estimated 5% sufficient context (timesteps)")
+    ax.set_title("Long-lag control — adaptive context reach across models")
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, which="both", alpha=0.25)
+    _save(fig, out_dir, "07_sufficient_context_vs_lag_all_models.png")
+
+
+def fig_perturbation_recency_all_models(frames: Dict[str, pd.DataFrame],
+                                        out_dir: str) -> None:
+    """Compare the block-mean Exp1 profile at each model's largest input W."""
+    curves = {}
+    for model, frame in frames.items():
+        if frame.empty:
+            continue
+        dataset_names = frame["dataset"].astype(str)
+        d = frame[(frame["method"] == "perturbation")
+                  & (frame["perturbation_type"] == "block_mean")
+                  & ~dataset_names.str.match(r"^fam[ABC]_")]
+        if d.empty:
+            continue
+        W = int(d["context_length"].max())
+        g = agg.collapse_seeds(d[d["context_length"] == W])
+        prof = g.groupby("lookback_start")["loss_delta"].apply(
+            lambda s: float(np.nanmean(np.abs(s.to_numpy(dtype=float)))))
+        scale = float(prof.max()) if not prof.empty else 0.0
+        if scale > 0:
+            curves[model] = (W, prof / scale)
+    if not curves:
+        return
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for model, (W, prof) in curves.items():
+        xvals = np.maximum(prof.index.to_numpy(dtype=float), 1.0)
+        ax.plot(xvals, prof.values, "o-", ms=3, label=f"{model} (W={W})")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("perturbed-block lookback (timesteps; 0 plotted at 1)")
+    ax.set_ylabel("mean |Δ loss| / model-profile maximum")
+    ax.set_title("Exp1 block-mean sensitivity at each model's largest input")
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, which="both", alpha=0.25)
+    _save(fig, out_dir, "03e_perturbation_recency_all_models.png")
+
+
 def generate_all_models(output_root: str, models: List[str]) -> None:
     """Generate figures whose comparison spans multiple model run trees."""
     frames = {
@@ -757,3 +1062,7 @@ def generate_all_models(output_root: str, models: List[str]) -> None:
         frames, os.path.join(output_root, "figures"))
     fig_masking_effect_all_models(
         frames, os.path.join(output_root, "figures"), absolute_loss=True)
+    fig_perturbation_recency_all_models(
+        frames, os.path.join(output_root, "figures"))
+    fig_control_sweeps_all_models(
+        output_root, models, os.path.join(output_root, "figures"))

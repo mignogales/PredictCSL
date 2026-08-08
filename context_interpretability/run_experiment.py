@@ -28,6 +28,7 @@ run_meta.skipped_capabilities.
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import random
 import traceback
@@ -69,10 +70,39 @@ CAPABILITY_GATE = {
 }
 
 
-def load_config(path: str, overrides: Dict[str, object]) -> dict:
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge mappings while replacing lists and scalar values."""
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if (key in merged and isinstance(merged[key], dict)
+                and isinstance(value, dict)):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _load_config_file(path: str, seen=None) -> dict:
+    """Load YAML, optionally inheriting from a relative ``extends`` file."""
     import yaml
-    with open(path) as f:
-        cfg = yaml.safe_load(f)
+    real = os.path.realpath(path)
+    seen = set() if seen is None else set(seen)
+    if real in seen:
+        chain = " -> ".join([*sorted(seen), real])
+        raise ValueError(f"Cyclic config inheritance: {chain}")
+    seen.add(real)
+    with open(real) as f:
+        cfg = yaml.safe_load(f) or {}
+    parent = cfg.pop("extends", None)
+    if parent is None:
+        return cfg
+    if not os.path.isabs(parent):
+        parent = os.path.join(os.path.dirname(real), parent)
+    return _deep_merge(_load_config_file(parent, seen), cfg)
+
+
+def load_config(path: str, overrides: Dict[str, object]) -> dict:
+    cfg = _load_config_file(path)
     for k, v in overrides.items():
         if v is not None:
             cfg[k] = v

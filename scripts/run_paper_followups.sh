@@ -102,9 +102,14 @@ do_interpretability() {
     --source synthetic --device "${INTERPRETABILITY_DEVICE:-cuda:0}"
 }
 
+do_interpretability_multimodel() {
+  echo "== Interpretability: multi-model long-lag follow-up ==" | tee -a "$LOG_FILE"
+  bash scripts/run_interpretability_multimodel.sh 2>&1 | tee -a "$LOG_FILE"
+}
+
 usage() {
   cat <<'EOF'
-Usage: bash scripts/run_paper_followups.sh {all|oracle|transfer|timing|interpretability} [...]
+Usage: bash scripts/run_paper_followups.sh {all|oracle|transfer|timing|interpretability|interpretability-multimodel} [...]
 
 Environment overrides: MAIN_ENV, LOG_ROOT, CANONICAL_CACHE, GPU_ID,
 TRANSFER_SOURCE, TRANSFER_TARGETS, TRANSFER_SHORT_CONTEXT_MODE, TIMING_MODELS,
@@ -129,6 +134,7 @@ for task in "$@"; do
     transfer) do_transfer ;;
     timing) do_timing ;;
     interpretability) do_interpretability ;;
+    interpretability-multimodel) do_interpretability_multimodel ;;
     -h|--help|help) usage ;;
     *) echo "Unknown task: $task" >&2; usage; exit 1 ;;
   esac

@@ -87,10 +87,15 @@ Stage-1 `--model-idx` order (from `experiments/models_config.py`, APPEND-ONLY):
 | **12** | **TiRex2** | **tirex (tirex2 package)** | **tirex** |
 
 - **Stage 2** (predictor training): the default PatchTST predictor can run in
-  each model's env group. The Mamba variant requires an env with `mamba-ssm`; the
-  master skips mamba variants only for `predictcsl-toto` and `predictcsl-tirex`.
-- **Stages 3–5** (GiftEval ablation / compare / timing): run in the env that can
-  import that model's TSFM package. The master handles this routing.
+  each model's env group. The Mamba variant requires an env with `mamba-ssm`.
+  Toto and TiRex native forecasts run in their dedicated environments, then the
+  master routes their Mamba predictor stages through `predictcsl-main` in
+  cached-only mode.
+- **Stages 3–5** (GiftEval ablation / compare / timing): normally run in the env
+  that can import that model's TSFM package. Cached-only alternate-predictor
+  overlays may run elsewhere (notably Toto/TiRex + Mamba in `predictcsl-main`)
+  because they are forbidden from loading the TSFM. The master handles this
+  routing.
 
 ### Typical server workflow
 

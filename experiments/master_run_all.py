@@ -46,9 +46,11 @@ the non-main groups with ``conda run -n <env>``:
 This is correct because (a) Stage 1 only loads a model when its shards are pending
 and (b) the v5 ablation lazy-imports each TSFM loader only for that model's cells —
 so a ``--models <one family>`` run in its env never touches the packages it lacks.
-The Toto and TiRex envs have no compatible ``mamba-ssm``, so those families are
-skipped for the Mamba variant (v4); see ``ENVS_WITHOUT_MAMBA``. The PatchTST env
-uses the official torch-2.8 Mamba wheels and runs the complete predictor matrix.
+The Toto and TiRex envs have no compatible ``mamba-ssm``. Their Mamba
+predictor-only stages are therefore routed back through ``predictcsl-main`` and
+consume the already-complete native forecast cache in ``--cached-only`` mode.
+The PatchTST env uses the official torch-2.8 Mamba wheels and runs the complete
+predictor matrix directly.
 
   !! Launch master IN predictcsl-main:  conda run -n predictcsl-main python -m experiments.master_run_all
 
@@ -126,9 +128,18 @@ FAMILY_ENV: Dict[str, str] = {
     "toto":    "predictcsl-toto",      # Python 3.12 + toto-2/toto-models
     "tirex":   "predictcsl-tirex",     # torch>=2.8 + tirex2 package
 }
-# Envs without mamba-ssm -> can't run the Mamba predictor variant (v4).
+# Native model envs without mamba-ssm. Entries may still have a predictor-only
+# fallback in MAMBA_PREDICTOR_ENV_OVERRIDES below.
 ENVS_WITHOUT_MAMBA = {
     "predictcsl-toto", "predictcsl-tirex",
+}
+# Predictor-only work can run outside the model's native environment once Phase
+# 1 has filled the canonical forecast cache. Keep this explicit per environment:
+# the v4 subprocess is guarded by --cached-only-ablation, so a missing/stale cell
+# fails instead of attempting to import the foundation model in the fallback env.
+MAMBA_PREDICTOR_ENV_OVERRIDES: Dict[str, str] = {
+    "predictcsl-toto": MAIN_ENV,
+    "predictcsl-tirex": MAIN_ENV,
 }
 ENV_ALIASES = {
     "predictcsl-patchtst": ("predictcsl-patchtst", "TSFM_PATCH"),
@@ -579,6 +590,27 @@ def _variant_cmd(
     return _py(env, *args)
 
 
+def _variant_route(
+    model_env: Optional[str], variant: Variant,
+) -> Optional[tuple[Optional[str], List[str]]]:
+    """Choose the env and safety flags for one model/predictor pairing.
+
+    ``None`` means the variant is unsupported. A tuple may itself contain a
+    ``None`` env, which is the normal in-process/main-environment route.
+    """
+    if not variant.needs_mamba:
+        return model_env, []
+    model_env_label = _env_label(model_env)
+    if model_env_label in MAMBA_PREDICTOR_ENV_OVERRIDES:
+        return (
+            MAMBA_PREDICTOR_ENV_OVERRIDES[model_env_label],
+            ["--cached-only-ablation"],
+        )
+    if model_env_label in ENVS_WITHOUT_MAMBA:
+        return None
+    return model_env, []
+
+
 def main() -> None:
     args = parse_args()
 
@@ -705,16 +737,26 @@ def main() -> None:
             )
 
             for v in variants:
-                if v.needs_mamba and _env_label(env) in ENVS_WITHOUT_MAMBA:
+                model_env_label = _env_label(env)
+                route = _variant_route(env, v)
+                if route is None:
                     print(Fore.YELLOW
                           + f"  ⤷ skip {v.name} for {display} "
-                            f"({_env_label(env)} has no mamba-ssm)." + Fore.RESET)
+                            f"({model_env_label} has no mamba-ssm and no "
+                            "predictor-env override)." + Fore.RESET)
                     continue
-                cmd = _variant_cmd(env, v, [display], vflag, fflag)
+                predictor_env, route_extra = route
+                if predictor_env != env:
+                    print(Fore.CYAN
+                          + f"  ↳ route {v.name} for {display} through "
+                            f"{_env_label(predictor_env)} (native forecasts: "
+                            "cached-only)." + Fore.RESET)
+                cmd = _variant_cmd(
+                    predictor_env, v, [display], vflag, fflag + route_extra)
                 _run(
                     cmd,
                     f"Model pipeline · {display} · {v.name} · stages 2→4 "
-                    f"[{_env_label(env)}]",
+                    f"[{_env_label(predictor_env)}]",
                 )
 
     # ---- Phase 6: genuine per-instance context choice. -----------------------

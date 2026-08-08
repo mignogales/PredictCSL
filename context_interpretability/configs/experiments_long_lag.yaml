@@ -1,0 +1,61 @@
+# Multi-model follow-up to the August 2026 interpretability suite.
+#
+# This inherits the standard experiment definition but writes to an isolated
+# output tree so completed Chronos2-Small cells from the earlier 32--256 lag
+# study cannot be reused accidentally.
+extends: experiments.yaml
+
+output_root: logs/experiments/context_interpretability_long_lag
+max_samples: 128
+
+# Dense around each planned planted lag, with enough headroom to see whether
+# performance continues to improve beyond the dependency itself. Each adapter
+# aligns and caps these requests to its native patch/context capability.
+context_lengths: [32, 64, 96, 128, 192, 256, 384, 512, 768,
+                  1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192]
+
+experiments:
+  exp0_attention_masking: false
+  exp1_perturbation: true
+  exp2_activation_patching: false
+  exp3_forecast_lens: false
+  exp4_synthetic_controls: true
+  exp5_integrated_gradients: false
+  exp6_predictor_contrast_saliency: false
+  exp7_context_decomposition: true
+  exp8_tsfm_contrast_saliency: false
+
+synthetic_controls:
+  n_instances: 128
+  # Four times the largest planted lag. This keeps the same design margin as
+  # the earlier d_max=256, T=1024 study while extending d_max to 2,048.
+  series_length: 8192
+  context_lengths: [16, 32, 64, 96, 128, 192, 256, 384, 512,
+                    768, 1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192]
+  local_order: 8
+  local_kinds: [linear, nonlinear, seasonal]
+  distant_kind: linear
+  distant_lags: [128, 512, 1024, 2048]
+  dependency_strengths: [0.0, 0.5, 1.0]
+  noise_levels: [0.1]
+  noise_robustness:
+    lag: 1024
+    strength: 1.0
+    extra_noise_levels: [0.05, 0.25]
+  family_c_fraction_distant: 0.5
+  oracle_ridge_alpha: 1.0
+  run_methods: [perturbation, attention_masking]
+  # Keep the multi-model comparison method-complete and architecture-neutral.
+  # Activation hooks and differentiable IG are not uniformly available.
+  sentinel_methods: []
+  sentinel_lags: [128, 2048]
+  sentinel_strengths: [0.0, 1.0]
+  sufficient_context_tolerance: 0.05
+
+context_decomposition:
+  metrics: [mae, mse]
+  all_full_contexts: false
+  full_contexts: null
+  # A focused logarithmic sweep keeps the test interpretable and comparable
+  # when models have different maximum supported contexts.
+  visible_lengths: [32, 64, 128, 256, 512, 1024, 2048, 4096, 6144]
