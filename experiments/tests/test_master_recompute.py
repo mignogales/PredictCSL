@@ -683,6 +683,7 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
                 "model": "autogluon/chronos-2-small",
                 "model_short": model,
                 "horizon": 24,
+                "n_instances": 2,
                 "dataset_display": "Example",
                 "term": "short",
                 "full_mase": 2.0,
@@ -697,7 +698,17 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
                 "speedup_pred_vs_full": 4 / 3,
                 "complexity_ratio_pred_vs_full": 0.75,
                 "full_flops": 1.0e12,
+                "best_flops": 0.5e12,
+                "safe_mase": 2.0,
+                "safe_flops": 1.0e12,
+                "rel_gain_safe_over_full": 0.0,
+                "complexity_ratio_safe_vs_full": 1.0,
+                "speedup_safe_vs_full": 1.0,
                 "naive_mase": 2.5,
+                "instance_oracle_mase": 0.9,
+                "instance_oracle_metric_exact": True,
+                "instance_oracle_metric_source": "mase_gluonts_real",
+                "best_is_full_native": False,
             }
             for version in ("v3", "v4"):
                 directory = os.path.join(
@@ -749,12 +760,29 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
             v3 = pd.read_csv(os.path.join(v3_dir, "comparison.csv"))
             v4 = pd.read_csv(os.path.join(v4_dir, "comparison.csv"))
             details = pd.read_csv(os.path.join(v3_dir, "instance_details.csv"))
+            expected_reports = (
+                "bar_aggregate_mase_gluonts.png",
+                "bar_aggregate_mase_gluonts_normalized.png",
+                "flops_savings.csv",
+                "rel_improvement_by_dataset.csv",
+                "rel_improvement_by_frequency.csv",
+                "rel_improvement_by_horizon.csv",
+                "rel_improvement_by_domain.csv",
+                "selector_analysis_comparison.csv",
+                "summary_stats.json",
+            )
+            generated_reports = {
+                filename: os.path.isfile(os.path.join(v3_dir, filename))
+                for filename in expected_reports
+            }
 
         self.assertAlmostEqual(v3.loc[0, "pred_mase"], 1.25)
         self.assertAlmostEqual(v4.loc[0, "pred_mase"], 1.5)
         self.assertEqual(v3.loc[0, "pred_policy_scope"], "instance_native")
         self.assertTrue(np.isfinite(v3.loc[0, "pred_flops"]))
         self.assertTrue(np.isfinite(details.loc[0, "selected_flops_estimate"]))
+        for filename, generated in generated_reports.items():
+            self.assertTrue(generated, filename)
         self.assertEqual(len(details), 2)
 
     def test_ineligible_stale_window_does_not_require_served_index(self) -> None:

@@ -464,7 +464,9 @@ def _write_instance_strategy_reports(
     ``instance_details.csv`` preserves every selected action and realised MASE.
     """
     from experiments.compare_window_strategies_gifteval import (
-        DEFAULT_PATCH_SIZES, compute_summary_stats, theoretical_flops,
+        DEFAULT_PATCH_SIZES, compute_flops_savings,
+        compute_relative_improvement_tables, compute_summary_stats,
+        plot_bar_aggregate_mase, theoretical_flops,
     )
 
     for variant, (base_subdir, output_subdir, alias) in (
@@ -538,7 +540,7 @@ def _write_instance_strategy_reports(
                     pred_flops / full_flops
                     if np.isfinite(pred_flops) and full_flops > 0
                     else float("nan"))
-                comparison.at[idx, "primary_strategy"] = f"{alias}_instance"
+                comparison.at[idx, "primary_strategy"] = alias
                 comparison.at[idx, "full_mase"] = full_mase
                 comparison.at[idx, "pred_mase"] = pred_mase
                 comparison.at[idx, "pred_window"] = float(pred.window_mean)
@@ -592,6 +594,13 @@ def _write_instance_strategy_reports(
             os.makedirs(output_dir, exist_ok=True)
             comparison.to_csv(
                 os.path.join(output_dir, "comparison.csv"), index=False)
+            selector = comparison
+            if "selection_eligible" in comparison.columns:
+                selector = comparison.loc[
+                    comparison["selection_eligible"].fillna(False).astype(bool)]
+            selector.to_csv(
+                os.path.join(output_dir, "selector_analysis_comparison.csv"),
+                index=False)
             model_selected.to_csv(
                 os.path.join(output_dir, "cell_results.csv"), index=False)
 
@@ -652,6 +661,25 @@ def _write_instance_strategy_reports(
                 json.dump(
                     compute_summary_stats(comparison), handle,
                     indent=2, allow_nan=True)
+            flops = compute_flops_savings(comparison)
+            flops.to_csv(
+                os.path.join(output_dir, "flops_savings.csv"),
+                index=False, float_format="%.6g")
+            compute_relative_improvement_tables(
+                comparison, output_dir, figures=True)
+            plot_bar_aggregate_mase(
+                comparison, output_dir,
+                metric_label="MASE (gluonts-real)",
+                fname="bar_aggregate_mase_gluonts.png",
+                extra_strategies=False)
+            if ("naive_mase" in comparison.columns
+                    and comparison["naive_mase"].notna().any()):
+                plot_bar_aggregate_mase(
+                    comparison, output_dir,
+                    metric_label=(
+                        "MASE (gluonts-real), norm. vs seasonal-naive"),
+                    fname="bar_aggregate_mase_gluonts_normalized.png",
+                    normalize=True, extra_strategies=False)
             print(Fore.GREEN
                   + f"Instance-wise {variant} report: {output_dir}"
                   + Fore.RESET)
