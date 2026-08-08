@@ -1249,6 +1249,56 @@ class PeriodStrategyAccountingTest(unittest.TestCase):
 
 
 class ConservativeStrategyTest(unittest.TestCase):
+    def test_rollup_folds_per_model_instance_reports(self) -> None:
+        from experiments.rollup_all_predictors import fold_instance_strategies
+
+        with tempfile.TemporaryDirectory() as root:
+            run_dir = os.path.join(root, "general_v3")
+            os.makedirs(run_dir)
+            report_dir = os.path.join(
+                root, "Chronos2-Small", "strategy_comparison_v3_instance")
+            os.makedirs(report_dir)
+            pd.DataFrame([{
+                "dataset_display": "Example",
+                "term": "short",
+                "pred_mase": 0.8,
+                "pred_flops": 42.0,
+            }]).to_csv(os.path.join(report_dir, "comparison.csv"), index=False)
+            base = pd.DataFrame([{
+                "model_short": "Chronos2-Small",
+                "dataset_display": "Example",
+                "term": "short",
+            }])
+
+            folded = fold_instance_strategies(base, run_dir)
+
+        self.assertAlmostEqual(folded.loc[0, "pred_cheap_instance_mase"], 0.8)
+        self.assertAlmostEqual(folded.loc[0, "pred_cheap_instance_flops"], 42.0)
+        self.assertTrue(pd.isna(folded.loc[0, "pred_mamba_instance_mase"]))
+
+    def test_flops_rollup_includes_instance_predictors(self) -> None:
+        frame = pd.DataFrame({
+            "primary_strategy": ["pred_cheap"],
+            "n_instances": [2],
+            "full_flops": [100.0],
+            "pred_flops": [60.0],
+            "safe_flops": [100.0],
+            "best_flops": [30.0],
+            "pred_cheap_instance_flops": [45.0],
+            "pred_mamba_instance_flops": [50.0],
+            "full_mase": [1.0],
+            "pred_mase": [0.95],
+            "safe_mase": [1.0],
+            "best_mase": [0.8],
+            "pred_cheap_instance_mase": [0.90],
+            "pred_mamba_instance_mase": [0.92],
+        })
+
+        rows = compute_flops_savings(frame)
+
+        self.assertIn("pred_cheap_instance", rows["strategy"].tolist())
+        self.assertIn("pred_mamba_instance", rows["strategy"].tolist())
+
     def test_native_gate_requires_confident_practical_advantage(self) -> None:
         # Candidate index 0 is consistently one score unit better than full.
         curves = np.array([

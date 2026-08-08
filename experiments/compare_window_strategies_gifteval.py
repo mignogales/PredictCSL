@@ -2024,6 +2024,14 @@ def compute_flops_savings(df: pd.DataFrame) -> pd.DataFrame:
     for vkey, _vlbl, _vclr in present_pred_variants(df):
         if vkey != primary_name and f"{vkey}_flops" in df.columns:
             strat_specs.append((vkey, f"{vkey}_flops", f"{vkey}_mase"))
+    # Phase-6 policies choose a different width for every test instance. Their
+    # reports expose an honest mean per-forecast FLOPs estimate, so they can be
+    # aggregated by the same instance-weighted machinery as dataset-grid rows.
+    for ikey in ("pred_cheap_instance", "pred_mamba_instance"):
+        if (ikey != primary_name
+                and f"{ikey}_flops" in df.columns
+                and f"{ikey}_mase" in df.columns):
+            strat_specs.append((ikey, f"{ikey}_flops", f"{ikey}_mase"))
 
     rows = []
     for name, flops_col, mase_col in strat_specs:
@@ -3544,6 +3552,10 @@ _STRATEGY_STYLE = {
     # predictor variants (auto-discovered sibling trees); see PRED_VARIANTS
     "pred_cheap": ("Predictor (cheap; dataset-grid)", "#1F77B4"),
     "pred_mamba": ("Predictor Mamba (dataset-grid)",  "#9C27B0"),
+    "pred_cheap_instance": (
+        "Predictor (cheap; instance-wise)", "#00A6A6"),
+    "pred_mamba_instance": (
+        "Predictor Mamba (instance-wise)", "#C44E52"),
     "pred_risk":  ("Predictor (risk; dataset-grid)",   "#FF7F0E"),
     "pred_cheap_cls": ("Predictor (cheap cls; dataset-grid)", "#17BECF"),
     "pred_mamba_cls": ("Predictor (Mamba cls; dataset-grid)", "#E377C2"),

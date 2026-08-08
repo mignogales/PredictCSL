@@ -19,8 +19,9 @@ Usage (run on the SERVER, where logs/ lives)::
 
     python -m experiments.rollup_all_predictors
     python -m experiments.rollup_all_predictors --models Moirai2-Small TimesFM2.5-200M
-    # oracle + both cheap predictors (files: *_gluonts_real.png + *_gluonts.png):
-    python -m experiments.rollup_all_predictors --plot-strategies best pred_cheap pred_mamba
+    # dataset-wise + instance-wise predictors:
+    python -m experiments.rollup_all_predictors --plot-strategies \
+      pred_cheap pred_mamba pred_cheap_instance pred_mamba_instance
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ from __future__ import annotations
 import argparse
 import os
 
+import numpy as np
+import pandas as pd
 from colorama import Fore
 
 from experiments.compare_window_strategies_gifteval import (
@@ -47,6 +50,52 @@ ABLATION_ROOT = "logs/experiments/window_ablation_gifteval"
 BASE_RUN_DIR  = os.path.join(ABLATION_ROOT, "general_v3")
 OUT_DIR       = os.path.join(ABLATION_ROOT, "general_all")
 
+INSTANCE_REPORTS = {
+    "pred_cheap_instance": "strategy_comparison_v3_instance",
+    "pred_mamba_instance": "strategy_comparison_v4_instance",
+}
+
+
+def fold_instance_strategies(df: pd.DataFrame, run_dir: str) -> pd.DataFrame:
+    """Attach Phase-6 per-instance MASE/FLOPs columns to Stage-4 records.
+
+    Instance reports are scored on ``mase_gluonts_real`` and live beside each
+    model's v3/v4 folders, one row per dataset/term. Missing or partial reports
+    remain NaN so resumability never drops otherwise valid rollup rows.
+    """
+    out = df.copy()
+    root = os.path.dirname(os.path.normpath(run_dir))
+    for key, subdir in INSTANCE_REPORTS.items():
+        out[f"{key}_mase"] = np.nan
+        out[f"{key}_flops"] = np.nan
+        for model in out["model_short"].dropna().astype(str).unique():
+            path = os.path.join(root, model, subdir, "comparison.csv")
+            if not os.path.isfile(path):
+                continue
+            report = pd.read_csv(path)
+            required = {"dataset_display", "term", "pred_mase", "pred_flops"}
+            if not required.issubset(report.columns):
+                print(Fore.YELLOW
+                      + f"Incomplete instance report, skipping: {path}"
+                      + Fore.RESET)
+                continue
+            lookup = {
+                (str(row.dataset_display), str(row.term)):
+                    (float(row.pred_mase), float(row.pred_flops))
+                for row in report.itertuples(index=False)
+            }
+            model_mask = out["model_short"].astype(str) == model
+            for idx in out.index[model_mask]:
+                row_key = (
+                    str(out.at[idx, "dataset_display"]),
+                    str(out.at[idx, "term"]),
+                )
+                values = lookup.get(row_key)
+                if values is not None:
+                    out.at[idx, f"{key}_mase"] = values[0]
+                    out.at[idx, f"{key}_flops"] = values[1]
+    return out
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -61,7 +110,8 @@ def parse_args() -> argparse.Namespace:
                    help="Restrict to these model_short names (default: all present).")
     p.add_argument("--plot-strategies", type=str, nargs="+", default=None,
                    help="Restrict the overview figures to these strategies "
-                        "(e.g. pred pred_cheap pred_mamba best). Default: all present.")
+                        "(e.g. pred_cheap pred_mamba pred_cheap_instance "
+                        "pred_mamba_instance). Default: all present.")
     return p.parse_args()
 
 
@@ -123,6 +173,7 @@ def main() -> None:
 
     df_gr = _load("mase_gluonts_real")
     if df_gr is not None:
+        df_gr = fold_instance_strategies(df_gr, run_dir)
         write_run_rollup(df_gr, out_dir, plot_strategies=args.plot_strategies,
                          suffix="_gluonts_real", metric_label="MASE (gluonts-real)")
         if not run_has_gluonts_real_curve(run_dir):
