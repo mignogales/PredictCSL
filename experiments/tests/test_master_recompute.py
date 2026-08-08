@@ -676,6 +676,55 @@ class MasterRecomputeConfigTest(unittest.TestCase):
 
 
 class PerInstanceWindowEvaluationTest(unittest.TestCase):
+    def test_ineligible_stale_window_does_not_require_served_index(self) -> None:
+        """Moirai-like stale caches outside Stage 3's mask are ignored."""
+        with tempfile.TemporaryDirectory() as root:
+            compare_dir = os.path.join(
+                root, "general_v3", "models", "Moirai2-Small",
+                "compare_real_vs_predicted")
+            os.makedirs(compare_dir)
+            anchor_path = os.path.join(
+                compare_dir, "compare_Example_tshort_Moirai2-Small.npz")
+            np.savez_compressed(
+                anchor_path,
+                window_grid=np.asarray([4096, 8192]),
+                predicted_curves=np.zeros((2, 2)),
+                real_curve_gluonts_real=np.asarray([1.0, np.nan]),
+            )
+            base = os.path.join(
+                root, "general_v3", "datasets", "Example",
+                "Moirai2-Small", "tshort")
+            for window, values, served in (
+                (4096, [1.0, 2.0], [0, 1]),
+                ("full_native", [1.5, 2.5], [0, 1]),
+            ):
+                path = os.path.join(base, f"w{window}")
+                os.makedirs(path)
+                np.savez_compressed(
+                    os.path.join(path, "per_sample_metrics.npz"),
+                    mase_gluonts_real=np.asarray(values),
+                    valid_count=np.ones(2, dtype=np.int32),
+                    served_index=np.asarray(served, dtype=np.int32),
+                    effective_context=np.asarray([4096, 4096]),
+                )
+            # Obsolete unsupported cache: deliberately unalignable and lacking
+            # served_index. Its presence must have no effect on evaluation.
+            stale = os.path.join(base, "w8192")
+            os.makedirs(stale)
+            np.savez_compressed(
+                os.path.join(stale, "per_sample_metrics.npz"),
+                mase_gluonts_real=np.asarray([99.0]),
+                valid_count=np.ones(1, dtype=np.int32),
+            )
+            cell = instance_eval.Cell(
+                "Moirai2-Small", "Example", "short", anchor_path)
+
+            records, _audit = instance_eval.evaluate_cell(
+                cell, root, os.path.join(root, "general_v3"))
+
+        self.assertTrue(records)
+        self.assertNotIn(99.0, [record["mase_gluonts"] for record in records])
+
     def test_comparable_curve_carries_forward_previous_window(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             base = os.path.join(

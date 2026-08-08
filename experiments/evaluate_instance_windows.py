@@ -281,12 +281,28 @@ def evaluate_cell(
     with np.load(cell.anchor_npz) as anchor:
         windows = np.asarray(anchor["window_grid"], dtype=np.int64)
         n = int(np.asarray(anchor["predicted_curves"]).shape[0])
+        curve_key = {
+            "mase_gluonts": "real_curve_gluonts",
+            "mase_gluonts_real": "real_curve_gluonts_real",
+        }[mase_field]
+        # Stage 3 is authoritative about which model/window cells are valid.
+        # In particular, Moirai's usable context shrinks with the forecast
+        # horizon, so the nominal 8192 grid action can be ineligible even when
+        # an obsolete cache from before that constraint still exists on disk.
+        # Never let such stale, unsupported caches enter (or block) Stage 6.
+        valid_windows = (
+            np.isfinite(np.asarray(anchor[curve_key], dtype=np.float64))
+            if curve_key in anchor.files
+            else np.ones(windows.shape, dtype=bool)
+        )
 
     errors = np.full((n, windows.size), np.nan, dtype=np.float64)
     error_counts = np.zeros((n, windows.size), dtype=np.float64)
     metric_sources = set()
     unaligned: List[int] = []
     for j, window in enumerate(windows):
+        if not valid_windows[j]:
+            continue
         errors[:, j], error_counts[:, j], meta = _load_vector(
             _cell_metric_path(ground_tree, cell, int(window)), n, mase_field)
         metric_sources.add(meta.get("source", "missing"))

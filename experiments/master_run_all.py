@@ -66,6 +66,7 @@ Usage
 -----
     python -m experiments.master_run_all                       # all-model ablation, then stop
     python -m experiments.master_run_all --pipeline-only       # reviewed: model-by-model pipeline
+    python -m experiments.master_run_all --resume-phase6       # restart at Phase 6, then roll up
     python -m experiments.master_run_all --continue-after-ablation  # both without review stop
     python -m experiments.master_run_all --models Chronos2-Small
     python -m experiments.master_run_all --force 3              # repeat cached ablation
@@ -407,6 +408,12 @@ def parse_args() -> argparse.Namespace:
         help=("Run the all-model ablation and immediately continue through the "
               "model-by-model pipeline instead of stopping for review."),
     )
+    phase.add_argument(
+        "--resume-phase6", action="store_true",
+        help=("Skip forecast generation, labeling, and predictor training; resume "
+              "at Phase 6 per-instance evaluation, then run the Phase 7 rollup. "
+              "This is the direct restart path after a Phase 6 failure."),
+    )
     p.add_argument("--force", nargs="*", default=None,
                    metavar="STAGE",
                    help="Forwarded verbatim to every variant (and the stage-1 "
@@ -613,6 +620,10 @@ def _variant_route(
 
 def main() -> None:
     args = parse_args()
+    if args.resume_phase6 and args.test:
+        raise SystemExit(
+            "--resume-phase6 cannot be combined with --test: resume must read "
+            "the production output tree, not the isolated smoke-test tree.")
 
     run_root = os.path.normpath(args.output_root)
     os.environ["PREDICTCSL_MASTER_ROOT"] = run_root
@@ -651,8 +662,11 @@ def main() -> None:
     print(Fore.CYAN + f"Master run — variants: {[v.name for v in variants]}" + Fore.RESET)
     for env, displays in groups.items():
         print(Fore.CYAN + f"  env {_env_label(env)}: {displays}" + Fore.RESET)
-    for env in groups:
-        _preflight_env(env)
+    # Phase 6/7 are inference-free and run in the current main environment;
+    # restarting there must not require every foundation-model environment.
+    if not args.resume_phase6:
+        for env in groups:
+            _preflight_env(env)
 
     t_start = time.perf_counter()
 
@@ -670,7 +684,7 @@ def main() -> None:
     # ---- Phase 1: predictor-independent GIFT-Eval forecasts + parity. --------
     # One model per invocation keeps its native window grid exact (no union of
     # unrelated family grids). Every model completes before the review gate.
-    if not args.pipeline_only:
+    if not args.pipeline_only and not args.resume_phase6:
         cache_root = os.path.join(
             os.environ["PREDICTCSL_ABLATION_ROOT"], "general")
         for env, displays in groups.items():
@@ -724,40 +738,41 @@ def main() -> None:
     # For one model: build labels once, then run every applicable predictor
     # variant through train -> cached ablation overlay -> comparison. Only after
     # that complete model pipeline succeeds do we advance to the next model.
-    for env, displays in groups.items():
-        for display in displays:
-            build_args = list(stage1_build_args)
-            if args.test:
-                build_args += ["--n-series", str(200)]
-            stage1 = _stage1_cmd(env, [display], vflag, fflag, build_args)
-            _run(
-                stage1,
-                f"Model pipeline · {display} · synthetic labeling "
-                f"[{_env_label(env)}]",
-            )
-
-            for v in variants:
-                model_env_label = _env_label(env)
-                route = _variant_route(env, v)
-                if route is None:
-                    print(Fore.YELLOW
-                          + f"  ⤷ skip {v.name} for {display} "
-                            f"({model_env_label} has no mamba-ssm and no "
-                            "predictor-env override)." + Fore.RESET)
-                    continue
-                predictor_env, route_extra = route
-                if predictor_env != env:
-                    print(Fore.CYAN
-                          + f"  ↳ route {v.name} for {display} through "
-                            f"{_env_label(predictor_env)} (native forecasts: "
-                            "cached-only)." + Fore.RESET)
-                cmd = _variant_cmd(
-                    predictor_env, v, [display], vflag, fflag + route_extra)
+    if not args.resume_phase6:
+        for env, displays in groups.items():
+            for display in displays:
+                build_args = list(stage1_build_args)
+                if args.test:
+                    build_args += ["--n-series", str(200)]
+                stage1 = _stage1_cmd(env, [display], vflag, fflag, build_args)
                 _run(
-                    cmd,
-                    f"Model pipeline · {display} · {v.name} · stages 2→4 "
-                    f"[{_env_label(predictor_env)}]",
+                    stage1,
+                    f"Model pipeline · {display} · synthetic labeling "
+                    f"[{_env_label(env)}]",
                 )
+
+                for v in variants:
+                    model_env_label = _env_label(env)
+                    route = _variant_route(env, v)
+                    if route is None:
+                        print(Fore.YELLOW
+                              + f"  ⤷ skip {v.name} for {display} "
+                                f"({model_env_label} has no mamba-ssm and no "
+                                "predictor-env override)." + Fore.RESET)
+                        continue
+                    predictor_env, route_extra = route
+                    if predictor_env != env:
+                        print(Fore.CYAN
+                              + f"  ↳ route {v.name} for {display} through "
+                                f"{_env_label(predictor_env)} (native forecasts: "
+                                "cached-only)." + Fore.RESET)
+                    cmd = _variant_cmd(
+                        predictor_env, v, [display], vflag, fflag + route_extra)
+                    _run(
+                        cmd,
+                        f"Model pipeline · {display} · {v.name} · stages 2→4 "
+                        f"[{_env_label(predictor_env)}]",
+                    )
 
     # ---- Phase 6: genuine per-instance context choice. -----------------------
     # This master intentionally excludes the period policy. The evaluator reads
