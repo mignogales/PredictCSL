@@ -676,6 +676,87 @@ class MasterRecomputeConfigTest(unittest.TestCase):
 
 
 class PerInstanceWindowEvaluationTest(unittest.TestCase):
+    def test_instance_reports_are_saved_beside_v3_and_v4(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            model = "Chronos2-Small"
+            base_row = {
+                "model": "autogluon/chronos-2-small",
+                "model_short": model,
+                "horizon": 24,
+                "dataset_display": "Example",
+                "term": "short",
+                "full_mase": 2.0,
+                "best_mase": 1.0,
+                "pred_mase": 1.8,
+                "pred_clamped": False,
+                "rel_gain_pred_over_full": 0.1,
+                "delta_pred_vs_best": 0.8,
+                "full_elapsed_s": 2.0,
+                "best_elapsed_s": 1.0,
+                "pred_elapsed_s": 1.5,
+                "speedup_pred_vs_full": 4 / 3,
+                "complexity_ratio_pred_vs_full": 0.75,
+                "full_flops": 1.0e12,
+                "naive_mase": 2.5,
+            }
+            for version in ("v3", "v4"):
+                directory = os.path.join(
+                    root, model, f"strategy_comparison_{version}")
+                os.makedirs(directory)
+                pd.DataFrame([base_row]).to_csv(
+                    os.path.join(directory, "comparison.csv"), index=False)
+            records = []
+            common = {
+                "model": model, "dataset_display": "Example", "term": "short",
+                "mase_metric_source": "mase_gluonts_real",
+                "mase_metric_exact": True, "n_instances": 2,
+                "n_native_fallback": 0, "n_native_selected": 0,
+                "window_mean": 48.0, "window_median": 48.0,
+            }
+            records.append({**common, "method": "full_native",
+                            "method_kind": "baseline", "policy_scope": "instance_native",
+                            "mase_gluonts": 2.0})
+            records.append({**common, "method": "oracle_instance",
+                            "method_kind": "oracle", "policy_scope": "instance_native",
+                            "mase_gluonts": 0.9})
+            records.append({**common, "method": "cheap_curve_instance",
+                            "method_kind": "predictor_instance",
+                            "policy_scope": "instance_native", "mase_gluonts": 1.25})
+            records.append({**common, "method": "mamba_curve_instance",
+                            "method_kind": "predictor_instance",
+                            "policy_scope": "instance_native", "mase_gluonts": 1.5})
+            audit_dir = os.path.join(root, "combined", "cells")
+            os.makedirs(audit_dir)
+            np.savez_compressed(
+                os.path.join(audit_dir, f"{model}__Example__tshort.npz"),
+                cheap_curve_instance__mase=np.asarray([1.0, 1.5]),
+                cheap_curve_instance__window=np.asarray([32, 64]),
+                cheap_curve_instance__valid_count=np.ones(2),
+                mamba_curve_instance__mase=np.asarray([1.25, 1.75]),
+                mamba_curve_instance__window=np.asarray([32, 64]),
+                mamba_curve_instance__valid_count=np.ones(2),
+                full_native__mase=np.asarray([2.0, 2.0]),
+                native_effective_context=np.asarray([80, 80]),
+            )
+
+            instance_eval._write_instance_strategy_reports(
+                pd.DataFrame(records), root, audit_dir)
+
+            v3_dir = os.path.join(
+                root, model, "strategy_comparison_v3_instance")
+            v4_dir = os.path.join(
+                root, model, "strategy_comparison_v4_instance")
+            v3 = pd.read_csv(os.path.join(v3_dir, "comparison.csv"))
+            v4 = pd.read_csv(os.path.join(v4_dir, "comparison.csv"))
+            details = pd.read_csv(os.path.join(v3_dir, "instance_details.csv"))
+
+        self.assertAlmostEqual(v3.loc[0, "pred_mase"], 1.25)
+        self.assertAlmostEqual(v4.loc[0, "pred_mase"], 1.5)
+        self.assertEqual(v3.loc[0, "pred_policy_scope"], "instance_native")
+        self.assertTrue(np.isfinite(v3.loc[0, "pred_flops"]))
+        self.assertTrue(np.isfinite(details.loc[0, "selected_flops_estimate"]))
+        self.assertEqual(len(details), 2)
+
     def test_ineligible_stale_window_does_not_require_served_index(self) -> None:
         """Moirai-like stale caches outside Stage 3's mask are ignored."""
         with tempfile.TemporaryDirectory() as root:

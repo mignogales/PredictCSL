@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import math
 import os
 import re
@@ -27,6 +28,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from colorama import Fore
+from tqdm import tqdm
 
 from experiments import datasets_config
 
@@ -37,6 +39,16 @@ VARIANT_TREES: Dict[str, str] = {
     "patchtst_risk": "general_v3_risk",
     "mamba_curve": "general_v4",
     "mamba_classification": "general_v4_classification",
+}
+
+# Instance-wise counterparts of the historical per-model Stage-4 reports.
+# The master uses the two curve-regression variants below; the other evaluator
+# variants remain available in the combined Phase-6 tables.
+INSTANCE_STRATEGY_OUTPUTS: Dict[str, Tuple[str, str, str]] = {
+    "cheap_curve": ("strategy_comparison_v3", "strategy_comparison_v3_instance",
+                    "pred_cheap"),
+    "mamba_curve": ("strategy_comparison_v4", "strategy_comparison_v4_instance",
+                    "pred_mamba"),
 }
 
 
@@ -440,6 +452,211 @@ def _geomean(values: np.ndarray) -> float:
     return float(np.exp(np.mean(np.log(values)))) if values.size else float("nan")
 
 
+def _write_instance_strategy_reports(
+    frame: pd.DataFrame, ablation_root: str, audit_dir: str,
+) -> None:
+    """Write v3/v4-shaped instance-policy reports beside Stage 4 outputs.
+
+    ``comparison.csv`` retains Stage 4's baseline/oracle/normalizer columns but
+    replaces the predictor action with the true per-instance policy aggregate.
+    Timing/FLOPs fields for that action are cleared: a mixture of per-instance
+    widths cannot honestly reuse the old one-window runtime or FLOPs estimate.
+    ``instance_details.csv`` preserves every selected action and realised MASE.
+    """
+    from experiments.compare_window_strategies_gifteval import (
+        DEFAULT_PATCH_SIZES, compute_summary_stats, theoretical_flops,
+    )
+
+    for variant, (base_subdir, output_subdir, alias) in (
+            INSTANCE_STRATEGY_OUTPUTS.items()):
+        method = f"{variant}_instance"
+        selected = frame[frame["method"] == method]
+        if selected.empty:
+            continue
+        for model, model_selected in selected.groupby("model", sort=True):
+            base_path = os.path.join(
+                ablation_root, model, base_subdir, "comparison.csv")
+            if not os.path.isfile(base_path):
+                print(Fore.YELLOW
+                      + f"Skip instance strategy report for {model}/{variant}: "
+                        f"missing {base_path}" + Fore.RESET)
+                continue
+            comparison = pd.read_csv(base_path)
+            comparison["term"] = comparison["term"].astype(str)
+            by_key = {
+                (str(row.dataset_display), str(row.term)): row
+                for row in model_selected.itertuples(index=False)
+            }
+            full_rows = frame[
+                (frame["model"] == model) & (frame["method"] == "full_native")]
+            oracle_rows = frame[
+                (frame["model"] == model) & (frame["method"] == "oracle_instance")]
+            full_by_key = {
+                (str(row.dataset_display), str(row.term)): row
+                for row in full_rows.itertuples(index=False)
+            }
+            oracle_by_key = {
+                (str(row.dataset_display), str(row.term)): row
+                for row in oracle_rows.itertuples(index=False)
+            }
+
+            keep = []
+            for idx, row in comparison.iterrows():
+                key = (str(row["dataset_display"]), str(row["term"]))
+                pred = by_key.get(key)
+                full = full_by_key.get(key)
+                oracle = oracle_by_key.get(key)
+                if pred is None or full is None:
+                    continue
+                keep.append(idx)
+                full_mase = float(full.mase_gluonts)
+                pred_mase = float(pred.mase_gluonts)
+                best_mase = float(row.get("best_mase", float("nan")))
+                audit_path = os.path.join(
+                    audit_dir, f"{model}__{key[0]}__t{key[1]}.npz")
+                pred_flops = float("nan")
+                if os.path.isfile(audit_path):
+                    with np.load(audit_path) as audit:
+                        chosen_contexts = np.asarray(
+                            audit[f"{method}__window"], dtype=np.int64)
+                        native_contexts = np.asarray(
+                            audit["native_effective_context"], dtype=np.int64)
+                    chosen_contexts = np.where(
+                        chosen_contexts > 0, chosen_contexts, native_contexts)
+                    chosen_contexts = chosen_contexts[chosen_contexts > 0]
+                    if chosen_contexts.size:
+                        model_id = str(row.get("model", model))
+                        horizon = int(row.get("horizon", 1))
+                        pred_flops = float(np.mean([
+                            theoretical_flops(
+                                model_id, int(context), horizon,
+                                DEFAULT_PATCH_SIZES)
+                            for context in chosen_contexts
+                        ]))
+                full_flops = float(row.get("full_flops", float("nan")))
+                complexity_ratio = (
+                    pred_flops / full_flops
+                    if np.isfinite(pred_flops) and full_flops > 0
+                    else float("nan"))
+                comparison.at[idx, "primary_strategy"] = f"{alias}_instance"
+                comparison.at[idx, "full_mase"] = full_mase
+                comparison.at[idx, "pred_mase"] = pred_mase
+                comparison.at[idx, "pred_window"] = float(pred.window_mean)
+                comparison.at[idx, "pred_window_median"] = float(pred.window_median)
+                comparison.at[idx, "pred_policy_scope"] = "instance_native"
+                comparison.at[idx, "pred_clamped"] = False
+                comparison.at[idx, "pred_n_native_selected"] = int(
+                    pred.n_native_selected)
+                comparison.at[idx, "delta_pred_vs_full"] = pred_mase - full_mase
+                comparison.at[idx, "delta_pred_vs_best"] = pred_mase - best_mase
+                comparison.at[idx, "rel_gain_pred_over_full"] = (
+                    (full_mase - pred_mase) / (abs(full_mase) + 1e-12))
+                comparison.at[idx, "pred_flops"] = pred_flops
+                comparison.at[idx, "complexity_ratio_pred_vs_full"] = (
+                    complexity_ratio)
+                if oracle is not None:
+                    oracle_mase = float(oracle.mase_gluonts)
+                    comparison.at[idx, "instance_oracle_mase"] = oracle_mase
+                    comparison.at[idx, "delta_instance_oracle_vs_full"] = (
+                        oracle_mase - full_mase)
+                    comparison.at[idx, "rel_gain_instance_oracle_over_full"] = (
+                        (full_mase - oracle_mase) / (abs(full_mase) + 1e-12))
+                # Canonical alias used by cross-variant consumers.
+                comparison.at[idx, f"{alias}_mase"] = pred_mase
+                comparison.at[idx, f"{alias}_window"] = float(pred.window_mean)
+                comparison.at[idx, f"{alias}_window_median"] = float(
+                    pred.window_median)
+                comparison.at[idx, f"{alias}_policy_scope"] = "instance_native"
+                comparison.at[idx, f"delta_{alias}_vs_full"] = pred_mase - full_mase
+                comparison.at[idx, f"delta_{alias}_vs_best"] = pred_mase - best_mase
+                comparison.at[idx, f"rel_gain_{alias}_over_full"] = (
+                    (full_mase - pred_mase) / (abs(full_mase) + 1e-12))
+                comparison.at[idx, f"{alias}_flops"] = pred_flops
+                comparison.at[idx, f"complexity_ratio_{alias}_vs_full"] = (
+                    complexity_ratio)
+                # Runtime still cannot be composed from the old dataset-wide
+                # measurements: batching/kernel overhead is nonlinear. FLOPs,
+                # in contrast, are estimated above per selected instance.
+                for column in (
+                    "pred_elapsed_s", "pred_elapsed_std_s",
+                    "speedup_pred_vs_full",
+                    f"{alias}_elapsed_s", f"{alias}_elapsed_std_s",
+                    f"speedup_{alias}_vs_full",
+                ):
+                    comparison.at[idx, column] = float("nan")
+
+            comparison = comparison.loc[keep].reset_index(drop=True)
+            if comparison.empty:
+                continue
+            output_dir = os.path.join(ablation_root, model, output_subdir)
+            os.makedirs(output_dir, exist_ok=True)
+            comparison.to_csv(
+                os.path.join(output_dir, "comparison.csv"), index=False)
+            model_selected.to_csv(
+                os.path.join(output_dir, "cell_results.csv"), index=False)
+
+            details = []
+            for cell in model_selected.itertuples(index=False):
+                path = os.path.join(
+                    audit_dir,
+                    f"{model}__{cell.dataset_display}__t{cell.term}.npz")
+                if not os.path.isfile(path):
+                    continue
+                with np.load(path) as data:
+                    mase = np.asarray(data[f"{method}__mase"], dtype=float)
+                    window = np.asarray(data[f"{method}__window"], dtype=int)
+                    counts = np.asarray(
+                        data[f"{method}__valid_count"], dtype=float)
+                    full_mase = np.asarray(data["full_native__mase"], dtype=float)
+                    native_context = np.asarray(
+                        data["native_effective_context"], dtype=int)
+                base_match = comparison[
+                    (comparison["dataset_display"].astype(str)
+                     == str(cell.dataset_display))
+                    & (comparison["term"].astype(str) == str(cell.term))]
+                model_id = (str(base_match.iloc[0].get("model", model))
+                            if not base_match.empty else model)
+                horizon = (int(base_match.iloc[0].get("horizon", 1))
+                           if not base_match.empty else 1)
+                valid = np.isfinite(mase) & np.isfinite(full_mase) & (counts > 0)
+                for instance_index in np.flatnonzero(valid):
+                    selected_context = int(window[instance_index])
+                    if selected_context <= 0:
+                        selected_context = int(native_context[instance_index])
+                    selected_flops = theoretical_flops(
+                        model_id, selected_context, horizon, DEFAULT_PATCH_SIZES)
+                    native_flops = theoretical_flops(
+                        model_id, int(native_context[instance_index]), horizon,
+                        DEFAULT_PATCH_SIZES)
+                    details.append({
+                        "model": model,
+                        "dataset_display": cell.dataset_display,
+                        "term": cell.term,
+                        "instance_index": int(instance_index),
+                        "selected_window": int(window[instance_index]),
+                        "native_context": int(native_context[instance_index]),
+                        "selected_mase": float(mase[instance_index]),
+                        "full_mase": float(full_mase[instance_index]),
+                        "valid_count": float(counts[instance_index]),
+                        "selected_flops_estimate": float(selected_flops),
+                        "full_flops_estimate": float(native_flops),
+                        "flops_saved_estimate": float(
+                            native_flops - selected_flops),
+                        "flops_saved_pct_estimate": float(
+                            100 * (native_flops - selected_flops) / native_flops
+                            if native_flops > 0 else float("nan")),
+                    })
+            pd.DataFrame(details).to_csv(
+                os.path.join(output_dir, "instance_details.csv"), index=False)
+            with open(os.path.join(output_dir, "summary_stats.json"), "w") as handle:
+                json.dump(
+                    compute_summary_stats(comparison), handle,
+                    indent=2, allow_nan=True)
+            print(Fore.GREEN
+                  + f"Instance-wise {variant} report: {output_dir}"
+                  + Fore.RESET)
+
+
 def run(args: argparse.Namespace) -> None:
     ablation_root = os.path.normpath(args.ablation_root)
     ground_tree = _ground_tree(ablation_root)
@@ -453,7 +670,7 @@ def run(args: argparse.Namespace) -> None:
     audit_dir = os.path.join(args.output_dir, "cells")
     os.makedirs(audit_dir, exist_ok=True)
     all_records: List[dict] = []
-    for cell in cells:
+    for cell in tqdm(cells, desc="Phase 6 instance evaluation", unit="cell"):
         records, audit = evaluate_cell(
             cell, ablation_root, ground_tree, args.fixed_window,
             args.mase_field)
@@ -508,6 +725,7 @@ def run(args: argparse.Namespace) -> None:
     summary = pd.DataFrame(summary_rows).sort_values(
         ["method_kind", "macro_mean_mase_gluonts"])
     summary.to_csv(os.path.join(args.output_dir, "summary.csv"), index=False)
+    _write_instance_strategy_reports(frame, ablation_root, audit_dir)
 
     predictor_summary = summary[
         summary["method_kind"].isin([
