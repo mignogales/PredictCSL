@@ -59,6 +59,21 @@ class TestConfigInheritance(unittest.TestCase):
             [128, 512, 1024, 2048])
         self.assertEqual(cfg["synthetic_controls"]["series_length"], 8192)
 
+    def test_dense_3k_followup_is_targeted_and_capped(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "configs",
+            "experiments_long_lag_dense_3k.yaml")
+        cfg = load_config(path, {})
+        scfg = cfg["synthetic_controls"]
+        self.assertTrue(cfg["output_root"].endswith(
+            "context_interpretability_long_lag_dense_3k"))
+        self.assertEqual(len(scfg["only_datasets"]), 4)
+        self.assertEqual(scfg["run_methods"], [])
+        self.assertEqual(scfg["sentinel_methods"], [])
+        self.assertEqual(max(scfg["context_lengths"]), 3000)
+        self.assertEqual(scfg["context_lengths"][-9:-1], [
+            2048, 2176, 2304, 2432, 2560, 2688, 2816, 2944])
+
     def test_forced_d2048_audit_is_targeted_and_isolated(self):
         path = os.path.join(
             os.path.dirname(__file__), "..", "configs",

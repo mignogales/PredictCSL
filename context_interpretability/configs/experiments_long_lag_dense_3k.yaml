@@ -1,0 +1,24 @@
+extends: experiments_long_lag_comparison.yaml
+
+# Resolution follow-up for the adaptive-context-reach figure.  Restrict the
+# run to the four strong Family-B cells used by the plotted lag-tracking curve,
+# and compute only clean forecast-error curves (no repeated interventions).
+output_root: logs/experiments/context_interpretability_long_lag_dense_3k
+
+synthetic_controls:
+  only_datasets:
+    - famB_linear_r8_d128_s1_linear_n0.1
+    - famB_linear_r8_d512_s1_linear_n0.1
+    - famB_linear_r8_d1024_s1_linear_n0.1
+    - famB_linear_r8_d2048_s1_linear_n0.1
+  run_methods: []
+  sentinel_methods: []
+
+  # Fine resolution at short contexts and 128-step resolution above 512.
+  # The final non-power-of-two point enforces the requested 3,000-step cap;
+  # adapters align requests downward to their native patch size.
+  context_lengths: [16, 32, 48, 64, 80, 96, 112, 128,
+                    160, 192, 224, 256, 320, 384, 448, 512,
+                    640, 768, 896, 1024, 1152, 1280, 1408, 1536,
+                    1664, 1792, 1920, 2048, 2176, 2304, 2432, 2560,
+                    2688, 2816, 2944, 3000]

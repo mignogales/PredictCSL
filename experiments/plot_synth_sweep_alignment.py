@@ -20,6 +20,17 @@ from typing import Sequence
 
 import numpy as np
 
+from paper_plot_style import (
+    INK,
+    MUTED,
+    PAPER_MPL_STYLE,
+    add_figure_title,
+    model_legend_handles,
+    model_plot_kwargs,
+    style_axes,
+    style_legend,
+)
+
 from experiments.plot_synth_sweep_results import (
     DEFAULT_MODELS,
     DEFAULT_ROOT,
@@ -321,82 +332,94 @@ def plot_mean_std_dashboard(
     experiments: Sequence[str], output_dir: Path, formats: Sequence[str],
 ) -> None:
     """Combined view: aligned mean lines with restrained ±1 STD ribbons."""
+    import matplotlib as mpl
     import matplotlib.pyplot as plt
 
-    colors = plt.get_cmap("tab20")(np.linspace(0, 1, len(models)))
-    fig, axes = plt.subplots(3, 4, figsize=(17, 11), sharex=False)
-    for ax, experiment in zip(axes.flat, experiments):
-        panel_cells = []
-        pending_bands = []
-        for model, color in zip(models, colors):
-            cell = cells.get((model, experiment))
-            if cell is None:
-                continue
-            valid = (np.isfinite(cell.aligned_mean)
-                     & np.isfinite(cell.alignment_std)
-                     & (cell.aligned_mean > 0))
-            x = cell.ratios[valid]
-            mean = cell.aligned_mean[valid]
-            std = cell.alignment_std[valid]
-            if not len(x):
-                continue
-            ax.plot(x, mean, marker="o", ms=2.5, lw=1.35, color=color,
-                    label=model, zorder=2)
-            panel_cells.append((cell, color))
-            pending_bands.append((x, mean, std, color))
-        # At this point only the mean lines contribute to Matplotlib's data
-        # limits, exactly as in the original mean-only dashboard.
-        mean_limits = ax.get_ylim()
-        ax.axhline(1.02, color="#6B7280", ls="--", lw=0.9, zorder=0)
-        ax.set_xscale("log", base=2)
-        ax.set_xlim(*dashboard_xlim(experiment))
-        ax.set_yscale("log")
-        ax.set_title(EXPERIMENT_TITLES[experiment])
-        ax.set_xlabel("context / parameter")
-        ax.set_ylabel("mean relative MAE")
-        ax.grid(alpha=0.22)
-        # Add uncertainty without letting it change the original line-only
-        # visual scale.
-        for x, mean, std, color in pending_bands:
-            ax.fill_between(x, np.maximum(mean - std, 1e-4), mean + std,
-                            color=color, alpha=0.055, lw=0, zorder=1)
-        ax.set_ylim(mean_limits)
-
-        if any(cell.clamped for cell, _ in panel_cells):
-            window = closest_agreement_window([
-                (cell.ratios, cell.aligned_mean) for cell, _ in panel_cells])
-            if window is None:
-                continue
-            zoom_min, _, zoom_max = window
-            inset = ax.inset_axes(open_inset_bounds(
-                ax, [(cell.ratios, cell.aligned_mean)
-                     for cell, _ in panel_cells]))
-            inset_means = []
-            for cell, color in panel_cells:
-                x, mean = _window_subset(
-                    cell.ratios, cell.aligned_mean, zoom_min, zoom_max)
-                _, std = _window_subset(
-                    cell.ratios, cell.alignment_std, zoom_min, zoom_max)
+    with mpl.rc_context(PAPER_MPL_STYLE):
+        fig, axes = plt.subplots(3, 4, figsize=(15.6, 9.8), sharex=False)
+        for ax, experiment in zip(axes.flat, experiments):
+            panel_cells = []
+            pending_bands = []
+            for model in models:
+                cell = cells.get((model, experiment))
+                if cell is None:
+                    continue
+                valid = (np.isfinite(cell.aligned_mean)
+                         & np.isfinite(cell.alignment_std)
+                         & (cell.aligned_mean > 0))
+                x = cell.ratios[valid]
+                mean = cell.aligned_mean[valid]
+                std = cell.alignment_std[valid]
                 if not len(x):
                     continue
-                inset.fill_between(x, np.maximum(mean - std, 1e-4), mean + std,
-                                   color=color, alpha=0.075, lw=0)
-                inset.plot(x, mean, marker="o", ms=1.8, lw=1, color=color)
-                inset_means.append(mean)
-            # Keep the zoom's vertical scale comparable to its parent: bands
-            # communicate dispersion but never expand the y-range.
-            _zoom_y_to_lines(inset, inset_means)
-            _finish_tail_inset(inset, "closest-agreement zoom")
-            inset.tick_params(labelsize=5.5, length=2)
-            inset.title.set_fontsize(6.5)
-    handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="outside lower center", ncol=6,
-               fontsize=8, frameon=False)
-    fig.suptitle("Synthetic sweeps — aligned mean with ±1 cross-bin STD",
-                 fontsize=16)
-    fig.tight_layout(rect=(0, 0.07, 1, 0.97))
-    _save_figure(fig, output_dir, "08_mean_std_dashboard", formats)
-    plt.close(fig)
+                plot_kwargs = model_plot_kwargs(model)
+                ax.plot(x, mean, ms=3.0, lw=1.35, label=model, zorder=2,
+                        **plot_kwargs)
+                panel_cells.append((model, cell))
+                pending_bands.append(
+                    (x, mean, std, plot_kwargs["color"]))
+            # At this point only the mean lines contribute to Matplotlib's data
+            # limits, exactly as in the original mean-only dashboard.
+            mean_limits = ax.get_ylim()
+            ax.axhline(1.02, color=MUTED, ls="--", lw=0.85, zorder=0)
+            ax.set_xscale("log", base=2)
+            ax.set_xlim(*dashboard_xlim(experiment))
+            ax.set_yscale("log")
+            ax.set_title(EXPERIMENT_TITLES[experiment], color=INK)
+            ax.set_xlabel("Context / parameter")
+            ax.set_ylabel("Mean relative MAE")
+            style_axes(ax, grid_axis="both")
+            # Add uncertainty without letting it change the original line-only
+            # visual scale.
+            for x, mean, std, color in pending_bands:
+                ax.fill_between(x, np.maximum(mean - std, 1e-4), mean + std,
+                                color=color, alpha=0.075, lw=0, zorder=1)
+            ax.set_ylim(mean_limits)
+
+            if any(cell.clamped for _, cell in panel_cells):
+                window = closest_agreement_window([
+                    (cell.ratios, cell.aligned_mean)
+                    for _, cell in panel_cells])
+                if window is None:
+                    continue
+                zoom_min, _, zoom_max = window
+                inset = ax.inset_axes(open_inset_bounds(
+                    ax, [(cell.ratios, cell.aligned_mean)
+                         for _, cell in panel_cells]))
+                inset_means = []
+                for model, cell in panel_cells:
+                    x, mean = _window_subset(
+                        cell.ratios, cell.aligned_mean, zoom_min, zoom_max)
+                    _, std = _window_subset(
+                        cell.ratios, cell.alignment_std, zoom_min, zoom_max)
+                    if not len(x):
+                        continue
+                    plot_kwargs = model_plot_kwargs(model)
+                    inset.fill_between(
+                        x, np.maximum(mean - std, 1e-4), mean + std,
+                        color=plot_kwargs["color"], alpha=0.095, lw=0)
+                    inset.plot(x, mean, ms=2.0, lw=1.0, **plot_kwargs)
+                    inset_means.append(mean)
+                # Keep the zoom's vertical scale comparable to its parent:
+                # bands communicate dispersion but never expand the y-range.
+                _zoom_y_to_lines(inset, inset_means)
+                _finish_tail_inset(inset, "Closest-agreement zoom")
+                inset.tick_params(labelsize=5.5, length=2)
+                inset.title.set_fontsize(6.5)
+        active_models = [model for model in models
+                         if any((model, exp) in cells for exp in experiments)]
+        legend = fig.legend(
+            handles=model_legend_handles(active_models),
+            loc="outside lower center", ncol=6, fontsize=7.2,
+        )
+        style_legend(legend)
+        add_figure_title(
+            fig, "Synthetic sweeps — aligned mean with ±1 cross-bin STD",
+            y=0.992,
+        )
+        fig.tight_layout(rect=(0, 0.075, 1, 0.975))
+        _save_figure(fig, output_dir, "08_mean_std_dashboard", formats)
+        plt.close(fig)
 
 
 def plot_cell_detail(cell: AlignmentCell, output_dir: Path,
