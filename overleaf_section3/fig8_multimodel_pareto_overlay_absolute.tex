@@ -1,0 +1,16 @@
+% Requires \usepackage{graphicx}
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.98\textwidth]
+        {figures/fig8_multimodel_pareto_overlay_absolute.pdf}
+    \caption{Superposed cell-shared supported Pareto frontiers for 11
+    time-series foundation models using absolute GiftEval normalized MASE,
+    without dividing by each model's native score.  Consequently, native
+    baselines are model-specific and appear as separate crosses at zero FLOPs
+    saved.  The vertical range extends to normalized MASE 0.85, with
+    higher-loss supported points clipped.
+    Circles mark minimum-MASE oracles and squares mark the greatest supported
+    FLOPs reduction that remains no worse than each model's native accuracy.
+    Chronos2-Small is highlighted in orange.}
+    \label{fig:multimodel-pareto-overlay-absolute}
+\end{figure*}

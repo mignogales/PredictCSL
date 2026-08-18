@@ -77,10 +77,17 @@ def run(args: argparse.Namespace) -> None:
             grid = np.asarray(data["window_grid"], dtype=int)
             grid_error = np.asarray(data["grid_mase"], dtype=float)
 
-            prefix = cell.method.removesuffix("_instance")
+            is_raw = cell.method.endswith("_instance_raw")
+            prefix = cell.method.removesuffix("_raw").removesuffix("_instance")
+            regularized_key = f"{prefix}__regularized_scores"
             score_key = f"{prefix}__scores"
             scores = (np.asarray(data[score_key], dtype=float)
                       if score_key in data.files else None)
+            if not is_raw and regularized_key in data.files:
+                scores = np.asarray(data[regularized_key], dtype=float)
+            native_score_supported = (
+                bool(np.asarray(data["native_score_supported"]).item())
+                if "native_score_supported" in data.files else True)
 
         delta = selected - full
         relative = delta / np.maximum(np.abs(full), 1e-12)
@@ -93,10 +100,13 @@ def run(args: argparse.Namespace) -> None:
         margin = np.full(selected.shape, np.nan)
         full_score_gap = np.full(selected.shape, np.nan)
         if scores is not None and scores.shape == grid_error.shape:
-            # Match the deployed instance-native policy exactly: native/full is
-            # an explicit action carrying the final synthetic score, including
-            # rows where that numeric grid window was not directly evaluated.
-            native_score = np.nextafter(scores[:, -1], -np.inf)
+            # Match the audited policy scores (regularized for the deployed
+            # policy, raw for the explicit legacy control). Native/full may
+            # reuse the final synthetic score only when that output was a valid,
+            # supervised action for this model/horizon.
+            native_score = (np.nextafter(scores[:, -1], -np.inf)
+                            if native_score_supported
+                            else np.full(scores.shape[0], np.nan))
             candidate_scores = np.column_stack([scores, native_score])
             candidate_errors = np.column_stack([grid_error, full])
             feasible = np.isfinite(candidate_errors) & np.isfinite(candidate_scores)

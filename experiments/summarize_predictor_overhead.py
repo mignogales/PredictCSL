@@ -19,8 +19,9 @@ pass" (cf. the PREDICTCSL_CHEAP_PREDICTOR note in predict_context_length.py).
 Both sides use the **same** MAC proxy as stage 4
 (``theoretical_flops`` in compare_window_strategies_gifteval.py), so the ratio
 is internally consistent with the FLOPs columns the pipeline already emits. It
-is a proxy (ignores embeddings/norms/heads kernel constants), comparable as a
-ratio rather than an exact instruction count.
+is a proxy (some embeddings/heads, norms, elementwise operations, and exact
+kernel constants are omitted), comparable as a ratio rather than an exact
+instruction count.
 
 Nothing here needs a GPU or torch — it reads ``best_config.json`` (the predictor
 architecture chosen by the random search) and computes MACs analytically. If the
@@ -55,6 +56,7 @@ from experiments.compare_window_strategies_gifteval import (
     MODEL_ARCH,
     _layer_macs,
     _n_patches,
+    resolve_model_arch,
     theoretical_flops,
 )
 from experiments import models_config
@@ -262,7 +264,11 @@ def build_rows(
         found = bool(forced_config) or os.path.isfile(path)
 
         pred = predictor_macs(cfg)
-        arch = MODEL_ARCH[family]
+        # Display labels must resolve to the same checkpoint-specific metadata
+        # as Hugging Face ids (notably Chronos2 Small versus Base).
+        arch = resolve_model_arch(display)
+        if arch is None:
+            continue
         full_window = min(arch.max_window, GRID_MAX_WINDOW)
         half_window = max(1, full_window // 2)
         quarter_window = max(1, full_window // 4)
@@ -325,9 +331,8 @@ def print_report(predictor_root: str, forced_config: Optional[str],
     print("=" * 124)
     print("  Note: MAC proxy (same as stage-4 theoretical_flops); the predictor")
     print("  runs once per series and returns the whole curve, while the TSFM cost")
-    print("  is one forecast. SSM/recurrent families (flowstate, tirex) are LINEAR")
-    print("  in context, so their proxy GMAC is a loose upper bound -> the % shown")
-    print("  for them understates the predictor's true relative cost.")
+    print("  is one forecast. FlowState uses an S5/FFT O(L log L) proxy and TiRex")
+    print("  uses a recurrent O(L) proxy; both avoid a spurious attention L^2 term.")
 
 
 def write_csv(path: str, horizon: int, rows: List[Dict]) -> None:

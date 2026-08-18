@@ -1,0 +1,281 @@
+% Section 4: Mechanisms of useful context saturation
+% Required packages: \usepackage{amsmath,booktabs,graphicx}
+% Upload this file together with the four main figures under figures/.
+
+\section{Mechanisms of useful context saturation}
+\label{sec:context-mechanisms}
+
+Section~\ref{sec:real-context} established that the context length that
+minimizes forecast error is heterogeneous and often substantially shorter than
+the available history.  An error--context curve alone, however, cannot explain
+why accuracy saturates.  The distant past may be \emph{predictively redundant}
+given recent observations, or the architecture may be unable to use distant
+information even when it is necessary.  We distinguish these explanations with
+three complementary tests: fixed-width temporal perturbations, oracle-verified
+distant-dependency controls, and a decomposition of physical slicing versus
+attention masking.
+
+\subsection{Causal and mechanistic protocol}
+\label{sec:mechanistic-protocol}
+
+For this analysis, we define the $5\%$ sufficient context as
+\begin{equation}
+    L_{5\%}
+    = \min\left\{
+        L\in\mathcal{G}:
+        E(L) \leq 1.05\min_{L'\in\mathcal{G}} E(L')
+      \right\},
+    \label{eq:sufficient-context}
+\end{equation}
+where $E(L)$ is mean forecast MAE and $\mathcal{G}$ is the model-supported
+context grid.  Requested lengths are aligned to each model's patching and
+context constraints, and all results below use the resulting effective length.
+The $5\%$ tolerance prevents small fluctuations around a broad optimum from
+being interpreted as substantively different windows.  Consequently,
+$L_{5\%}$ is a performance threshold, not an assumed causal boundary.
+
+The ordinary synthetic evaluation uses horizon 64 and seed 42.  Temporal
+perturbations are available for 11 TSFMs, the complete planted-lag grid for 10,
+and the masking--slicing decomposition for eight.  Each condition in the
+completed planted-lag grid contains 128 instances; each masking--slicing cell
+contains 256 series.  The long-lag extension contains 48 instances per
+condition and is complete for nine models at $\alpha=1$, with an additional
+$\alpha=0.5$ series for Toto.  We do not turn unsupported experiments or
+incomplete cells into zero effects.
+
+\subsection{Temporal sensitivity is strongly front-loaded}
+\label{sec:temporal-perturbation-results}
+
+For a temporal block $b$, input width $W$, and perturbation family $p$, we
+measure
+\begin{equation}
+    A_p(b,W)
+    = \mathbb{E}_i\!\left[
+        \left|
+        \ell\!\left(f(\widetilde{x}^{\,p}_{i,b}),y_i\right)
+        - \ell\!\left(f(x_i),y_i\right)
+        \right|
+      \right].
+    \label{eq:block-perturbation-effect}
+\end{equation}
+The intervention replaces only block $b$ while preserving the total input
+width, positions, and mask.  We use block-mean replacement, within-block
+permutation, a locally matched replacement, and Gaussian noise at three
+severities.  The four families trade off intervention strength against
+distribution shift; agreement across them is more informative than any single
+corruption.
+
+Figure~\ref{fig:perturbation-recency} compares block-mean profiles at each
+model's largest completed input.  The dominant pattern is a steep decline in
+sensitivity with lookback.  The three Chronos-2 variants, FlowState, Moirai,
+PatchTST-FM, TimesFM, TiRex, Toto, and Chronos-Bolt all assign much smaller
+effects to distant blocks than to the most recent block.  Sundial is a notable
+exception: its profile falls initially but retains a broad plateau over older
+blocks.  Useful context is therefore generally concentrated near the forecast
+origin, but the concentration is architecture dependent.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.95\textwidth]
+        {figures/fig1_perturbation_recency_all_models.png}
+    \caption{Temporal block sensitivity across 11 TSFMs on the ordinary
+    synthetic pool.  For each model, we show the block-mean intervention at
+    its largest completed effective input $W$ and divide the mean absolute
+    loss change by the largest value in that model's profile.  Lookback zero
+    is displayed at one on the logarithmic axis.  The normalization supports
+    comparison of profile shape, not absolute sensitivity magnitude.}
+    \label{fig:perturbation-recency}
+\end{figure*}
+
+Chronos2-Small provides a fully scoped worked example.  Its mean MAE falls from
+$0.797$ at $W=32$ to a minimum of $0.312$ at $W=3{,}072$, while the first
+window within $5\%$ of that minimum is $L_{5\%}=1{,}536$.  At $W=8{,}192$, the
+mean absolute effect outside versus inside this boundary is $0.146$ for
+block-mean replacement, $0.189$ for matched replacement, $0.222$ for
+permutation, and $0.376$ for noise.  Thus, the older prefix is much less
+influential, but it is not absolutely inert.  The data support practical
+concentration rather than a sharp causal cutoff at $1{,}536$.
+
+\subsection{Verified distant dependencies induce adaptive reach}
+\label{sec:planted-lag-results}
+
+Low distant sensitivity on ordinary data remains compatible with architectural
+inaccessibility.  We therefore construct controlled processes of the form
+\begin{equation}
+    x_t
+    = g\!\left(x_{t-1:t-r}\right)
+      + \alpha h(x_{t-d}) + \varepsilon_t,
+    \qquad
+    r=8,
+    \quad
+    d\in\{32,64,128,256\},
+    \quad
+    \alpha\in\{0,0.5,1\}.
+    \label{eq:planted-lag-generator}
+\end{equation}
+A held-out ridge oracle must show that lag-$d$ features improve prediction over
+recent-only features before the condition is used to draw a model conclusion.
+No condition in the completed ten-model grid was marked as a broken generator.
+
+For each model, we summarize the eight oracle-verified cells with
+\begin{equation}
+    \rho_m
+    = \operatorname{Spearman}\!\left(d,L_{5\%}\right),
+    \qquad
+    q_m
+    = \frac{1}{8}\sum_c
+      \mathbf{1}\!\left[L_{5\%,c}\geq d_c\right],
+    \label{eq:adaptive-reach-statistics}
+\end{equation}
+where the sum covers dependency strengths $\alpha\geq0.5$.  All ten models
+have positive and strong lag tracking: $\rho_m$ ranges from $0.730$ to $0.908$.
+The estimated sufficient context reaches the planted lag in every strong cell
+for the three Chronos-2 variants, in seven of eight cells for six further
+models, and in five of eight for Sundial (Table~\ref{tab:adaptive-reach}).
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.98\textwidth]
+        {figures/visual_draft/fig2_sufficient_context_vs_lag_with_toto_placeholder.pdf}
+    \caption{Adaptive context reach across both oracle-verified dependency
+    strengths.  Panels A--B show the completed ten-model grid at lags
+    32--256.  Panel C shows the completed nine-model long-lag cohort at
+    $\alpha=1$ and lags 128--2,048 with 48 series per condition; Toto's
+    $\alpha=0.5$ series is retained as the only completed weak long-lag run.
+    The dashed diagonal marks exact boundary recovery, and red rings identify
+    conditions where $L_{5\%}<d$.}
+    \label{fig:adaptive-reach}
+\end{figure*}
+
+\paragraph{Long-lag extension.}
+At $\alpha=1$, the nine-model follow-up reaches the planted lag in 28 of 36
+conditions.  Chronos2-Small, Chronos2-Synth, PatchTST-FM, TimesFM, and Toto
+reach all four lags; Chronos2-Base reaches three, FlowState and Sundial two,
+and Moirai one.  Toto selects $L_{5\%}=384,1{,}024,1{,}536,$ and $2{,}560$ at
+$d=128,512,1{,}024,$ and $2{,}048$, respectively.  Its additional
+$\alpha=0.5$ series selects $192,192,128,$ and $192$; only the first condition
+reaches the planted lag.  Chronos-Bolt and TiRex do not have completed
+long-lag controls in this cohort and are not shown in panel C.
+
+\begin{table*}[t]
+    \centering
+    \footnotesize
+    \setlength{\tabcolsep}{4pt}
+    \caption{Lag tracking over the eight oracle-verified cells with
+    $\alpha\geq0.5$.  ``Reach'' is $q_m$ in
+    Equation~\ref{eq:adaptive-reach-statistics}; ``null range'' is the range of
+    $L_{5\%}$ selected in the four $\alpha=0$ cells.}
+    \label{tab:adaptive-reach}
+    \begin{tabular}{lrrr}
+        \toprule
+        Model & $\rho_m$ & Reach & Null range \\
+        \midrule
+        Chronos2-Base      & 0.889 & 1.000 & 192--256 \\
+        Chronos2-Small     & 0.889 & 1.000 & 128--256 \\
+        Chronos2-Synth     & 0.908 & 1.000 & 128--256 \\
+        ChronosBolt-Base   & 0.800 & 0.875 &  96--192 \\
+        FlowState-R1       & 0.765 & 0.875 &  64--128 \\
+        Moirai2-Small      & 0.800 & 0.875 &  96--192 \\
+        PatchTST-FM-R1     & 0.765 & 0.875 &  48--192 \\
+        Sundial-Base-128M  & 0.730 & 0.625 &  48--96  \\
+        TiRex2             & 0.745 & 0.875 & 128--192 \\
+        TimesFM2.5-200M    & 0.830 & 0.875 &  64--192 \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+The null cells expose an equally important limitation.  Although their distant
+coefficient is zero, they select $L_{5\%}$ between 48 and 256 across models.
+Local-only controls with true order eight select between 32 and 384.  Hence the
+operational threshold tracks a real increase in dependency reach but does not
+precisely recover the causal boundary.  This falsification test favors adaptive
+context use over a fixed architectural limit, while showing that
+$L_{5\%}$ is conservative and requires calibration.
+
+\subsection{Masking effects are partly preprocessing effects}
+\label{sec:masking-decomposition-results}
+
+Physical slicing changes input width, positions, padding, and potentially
+normalization statistics at the same time.  Conversely, hiding an old prefix
+with an attention mask preserves width and position but may still allow the
+hidden values to affect preprocessing.  For each visible suffix $L$ inside a
+fixed full width $W$, we therefore compare
+\begin{align}
+    E_{\mathrm{slice}}(L)
+        &: \text{physically supply only the last }L\text{ values}, \nonumber\\
+    E_{\mathrm{fullstat}}(L)
+        &: \text{mask the true old prefix at width }W, \nonumber\\
+    E_{\mathrm{tailstat}}(L)
+        &: \text{mask a prefix matched to the tail's mean and scale}.
+    \label{eq:restriction-conditions}
+\end{align}
+Their differences define the operational decomposition
+\begin{equation}
+    \Delta_{\mathrm{stat}}(L)
+      = E_{\mathrm{fullstat}}(L)-E_{\mathrm{tailstat}}(L),
+    \qquad
+    \Delta_{\mathrm{resid}}(L)
+      = E_{\mathrm{tailstat}}(L)-E_{\mathrm{slice}}(L).
+    \label{eq:restriction-decomposition}
+\end{equation}
+$\Delta_{\mathrm{stat}}$ exactly isolates normalization only for a global
+affine mean--standard-deviation transform; for other pipelines it is a proxy
+for normalization and related prefix-dependent preprocessing.
+
+Figure~\ref{fig:restriction-decomposition} displays the three conditions
+directly for every model with a completed decomposition.  Full-history-stat
+masking can produce large and non-monotonic errors at short suffixes.  Matching
+the hidden prefix to the visible tail removes almost all of this separation for
+the Chronos variants, Chronos-Bolt, and Moirai, but not universally.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]
+        {figures/visual_draft/fig3_slicing_vs_masking_all_models.pdf}
+    \caption{Direct slicing--masking comparison across eight TSFMs.  Each
+    panel has its own MAE scale.  Tail-matched masking is shown by teal dashed
+    lines with open markers; where it lies directly over the physical-slice
+    curve, the preprocessing-matched gap is visually negligible.  Material
+    residual separations remain for PatchTST-FM, TimesFM, and Sundial.}
+    \label{fig:restriction-decomposition}
+\end{figure*}
+
+For Chronos2-Small, mean $|\Delta\mathrm{MAE}|$ falls from $0.03115$ under
+full-history-stat masking to $0.00105$ under tail matching, a $29.7\times$
+difference.  Across eight models, tail matching reduces the mean absolute
+masking--slicing gap by $48.2\%$ to approximately $100\%$, with a median
+reduction of $97.2\%$.  The residual is not negligible everywhere: TimesFM
+retains $51.8\%$ of the original gap, PatchTST-FM $34.5\%$, and Sundial
+$17.3\%$; each of the other five models retains at most $3.4\%$.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]
+        {figures/visual_draft/fig4_masking_gap_heatmap_all_models.pdf}
+    \caption{Mean absolute masking--slicing MAE gap before and after tail-stat
+    matching.  The logarithmic color scale makes broad preprocessing effects
+    and smaller residuals simultaneously visible.  Pale cells denote suffixes
+    not evaluated because the model's full context is shorter.}
+    \label{fig:masking-gap-heatmap}
+\end{figure*}
+
+Apparent context use under fixed-width masking can therefore be dominated by
+prefix-dependent preprocessing, but width, position, padding, or other
+architecture-specific effects remain important for some models.  Masking is
+not a neutral substitute for shortening the input: mechanistic claims should
+report both full-stat and tail-matched conditions and treat the remaining gap
+as architecture specific rather than universal.
+
+\subsection{Implications for context selection}
+\label{sec:mechanistic-implications}
+
+Taken together, the experiments support an adaptive rather than fixed context
+mechanism.  On ordinary series, forecast sensitivity is predominantly recent;
+when a verified distant dependency becomes necessary, effective context grows
+toward it across diverse architectures.  However, the operational
+$L_{5\%}$ threshold overestimates causal span in null controls, and naive
+masking can mistake preprocessing-statistic changes for information use.
+Accordingly, the learned selector in the next section predicts performance over
+a discrete context grid rather than a literal last-used timestep.  Its value is
+to choose an accuracy--compute operating point, not to claim exact recovery of
+the data-generating dependency length.

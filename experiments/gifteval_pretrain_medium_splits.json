@@ -1,0 +1,31 @@
+{
+  "train": [
+    "australian_electricity_demand",
+    "oikolab_weather",
+    "bdg-2_panther",
+    "bdg-2_fox",
+    "gfc12_load",
+    "gfc17_load",
+    "pedestrian_counts",
+    "PEMS03",
+    "PEMS04",
+    "PEMS08",
+    "PEMS_BAY",
+    "lcl",
+    "beijing_air_quality",
+    "wind_power",
+    "solar_power"
+  ],
+  "val": [
+    "bdg-2_bear",
+    "PEMS07",
+    "BEIJING_SUBWAY_30MIN",
+    "SHMETRO"
+  ],
+  "test": [
+    "bdg-2_rat",
+    "traffic_hourly",
+    "LOS_LOOP",
+    "subseasonal_precip"
+  ]
+}

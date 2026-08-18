@@ -1,0 +1,25 @@
+{
+  "study": "GIFT-Eval context-window ablation",
+  "grid_v1": {
+    "role": "canonical existing cells",
+    "windows": [
+      32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
+      1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192,
+      12288, 15360
+    ],
+    "output_root": "logs/experiments/master_recompute/window_ablation_gifteval/general"
+  },
+  "grid_v2": {
+    "role": "complementary midpoint cells",
+    "windows": [
+      40, 56, 80, 112, 160, 224, 320, 448, 640, 896,
+      1280, 1792, 2304, 2816, 3584, 5120, 7168, 10240, 13824
+    ],
+    "output_root": "logs/experiments/master_recompute/window_ablation_gifteval_grid_v2/general",
+    "launcher": "scripts/run_window_grid_v2_gpu3.sh"
+  },
+  "notes": [
+    "Filter both grids at each model family's registered context cap.",
+    "Keep v2 physically separate so no v1 cell, aggregate, or done marker is overwritten."
+  ]
+}

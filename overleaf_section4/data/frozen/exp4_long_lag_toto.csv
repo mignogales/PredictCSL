@@ -1,0 +1,9 @@
+model,lag,strength,sufficient_context,oracle_relative_gain,oracle_distant_predictive,config_broken,limitation_flag,n_instances,series_length,max_supported_context
+Toto-2.0-313m,128,0.5,192,0.03164761681,True,False,False,48,8192,4096
+Toto-2.0-313m,128,1.0,384,0.1361393553,True,False,False,48,8192,4096
+Toto-2.0-313m,512,0.5,192,0.03431709249,True,False,True,48,8192,4096
+Toto-2.0-313m,512,1.0,1024,0.1710330913,True,False,False,48,8192,4096
+Toto-2.0-313m,1024,0.5,128,0.03056016988,True,False,True,48,8192,4096
+Toto-2.0-313m,1024,1.0,1536,0.1510657865,True,False,False,48,8192,4096
+Toto-2.0-313m,2048,0.5,192,0.06785808922,True,False,True,48,8192,4096
+Toto-2.0-313m,2048,1.0,2560,0.2086780795,True,False,False,48,8192,4096

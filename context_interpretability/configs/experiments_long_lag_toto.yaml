@@ -1,0 +1,13 @@
+extends: experiments_long_lag.yaml
+
+# Toto's fused attention kernel failed under the old aggressive dynamic batch
+# search.  Keep this rerun in the shared fresh long-lag tree, but use a small,
+# fixed microbatch and a reduced diagnostic cohort.
+batch_size: 2
+max_samples: 48
+dynamic_batching:
+  enabled: false
+
+synthetic_controls:
+  n_instances: 48
+

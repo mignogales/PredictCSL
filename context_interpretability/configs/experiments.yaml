@@ -113,6 +113,9 @@ predictor_contrast_saliency:
 # nested W; ``full_contexts``/``visible_lengths`` can select exact grid points.
 context_decomposition:
   metrics: [mae, mse]
+  # Direct mean-only, scale-only, and mean+scale controls are currently
+  # verified for Chronos-Bolt and PatchTST-FM. They leave inputs unchanged.
+  statistic_ablation: false
   all_full_contexts: false
   full_contexts: null
   visible_lengths: null

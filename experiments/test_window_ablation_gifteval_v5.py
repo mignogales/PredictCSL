@@ -79,7 +79,7 @@ except ImportError:
     PatchTSTFMForPrediction = None
 
 from experiments.predict_context_length import (
-    PatchTSTContextLength, build_predictor)
+    PatchTSTContextLength, acceptable_decision_scores, build_predictor)
 from experiments import models_config
 from experiments import datasets_config
 
@@ -2043,6 +2043,7 @@ def predict_curves_for_dataset(
     horizon_idx: int,
     device: str,
     training_objective: str = "curve",
+    acceptable_prob_threshold: float = 0.5,
     batch_size: int = 64,
 ) -> np.ndarray:
     """Per-instance predicted window-decision scores.
@@ -2050,9 +2051,10 @@ def predict_curves_for_dataset(
     Returns
     -------
     np.ndarray of shape (n_instances, n_windows). Curve mode returns z-scored
-    error; classification returns negative probability; risk mode returns
-    calibrated log error relative to full/native context. In every mode lower
-    is better.
+    error; classification returns negative probability; acceptable-set mode
+    returns a safe-largest credible-action score; risk mode returns calibrated
+    log error relative to full/native context; pairwise mode returns uncalibrated
+    ranking scores. In every mode lower is better.
     """
     x_np = _prepare_predictor_inputs(cache.contexts, context_length)
     x = torch.from_numpy(x_np).unsqueeze(-1)  # (N, L, 1)
@@ -2079,6 +2081,9 @@ def predict_curves_for_dataset(
                 # sigmoid scores so argmin remains the single decision contract
                 # while preserving the classifier's argmax exactly.
                 curve_pred = -torch.sigmoid(curve_pred)
+            elif training_objective == "acceptable":
+                curve_pred = acceptable_decision_scores(
+                    curve_pred, prob_threshold=acceptable_prob_threshold)
             preds.append(curve_pred.float().cpu().numpy())
     return np.concatenate(preds, axis=0)
 
@@ -2162,9 +2167,11 @@ def plot_real_vs_predicted_curve(
     pred_label = (
         f"Classifier decision score (mean over {n_inst} inst.)"
         if training_objective == "classification"
-        else (f"Predicted log-error/full (mean over {n_inst} inst.)"
+        else (f"Acceptable-set safe decision score (mean over {n_inst} inst.)"
+              if training_objective == "acceptable"
+              else (f"Predicted log-error/full (mean over {n_inst} inst.)"
               if training_objective == "risk"
-              else f"Predicted curve (mean over {n_inst} inst.)"))
+              else f"Predicted curve (mean over {n_inst} inst.)")))
     ax.plot(ws, pred_mean,
             marker="x", linewidth=2.0, color="#d62728",
             label=pred_label)
@@ -2184,9 +2191,11 @@ def plot_real_vs_predicted_curve(
     ax.set_ylabel(
         "Real z-score / classifier score (-probability)"
         if training_objective == "classification"
-        else ("Log error relative to full"
+        else ("Real z-score / acceptable-set decision score"
+              if training_objective == "acceptable"
+              else ("Log error relative to full"
               if training_objective == "risk"
-              else f"Z-scored {curve_metric.upper()} along windows"))
+              else f"Z-scored {curve_metric.upper()} along windows")))
     ax.set_title(
         f"{dataset_display}  (term={term}, h_real={horizon_real}, "
         f"h_pred={horizon_pred})  --  {model_short}",
@@ -2782,6 +2791,11 @@ def parse_args() -> argparse.Namespace:
               "leaderboard-parity summary, then exits. A later normal stage-3 "
               "run reuses these exact cached forecasts for predictor overlays."),
     )
+    p.add_argument(
+        "--window-grid", type=int, nargs="+", default=None,
+        help=("Explicit forecast window grid. Only valid with --forecast-only; "
+              "intended for versioned complementary-grid runs."),
+    )
     p.add_argument("--predictor-batch-size", type=int, default=64,
                    help="Batch size used when running the predictor on test-instance contexts.")
     p.add_argument("--short-context-mode", choices=["skip", "pad"], default="pad",
@@ -2807,6 +2821,10 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.preloaded_results_csv and not args.cached_only:
         p.error("--preloaded-results-csv requires --cached-only")
+    if args.window_grid is not None and not args.forecast_only:
+        p.error("--window-grid requires --forecast-only")
+    if args.window_grid is not None and any(w <= 0 for w in args.window_grid):
+        p.error("--window-grid values must be positive")
     return args
 
 
@@ -2908,11 +2926,33 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
         )
 
         predictor_dir = None
-        window_grid = sorted({
-            int(window)
-            for _model_id, family, _display in models
-            for window in window_grid_for_family(family)
-        })
+        if args.window_grid is None:
+            window_grid = sorted({
+                int(window)
+                for _model_id, family, _display in models
+                for window in window_grid_for_family(family)
+            })
+        else:
+            window_grid = sorted({int(window) for window in args.window_grid})
+            over_limit = {
+                display: {
+                    "family": family,
+                    "cap": int(models_config.context_limit(family)),
+                    "windows": [
+                        window for window in window_grid
+                        if window > int(models_config.context_limit(family))
+                    ],
+                }
+                for _model_id, family, display in models
+                if any(
+                    window > int(models_config.context_limit(family))
+                    for window in window_grid
+                )
+            }
+            if over_limit:
+                raise ValueError(
+                    "Explicit --window-grid exceeds a selected model's registered "
+                    f"context cap: {over_limit}")
         horizon_grid = list(HORIZON_GRID)
         print(Fore.CYAN
               + "Forecast-only parity pass (no predictor loaded).\n"
@@ -3549,6 +3589,8 @@ def run_ablation(args, device: str, shard_id: Optional[int] = None,
             predicted_curves = predict_curves_for_dataset(
                 predictor, cache, pred_ctx_len, h_idx, device,
                 training_objective=training_objective,
+                acceptable_prob_threshold=float(
+                    pred_cfg.get("acceptable_prob_threshold", 0.5)),
                 batch_size=args.predictor_batch_size,
             )
 

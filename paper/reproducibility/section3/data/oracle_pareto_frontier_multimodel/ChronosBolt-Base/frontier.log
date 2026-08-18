@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/mnogales/Projects/PredictCSL/experiments/oracle_pareto_frontier_gifteval.py", line 506, in <module>
+    main()
+  File "/home/mnogales/Projects/PredictCSL/experiments/oracle_pareto_frontier_gifteval.py", line 448, in main
+    raise RuntimeError(
+RuntimeError: Frontier accuracy endpoint does not reproduce Stage 4: 0.7748244078170131 vs 0.7747922341852038.

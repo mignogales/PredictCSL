@@ -1,0 +1,74 @@
+{
+  "model": "Toto-2.0-313m",
+  "mase_metric": "mase_gluonts_real",
+  "flops_weighting": "cell",
+  "policy_scope": "one dataset-shared action per GiftEval dataset/term cell",
+  "frontier_kind": "exact supported frontier from global linear scalarization",
+  "n_cells": 97,
+  "n_supported_points": 499,
+  "full_normalized_mase": 0.7039989334046809,
+  "full_total_flops": 2304709475476.9385,
+  "unconstrained_oracle_normalized_mase": 0.6932473803873336,
+  "unconstrained_oracle_flops_saved_pct": 21.768437158446595,
+  "maximum_supported_flops_saved_pct": 89.78786784293953,
+  "minimum_compute_normalized_mase": 1.095511334913619,
+  "key_operating_points": [
+    {
+      "constraint": "no worse than full",
+      "normalized_mase_limit": 0.7039989334046809,
+      "normalized_mase": 0.7038424898791374,
+      "flops_saved_pct": 63.0686847872429,
+      "native_cells": 13,
+      "frontier_index": 128
+    },
+    {
+      "constraint": "within 0.1% of oracle",
+      "normalized_mase_limit": 0.6939406277677208,
+      "normalized_mase": 0.6939190573743225,
+      "flops_saved_pct": 37.38018340119338,
+      "native_cells": 23,
+      "frontier_index": 32
+    },
+    {
+      "constraint": "within 0.5% of oracle",
+      "normalized_mase_limit": 0.6967136172892702,
+      "normalized_mase": 0.6966305781655723,
+      "flops_saved_pct": 51.61187817837206,
+      "native_cells": 16,
+      "frontier_index": 80
+    },
+    {
+      "constraint": "within 1% of oracle",
+      "normalized_mase_limit": 0.7001798541912069,
+      "normalized_mase": 0.6999384237040078,
+      "flops_saved_pct": 58.011145276937434,
+      "native_cells": 14,
+      "frontier_index": 106
+    },
+    {
+      "constraint": "within 2% of oracle",
+      "normalized_mase_limit": 0.7071123279950803,
+      "normalized_mase": 0.7068290782371758,
+      "flops_saved_pct": 65.64299221798574,
+      "native_cells": 9,
+      "frontier_index": 146
+    },
+    {
+      "constraint": "within 5% of oracle",
+      "normalized_mase_limit": 0.7279097494067003,
+      "normalized_mase": 0.7277819564652691,
+      "flops_saved_pct": 76.36174724264279,
+      "native_cells": 3,
+      "frontier_index": 219
+    },
+    {
+      "constraint": "within 10% of oracle",
+      "normalized_mase_limit": 0.762572118426067,
+      "normalized_mase": 0.7621199849027979,
+      "flops_saved_pct": 82.82384908761308,
+      "native_cells": 3,
+      "frontier_index": 293
+    }
+  ]
+}
+Saved frontier artifacts to logs/experiments/master_recompute/oracle_pareto_frontier_multimodel/Toto-2.0-313m

@@ -1,0 +1,74 @@
+{
+  "model": "PatchTST-FM-R1",
+  "mase_metric": "mase_gluonts_real",
+  "flops_weighting": "cell",
+  "policy_scope": "one dataset-shared action per GiftEval dataset/term cell",
+  "frontier_kind": "exact supported frontier from global linear scalarization",
+  "n_cells": 97,
+  "n_supported_points": 541,
+  "full_normalized_mase": 0.7045267799847655,
+  "full_total_flops": 9173747506974.482,
+  "unconstrained_oracle_normalized_mase": 0.6951509834288481,
+  "unconstrained_oracle_flops_saved_pct": 29.06269228250755,
+  "maximum_supported_flops_saved_pct": 94.66488370703571,
+  "minimum_compute_normalized_mase": 1.251363709675546,
+  "key_operating_points": [
+    {
+      "constraint": "no worse than full",
+      "normalized_mase_limit": 0.7045267799847655,
+      "normalized_mase": 0.7044196506896077,
+      "flops_saved_pct": 68.2532446430356,
+      "native_cells": 21,
+      "frontier_index": 92
+    },
+    {
+      "constraint": "within 0.1% of oracle",
+      "normalized_mase_limit": 0.6958461344122768,
+      "normalized_mase": 0.6957774506135374,
+      "flops_saved_pct": 40.38151982563946,
+      "native_cells": 31,
+      "frontier_index": 22
+    },
+    {
+      "constraint": "within 0.5% of oracle",
+      "normalized_mase_limit": 0.6986267383459922,
+      "normalized_mase": 0.6984171759242976,
+      "flops_saved_pct": 54.2874341167199,
+      "native_cells": 28,
+      "frontier_index": 49
+    },
+    {
+      "constraint": "within 1% of oracle",
+      "normalized_mase_limit": 0.7021024932631366,
+      "normalized_mase": 0.7018556670040339,
+      "flops_saved_pct": 63.57744101948314,
+      "native_cells": 25,
+      "frontier_index": 72
+    },
+    {
+      "constraint": "within 2% of oracle",
+      "normalized_mase_limit": 0.7090540030974251,
+      "normalized_mase": 0.7090303489282791,
+      "flops_saved_pct": 73.28212493922057,
+      "native_cells": 20,
+      "frontier_index": 114
+    },
+    {
+      "constraint": "within 5% of oracle",
+      "normalized_mase_limit": 0.7299085326002905,
+      "normalized_mase": 0.7297273330847148,
+      "flops_saved_pct": 84.78537457448775,
+      "native_cells": 10,
+      "frontier_index": 173
+    },
+    {
+      "constraint": "within 10% of oracle",
+      "normalized_mase_limit": 0.7646660817717329,
+      "normalized_mase": 0.7632184415365272,
+      "flops_saved_pct": 90.21108758982666,
+      "native_cells": 6,
+      "frontier_index": 273
+    }
+  ]
+}
+Saved frontier artifacts to logs/experiments/master_recompute/oracle_pareto_frontier_multimodel/PatchTST-FM-R1

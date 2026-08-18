@@ -1,0 +1,47 @@
+extends: experiments.yaml
+
+# Long-context covariance-matched KernelSynth approximation. The exact Chronos
+# generator is cubic in sequence length and fixed to 1024 upstream; this pool
+# samples each base kernel with FFT circulant embedding and combines independent
+# samples with the same random +/* expression. Product expressions preserve the
+# target covariance but are not themselves Gaussian, hence the explicit name.
+output_root: logs/experiments/context_interpretability_masking_kernelsynth_long
+max_samples: 16
+batch_size: 2
+dynamic_batching:
+  enabled: false
+
+context_lengths: [32, 64, 128, 256, 512, 768, 1024, 1536, 2048,
+                  2880, 3072, 4096, 6144, 8128, 8192]
+
+experiments:
+  exp0_attention_masking: true
+  exp1_perturbation: false
+  exp2_activation_patching: false
+  exp3_forecast_lens: false
+  exp4_synthetic_controls: false
+  exp5_integrated_gradients: false
+  exp6_predictor_contrast_saliency: false
+  exp7_context_decomposition: true
+  exp8_tsfm_contrast_saliency: false
+
+attention_masking:
+  enabled: true
+  metrics: [mse, mae]
+
+context_decomposition:
+  metrics: [mse, mae]
+  all_full_contexts: false
+  full_contexts: null
+  visible_lengths: [32, 64, 128, 256, 512, 1024, 2048, 4096, 6144]
+
+datasets:
+  source: kernelsynth
+  kernelsynth:
+    n_series: 16
+    series_length: 8192
+    seed: 4203
+    max_kernels: 5
+    normalize_std: true
+    scalable: true
+    cache_path: logs/experiments/_interpretability_data_cache/kernelsynth_long_covapprox_n16_t8256_seed4203.npz

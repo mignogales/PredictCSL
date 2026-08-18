@@ -1,0 +1,5 @@
+perturbation,full_context,sufficient_context_5pct,distant_recent_mean_abs_effect_ratio
+block_mean,8192,1536,0.146
+matched_block,8192,1536,0.189
+permutation,8192,1536,0.222
+noise,8192,1536,0.376

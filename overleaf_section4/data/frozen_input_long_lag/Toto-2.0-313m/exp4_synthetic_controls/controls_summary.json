@@ -1,0 +1,1105 @@
+{
+  "model": "Toto-2.0-313m",
+  "tolerance": 0.05,
+  "controls": [
+    {
+      "spec": {
+        "family": "A",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 0,
+        "strength": 0.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famA_linear_r8_n0.1",
+      "design_role": "local_control",
+      "oracle": {
+        "oracle_mse_recent": 0.009128202978263226,
+        "oracle_mse_full": 0.009128202978263226,
+        "relative_gain": 0.0,
+        "distant_predictive": false
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.09592171952432575,
+        0.094190067055037,
+        0.09414392415898358,
+        0.09249672578729336,
+        0.09187093417104937,
+        0.09137881414976216,
+        0.08915780173284678,
+        0.08900650617881567,
+        0.08766194072294435,
+        0.08705955584040126,
+        0.0866518427077132,
+        0.08648800039813764,
+        0.086536679097397,
+        0.08636803110781106,
+        0.08993096864433288
+      ],
+      "sufficient_context": 384,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "A",
+        "local_kind": "nonlinear",
+        "local_order": 8,
+        "distant_lag": 0,
+        "strength": 0.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famA_nonlinear_r8_n0.1",
+      "design_role": "local_control",
+      "oracle": {
+        "oracle_mse_recent": 0.009141313058679212,
+        "oracle_mse_full": 0.009141313058679212,
+        "relative_gain": 0.0,
+        "distant_predictive": false
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.12281917939758931,
+        0.12281008524399202,
+        0.12063075796227807,
+        0.11748569602095316,
+        0.1158633561335769,
+        0.11531803698335234,
+        0.11150785300954762,
+        0.11120085687378516,
+        0.10859959922124673,
+        0.10715770394946489,
+        0.10596943069739358,
+        0.10536059845576891,
+        0.10518165382298268,
+        0.10466241017736522,
+        0.10933247398873884
+      ],
+      "sufficient_context": 768,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "A",
+        "local_kind": "seasonal",
+        "local_order": 8,
+        "distant_lag": 0,
+        "strength": 0.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famA_seasonal_r8_n0.1",
+      "design_role": "local_control",
+      "oracle": {
+        "oracle_mse_recent": 0.01038214684013461,
+        "oracle_mse_full": 0.01038214684013461,
+        "relative_gain": 0.0,
+        "distant_predictive": false
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.1780485119120634,
+        0.11702505714213036,
+        0.10340202018279025,
+        0.09566701027224056,
+        0.09524667533310686,
+        0.09376059495329159,
+        0.09078511359689993,
+        0.09019618481227691,
+        0.08888228668345377,
+        0.08825137674217014,
+        0.08766249338648535,
+        0.0875391527477009,
+        0.0874262631713106,
+        0.0869864663697193,
+        0.09092639285454258
+      ],
+      "sufficient_context": 384,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 128,
+        "strength": 0.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d128_s0_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.010233807765811516,
+        "oracle_mse_full": 0.01022685755068186,
+        "relative_gain": 0.0006791426308470074,
+        "distant_predictive": false
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.09858536511486982,
+        0.09747265601644568,
+        0.09397468604575288,
+        0.09369079632261723,
+        0.09285864119887854,
+        0.09268195527919983,
+        0.09197581484810809,
+        0.09080556300858038,
+        0.09079516676641279,
+        0.09033842237865446,
+        0.08992805122861884,
+        0.0899257473127933,
+        0.08967507087867126,
+        0.08945096508965082,
+        0.09153868913153751
+      ],
+      "sufficient_context": 128,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 128,
+        "strength": 0.5,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d128_s0.5_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.010578828202632562,
+        "oracle_mse_full": 0.010244033501337919,
+        "relative_gain": 0.03164761681367781,
+        "distant_predictive": true
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.10414362900709466,
+        0.10419833833270016,
+        0.09876056337440946,
+        0.09800562651222045,
+        0.09600859018033188,
+        0.09546491320433563,
+        0.09457014455127381,
+        0.0936158662865072,
+        0.09320309062545284,
+        0.09289670927398852,
+        0.09300351150293018,
+        0.0928490345084582,
+        0.09241076115045803,
+        0.09182992003488917,
+        0.09202149556773698
+      ],
+      "sufficient_context": 192,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 128,
+        "strength": 1.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d128_s1_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.01188741964067363,
+        "oracle_mse_full": 0.010269073994557416,
+        "relative_gain": 0.13613935530457197,
+        "distant_predictive": true
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.13165203678816914,
+        0.1299576740568741,
+        0.12177174074132442,
+        0.11904243467133924,
+        0.11057068283774758,
+        0.10479122901546727,
+        0.09788397864586902,
+        0.0967690687292458,
+        0.09425706109242189,
+        0.09515292642345823,
+        0.0943241447682901,
+        0.09384252467554788,
+        0.09388032088725733,
+        0.09359006566836214,
+        0.09352016096834959
+      ],
+      "sufficient_context": 384,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 512,
+        "strength": 0.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d512_s0_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.009763017158474229,
+        "oracle_mse_full": 0.009779427092540215,
+        "relative_gain": -0.0016808261011548593,
+        "distant_predictive": false
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.09540368842084963,
+        0.09383073885878446,
+        0.09202299131056198,
+        0.09176369881105018,
+        0.0907851081277471,
+        0.08998744885792576,
+        0.08967222330547979,
+        0.08882658341517431,
+        0.08868238403327666,
+        0.08878582512648829,
+        0.08866667367595522,
+        0.08845481836969782,
+        0.08845966182916006,
+        0.08830563390293378,
+        0.0926141282732414
+      ],
+      "sufficient_context": 96,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 512,
+        "strength": 0.5,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d512_s0.5_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.010162353582115475,
+        "oracle_mse_full": 0.009813611154303225,
+        "relative_gain": 0.03431709249184115,
+        "distant_predictive": true
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.09890082055957332,
+        0.09668637528887321,
+        0.09537080846205015,
+        0.09508552043475997,
+        0.09436596682979825,
+        0.09286910337463894,
+        0.09221265488141721,
+        0.09162711943460049,
+        0.09111008658934357,
+        0.09128055165661901,
+        0.09066926328076856,
+        0.09003292963636274,
+        0.09027485206482311,
+        0.09039478627288607,
+        0.09104678421880881
+      ],
+      "sufficient_context": 192,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": true
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 512,
+        "strength": 1.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d512_s1_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.011881463843201283,
+        "oracle_mse_full": 0.009849340352587417,
+        "relative_gain": 0.17103309132878197,
+        "distant_predictive": true
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.13074441399159417,
+        0.123731971743729,
+        0.12481057270097178,
+        0.12137343389294249,
+        0.12121264739217352,
+        0.1204570464700095,
+        0.11626468779208328,
+        0.11528665691350544,
+        0.10443037321566706,
+        0.09469060135534235,
+        0.09291545036699134,
+        0.09257944517475754,
+        0.09255281073574295,
+        0.09288372663133633,
+        0.09339090241060788
+      ],
+      "sufficient_context": 1024,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 1024,
+        "strength": 0.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d1024_s0_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.010317306080400249,
+        "oracle_mse_full": 0.010315188249466799,
+        "relative_gain": 0.00020526975907724128,
+        "distant_predictive": false
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.0929742266942289,
+        0.09043468430517028,
+        0.08928652528878445,
+        0.08882018220128411,
+        0.08808441494698609,
+        0.08771873480364907,
+        0.08730291536660673,
+        0.08645675008103619,
+        0.08634175022928521,
+        0.08601909623380284,
+        0.08607559707490016,
+        0.0864465478722612,
+        0.08638241549729268,
+        0.08621826074193469,
+        0.08754367212010905
+      ],
+      "sufficient_context": 96,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 1024,
+        "strength": 0.5,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d1024_s0.5_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.01063499247150292,
+        "oracle_mse_full": 0.010309985294872582,
+        "relative_gain": 0.030560169882697438,
+        "distant_predictive": true
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.10019647634545474,
+        0.09651969858930443,
+        0.09505726284479958,
+        0.09386589609406808,
+        0.09331475899512043,
+        0.09282490781271235,
+        0.09144248766828393,
+        0.0909376790633966,
+        0.09093999478458652,
+        0.09017483767602623,
+        0.08971628989053215,
+        0.08980189435650725,
+        0.08975069087206577,
+        0.08943752490379353,
+        0.09042632668312933
+      ],
+      "sufficient_context": 128,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": true
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 1024,
+        "strength": 1.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d1024_s1_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.012163876578523736,
+        "oracle_mse_full": 0.010326330996713881,
+        "relative_gain": 0.15106578646598434,
+        "distant_predictive": true
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.12084513867777957,
+        0.1171189375681602,
+        0.11675437072881796,
+        0.11376935257420939,
+        0.11420737159094092,
+        0.11250196719253817,
+        0.11018807390812431,
+        0.11050835905689856,
+        0.109643642531708,
+        0.10868542665603798,
+        0.09413855458523794,
+        0.09032552526386912,
+        0.08991711934689779,
+        0.0897157177307643,
+        0.09055206860068192
+      ],
+      "sufficient_context": 1536,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 2048,
+        "strength": 0.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d2048_s0_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.009924989248119213,
+        "oracle_mse_full": 0.009972206646325503,
+        "relative_gain": -0.004757425627966022,
+        "distant_predictive": false
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.09568576830798481,
+        0.09214252304684312,
+        0.09113787909968322,
+        0.08997383318414827,
+        0.08978053037887168,
+        0.08974965275350844,
+        0.08838790155989044,
+        0.08815422738626182,
+        0.08771745728561786,
+        0.08742239486980186,
+        0.08734158193572927,
+        0.08723224925235673,
+        0.08723807979036231,
+        0.08723036404651226,
+        0.08856542660065465
+      ],
+      "sufficient_context": 96,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 2048,
+        "strength": 0.5,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d2048_s0.5_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.010684186242227911,
+        "oracle_mse_full": 0.009959177778969876,
+        "relative_gain": 0.0678580892190488,
+        "distant_predictive": true
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.10031944610804307,
+        0.09698818846010937,
+        0.09470265728785184,
+        0.09427347518611622,
+        0.09304138673910482,
+        0.09281402379050736,
+        0.09159924619544076,
+        0.09134664666366869,
+        0.09092296631735763,
+        0.09051656490638749,
+        0.09016935131623664,
+        0.08994920769792476,
+        0.08979098903160339,
+        0.08966626270817102,
+        0.09170113120127373
+      ],
+      "sufficient_context": 192,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": true
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 2048,
+        "strength": 1.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d2048_s1_linear_n0.1",
+      "design_role": "core",
+      "oracle": {
+        "oracle_mse_recent": 0.012554272300201702,
+        "oracle_mse_full": 0.00993447086735945,
+        "relative_gain": 0.2086780794773872,
+        "distant_predictive": true
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.11946801451065407,
+        0.1147799815160937,
+        0.11082472736160771,
+        0.11033013434445611,
+        0.10779183143251221,
+        0.10767941026575063,
+        0.10593966896998097,
+        0.1055954050964365,
+        0.10448909790061123,
+        0.10369914082028704,
+        0.10334833615768939,
+        0.10323646029768459,
+        0.09479042400308894,
+        0.09218574454684376,
+        0.09156689148828434
+      ],
+      "sufficient_context": 2560,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 1024,
+        "strength": 1.0,
+        "distant_kind": "linear",
+        "noise": 0.05,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d1024_s1_linear_n0.05",
+      "design_role": "noise_robustness",
+      "oracle": {
+        "oracle_mse_recent": 0.003046981967949143,
+        "oracle_mse_full": 0.002590359006089819,
+        "relative_gain": 0.14986073651320844,
+        "distant_predictive": true
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.06042256933888979,
+        0.0585594687840801,
+        0.05837718536440898,
+        0.056884676287104696,
+        0.05710368579547046,
+        0.05625098359626909,
+        0.055094036954062155,
+        0.05525417952844928,
+        0.054821821265854,
+        0.05434271332801899,
+        0.04706927729261897,
+        0.04516276263193456,
+        0.044958559673448896,
+        0.04485785886538215,
+        0.04527603430034096
+      ],
+      "sufficient_context": 1536,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "B",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 1024,
+        "strength": 1.0,
+        "distant_kind": "linear",
+        "noise": 0.25,
+        "season": 24
+      },
+      "dataset": "famB_linear_r8_d1024_s1_linear_n0.25",
+      "design_role": "noise_robustness",
+      "oracle": {
+        "oracle_mse_recent": 0.07599944479591568,
+        "oracle_mse_full": 0.06451729829233081,
+        "relative_gain": 0.15108197874890178,
+        "distant_predictive": true
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.3021128475013768,
+        0.2927973470783532,
+        0.2918859272297804,
+        0.28442338412026896,
+        0.28551842550966927,
+        0.2812549150403072,
+        0.2754701864809495,
+        0.27627089666906574,
+        0.2741091066577705,
+        0.2717135655936905,
+        0.23534638407125877,
+        0.22581381514295154,
+        0.2247928017129368,
+        0.22428928731010464,
+        0.22638017993241988
+      ],
+      "sufficient_context": 1536,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    },
+    {
+      "spec": {
+        "family": "C",
+        "local_kind": "linear",
+        "local_order": 8,
+        "distant_lag": 1024,
+        "strength": 1.0,
+        "distant_kind": "linear",
+        "noise": 0.1,
+        "season": 24
+      },
+      "dataset": "famC_linear_r8_d1024_s1_linear_n0.1",
+      "design_role": "conditional_control",
+      "oracle": {
+        "oracle_mse_recent": 0.8010441784985365,
+        "oracle_mse_full": 0.7687583409198389,
+        "relative_gain": 0.04030469035954253,
+        "distant_predictive": true,
+        "gate_detect_accuracy": 1.0
+      },
+      "config_broken": false,
+      "windows": [
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096
+      ],
+      "mean_error_curve": [
+        0.8663347942389237,
+        0.839898727299707,
+        0.8450212785614516,
+        0.8369026908468413,
+        0.8333085784818574,
+        0.8279705505977214,
+        0.8234365690809303,
+        0.8179851299135331,
+        0.8146891046131941,
+        0.813462134937519,
+        0.7555926361594251,
+        0.7395953885646426,
+        0.7409873630428668,
+        0.74022273449566,
+        0.7487634164028426
+      ],
+      "sufficient_context": 1536,
+      "methods_run": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "limitation_flag": false
+    }
+  ]
+}

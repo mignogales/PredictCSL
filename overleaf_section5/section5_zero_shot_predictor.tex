@@ -1,0 +1,332 @@
+% Section 5: Zero-shot context selection with controllable risk
+% Required packages: \usepackage{amsmath,booktabs,graphicx}
+% Upload this file together with the three PDF figures under figures/.
+
+\section{Zero-shot context selection with controllable risk}
+\label{sec:zero-shot-predictor}
+
+Sections~\ref{sec:real-context}--\ref{sec:context-mechanisms} established that
+the native context is often unnecessarily long, but also that the best shorter
+window is not stable enough to treat as an ordinary classification label.  The
+deployment question is therefore not simply \emph{which window will win?}  It
+is \emph{how much risk of degradation are we willing to accept in exchange for
+less context compute?}
+
+We answer that question with a zero-shot risk predictor.  For every candidate
+window, it estimates loss relative to native context, uncertainty in that
+estimate, and the probability of a material error increase.  Synthetic-only
+calibration converts these estimates into five ordered operating profiles,
+from Conservative to Max efficiency.  A profile selects the shortest window
+that passes its risk threshold and otherwise abstains to native context.  The
+result is an explicit compute--harm dial rather than a single brittle guess.
+
+\subsection{Predict risk relative to the native action}
+\label{sec:risk-target}
+
+Each frozen TSFM labels a synthetic pool independently over six forecast
+horizons, $h\in\{16,32,64,128,512,1024\}$, and an 18-point context grid from
+32 to 8,192 steps, truncated to the model's supported context.  For synthetic
+series $i$, candidate window $L_k$, horizon $h$, and forecast MAE
+$E_{i,k,h}$, the regression target is the log-risk relative to the model's
+native window,
+
+\begin{equation}
+    r_{i,k,h}
+      = \log\!\left(\frac{E_{i,k,h}}
+                          {E_{i,\mathrm{native},h}}\right).
+    \label{eq:risk-target}
+\end{equation}
+
+The regressor is fitted to this target after clipping it to $[-3,3]$.  A
+separate classifier predicts a material-harm event,
+
+\begin{equation}
+    b_{i,k,h}
+      = \mathbb{1}\!\left[
+          E_{i,k,h} > 1.05\,E_{i,\mathrm{native},h}
+        \right].
+    \label{eq:harm-event}
+\end{equation}
+
+This relative formulation makes native context the explicit safe action and
+avoids asking the predictor to reproduce a noisy exact argmin.  Positive risk
+means that the shorter window is expected to hurt; negative risk means that it
+is expected to improve on native context.
+
+The predictor is deliberately lightweight.  A 192-tree ExtraTrees regressor
+and classifier consume 94 scale-invariant features describing recent and
+remote summaries, autocorrelation, spectrum, regime shifts, valid-history
+length, forecast horizon, and candidate-window geometry.  For each TSFM, the
+models use 12,000 synthetic training series, 2,000 disjoint synthetic
+calibration series, and 600,000 sampled series--window--horizon pairs.  No
+GiftEval target, error, or model-selection signal enters fitting or
+calibration.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/fig1_risk_selector_pipeline.pdf}
+    \caption{Risk-calibrated context selection.  Offline, a frozen TSFM labels
+    synthetic context actions relative to its native window; a lightweight
+    predictor learns expected log-risk, uncertainty, and the probability of
+    more than 5\% harm.  Synthetic calibration turns one frozen risk score into
+    five nested profiles.  At deployment, the chosen profile returns the
+    shortest acceptable window or abstains to native context.  Real forecast
+    outcomes are revealed only for final evaluation.}
+    \label{fig:risk-pipeline}
+\end{figure*}
+
+\subsection{Calibrate a selectable harm profile}
+\label{sec:risk-calibration}
+
+Let $\widehat\mu_{i,k,h}$ be predicted mean log-risk,
+$\widehat\sigma_{i,k,h}$ the standard deviation across regression trees, and
+$\widehat p^{(5)}_{i,k,h}$ the predicted probability of the event in
+Equation~\ref{eq:harm-event}.  Candidate actions are ordered by the composite
+risk score
+
+\begin{equation}
+    q_{i,k,h}
+      = \widehat\mu_{i,k,h}
+        + u\,\widehat\sigma_{i,k,h}
+        + v\,\widehat p^{(5)}_{i,k,h},
+    \label{eq:risk-score}
+\end{equation}
+
+where $(u,v)$ is selected once for each TSFM using the balanced synthetic
+profile.  Holding that score fixed, profile-specific thresholds are calibrated
+on the same disjoint synthetic split.  The deployed decision is
+
+\begin{equation}
+    \widehat L_{i,h}^{(a)}
+      = \min\{L_k:q_{i,k,h}\leq\tau_a\},
+    \quad\text{or }L_{\mathrm{native}}\text{ if the set is empty},
+    \label{eq:risk-selection}
+\end{equation}
+
+for profile $a$.  For Chronos2-Base, calibration selects $(u,v)=(0,0.5)$, so
+the deployed score is the predicted log-error ratio plus one half of the
+predicted probability of more than 5\% harm.  This makes the safety preference
+explicit without changing the shortest-acceptable-window decision rule.
+
+Because a looser profile raises the accepted-risk threshold,
+the profiles are nested: increasing the harm budget can only retain or shorten
+the chosen context.  Calibration constrains both the rate of instances harmed
+by more than 5\% and the mean error ratio.  The five budgets and their real
+zero-shot operating points are reported together in
+Table~\ref{tab:risk-profiles}.
+
+\begin{table*}[t]
+    \centering
+    \footnotesize
+    \renewcommand{\arraystretch}{1.12}
+    \caption{The calibrated compute--harm dial.  Budget columns are constraints
+    on the disjoint synthetic calibration split.  Real columns aggregate 97
+    GiftEval cells for each of 11 TSFMs: coverage and FLOPs saved are macro
+    averages across models, harm is pooled across model--instance evaluations,
+    and $\Delta$MASE is the change implied by the geometric mean of the 11
+    cell-geometric MASE ratios.  Positive $\Delta$MASE denotes improvement.}
+    \label{tab:risk-profiles}
+    \begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lrrrrrr@{}}
+        \toprule
+        Profile & Harm budget & Mean-ratio cap & Coverage & FLOPs saved & Real harm $>5\%$ & $\Delta$MASE \\
+        \midrule
+        Conservative   & 0.5\% & 1.000 &  6.43\% &  4.77\% & 0.70\% & $-0.015\%$ \\
+        Balanced       & 1.0\% & 1.001 & 17.77\% &  9.04\% & 1.54\% & $-0.014\%$ \\
+        Aggressive     & 3.0\% & 1.005 & 29.77\% & 19.17\% & 3.01\% & $-0.045\%$ \\
+        \addlinespace[2pt]
+        Efficiency      & 15.0\% & 1.040 & 49.21\% & 45.43\% & 8.52\% & $-0.401\%$ \\
+        Max efficiency  & 20.0\% & 1.070 & 56.01\% & 52.57\% & 11.15\% & $-0.795\%$ \\
+        \bottomrule
+    \end{tabular*}
+\end{table*}
+
+The central result is the ordering of these operating points.  Moving from the
+Conservative to the Max-efficiency profile increases average theoretical
+TSFM FLOPs savings from 4.77\% to 52.57\%, while the pooled rate of instances
+whose MASE worsens by more than 5\% rises from 0.70\% to 11.15\%.  The
+corresponding model-geometric MASE change is 0.795\% worse than native at the
+most aggressive endpoint.  The risk predictor therefore exposes a useful continuum:
+deployments can preserve native behavior almost everywhere, or deliberately
+accept more tail risk to unlock substantially more context reduction.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{figures/fig2_compute_harm_dial.pdf}
+    \caption{Aggregate real-data behavior of the five synthetic-calibrated
+    profiles.  Left: mean theoretical TSFM FLOPs saved versus pooled incidence
+    of more than 5\% harm.  Right: aggregate MASE stays close to native while
+    profiles move along the compute--harm curve.  The labels show synthetic
+    harm budgets; they are calibration targets, not real-domain guarantees.}
+    \label{fig:compute-harm-dial}
+\end{figure}
+
+\subsection{The same dial behaves differently across forecasters}
+\label{sec:risk-transfer}
+
+The average curve hides substantial model dependence
+(Table~\ref{tab:risk-models} and Figure~\ref{fig:risk-models}).  At the
+Max-efficiency profile, Chronos2-Base and Chronos2-Synth save 77.44\% and
+74.18\% of theoretical FLOPs with 12.45\% and 15.48\% observed harm,
+respectively.  Chronos2-Small saves 64.73\% with a 0.563\% aggregate MASE cost.
+Moirai2-Small reaches 70.13\% savings at 11.16\% harm.  ChronosBolt-Base is
+much more cautious, saving 20.71\% with a 0.070\% aggregate MASE cost.
+
+The Chronos2-Base result is also meaningful across model sizes.  Under Max
+efficiency, its cell-geometric MASE is 0.9995, compared with 1.0176 for
+full-context Chronos2-Small, while its selected theoretical compute is 77.4\%
+below the full-context Small run.  On this benchmark, the risk-controlled Base
+model therefore beats full Small in both aggregate accuracy and theoretical
+compute, making Max efficiency the strongest efficiency endpoint rather than the
+safest operating default.
+
+Other models are naturally conservative.  Toto and ChronosBolt abstain almost
+entirely under the conservative profile.  Sundial shortens many instances but
+realizes little theoretical FLOPs reduction because many accepted changes are
+small relative to its native compute profile.  These cases are not failures of
+the abstention mechanism: they show that the same harm target can imply very
+different amounts of useful compression.
+
+\begin{table*}[t]
+    \centering
+    \footnotesize
+    \renewcommand{\arraystretch}{1.10}
+    \caption{Per-forecaster operating points on GiftEval.  The balanced and
+    Max-efficiency columns report theoretical TSFM FLOPs saved and the
+    instance rate with more than 5\% MASE harm.  The final column reports the
+    cell-geometric MASE change under the Max-efficiency profile; positive is
+    better.}
+    \label{tab:risk-models}
+    \begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lrrrrr@{}}
+        \toprule
+        Model & Balanced FLOPs & Balanced harm & Max-eff. FLOPs & Max-eff. harm & $\Delta$MASE \\
+        \midrule
+        Chronos2-Base      & 18.05\% & 0.96\% & 77.44\% & 12.45\% & $-1.368\%$ \\
+        Chronos2-Small     & 12.44\% & 2.13\% & 64.73\% &  9.20\% & $-0.563\%$ \\
+        Chronos2-Synth     & 15.05\% & 0.96\% & 74.18\% & 15.48\% & $-1.301\%$ \\
+        ChronosBolt-Base   &  1.95\% & 0.39\% & 20.71\% &  7.89\% & $-0.070\%$ \\
+        FlowState-R1       & 18.90\% & 5.58\% & 48.30\% & 10.30\% & $-0.844\%$ \\
+        Moirai2-Small      & 12.15\% & 1.00\% & 70.13\% & 11.16\% & $-0.352\%$ \\
+        PatchTST-FM-R1     &  8.45\% & 1.05\% & 49.89\% &  7.58\% & $-0.747\%$ \\
+        Sundial-Base-128M  &  0.72\% & 3.85\% &  4.93\% & 16.15\% & $-0.455\%$ \\
+        TimesFM2.5-200M    &  6.87\% & 0.39\% & 70.62\% & 11.27\% & $-0.900\%$ \\
+        TiRex2             &  4.82\% & 0.45\% & 53.34\% & 11.44\% & $-1.243\%$ \\
+        Toto-2.0-313m      &  0.01\% & 0.01\% & 44.02\% &  9.77\% & $-0.914\%$ \\
+        \bottomrule
+    \end{tabular*}
+\end{table*}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/fig3_model_profile_heatmaps.pdf}
+    \caption{How the risk dial transfers across forecasters.  Each row is one
+    independently trained predictor and each column is a harm profile.  Cells
+    show theoretical FLOPs saved (left) and observed incidence of more than
+    5\% MASE harm (right).  The nested profiles produce an ordered trade-off,
+    but the attainable savings and calibration error remain model specific.}
+    \label{fig:risk-models}
+\end{figure*}
+
+\subsection{Where the efficiency profiles help---and where they fail}
+\label{sec:risk-datasets}
+
+The model-wide result is not uniform across recognizable data domains.
+Table~\ref{tab:risk-datasets} groups the Chronos2-Base cells by dataset family.
+Here $\Delta$MASE is relative to full-context Chronos2-Base (negative is
+better), context saved pools selected and native context tokens across all
+family instances, and shortened is the fraction that does not abstain.
+
+\begin{table*}[t]
+    \centering
+    \footnotesize
+    \renewcommand{\arraystretch}{1.12}
+    \caption{Dataset-level behavior of the Chronos2-Base Max-efficiency profile.
+    Large aggregate context savings can coexist with high instance-level tail
+    risk.  M4 and COVID Deaths show the opposite regime: selective or complete
+    abstention.}
+    \label{tab:risk-datasets}
+    \begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lrrrr@{}}
+        \toprule
+        Dataset family & $\Delta$MASE & Context saved & Shortened & Harm $>5\%$ \\
+        \midrule
+        M4              & $-1.12\%$ & 11.5\% &  5.1\% &  1.4\% \\
+        Electricity     & $+0.22\%$ & 80.7\% & 97.0\% & 18.1\% \\
+        Solar           & $+0.64\%$ & 72.1\% & 95.4\% & 23.2\% \\
+        Shenzhen Taxi   & $+0.79\%$ & 69.0\% & 99.1\% & 17.8\% \\
+        ETTm1           & $+1.01\%$ & 75.3\% & 97.0\% & 27.5\% \\
+        Jena Weather    & $+1.89\%$ & 76.7\% & 97.1\% & 35.6\% \\
+        ETTm2           & $+2.06\%$ & 77.3\% & 95.9\% & 25.8\% \\
+        Seattle Traffic & $+2.39\%$ & 76.1\% & 97.5\% & 30.8\% \\
+        \addlinespace[2pt]
+        COVID Deaths    & $+0.00\%$ &  0.0\% &  0.0\% &  0.0\% \\
+        \bottomrule
+    \end{tabular*}
+\end{table*}
+
+M4 is the cleanest reliability result.  Short histories make the policy abstain
+on 94.9\% of instances; the remaining selective shortening reduces aggregate
+MASE by 1.12\%.  COVID Deaths triggers complete abstention, the intended
+response when no shorter action appears acceptable.  Electricity is the
+strongest efficiency result: 80.7\% of context is removed for only a 0.22\%
+aggregate MASE cost.  Solar is also attractive in aggregate, with 72.1\%
+context reduction for a 0.64\% MASE cost.
+
+The same aggregates expose a reliability gap.  ETT and Jena Weather are
+horizon sensitive: some long- or medium-horizon cells improve while their
+short-horizon counterparts degrade.  For example, ETTm1 hourly-medium improves
+by about 2\%, whereas ETTm1 hourly-short worsens by about 5.3\%.  Jena Weather
+10-minute long improves by 2.6\%, but its short-horizon cell worsens by 9.8\%.
+Seattle Traffic is the weakest familiar family, combining 76.1\% context
+reduction with a 2.39\% aggregate MASE increase and 30.8\% instance-level harm.
+
+The Efficiency profile is a more credible operational choice when individual
+series reliability matters.  It retains most of the compute benefit on
+Electricity (75.9\% context saved) while improving MASE by 0.27\%.  Relative to
+Max efficiency, it also lowers MASE costs on ETTm1 (0.22\% versus 1.01\%), ETTm2
+(1.04\% versus 2.06\%), Jena Weather (1.67\% versus 1.89\%), and Seattle
+Traffic (1.73\% versus 2.39\%).  Solar is the exception: Max efficiency has the
+lower aggregate MASE cost (0.64\% versus 1.22\%) despite its looser threshold.
+M4 remains
+selective and improves by 1.47\%.  Thus Max efficiency is the efficiency-first
+endpoint, whereas Efficiency is the stronger default for reliability-sensitive
+deployment.
+
+These discrete profiles are operating-point samples, not the final frontier.
+We will next evaluate the dense threshold sweep and retain only nondominated
+accuracy--compute points to construct a Pareto front.  That analysis will show
+whether the named profiles lie near the attainable frontier or whether better
+thresholds dominate them.
+
+\subsection{Calibration is a control target, not a guarantee}
+\label{sec:risk-limits}
+
+The profiles are calibrated without real labels, so their budgets should be
+read as deployment controls rather than distribution-free guarantees.  This
+distinction is visible in the balanced profile: its synthetic harm budget is
+1\%, whereas pooled real harm is 1.54\%.  FlowState-R1 is the clearest
+calibration failure.  Even its conservative profile produces 5.58\% real harm
+and a 0.330\% aggregate MASE degradation, despite satisfying the 0.5\%
+synthetic calibration target.  For this model, native context remains the
+appropriate default until calibration data better matches the deployment
+distribution.
+
+Two compute qualifications also remain.  Reported savings cover the TSFM
+forecast stage and do not yet include feature extraction or tree inference.
+They are theoretical proxies: TiRex2 internally pads inputs to a fixed length,
+and the quadratic proxy is only approximate for the linear-state-space
+FlowState architecture.  These two models therefore require measured latency
+and memory profiling before their apparent context savings are interpreted as
+deployment speedups.
+
+\subsection{Implications}
+\label{sec:risk-implications}
+
+The useful-context problem is better posed as selective risk management than
+as exact window prediction.  Relative-risk targets align learning with the
+native action, abstention prevents forced shortening, and calibrated profiles
+make the deployment preference explicit.  Across 11 forecasters, this design
+turns one zero-shot predictor into a family of operating points spanning
+roughly 5--53\% average theoretical FLOPs savings.  Its main limitation is
+equally informative: synthetic calibration does not transfer uniformly across
+architectures.  The practical next step is therefore not a more aggressive
+argmin predictor, but stronger calibration diagnostics and model-specific
+safeguards around a user-chosen harm budget.

@@ -1,0 +1,74 @@
+{
+  "model": "TiRex2",
+  "mase_metric": "mase_gluonts_real",
+  "flops_weighting": "cell",
+  "policy_scope": "one dataset-shared action per GiftEval dataset/term cell",
+  "frontier_kind": "exact supported frontier from global linear scalarization",
+  "n_cells": 97,
+  "n_supported_points": 541,
+  "full_normalized_mase": 0.6966887535382917,
+  "full_total_flops": 709718829957.5105,
+  "unconstrained_oracle_normalized_mase": 0.6897480126597578,
+  "unconstrained_oracle_flops_saved_pct": 22.51782623039257,
+  "maximum_supported_flops_saved_pct": 84.51156787842575,
+  "minimum_compute_normalized_mase": 1.022336489107962,
+  "key_operating_points": [
+    {
+      "constraint": "no worse than full",
+      "normalized_mase_limit": 0.6966887535382917,
+      "normalized_mase": 0.696630718887604,
+      "flops_saved_pct": 59.82239482844381,
+      "native_cells": 16,
+      "frontier_index": 99
+    },
+    {
+      "constraint": "within 0.1% of oracle",
+      "normalized_mase_limit": 0.6904377606724175,
+      "normalized_mase": 0.690411099375794,
+      "flops_saved_pct": 35.27973421795767,
+      "native_cells": 31,
+      "frontier_index": 29
+    },
+    {
+      "constraint": "within 0.5% of oracle",
+      "normalized_mase_limit": 0.6931967527230566,
+      "normalized_mase": 0.6931715920358603,
+      "flops_saved_pct": 50.488661838162166,
+      "native_cells": 23,
+      "frontier_index": 69
+    },
+    {
+      "constraint": "within 1% of oracle",
+      "normalized_mase_limit": 0.6966454927863555,
+      "normalized_mase": 0.696630718887604,
+      "flops_saved_pct": 59.82239482844381,
+      "native_cells": 16,
+      "frontier_index": 99
+    },
+    {
+      "constraint": "within 2% of oracle",
+      "normalized_mase_limit": 0.703542972912953,
+      "normalized_mase": 0.7032743335916125,
+      "flops_saved_pct": 67.93892896907647,
+      "native_cells": 16,
+      "frontier_index": 141
+    },
+    {
+      "constraint": "within 5% of oracle",
+      "normalized_mase_limit": 0.7242354132927458,
+      "normalized_mase": 0.7240378182290982,
+      "flops_saved_pct": 76.99099399376455,
+      "native_cells": 9,
+      "frontier_index": 243
+    },
+    {
+      "constraint": "within 10% of oracle",
+      "normalized_mase_limit": 0.7587228139257337,
+      "normalized_mase": 0.7583624512411643,
+      "flops_saved_pct": 80.5016552998172,
+      "native_cells": 6,
+      "frontier_index": 347
+    }
+  ]
+}
+Saved frontier artifacts to logs/experiments/master_recompute/oracle_pareto_frontier_multimodel/TiRex2

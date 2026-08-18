@@ -1,0 +1,3 @@
+label,normalized_mase,flops_saved_pct,source
+Full/native,0.7352280546077214,0.0,logs/experiments/master_recompute/window_ablation_gifteval/Chronos2-Synth/strategy_comparison_v4_oracle_refresh/comparison.csv
+Unconstrained oracle,0.7156502319622784,45.48837041700038,logs/experiments/master_recompute/window_ablation_gifteval/Chronos2-Synth/strategy_comparison_v4_oracle_refresh/comparison.csv

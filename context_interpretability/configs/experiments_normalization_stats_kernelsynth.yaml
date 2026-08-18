@@ -1,0 +1,27 @@
+extends: experiments_masking_kernelsynth.yaml
+
+# Direct preprocessing-statistic decomposition. These cells leave the complete
+# input unchanged and substitute the tail mean, tail scale, or both inside the
+# verified model normalization module.
+output_root: logs/experiments/context_interpretability_normalization_stats_kernelsynth
+batch_size: 2
+dynamic_batching:
+  enabled: false
+
+experiments:
+  exp0_attention_masking: false
+  exp1_perturbation: false
+  exp2_activation_patching: false
+  exp3_forecast_lens: false
+  exp4_synthetic_controls: false
+  exp5_integrated_gradients: false
+  exp6_predictor_contrast_saliency: false
+  exp7_context_decomposition: true
+  exp8_tsfm_contrast_saliency: false
+
+context_decomposition:
+  metrics: [mse, mae]
+  all_full_contexts: false
+  full_contexts: [768]
+  visible_lengths: [32, 64, 128, 256, 512]
+  statistic_ablation: true

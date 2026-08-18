@@ -1,0 +1,15 @@
+extends: experiments_long_lag_comparison.yaml
+
+# Full TiRex Family-B paper completion. Keep the comparison cohort and every
+# perturbation context/block/method, but avoid unrelated Family-A, noise-anchor,
+# and conditional controls that are not needed for the missing Family-B panel.
+output_root: logs/experiments/context_interpretability_long_lag
+
+synthetic_controls:
+  only_datasets:
+    - famB_linear_r8_d128_s1_linear_n0.1
+    - famB_linear_r8_d512_s1_linear_n0.1
+    - famB_linear_r8_d1024_s1_linear_n0.1
+    - famB_linear_r8_d2048_s1_linear_n0.1
+  run_methods: [perturbation]
+

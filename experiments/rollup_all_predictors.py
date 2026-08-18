@@ -53,6 +53,7 @@ OUT_DIR       = os.path.join(ABLATION_ROOT, "general_all")
 INSTANCE_REPORTS = {
     "pred_cheap_instance": "strategy_comparison_v3_instance",
     "pred_mamba_instance": "strategy_comparison_v4_instance",
+    "pred_ensemble_instance": "strategy_comparison_ensemble_instance",
 }
 
 

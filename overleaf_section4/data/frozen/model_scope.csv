@@ -1,0 +1,12 @@
+model,checkpoint,git_commit,seed,horizon,exp1_complete,exp1_n_contexts,exp1_max_context,exp1_n_samples_at_max,exp1_sufficient_context_5pct,exp4_complete_core_grid,exp7_complete,exp7_full_context,exp7_n_samples,activation_patching_status,activation_patching_full_context,activation_patching_n_samples,forecast_lens_status,forecast_lens_n_layers,forecast_lens_n_contexts,forecast_lens_n_saturated,forecast_lens_n_early_saturated
+Chronos2-Base,autogluon/chronos-2,6e371a8a653bd9f881871d9e2c3625037b5673d9,42,64,False,0,,0,,True,True,8192,256,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+Chronos2-Small,autogluon/chronos-2-small,6e371a8a653bd9f881871d9e2c3625037b5673d9,42,64,False,0,,0,,True,True,8192,256,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+Chronos2-Synth,autogluon/chronos-2-synth,6e371a8a653bd9f881871d9e2c3625037b5673d9,42,64,False,0,,0,,True,True,8192,256,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+ChronosBolt-Base,amazon/chronos-bolt-base,6e371a8a653bd9f881871d9e2c3625037b5673d9,42,64,False,0,,0,,True,True,2048,256,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+FlowState-R1,ibm-granite/granite-timeseries-flowstate-r1,6e371a8a653bd9f881871d9e2c3625037b5673d9,42,64,False,0,,0,,True,False,,0,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+Moirai2-Small,Salesforce/moirai-2.0-R-small,6e371a8a653bd9f881871d9e2c3625037b5673d9,42,64,False,0,,0,,True,True,6144,256,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+PatchTST-FM-R1,ibm-research/patchtst-fm-r1,da1ab919bfcdbfaed017ed0126380a5daf2b2694,42,64,False,0,,0,,True,True,8192,256,unsupported_or_not_run,,0,complete,20,18,18,0
+Sundial-Base-128M,thuml/sundial-base-128m,b1c81d08ab2c43e13d4a0c0542342c704bf8c843,42,64,False,0,,0,,True,True,2560,256,unsupported_or_not_run,,0,complete,12,14,0,0
+TiRex2,NX-AI/TiRex-2-gifteval-zs,b1c81d08ab2c43e13d4a0c0542342c704bf8c843,42,64,False,0,,0,,True,False,,0,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+TimesFM2.5-200M,google/timesfm-2.5-200m-pytorch,6e371a8a653bd9f881871d9e2c3625037b5673d9,42,64,False,0,,0,,True,True,8192,256,unsupported_or_not_run,,0,complete,20,17,17,0
+Toto-2.0-313m,Datadog/Toto-2.0-313m,b1c81d08ab2c43e13d4a0c0542342c704bf8c843,42,64,False,0,,0,,False,False,,0,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0

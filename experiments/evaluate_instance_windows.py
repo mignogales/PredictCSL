@@ -9,9 +9,13 @@ predictor curves before choosing a window.  For every series i it:
 4. aggregates selected ratios with their valid forecast counts (the exact
    GiftEval/GluonTS axis=None MASE rule).
 
-All master predictor variants are evaluated together.  Full-native
-context, an optional single globally fixed window, dataset-shared
-predictor controls, and dataset/per-instance oracles are included as baselines.
+All master predictor variants are evaluated together. The deployed instance
+policy shrinks each row's noisy score curve toward its dataset/term consensus,
+guards native/full scoring behind Stage-3 validity, and also reports a v3+v4
+score ensemble. Raw per-row argmins remain explicit diagnostic controls.
+Full-native context, an optional single globally fixed window, dataset-shared
+predictor controls (including a configurable near-native trust region), and
+dataset/per-instance oracles are included as baselines.
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ VARIANT_TREES: Dict[str, str] = {
     "patchtst_risk": "general_v3_risk",
     "mamba_curve": "general_v4",
     "mamba_classification": "general_v4_classification",
+    "mamba_pairwise": "general_v4_pairwise",
+    "mamba_acceptable": "general_v4_acceptable",
 }
 
 # Instance-wise counterparts of the historical per-model Stage-4 reports.
@@ -49,7 +55,14 @@ INSTANCE_STRATEGY_OUTPUTS: Dict[str, Tuple[str, str, str]] = {
                     "pred_cheap"),
     "mamba_curve": ("strategy_comparison_v4", "strategy_comparison_v4_instance",
                     "pred_mamba"),
+    "ensemble_curve": ("strategy_comparison_v3",
+                       "strategy_comparison_ensemble_instance",
+                       "pred_ensemble"),
 }
+
+INSTANCE_POLICY_VERSION = 3
+DEFAULT_INSTANCE_WEIGHT = 0.25
+DEFAULT_MAX_BACKOFF_STEPS = 2
 
 
 @dataclass(frozen=True)
@@ -186,6 +199,7 @@ def _choose_scores(
 def _choose_scores_with_native(
     scores: np.ndarray, errors: np.ndarray, windows: np.ndarray,
     native: np.ndarray, native_w: np.ndarray,
+    native_score_supported: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Choose per row while treating native-full as a real policy action.
 
@@ -197,7 +211,9 @@ def _choose_scores_with_native(
     # Prefer the real native action on an exact tie with the largest grid
     # output. For full-length rows they are normally the same workload; for
     # short rows only native can use the non-grid amount of genuine history.
-    native_score = np.nextafter(scores[:, -1], -np.inf)
+    native_score = (np.nextafter(scores[:, -1], -np.inf)
+                    if native_score_supported
+                    else np.full(scores.shape[0], np.nan, dtype=np.float64))
     candidate_scores = np.column_stack([scores, native_score])
     candidate_errors = np.column_stack([errors, native])
     feasible = np.isfinite(candidate_scores) & np.isfinite(candidate_errors)
@@ -215,6 +231,42 @@ def _choose_scores_with_native(
     return selected, selected_w, selected_native
 
 
+def _regularize_scores(
+    scores: np.ndarray, instance_weight: float,
+) -> np.ndarray:
+    """Shrink noisy row-level curves toward their unlabeled cell consensus.
+
+    ``instance_weight=1`` is the raw per-instance predictor and ``0`` is the
+    cell-mean curve.  The operation is transductive but label-free, matching the
+    existing dataset-shared policy's use of the same batch of predictor outputs.
+    """
+    weight = float(instance_weight)
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError("instance_weight must lie in [0, 1].")
+    consensus = np.mean(scores, axis=0, keepdims=True)
+    return weight * scores + (1.0 - weight) * consensus
+
+
+def _choose_regularized_scores(
+    scores: np.ndarray, errors: np.ndarray, windows: np.ndarray,
+    native: np.ndarray, native_w: np.ndarray,
+    instance_weight: float = DEFAULT_INSTANCE_WEIGHT,
+    native_score_supported: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Choose from consensus-regularized scores plus a guarded native action.
+
+    Native/full can reuse the last curve output only when Stage 3 confirms that
+    output is a valid, supervised action for the current model/horizon.  When it
+    is unsupported (for example a horizon-dependent Moirai cap), native remains
+    a fallback but is not assigned an invented score.
+    """
+    regularized = _regularize_scores(scores, instance_weight)
+    selected, selected_w, selected_native = _choose_scores_with_native(
+        regularized, errors, windows, native, native_w,
+        native_score_supported=native_score_supported)
+    return selected, selected_w, selected_native, regularized
+
+
 def _choose_capped_fixed(
     target: int, errors: np.ndarray, windows: np.ndarray, native: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -229,6 +281,46 @@ def _choose_capped_fixed(
     return selected, selected_w, ~has_grid
 
 
+def _shared_score_window(
+    scores: np.ndarray, windows: np.ndarray, valid_windows: np.ndarray,
+) -> int:
+    """Stage-4-compatible shared action with unsupported-choice clamping."""
+    idx = int(np.argmin(np.mean(scores, axis=0)))
+    if not bool(valid_windows[idx]):
+        valid_idx = np.flatnonzero(valid_windows)
+        if not valid_idx.size:
+            raise ValueError("No valid shared window action.")
+        idx = int(valid_idx[-1])
+    return int(windows[idx])
+
+
+def _bounded_shared_score_window(
+    scores: np.ndarray,
+    windows: np.ndarray,
+    valid_windows: np.ndarray,
+    max_backoff_steps: int = DEFAULT_MAX_BACKOFF_STEPS,
+) -> int:
+    """Choose the shared action within a near-native trust region.
+
+    Backoff is counted over valid actions so horizon-dependent holes do not
+    accidentally enlarge the allowed shortening. A globally unsupported raw
+    argmin first receives the same largest-valid clamp as Stage 4.
+    """
+    steps = int(max_backoff_steps)
+    if steps < 0:
+        raise ValueError("max_backoff_steps must be non-negative.")
+    valid_idx = np.flatnonzero(np.asarray(valid_windows, dtype=bool))
+    if not valid_idx.size:
+        raise ValueError("No valid shared window action.")
+
+    raw_idx = int(np.argmin(np.mean(scores, axis=0)))
+    if not bool(valid_windows[raw_idx]):
+        raw_idx = int(valid_idx[-1])
+    floor_position = max(0, valid_idx.size - 1 - steps)
+    floor_idx = int(valid_idx[floor_position])
+    return int(windows[max(raw_idx, floor_idx)])
+
+
 def _record(
     cell: Cell, method: str, error: np.ndarray, window: np.ndarray,
     fallback: np.ndarray, method_kind: str, valid_count: np.ndarray,
@@ -238,7 +330,7 @@ def _record(
     w = window[(window >= 0) & ok]
     if method == "full_native" or method.startswith("period"):
         policy_scope = "instance_native"
-    elif method_kind == "predictor_instance":
+    elif method_kind in {"predictor_instance", "predictor_instance_raw"}:
         policy_scope = "instance_native"
     elif method_kind == "predictor_instance_control":
         policy_scope = "instance_grid"
@@ -289,6 +381,8 @@ def evaluate_cell(
     cell: Cell, ablation_root: str, ground_tree: str,
     fixed_window: Optional[int] = None,
     mase_field: str = "mase_gluonts_real",
+    instance_weight: float = DEFAULT_INSTANCE_WEIGHT,
+    max_backoff_steps: int = DEFAULT_MAX_BACKOFF_STEPS,
 ) -> Tuple[List[dict], dict]:
     with np.load(cell.anchor_npz) as anchor:
         windows = np.asarray(anchor["window_grid"], dtype=np.int64)
@@ -307,6 +401,8 @@ def evaluate_cell(
             if curve_key in anchor.files
             else np.ones(windows.shape, dtype=bool)
         )
+        selection_eligible = bool(valid_windows.sum() >= 2)
+        native_score_supported = bool(valid_windows[-1])
 
     errors = np.full((n, windows.size), np.nan, dtype=np.float64)
     error_counts = np.zeros((n, windows.size), dtype=np.float64)
@@ -351,9 +447,17 @@ def evaluate_cell(
     audit: Dict[str, np.ndarray] = {
         "window_grid": windows,
         "grid_mase": errors,
+        # Preserve the exact GluonTS axis=None weight for every candidate
+        # action.  Series-wise Pareto analyses can otherwise only approximate
+        # a mixed-window policy with the native action's valid-count vector.
+        "grid_valid_count": error_counts,
         "native_mase": native,
         "native_valid_count": native_counts,
         "native_effective_context": native_w,
+        "selection_eligible": np.asarray(selection_eligible),
+        "native_score_supported": np.asarray(native_score_supported),
+        "instance_weight": np.asarray(float(instance_weight)),
+        "max_backoff_steps": np.asarray(int(max_backoff_steps)),
     }
 
     def counts_for_choice(
@@ -415,6 +519,7 @@ def evaluate_cell(
         oracle_idx == windows.size, "oracle",
         counts_for_choice(oracle_w, oracle_idx == windows.size))
 
+    variant_scores: Dict[str, np.ndarray] = {}
     for variant, tree in VARIANT_TREES.items():
         path = _variant_prediction_path(ablation_root, tree, cell)
         if not os.path.isfile(path):
@@ -426,23 +531,96 @@ def evaluate_cell(
             print(Fore.YELLOW + f"Skip misaligned predictor artifact: {path}"
                   + Fore.RESET)
             continue
+        variant_scores[variant] = scores
+
+        if not selection_eligible:
+            no_op = np.ones(n, dtype=bool)
+            add(f"{variant}_instance_grid", native, native_w, no_op,
+                "predictor_instance_control", native_counts)
+            add(f"{variant}_instance_raw", native, native_w, no_op,
+                "predictor_instance_raw", native_counts)
+            add(f"{variant}_instance", native, native_w, no_op,
+                "predictor_instance", native_counts)
+            add(f"{variant}_dataset", native, native_w, no_op,
+                "predictor_dataset", native_counts)
+            add(f"{variant}_dataset_bounded", native, native_w, no_op,
+                "predictor_dataset", native_counts)
+            audit[f"{variant}__scores"] = scores
+            audit[f"{variant}__regularized_scores"] = _regularize_scores(
+                scores, instance_weight)
+            continue
+
         values, chosen_w, fallback = _choose_scores(
             scores, errors, windows, native)
         add(f"{variant}_instance_grid", values, chosen_w, fallback,
             "predictor_instance_control", counts_for_choice(chosen_w, fallback))
 
         values, chosen_w, selected_native = _choose_scores_with_native(
-            scores, errors, windows, native, native_w)
+            scores, errors, windows, native, native_w,
+            native_score_supported=native_score_supported)
+        add(f"{variant}_instance_raw", values, chosen_w, selected_native,
+            "predictor_instance_raw",
+            counts_for_choice(chosen_w, selected_native))
+
+        values, chosen_w, selected_native, regularized = (
+            _choose_regularized_scores(
+                scores, errors, windows, native, native_w,
+                instance_weight=instance_weight,
+                native_score_supported=native_score_supported))
         add(f"{variant}_instance", values, chosen_w, selected_native,
             "predictor_instance",
             counts_for_choice(chosen_w, selected_native))
         audit[f"{variant}__scores"] = scores
+        audit[f"{variant}__regularized_scores"] = regularized
 
-        shared_w = int(windows[int(np.argmin(np.mean(scores, axis=0)))])
+        # Match Stage 4: a globally unsupported predictor action clamps to the
+        # largest valid grid action before per-row cumulative capping.
+        shared_w = _shared_score_window(scores, windows, valid_windows)
         values, chosen_w, fallback = _choose_capped_fixed(
             shared_w, errors, windows, native)
         add(f"{variant}_dataset", values, chosen_w, fallback,
             "predictor_dataset", counts_for_choice(chosen_w, fallback))
+
+        bounded_w = _bounded_shared_score_window(
+            scores, windows, valid_windows,
+            max_backoff_steps=max_backoff_steps)
+        values, chosen_w, fallback = _choose_capped_fixed(
+            bounded_w, errors, windows, native)
+        add(f"{variant}_dataset_bounded", values, chosen_w, fallback,
+            "predictor_dataset", counts_for_choice(chosen_w, fallback))
+
+    # The cheap PatchTST and Mamba predictors were trained against the same
+    # z-scored targets and window grid. Averaging their scores reduces independent
+    # architecture noise before applying the same hierarchical shrinkage policy.
+    ensemble_members = [
+        variant_scores[name]
+        for name in ("cheap_curve", "mamba_curve")
+        if name in variant_scores
+    ]
+    if len(ensemble_members) == 2:
+        ensemble_scores = np.mean(np.stack(ensemble_members, axis=0), axis=0)
+        if selection_eligible:
+            values, chosen_w, selected_native, regularized = (
+                _choose_regularized_scores(
+                    ensemble_scores, errors, windows, native, native_w,
+                    instance_weight=instance_weight,
+                    native_score_supported=native_score_supported))
+        else:
+            values, chosen_w = native, native_w
+            selected_native = np.ones(n, dtype=bool)
+            regularized = _regularize_scores(
+                ensemble_scores, instance_weight)
+        add("ensemble_curve_instance", values, chosen_w, selected_native,
+            "predictor_instance",
+            counts_for_choice(chosen_w, selected_native))
+        audit["ensemble_curve__scores"] = ensemble_scores
+        audit["ensemble_curve__regularized_scores"] = regularized
+
+    for record in records:
+        record["selection_eligible"] = selection_eligible
+        record["instance_policy_version"] = INSTANCE_POLICY_VERSION
+        record["instance_weight"] = float(instance_weight)
+        record["max_backoff_steps"] = int(max_backoff_steps)
 
     return records, audit
 
@@ -547,6 +725,12 @@ def _write_instance_strategy_reports(
                 comparison.at[idx, "pred_window_median"] = float(pred.window_median)
                 comparison.at[idx, "pred_policy_scope"] = "instance_native"
                 comparison.at[idx, "pred_clamped"] = False
+                comparison.at[idx, "instance_policy_version"] = int(
+                    getattr(pred, "instance_policy_version",
+                            INSTANCE_POLICY_VERSION))
+                comparison.at[idx, "instance_weight"] = float(
+                    getattr(pred, "instance_weight",
+                            DEFAULT_INSTANCE_WEIGHT))
                 comparison.at[idx, "pred_n_native_selected"] = int(
                     pred.n_native_selected)
                 comparison.at[idx, "delta_pred_vs_full"] = pred_mase - full_mase
@@ -701,7 +885,7 @@ def run(args: argparse.Namespace) -> None:
     for cell in tqdm(cells, desc="Phase 6 instance evaluation", unit="cell"):
         records, audit = evaluate_cell(
             cell, ablation_root, ground_tree, args.fixed_window,
-            args.mase_field)
+            args.mase_field, args.instance_weight, args.max_backoff_steps)
         all_records.extend(records)
         np.savez_compressed(
             os.path.join(
@@ -784,7 +968,25 @@ def parse_args() -> argparse.Namespace:
               "the leaderboard GluonTS MASE; old caches may explicitly fall "
               "back to the proxy and are marked in the CSV."),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--instance-weight", type=float, default=DEFAULT_INSTANCE_WEIGHT,
+        help=("Weight on each row's predictor curve after shrinkage toward the "
+              "dataset/term consensus: 0 is consensus-only, 1 is the raw "
+              "instance argmin (default: %(default)s)."),
+    )
+    parser.add_argument(
+        "--max-backoff-steps", type=int,
+        default=DEFAULT_MAX_BACKOFF_STEPS,
+        help=("Maximum number of valid grid actions below the largest valid "
+              "action allowed by each *_dataset_bounded policy "
+              "(default: %(default)s)."),
+    )
+    args = parser.parse_args()
+    if not 0.0 <= args.instance_weight <= 1.0:
+        parser.error("--instance-weight must lie in [0, 1].")
+    if args.max_backoff_steps < 0:
+        parser.error("--max-backoff-steps must be non-negative.")
+    return args
 
 
 if __name__ == "__main__":

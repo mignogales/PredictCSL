@@ -47,6 +47,69 @@ class TestConfigInheritance(unittest.TestCase):
             cfg["perturbation"]["methods"],
             ["block_mean", "permutation", "matched_block", "noise"])
 
+    def test_long_lag_paper_comparison_matches_toto_sample_budget(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "configs",
+            "experiments_long_lag_comparison.yaml")
+        cfg = load_config(path, {})
+        self.assertEqual(cfg["max_samples"], 48)
+        self.assertEqual(cfg["synthetic_controls"]["n_instances"], 48)
+        self.assertEqual(
+            cfg["synthetic_controls"]["distant_lags"],
+            [128, 512, 1024, 2048])
+        self.assertEqual(cfg["synthetic_controls"]["series_length"], 8192)
+
+    def test_forced_d2048_audit_is_targeted_and_isolated(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "configs",
+            "experiments_long_lag_forced_d2048.yaml")
+        cfg = load_config(path, {})
+        self.assertTrue(cfg["output_root"].endswith(
+            "context_interpretability_long_lag_forced_d2048"))
+        self.assertEqual(cfg["synthetic_controls"]["only_datasets"], [
+            "famB_linear_r8_d2048_s1_linear_n0.1"])
+        self.assertTrue(cfg["perturbation"]["largest_context_only"])
+        self.assertTrue(cfg["perturbation"]["only_forced_blocks"])
+        self.assertTrue(cfg["perturbation"]["reuse_clean_cache_root"].endswith(
+            "context_interpretability_long_lag"))
+
+    def test_tirex_family_b_followup_is_core_and_causal_band_only(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "configs",
+            "experiments_long_lag_tirex_family_b_targeted.yaml")
+        cfg = load_config(path, {})
+        self.assertTrue(cfg["output_root"].endswith(
+            "context_interpretability_long_lag"))
+        self.assertEqual(cfg["synthetic_controls"]["only_datasets"], [
+            "famB_linear_r8_d128_s1_linear_n0.1",
+            "famB_linear_r8_d512_s1_linear_n0.1",
+            "famB_linear_r8_d1024_s1_linear_n0.1",
+            "famB_linear_r8_d2048_s1_linear_n0.1",
+        ])
+        self.assertEqual(
+            cfg["synthetic_controls"]["run_methods"], ["perturbation"])
+        self.assertTrue(cfg["perturbation"]["largest_context_only"])
+        self.assertTrue(cfg["perturbation"]["only_forced_blocks"])
+        self.assertEqual(
+            cfg["perturbation"]["cell_subdir"], "targeted_causal_band")
+
+    def test_tirex_family_b_full_followup_keeps_exhaustive_perturbation(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "configs",
+            "experiments_long_lag_tirex_family_b_full.yaml")
+        cfg = load_config(path, {})
+        self.assertEqual(cfg["synthetic_controls"]["only_datasets"], [
+            "famB_linear_r8_d128_s1_linear_n0.1",
+            "famB_linear_r8_d512_s1_linear_n0.1",
+            "famB_linear_r8_d1024_s1_linear_n0.1",
+            "famB_linear_r8_d2048_s1_linear_n0.1",
+        ])
+        self.assertEqual(
+            cfg["synthetic_controls"]["run_methods"], ["perturbation"])
+        self.assertFalse(cfg["perturbation"].get("largest_context_only", False))
+        self.assertFalse(cfg["perturbation"].get("only_forced_blocks", False))
+        self.assertNotIn("cell_subdir", cfg["perturbation"])
+
 
 if __name__ == "__main__":
     unittest.main()

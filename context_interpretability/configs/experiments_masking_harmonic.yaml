@@ -1,0 +1,43 @@
+extends: experiments.yaml
+
+# Diagnostic pool for distinguishing a genuine attention-mask effect from
+# dataset irregularities and preprocessing/statistics leakage.
+output_root: logs/experiments/context_interpretability_masking_harmonic
+max_samples: 24
+batch_size: 2
+dynamic_batching:
+  enabled: false
+
+context_lengths: [32, 64, 128, 256, 512, 1024, 2048, 4096]
+
+experiments:
+  exp0_attention_masking: true
+  exp1_perturbation: false
+  exp2_activation_patching: false
+  exp3_forecast_lens: false
+  exp4_synthetic_controls: false
+  exp5_integrated_gradients: false
+  exp6_predictor_contrast_saliency: false
+  exp7_context_decomposition: true
+  exp8_tsfm_contrast_saliency: false
+
+attention_masking:
+  enabled: true
+  metrics: [mse, mae]
+
+context_decomposition:
+  metrics: [mse, mae]
+  all_full_contexts: false
+  full_contexts: null
+  visible_lengths: [32, 64, 128, 256, 512, 1024, 2048]
+
+datasets:
+  source: harmonic
+  harmonic:
+    n_series: 24
+    series_length: 4096
+    seed: 4201
+    periods: [32, 64, 128, 256, 512, 1024, 2048]
+    scales: [0.5, 1.0, 2.0]
+    max_tones: 4
+

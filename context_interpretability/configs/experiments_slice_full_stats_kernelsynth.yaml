@@ -1,0 +1,29 @@
+extends: experiments_masking_kernelsynth.yaml
+
+# Direct test of the deployment proposal: physically slice to L exactly as the
+# context selector normally does, but run the TSFM's RevIN with statistics from
+# the complete W-step history. Only verified global mean/scale implementations
+# (Chronos-Bolt and PatchTST-FM) are included in this study.
+output_root: logs/experiments/context_interpretability_slice_full_stats_kernelsynth
+batch_size: 2
+dynamic_batching:
+  enabled: false
+
+experiments:
+  exp0_attention_masking: false
+  exp1_perturbation: false
+  exp2_activation_patching: false
+  exp3_forecast_lens: false
+  exp4_synthetic_controls: false
+  exp5_integrated_gradients: false
+  exp6_predictor_contrast_saliency: false
+  exp7_context_decomposition: true
+  exp8_tsfm_contrast_saliency: false
+
+context_decomposition:
+  metrics: [mse, mae]
+  all_full_contexts: false
+  full_contexts: [768]
+  visible_lengths: [32, 64, 128, 256, 512]
+  statistic_ablation: false
+  slice_full_history_stats: true

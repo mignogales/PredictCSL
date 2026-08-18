@@ -1,0 +1,47 @@
+{
+  "model": "FlowState-R1",
+  "timing_summary": "logs/experiments/master_recompute/window_ablation_gifteval/general/timing_summary.csv",
+  "methodology": "measured selector stages plus deterministic context-stratified TSFM throughput samples (up to max_series per cell), scaled from measured seconds per series; full-native uses genuine variable history lengths",
+  "native": {
+    "estimated_tsfm_s": 4868.959869312499,
+    "n_instances": 366912,
+    "timing_coverage": 1.0,
+    "missing_windows": [],
+    "peak_cuda_allocated_gb": 12.735342,
+    "incremental_peak_cuda_allocated_gb": 12.657665
+  },
+  "policies": {
+    "ExtraTrees balanced": {
+      "estimated_tsfm_s": 4769.230030046552,
+      "n_instances": 366912,
+      "timing_coverage": 1.0,
+      "missing_windows": [],
+      "peak_cuda_allocated_gb": 12.436866,
+      "incremental_peak_cuda_allocated_gb": 12.357636,
+      "histogram": "logs/experiments/master_recompute/context_selection_reviewer_followups/fronts/flowstate_r1/full_score/selected_window_histograms.csv",
+      "method": "balanced",
+      "overhead_label": "extra_trees",
+      "selector_batch_size": 256,
+      "selector_us_per_series": 2972.326550661819,
+      "selector_total_s": 1090.5822793564294,
+      "estimated_end_to_end_s": 5859.812309402982,
+      "estimated_end_to_end_saved_pct": -20.350392418214614
+    },
+    "Compact tree balanced": {
+      "estimated_tsfm_s": 4810.279788554167,
+      "n_instances": 366912,
+      "timing_coverage": 1.0,
+      "missing_windows": [],
+      "peak_cuda_allocated_gb": 10.100423,
+      "incremental_peak_cuda_allocated_gb": 10.022899,
+      "histogram": "logs/experiments/master_recompute/compact_context_risk_all_models/flowstate_r1/distill_tree_depth8/selected_window_histograms.csv",
+      "method": "balanced",
+      "overhead_label": "compact_tree",
+      "selector_batch_size": 256,
+      "selector_us_per_series": 1687.7889465831686,
+      "selector_total_s": 619.2700179687236,
+      "estimated_end_to_end_s": 5429.54980652289,
+      "estimated_end_to_end_saved_pct": -11.513546060291247
+    }
+  }
+}

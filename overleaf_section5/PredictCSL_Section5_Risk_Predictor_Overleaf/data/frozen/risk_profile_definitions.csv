@@ -1,0 +1,6 @@
+profile,harm5_budget_pct,mean_ratio_cap
+Conservative,0.5,1.000
+Balanced,1.0,1.001
+Aggressive,3.0,1.005
+Extreme,15.0,1.040
+Very extreme,20.0,1.070

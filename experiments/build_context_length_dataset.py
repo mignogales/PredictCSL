@@ -866,8 +866,18 @@ def predict_toto(model, x: torch.Tensor, horizon: int, device: str) -> torch.Ten
 
 def load_flowstate(model_id: str, device: str):
     from tsfm_public import FlowStateForPrediction
-    model = FlowStateForPrediction.from_pretrained(
-        model_id, revision=FLOWSTATE_REVISION).to(device)
+    model, loading_info = FlowStateForPrediction.from_pretrained(
+        model_id, revision=FLOWSTATE_REVISION, output_loading_info=True)
+    missing = list(loading_info.get("missing_keys", ()))
+    unexpected = list(loading_info.get("unexpected_keys", ()))
+    if missing or unexpected:
+        raise RuntimeError(
+            "FlowState checkpoint/code mismatch: "
+            f"missing_keys={missing[:8]!r}, unexpected_keys={unexpected[:8]!r}. "
+            "FlowState r1.1 requires granite-tsfm>=0.3.6 in predictcsl-main; "
+            "do not run it from the legacy PatchTST environment."
+        )
+    model = model.to(device)
     model.eval()
     return model
 

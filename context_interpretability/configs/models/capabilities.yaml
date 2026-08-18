@@ -95,7 +95,7 @@ families:
     supports_forecast_lens: false
     supports_integrated_gradients: false
     uses_patches: true
-    patch_length: 64
+    patch_length: 32                    # Toto2ModelConfig.patch_size
     maximum_context_length: 4096
   flowstate:
     supports_attention_masking: false      # SSM — no attention

@@ -36,7 +36,10 @@ synthetic_controls:
   local_kinds: [linear, nonlinear, seasonal]
   distant_kind: linear
   distant_lags: [128, 512, 1024, 2048]
-  dependency_strengths: [0.0, 0.5, 1.0]
+  # The long-lag comparison targets the clearest dependency regime. Family A
+  # remains the no-distant-dependency control, so weaker Family B strengths do
+  # not add enough information to justify their substantial compute cost.
+  dependency_strengths: [1.0]
   noise_levels: [0.1]
   noise_robustness:
     lag: 1024

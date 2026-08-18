@@ -55,7 +55,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=["exp0", "exp1", "exp2", "exp3", "exp4", "exp5",
                  "exp6", "exp7", "exp8"],
         help="Experiment subset forwarded to run_experiment.")
-    parser.add_argument("--source", choices=["synthetic", "gifteval"])
+    parser.add_argument(
+        "--source", choices=["synthetic", "harmonic", "kernelsynth", "gifteval"])
     parser.add_argument("--config", default=None)
     parser.add_argument("--out", default=None)
     parser.add_argument("--horizon", type=int)

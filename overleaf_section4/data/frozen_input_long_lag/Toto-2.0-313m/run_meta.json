@@ -1,0 +1,318 @@
+{
+  "git_commit": "b1c81d08ab2c43e13d4a0c0542342c704bf8c843",
+  "model": "Toto-2.0-313m",
+  "device": "cuda:0",
+  "seed": 42,
+  "platform": "Linux-5.15.0-179-generic-x86_64-with-glibc2.35",
+  "package_versions": {
+    "python": "3.12.13",
+    "torch": "2.5.1+cu121",
+    "numpy": "1.26.4",
+    "pandas": "2.3.3",
+    "scipy": "1.11.4",
+    "transformers": "not installed",
+    "gluonts": "0.15.1",
+    "tsfm_public": "not installed"
+  },
+  "config": {
+    "output_root": "logs/experiments/context_interpretability_long_lag",
+    "seed": 42,
+    "horizon": 64,
+    "batch_size": 48,
+    "dynamic_batching": {
+      "enabled": false,
+      "reference_context": 8192,
+      "max_batch_size": 4096
+    },
+    "max_samples": 48,
+    "primary_metric": "mae",
+    "extra_metrics": [
+      "mse",
+      "smape"
+    ],
+    "context_lengths": [
+      32,
+      64,
+      96,
+      128,
+      192,
+      256,
+      384,
+      512,
+      768,
+      1024,
+      1536,
+      2048,
+      2560,
+      3072,
+      4096,
+      6144,
+      8192
+    ],
+    "block_mode": "model_patch",
+    "block_length": 32,
+    "perturb_partial_patches": false,
+    "max_blocks_per_context": 64,
+    "experiments": {
+      "exp0_attention_masking": false,
+      "exp1_perturbation": true,
+      "exp2_activation_patching": false,
+      "exp3_forecast_lens": false,
+      "exp4_synthetic_controls": true,
+      "exp5_integrated_gradients": false,
+      "exp6_predictor_contrast_saliency": false,
+      "exp7_context_decomposition": true,
+      "exp8_tsfm_contrast_saliency": false
+    },
+    "perturbation": {
+      "methods": [
+        "block_mean",
+        "permutation",
+        "matched_block",
+        "noise"
+      ],
+      "interventions_per_call": 8,
+      "mean_scope": "block",
+      "noise_scales": [
+        0.1,
+        0.5,
+        1.0
+      ],
+      "noise_std_floor": 0.001,
+      "n_seeds": 3,
+      "matched": {
+        "same_series_tolerance": 0.25,
+        "fallback": "other_series"
+      }
+    },
+    "attention_masking": {
+      "enabled": true
+    },
+    "activation_patching": {
+      "corruption": "permutation",
+      "granularity": [
+        "block_token",
+        "forecast_token"
+      ],
+      "pilot_samples": 32,
+      "layers": "all",
+      "full_layers": "every:2"
+    },
+    "forecast_lens": {
+      "stability_tau": 0.05
+    },
+    "integrated_gradients": {
+      "steps": 64,
+      "batch_size": 16,
+      "convergence_steps": [
+        16,
+        32,
+        64
+      ],
+      "internal_batch_size": 8,
+      "baselines": [
+        "context_mean",
+        "zero_after_norm",
+        "random_sample"
+      ],
+      "n_random_baselines": 3,
+      "target": "mean_forecast",
+      "supplementary_loss_target": true
+    },
+    "predictor_contrast_saliency": {
+      "predictor_dir": null,
+      "predictor_root": "logs/experiments/context_length_predictor",
+      "short_window": null,
+      "long_window": null,
+      "window_pairs": null,
+      "steps": 64,
+      "baselines": [
+        "zero",
+        "random_sample"
+      ],
+      "n_random_baselines": 3,
+      "max_blocks": 64
+    },
+    "context_decomposition": {
+      "metrics": [
+        "mae",
+        "mse"
+      ],
+      "statistic_ablation": false,
+      "all_full_contexts": false,
+      "full_contexts": null,
+      "visible_lengths": [
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        6144
+      ]
+    },
+    "tsfm_contrast_saliency": {
+      "metrics": [
+        "mae",
+        "mse"
+      ],
+      "short_window": null,
+      "long_window": null,
+      "window_pairs": null,
+      "steps": 64,
+      "batch_size": 8,
+      "baselines": [
+        "context_mean",
+        "random_sample"
+      ],
+      "n_random_baselines": 3
+    },
+    "synthetic_controls": {
+      "n_instances": 48,
+      "series_length": 8192,
+      "context_lengths": [
+        16,
+        32,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        4096,
+        6144,
+        8192
+      ],
+      "local_order": 8,
+      "local_kinds": [
+        "linear",
+        "nonlinear",
+        "seasonal"
+      ],
+      "distant_kind": "linear",
+      "distant_lags": [
+        128,
+        512,
+        1024,
+        2048
+      ],
+      "dependency_strengths": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "noise_levels": [
+        0.1
+      ],
+      "noise_robustness": {
+        "lag": 1024,
+        "strength": 1.0,
+        "extra_noise_levels": [
+          0.05,
+          0.25
+        ]
+      },
+      "family_c_fraction_distant": 0.5,
+      "oracle_ridge_alpha": 1.0,
+      "run_methods": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "sentinel_methods": [],
+      "sentinel_lags": [
+        128,
+        2048
+      ],
+      "sentinel_strengths": [
+        0.0,
+        1.0
+      ],
+      "sufficient_context_tolerance": 0.05
+    },
+    "analysis": {
+      "bootstrap_samples": 2000,
+      "alpha": 0.05,
+      "multiple_comparison": "benjamini_hochberg",
+      "top_k_blocks": 5
+    },
+    "datasets": {
+      "source": "synthetic",
+      "synthetic": {
+        "n_series": 256,
+        "seed": 42
+      },
+      "gifteval": {
+        "datasets": [
+          "ETTh1",
+          "ETTh2",
+          "us_births/D"
+        ],
+        "term": "short"
+      }
+    }
+  },
+  "started_utc": "2026-08-11T23:02:57Z",
+  "precision": "torch.float32",
+  "checkpoint": "Datadog/Toto-2.0-313m",
+  "effective_context_lengths": {
+    "32": 32,
+    "64": 64,
+    "96": 96,
+    "128": 128,
+    "192": 192,
+    "256": 256,
+    "384": 384,
+    "512": 512,
+    "768": 768,
+    "1024": 1024,
+    "1536": 1536,
+    "2048": 2048,
+    "2560": 2560,
+    "3072": 3072,
+    "4096": 4096
+  },
+  "n_samples": {
+    "exp1_perturbation": 48
+  },
+  "subsampling": {
+    "exp1_perturbation": "w4096: 64 of 128 blocks (geometric thinning)"
+  },
+  "skipped_capabilities": [],
+  "runtime_seconds": 1928.9,
+  "peak_gpu_memory_bytes": 1873498624,
+  "adapter": {
+    "name": "Toto-2.0-313m",
+    "horizon": 64,
+    "device": "cuda:0",
+    "batching": {
+      "dynamic": false,
+      "base_batch_size": 48,
+      "reference_context": 8192,
+      "max_batch_size": 4096
+    },
+    "capabilities": {
+      "supports_attention_masking": true,
+      "supports_activation_patching": true,
+      "supports_forecast_lens": false,
+      "supports_integrated_gradients": false,
+      "uses_patches": true,
+      "patch_length": 32,
+      "maximum_context_length": 4096,
+      "max_includes_horizon": false,
+      "fixed_native_context": false
+    },
+    "model_id": "Datadog/Toto-2.0-313m",
+    "family": "toto",
+    "precision": "torch.float32",
+    "n_parameters": 312684608
+  }
+}

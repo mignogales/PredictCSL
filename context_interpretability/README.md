@@ -17,6 +17,16 @@ Moirai2-Small, TimesFM2.5-200M, PatchTST-FM-R1, Sundial-Base-128M, and
 Toto-2.0-313m. These models span distinct architectures while retaining Exp7
 masking support.
 
+For the paper's Exp4 comparison, use
+`configs/experiments_long_lag_comparison.yaml`. It fixes the synthetic cohort
+at 48 series per condition, matching the completed Toto recovery run. Once a
+GPU is available, the following helper runs only the five missing comparators:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 \
+  bash scripts/run_interpretability_long_lag_exp4_missing.sh
+```
+
 Launch the full run set through the environment-routing master:
 
 ```bash

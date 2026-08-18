@@ -122,11 +122,31 @@ def block_grid(adapter: InterpretabilityAdapter, context_length: int,
     """
     P = adapter.block_length(config.get("block_mode", "model_patch"),
                              config.get("block_length", 32))
-    blocks = blocks_for_context(context_length, P,
-                                include_partial=config.get(
-                                    "perturb_partial_patches", False))
-    blocks, thinned = thin_blocks(blocks,
-                                  int(config.get("max_blocks_per_context", 64)))
+    all_blocks = blocks_for_context(
+        context_length, P,
+        include_partial=config.get("perturb_partial_patches", False))
+    pcfg = config.get("perturbation") or {}
+    force_ranges = [
+        (int(lo), int(hi))
+        for lo, hi in pcfg.get("force_lookback_ranges", [])
+    ]
+
+    def forced(block: TemporalBlock) -> bool:
+        return any(block.lookback_end > lo and block.lookback_start < hi
+                   for lo, hi in force_ranges)
+
+    if pcfg.get("only_forced_blocks", False):
+        blocks = [block for block in all_blocks if forced(block)]
+        return blocks, len(blocks) < len(all_blocks), P
+
+    blocks, thinned = thin_blocks(
+        all_blocks, int(config.get("max_blocks_per_context", 64)))
+    if force_ranges:
+        selected = {block.index for block in blocks}
+        blocks.extend(block for block in all_blocks
+                      if forced(block) and block.index not in selected)
+        blocks.sort(key=lambda block: block.index)
+        thinned = len(blocks) < len(all_blocks)
     return blocks, thinned, P
 
 

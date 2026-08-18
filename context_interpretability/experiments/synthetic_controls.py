@@ -161,11 +161,21 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
     length = min(canonical_length, adapter.max_context())
     metric = config.get("primary_metric", "mae")
     summary: List[dict] = []
-    cache_root = os.path.join(
+    cache_root = str(scfg.get("control_cache_root") or os.path.join(
         config.get("output_root", os.path.dirname(out_dir)),
-        "_synthetic_control_cache")
+        "_synthetic_control_cache"))
+    reuse_clean_root = scfg.get("reuse_clean_cache_root")
 
     specs = _control_specs(scfg)
+    only_datasets = set(scfg.get("only_datasets") or [])
+    if only_datasets:
+        specs = [(spec, role) for spec, role in specs
+                 if spec.name in only_datasets]
+        found = {spec.name for spec, _role in specs}
+        missing = sorted(only_datasets - found)
+        if missing:
+            raise ValueError(
+                f"synthetic_controls.only_datasets not in design: {missing}")
     exp_config = copy.deepcopy(config)
     exp_config["context_lengths"] = list(
         scfg.get("context_lengths", config["context_lengths"]))
@@ -194,9 +204,24 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
         broken = (spec.family in ("B", "C") and spec.strength > 0
                   and not oracle["distant_predictive"])
 
+        # Preserve the full causal source band for all forecast steps even
+        # when the ordinary geometric block cap thins distant history.
+        spec_exp_config = copy.deepcopy(exp_config)
+        if spec.family in ("B", "C") and spec.distant_lag > 0:
+            pcfg = spec_exp_config.setdefault("perturbation", {})
+            pcfg["force_lookback_ranges"] = [[
+                max(0, spec.distant_lag - adapter.horizon + 1),
+                spec.distant_lag + 1,
+            ]]
+
         # -- 2. context-length error curve + sufficient context ----------------
+        curve_cache_dir = (
+            os.path.join(str(reuse_clean_root), adapter.name,
+                         "exp4_synthetic_controls", spec.name, "clean_cache")
+            if reuse_clean_root else os.path.join(ds_dir, "clean_cache")
+        )
         cache = CleanCache(adapter, data, metric,
-                           cache_dir=os.path.join(ds_dir, "clean_cache"))
+                           cache_dir=curve_cache_dir)
         pairs = adapter.effective_context_lengths(exp_config["context_lengths"])
         pairs = [(r_, e) for r_, e in pairs if e <= length]
         eff = [e for _r, e in pairs]
@@ -218,7 +243,7 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
                                   f"{adapter.name}: capability off")
                 continue
             try:
-                mod.run(adapter, data, exp_config,
+                mod.run(adapter, data, spec_exp_config,
                         os.path.join(ds_dir, m), run_meta=run_meta, seed=seed)
                 methods_run.append(m)
             except CapabilityError as exc:
@@ -239,7 +264,9 @@ def run(adapter: InterpretabilityAdapter, config: dict, out_dir: str,
               f"oracle_gain={oracle['relative_gain']:.3f}"
               f"{'  BROKEN-CONFIG' if broken else ''}")
 
-    path = os.path.join(out_dir, "controls_summary.json")
+    summary_filename = os.path.basename(str(
+        scfg.get("summary_filename", "controls_summary.json")))
+    path = os.path.join(out_dir, summary_filename)
     with open(path, "w") as f:
         json.dump({"model": adapter.name, "tolerance": tol,
                    "controls": summary}, f, indent=2, default=_json_default)

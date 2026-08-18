@@ -1,0 +1,3 @@
+label,normalized_mase,flops_saved_pct,source
+Full/native,0.8095856948197846,0.0,logs/experiments/master_recompute/window_ablation_gifteval/ChronosBolt-Base/strategy_comparison_v4_oracle_refresh/comparison.csv
+Unconstrained oracle,0.7747922341852038,29.016816020438764,logs/experiments/master_recompute/window_ablation_gifteval/ChronosBolt-Base/strategy_comparison_v4_oracle_refresh/comparison.csv

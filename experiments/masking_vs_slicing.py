@@ -125,7 +125,8 @@ def forecast_masked(
         x_grp = torch.from_numpy(
             np.ascontiguousarray(contexts[idx, -int(W):])).unsqueeze(-1)
         L_vis = min(int(last_timesteps), int(W))
-        with context_attention_mask(family, base, L_vis, int(W)):
+        with context_attention_mask(
+                family, base, L_vis, int(W), horizon=horizon):
             med = _forecast_uniform(
                 family, base, model_id, x_grp, int(W), horizon, batch_size, device)
         out[torch.as_tensor(idx, device=device, dtype=torch.long)] = med

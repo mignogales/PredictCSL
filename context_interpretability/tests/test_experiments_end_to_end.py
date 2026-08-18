@@ -22,9 +22,12 @@ class TestAttentionMaskingExp0(unittest.TestCase):
         data = make_data()
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "exp0")
-            attention_masking.run(adapter, data, make_config(tmp), out, seed=0)
+            config = make_config(tmp)
+            config["attention_masking"] = {"metrics": ["mse", "mae"]}
+            attention_masking.run(adapter, data, config, out, seed=0)
             df = load_results(out)
             self.assertTrue((df["method"] == "attention_masking").all())
+            self.assertEqual(set(df["metric"]), {"mse", "mae"})
             w64 = df[df["context_length"] == 64]
             # hidden span rows: lookback_start = visible L, lookback_end = W
             self.assertEqual(sorted(w64["lookback_start"].unique().tolist()),

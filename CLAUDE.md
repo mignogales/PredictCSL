@@ -262,6 +262,17 @@ Token-mapping / hook assumptions per family carry "verify on server" notes in
   Outputs default to the isolated `logs/experiments/master_recompute/` tree;
   `--test` runs the same matrix with reduced smoke settings and keeps its output
   for environment/debug inspection.
+- **Instance policy (Phase 6)** — `evaluate_instance_windows.py` uses policy v3:
+  row-level v3/v4 score curves are shrunk 25%/75% toward their unlabeled
+  dataset-term consensus (`--instance-weight` overrides), unsupported final
+  outputs cannot masquerade as native/full actions, and one-action cells are
+  forced to native no-ops. It emits regularized v3/v4 reports plus a cheap+Mamba
+  score-ensemble report; `*_instance_raw` rows preserve the raw row-level argmin
+  under the corrected guards for audit. Dataset-shared controls additionally
+  emit `*_dataset_bounded`, which clips aggressive predictions to at most two
+  valid grid actions below the largest valid action (`--max-backoff-steps`).
+  Stage 4 keeps undefined per-row MASE denominators masked rather than abandoning
+  the aligned cumulative cohort.
 - **`evaluate_topk_predictor_checkpoints.py`** — post-training robustness check.
   Packages the top-k durable per-trial predictor weights, reuses the canonical
   GiftEval `datasets/` cache, and reports cross-checkpoint normalized MASE plus

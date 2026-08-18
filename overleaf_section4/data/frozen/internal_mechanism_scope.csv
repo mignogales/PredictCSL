@@ -1,0 +1,12 @@
+model,activation_patching_status,activation_patching_full_context,activation_patching_n_samples,forecast_lens_status,forecast_lens_n_layers,forecast_lens_n_contexts,forecast_lens_n_saturated,forecast_lens_n_early_saturated
+Chronos2-Base,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+Chronos2-Small,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+Chronos2-Synth,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+ChronosBolt-Base,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+FlowState-R1,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+Moirai2-Small,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+PatchTST-FM-R1,unsupported_or_not_run,,0,complete,20,18,18,0
+Sundial-Base-128M,unsupported_or_not_run,,0,complete,12,14,0,0
+TiRex2,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0
+TimesFM2.5-200M,unsupported_or_not_run,,0,complete,20,17,17,0
+Toto-2.0-313m,unsupported_or_not_run,,0,unsupported_or_not_run,,0,0,0

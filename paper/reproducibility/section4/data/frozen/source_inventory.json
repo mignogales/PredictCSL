@@ -1,0 +1,315 @@
+{
+  "files": [
+    {
+      "bytes": 22378,
+      "model": "Chronos2-Base",
+      "path_relative_to_input_root": "Chronos2-Base/exp4_synthetic_controls/controls_summary.json",
+      "role": "Exp4 controls summary",
+      "sha256": "f763259aa6c554cffeaa28dbf226f5687010f933cc366c2878ffb07b162b89cd"
+    },
+    {
+      "bytes": 3998300,
+      "model": "Chronos2-Base",
+      "path_relative_to_input_root": "Chronos2-Base/exp7_context_decomposition/synthetic/w8192/results.csv",
+      "role": "Exp7 largest-width cell",
+      "sha256": "f3db4b9a4acfeac54f1c2fc338918854da37f9d476125f16f601872df19a062c"
+    },
+    {
+      "bytes": 6402,
+      "model": "Chronos2-Base",
+      "path_relative_to_input_root": "Chronos2-Base/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "14177db71ab7a4ec6133d67621832ace1e1ddd498225ad669f459c8d544d2e9e"
+    },
+    {
+      "bytes": 8052,
+      "model": "Chronos2-Base",
+      "path_relative_to_input_root": "Chronos2-Base/run_meta.json",
+      "role": "run metadata",
+      "sha256": "a2342b045eca55b80aeae332b77f478984e3a72df62da405cf18d5c76d79472b"
+    },
+    {
+      "bytes": 22366,
+      "model": "Chronos2-Small",
+      "path_relative_to_input_root": "Chronos2-Small/exp4_synthetic_controls/controls_summary.json",
+      "role": "Exp4 controls summary",
+      "sha256": "ada82f12f4de433852ab0a9b0518c072ce45fc83931d5e93671129ee0893edeb"
+    },
+    {
+      "bytes": 4017270,
+      "model": "Chronos2-Small",
+      "path_relative_to_input_root": "Chronos2-Small/exp7_context_decomposition/synthetic/w8192/results.csv",
+      "role": "Exp7 largest-width cell",
+      "sha256": "1bb2d7de29e6266afb6bb3f5cc9c56c3f57a3cf34d5556ed929106d7d5a835e3"
+    },
+    {
+      "bytes": 7917,
+      "model": "Chronos2-Small",
+      "path_relative_to_input_root": "Chronos2-Small/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "b7a6f7de1409e0358bd330c64761a07395edbf94e575cb826bb1d24a420947e5"
+    },
+    {
+      "bytes": 8066,
+      "model": "Chronos2-Small",
+      "path_relative_to_input_root": "Chronos2-Small/run_meta.json",
+      "role": "run metadata",
+      "sha256": "1f737fb89806521e726072b206304f3fd69fedb5d84e159f5940a09fee1312bd"
+    },
+    {
+      "bytes": 22363,
+      "model": "Chronos2-Synth",
+      "path_relative_to_input_root": "Chronos2-Synth/exp4_synthetic_controls/controls_summary.json",
+      "role": "Exp4 controls summary",
+      "sha256": "8935c6a259173d445fbb2572bf00ff8b7fcbe1179feb890b62717ce005a72beb"
+    },
+    {
+      "bytes": 4012717,
+      "model": "Chronos2-Synth",
+      "path_relative_to_input_root": "Chronos2-Synth/exp7_context_decomposition/synthetic/w8192/results.csv",
+      "role": "Exp7 largest-width cell",
+      "sha256": "9146c6a44f956db46b8e0fc26dbcec2fc784ee778587e8321b74916b6068a434"
+    },
+    {
+      "bytes": 6397,
+      "model": "Chronos2-Synth",
+      "path_relative_to_input_root": "Chronos2-Synth/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "7c71aaf550f40184feca624938979d7630d0432973c15a83cb9a8ef48802213e"
+    },
+    {
+      "bytes": 8074,
+      "model": "Chronos2-Synth",
+      "path_relative_to_input_root": "Chronos2-Synth/run_meta.json",
+      "role": "run metadata",
+      "sha256": "38f666bc17acc8862836fc81034149fa453dfd64597a5c783f1072f53f105fb4"
+    },
+    {
+      "bytes": 22496,
+      "model": "ChronosBolt-Base",
+      "path_relative_to_input_root": "ChronosBolt-Base/exp4_synthetic_controls/controls_summary.json",
+      "role": "Exp4 controls summary",
+      "sha256": "8d89576f8661209de37406d64da906f821926a5a2f0d3f9d6480cc1c3fbaacc8"
+    },
+    {
+      "bytes": 2898244,
+      "model": "ChronosBolt-Base",
+      "path_relative_to_input_root": "ChronosBolt-Base/exp7_context_decomposition/synthetic/w2048/results.csv",
+      "role": "Exp7 largest-width cell",
+      "sha256": "774e44f5b2df7745cf7bb46927e2321dae470884b352e9ec59b239e9fbe94117"
+    },
+    {
+      "bytes": 6818,
+      "model": "ChronosBolt-Base",
+      "path_relative_to_input_root": "ChronosBolt-Base/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "e4346f5a0dc81a41aab42b7874040d4c2123b91fab1e630b3a4b4eb745d80cb3"
+    },
+    {
+      "bytes": 20340,
+      "model": "ChronosBolt-Base",
+      "path_relative_to_input_root": "ChronosBolt-Base/run_meta.json",
+      "role": "run metadata",
+      "sha256": "d6617eda4ff24191c2feb544f9e7a2d07c9a64f037eff46cb784c01f7ce06edc"
+    },
+    {
+      "bytes": 21826,
+      "model": "FlowState-R1",
+      "path_relative_to_input_root": "FlowState-R1/exp4_synthetic_controls/controls_summary.json",
+      "role": "Exp4 controls summary",
+      "sha256": "c0e2ecad12749c3879d97612ca10b07f07f5630b05f0e81ad34d8df0081fddff"
+    },
+    {
+      "bytes": 4653,
+      "model": "FlowState-R1",
+      "path_relative_to_input_root": "FlowState-R1/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "94d870cf513f3b872efcecd91d962cc50032010f07dec11f0dc4b03af1b28518"
+    },
+    {
+      "bytes": 10308,
+      "model": "FlowState-R1",
+      "path_relative_to_input_root": "FlowState-R1/run_meta.json",
+      "role": "run metadata",
+      "sha256": "c464d1e80820e0f990c62f972c4229497bea0fb54e12285a9e865238cf8ee1f9"
+    },
+    {
+      "bytes": 22494,
+      "model": "Moirai2-Small",
+      "path_relative_to_input_root": "Moirai2-Small/exp4_synthetic_controls/controls_summary.json",
+      "role": "Exp4 controls summary",
+      "sha256": "7feba1dcee4b066b5f48b5034acd075f7a30ed57e9337eaf2cbd3a599492eca7"
+    },
+    {
+      "bytes": 3822471,
+      "model": "Moirai2-Small",
+      "path_relative_to_input_root": "Moirai2-Small/exp7_context_decomposition/synthetic/w6144/results.csv",
+      "role": "Exp7 largest-width cell",
+      "sha256": "2203834e8f624012e23b26f989a71df72fe5eda7a2fb3052777bbfe7b5b8071d"
+    },
+    {
+      "bytes": 6814,
+      "model": "Moirai2-Small",
+      "path_relative_to_input_root": "Moirai2-Small/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "393569bc79c869daf006131fe110c87e18d24922a327c1429714d11de6dbd061"
+    },
+    {
+      "bytes": 20058,
+      "model": "Moirai2-Small",
+      "path_relative_to_input_root": "Moirai2-Small/run_meta.json",
+      "role": "run metadata",
+      "sha256": "01249067e0d2563aabe932d4827681d45d97a185f1545eda2ba07a083457dd5a"
+    },
+    {
+      "bytes": 858,
+      "model": "PatchTST-FM-R1",
+      "path_relative_to_input_root": "PatchTST-FM-R1/exp3_forecast_lens/synthetic/saturation_layers.json",
+      "role": "Exp3 saturation summary",
+      "sha256": "8ad7f9861e80ea21000a639d309d852c868982c121b674d9e0681c48f154b7d3"
+    },
+    {
+      "bytes": 22499,
+      "model": "PatchTST-FM-R1",
+      "path_relative_to_input_root": "PatchTST-FM-R1/exp4_synthetic_controls/controls_summary.json",
+      "role": "Exp4 controls summary",
+      "sha256": "470ddbb49566d9780a8a9088fd1e8f874b13d750760927ea528bc372d50b56da"
+    },
+    {
+      "bytes": 4023443,
+      "model": "PatchTST-FM-R1",
+      "path_relative_to_input_root": "PatchTST-FM-R1/exp7_context_decomposition/synthetic/w8192/results.csv",
+      "role": "Exp7 largest-width cell",
+      "sha256": "14ff7450d7ddfc90980d82dc64983d1d407c1bdc3a459fd7fd7423fe6a1de473"
+    },
+    {
+      "bytes": 7166,
+      "model": "PatchTST-FM-R1",
+      "path_relative_to_input_root": "PatchTST-FM-R1/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "7c9ae4d7311aaac7d05ca28be47b52882b7bf81b3c8dad087ab24a87da50a8c0"
+    },
+    {
+      "bytes": 20476,
+      "model": "PatchTST-FM-R1",
+      "path_relative_to_input_root": "PatchTST-FM-R1/run_meta.json",
+      "role": "run metadata",
+      "sha256": "b4fdf207ccef9241afeec53b52051a6977f3ae091f2a59da7f0150c593cad9af"
+    },
+    {
+      "bytes": 478,
+      "model": "Sundial-Base-128M",
+      "path_relative_to_input_root": "Sundial-Base-128M/exp3_forecast_lens/synthetic/saturation_layers.json",
+      "role": "Exp3 saturation summary",
+      "sha256": "bd125338f036cede1b5e22442e144b65bae1ffa2ddb4e2da3d19d1e9036935ca"
+    },
+    {
+      "bytes": 22485,
+      "model": "Sundial-Base-128M",
+      "path_relative_to_input_root": "Sundial-Base-128M/exp4_synthetic_controls/controls_summary.json",
+      "role": "Exp4 controls summary",
+      "sha256": "0582cd9ea01fcbe1df4b9104b43a86b26682c20c24b1956c538cc0fa1d02d31f"
+    },
+    {
+      "bytes": 3126087,
+      "model": "Sundial-Base-128M",
+      "path_relative_to_input_root": "Sundial-Base-128M/exp7_context_decomposition/synthetic/w2560/results.csv",
+      "role": "Exp7 largest-width cell",
+      "sha256": "8a1453eb5fec74cabaa469f19e09e07bb96eb7a3d4bbcb4bafaba1ab51a3a0ac"
+    },
+    {
+      "bytes": 6996,
+      "model": "Sundial-Base-128M",
+      "path_relative_to_input_root": "Sundial-Base-128M/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "379d4f6fde5563854bec4e01fc7e6f5e528fe27ec39a99cda55dbb6408208a37"
+    },
+    {
+      "bytes": 7363,
+      "model": "Sundial-Base-128M",
+      "path_relative_to_input_root": "Sundial-Base-128M/run_meta.json",
+      "role": "run metadata",
+      "sha256": "3895a16b7b5ec187fe684790d097d910691dec513624e95aaf185c3e18a01992"
+    },
+    {
+      "bytes": 20370,
+      "model": "TiRex2",
+      "path_relative_to_input_root": "TiRex2/exp4_synthetic_controls/controls_summary.json",
+      "role": "Exp4 controls summary",
+      "sha256": "839208d474fd5f02541fa4da8ca4126a0384498775355157163e34fd6f022ec2"
+    },
+    {
+      "bytes": 4654,
+      "model": "TiRex2",
+      "path_relative_to_input_root": "TiRex2/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "354dc69bbb0ba1f33cba56696d470f7362e752b5d82d1c1da2178a7c08573d95"
+    },
+    {
+      "bytes": 10071,
+      "model": "TiRex2",
+      "path_relative_to_input_root": "TiRex2/run_meta.json",
+      "role": "run metadata",
+      "sha256": "1906309a5bf5a9b007321ca3de0fba324a28034352f4e48244923845e764f1df"
+    },
+    {
+      "bytes": 744,
+      "model": "TimesFM2.5-200M",
+      "path_relative_to_input_root": "TimesFM2.5-200M/exp3_forecast_lens/synthetic/saturation_layers.json",
+      "role": "Exp3 saturation summary",
+      "sha256": "c19581882347f8de4ea47562c73cd6da0983b8ab53921f918fe6dd534a04f3fb"
+    },
+    {
+      "bytes": 21030,
+      "model": "TimesFM2.5-200M",
+      "path_relative_to_input_root": "TimesFM2.5-200M/exp4_synthetic_controls/controls_summary.json",
+      "role": "Exp4 controls summary",
+      "sha256": "979bbe62d6f8748673f2d9eb58a0acb0cdaa44e668e89a6760ace82f5c8554f0"
+    },
+    {
+      "bytes": 3822081,
+      "model": "TimesFM2.5-200M",
+      "path_relative_to_input_root": "TimesFM2.5-200M/exp7_context_decomposition/synthetic/w8192/results.csv",
+      "role": "Exp7 largest-width cell",
+      "sha256": "5bffe200b8e9bc1c46022f7277855c6b26d0738e52b749e25fbd260a0d59b38b"
+    },
+    {
+      "bytes": 7154,
+      "model": "TimesFM2.5-200M",
+      "path_relative_to_input_root": "TimesFM2.5-200M/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "e5da59a2b4296addc005f6d16089790581c405e82d94ad3ef64a49248276cafa"
+    },
+    {
+      "bytes": 17892,
+      "model": "TimesFM2.5-200M",
+      "path_relative_to_input_root": "TimesFM2.5-200M/run_meta.json",
+      "role": "run metadata",
+      "sha256": "e31a443ef3bbc654ae9be7ad225fc9cc6d66b18851b624ff1bb431f1e03af2d5"
+    },
+    {
+      "bytes": 1828,
+      "model": "Toto-2.0-313m",
+      "path_relative_to_input_root": "Toto-2.0-313m/hypotheses_report.json",
+      "role": "pre-specified hypothesis output",
+      "sha256": "67a60fe46e332d0c21397dce8611ec87131f60074cc9da11a30ff66d604ac43a"
+    },
+    {
+      "bytes": 13840,
+      "model": "Toto-2.0-313m",
+      "path_relative_to_input_root": "Toto-2.0-313m/run_meta.json",
+      "role": "run metadata",
+      "sha256": "b511b8fb15d97e306d14716f2f5ae730462dea30dfff1c631be28f2f54396ad0"
+    }
+  ],
+  "freeze_protocol": {
+    "bootstrap_draws": 2000,
+    "bootstrap_seed_base": 4200,
+    "exp1_scope": "ordinary synthetic pool only; largest effective context for ratios",
+    "exp4_scope": "complete 4 lag x 3 strength family-B core grid at noise 0.1",
+    "exp7_scope": "largest completed full-width cell; MAE and MSE retained",
+    "primary_metric": "MAE",
+    "sufficient_context_tolerance": 0.05
+  },
+  "input_root": "/Users/miguelnogales/Desktop/PhD/Projects/PredictCSL/overleaf_section4/data/frozen_input"
+}

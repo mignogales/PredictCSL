@@ -136,6 +136,12 @@ def _load_datasets(config: dict, adapter) -> List:
             min(int(scfg.get("n_series", 256)), max_samples),
             int(scfg.get("seed", config.get("seed", 42))), adapter.horizon)
         return [data]
+    if source == "harmonic":
+        return loaders.load_harmonic(
+            dcfg.get("harmonic") or {}, max_samples, adapter.horizon)
+    if source == "kernelsynth":
+        return [loaders.load_kernelsynth(
+            dcfg.get("kernelsynth") or {}, max_samples, adapter.horizon)]
     if source == "gifteval":
         gcfg = dcfg.get("gifteval") or {}
         pairs = adapter.effective_context_lengths(config["context_lengths"])
@@ -250,7 +256,9 @@ def main() -> None:
                     choices=list(EXPERIMENTS), metavar="expK",
                     help=(f"subset of {list(EXPERIMENTS)}; an explicit subset "
                           "overrides per-experiment enabled:false settings"))
-    ap.add_argument("--source", choices=["synthetic", "gifteval"], default=None,
+    ap.add_argument("--source",
+                    choices=["synthetic", "harmonic", "kernelsynth", "gifteval"],
+                    default=None,
                     help="override datasets.source")
     ap.add_argument("--horizon", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=None)

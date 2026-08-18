@@ -176,7 +176,8 @@ def masked_forecast(family, handle, model_id, groups_full, L, cache, horizon,
     results = []
     for W_g, batches_g, _ax, _ay, idx_g in groups_full:
         L_vis = min(int(L), int(W_g))
-        with context_attention_mask(family, handle, L_vis, int(W_g)):
+        with context_attention_mask(
+                family, handle, L_vis, int(W_g), horizon=horizon):
             fr_g, tg_g = abl._forecast_cell(
                 family, handle, model_id, batches_g, int(W_g), horizon,
                 device, batch_size)

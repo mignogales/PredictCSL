@@ -1,0 +1,41 @@
+{
+  "run_dir": "logs/experiments/context_interpretability/Toto-2.0-313m",
+  "sufficient_contexts": {
+    "exp1_perturbation": 1536,
+    "exp4_synthetic_controls/famA_linear_r8_n0.1": 64,
+    "exp4_synthetic_controls/famA_linear_r8_n0.1/perturbation": 64
+  },
+  "ig_limitations": "Low gradient attribution is not proof of causal irrelevance; gradients may be affected by model saturation; attribution depends on the baseline; the perturbation experiments remain the principal causal evidence.",
+  "hypotheses": {
+    "H1": {
+      "statement": "Perturbing observations beyond the sufficient context causes negligible forecast degradation.",
+      "recent_effect": 0.11698850498768548,
+      "distant_effect": 0.01182341603666889,
+      "ratio": 0.10106476732832387,
+      "n_significant_distant_blocks": 271,
+      "threshold": 0.2,
+      "verdict": "supporting"
+    },
+    "H2": {
+      "statement": "Forecast-relevant attribution and intervention effects concentrate inside the sufficient context.",
+      "per_method_fraction_inside": {
+        "perturbation": 0.49598739330374586
+      },
+      "mean_fraction_inside": 0.49598739330374586,
+      "threshold": 0.8,
+      "verdict": "contradicting"
+    },
+    "H3": {
+      "statement": "Intermediate predictions stabilize across context lengths as representations progress through the network.",
+      "verdict": "insufficient_data"
+    },
+    "H4": {
+      "statement": "When distant information is made genuinely predictive, the model's effective context expands toward that dependency.",
+      "verdict": "insufficient_data"
+    },
+    "H5": {
+      "statement": "Attention masking, perturbation, activation patching, forecast lens and integrated gradients give qualitatively consistent estimates of the effective context.",
+      "verdict": "insufficient_data"
+    }
+  }
+}

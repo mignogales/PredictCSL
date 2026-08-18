@@ -1,0 +1,74 @@
+{
+  "files": [
+    {
+      "bytes": 574,
+      "path": "chronos2_small_exp1_curve.csv",
+      "sha256": "41bbe9b489901944aad67f94f4fe96bc8a710d56d027db12255c8edd88e0a793"
+    },
+    {
+      "bytes": 194,
+      "path": "chronos2_small_exp1_region_ratios.csv",
+      "sha256": "64c9a82c242cdc388338dd63c3ab2a3f2d9b48eb0ac91924fb42b92259c9ef96"
+    },
+    {
+      "bytes": 1,
+      "path": "exp1_block_mean_profiles.csv",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "bytes": 1,
+      "path": "exp1_distant_recent_ratios.csv",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "bytes": 1,
+      "path": "exp1_error_curves.csv",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "bytes": 1,
+      "path": "exp2_patching_profiles.csv",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "bytes": 13722,
+      "path": "exp4_controls.csv",
+      "sha256": "21b0fc8aa825a39298932a14aff038623a861a7a7aec325dcfc09de0802d5941"
+    },
+    {
+      "bytes": 644,
+      "path": "exp4_lag_tracking_summary.csv",
+      "sha256": "43c33bd77dd5d372f1a283da350021919a2541ac9cfdcb06da099c064ad99e6a"
+    },
+    {
+      "bytes": 55358,
+      "path": "exp7_decomposition_profiles.csv",
+      "sha256": "251fcf8e59d1ef5ca9ac5454ba5833f066d3c06d728c970ac95ac7b81f20849c"
+    },
+    {
+      "bytes": 3642,
+      "path": "exp7_decomposition_summary.csv",
+      "sha256": "c58766d08c55509d73cb529cd5573ae0d11dbf6f242d7b65861f4eb94f1415ab"
+    },
+    {
+      "bytes": 966,
+      "path": "internal_mechanism_scope.csv",
+      "sha256": "5d1b723752c5a2a5535f8755d073441f94e337d7689b0e590be77ba805fd588f"
+    },
+    {
+      "bytes": 1770,
+      "path": "manifest.json",
+      "sha256": "84b5acdca1ef8f59b35aa03e91bfd75afe3a3d74a50b979ff6c4460fb55820e3"
+    },
+    {
+      "bytes": 2317,
+      "path": "model_scope.csv",
+      "sha256": "5a373fb73ee6fade038a61e095c5ef935031004502833104c2afa41534248c75"
+    },
+    {
+      "bytes": 12536,
+      "path": "source_inventory.json",
+      "sha256": "517042a9158bd4b071142d8dd51f0f9e8aa1742e7f0ac3fb9bbd91897ef72bfa"
+    }
+  ]
+}

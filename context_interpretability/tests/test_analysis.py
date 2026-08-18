@@ -117,6 +117,7 @@ class TestAnalysis(unittest.TestCase):
                     "model": "m", "dataset": "d", "sample_id": sample,
                     "context_length": W, "lookback_start": 16,
                     "clean_loss": loss, "method": "attention_masking",
+                    "metric": "mse",
                 })
         frame = pd.DataFrame(rows)
         profiles = figures._sliced_loss_delta_profiles(
@@ -133,6 +134,7 @@ class TestAnalysis(unittest.TestCase):
                     "model": "m", "dataset": "d", "sample_id": sample,
                     "context_length": W, "lookback_start": 16,
                     "clean_loss": loss, "method": "attention_masking",
+                    "metric": "mse",
                 })
         frame = pd.DataFrame(rows)
         profiles = figures._sliced_loss_profiles(

@@ -1,0 +1,11 @@
+model,spearman_lag_vs_sufficient,fraction_reaching_lag,n_strong_cells,zero_min_context,zero_max_context,local_min_context,local_max_context,n_broken_controls
+Chronos2-Base,0.888956637,1,8,192,256,192,384,0
+Chronos2-Small,0.888956637,1,8,128,256,192,384,0
+Chronos2-Synth,0.9081292833,1,8,128,256,96,384,0
+ChronosBolt-Base,0.8,0.875,8,96,192,96,384,0
+FlowState-R1,0.7654904374,0.875,8,64,128,64,192,0
+Moirai2-Small,0.8,0.875,8,96,192,48,256,0
+PatchTST-FM-R1,0.7654904374,0.875,8,48,192,48,384,0
+Sundial-Base-128M,0.7295741779,0.625,8,48,96,32,192,0
+TiRex2,0.7453559925,0.875,8,128,192,96,192,0
+TimesFM2.5-200M,0.830205099,0.875,8,64,192,64,256,0

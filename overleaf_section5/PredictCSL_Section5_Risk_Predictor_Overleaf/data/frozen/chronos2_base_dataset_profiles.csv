@@ -1,0 +1,19 @@
+dataset,profile,delta_mase_pct,context_saved_pct,shortened_pct,harm5_pct
+M4,extreme,-1.467,11.750,3.852,1.068
+Electricity,extreme,-0.267,75.869,96.896,14.231
+Solar,extreme,1.215,63.962,95.385,23.515
+Shenzhen Taxi,extreme,0.231,57.753,96.154,11.480
+ETTm1,extreme,0.221,68.979,95.362,18.367
+Jena Weather,extreme,1.673,68.694,95.759,30.580
+ETTm2,extreme,1.035,68.271,94.805,21.150
+Seattle Traffic,extreme,1.729,70.153,97.500,25.298
+COVID Deaths,extreme,0.000,0.000,0.000,0.000
+M4,very_extreme,-1.119,11.514,5.068,1.436
+Electricity,very_extreme,0.220,80.653,97.011,18.106
+Solar,very_extreme,0.637,72.144,95.407,23.245
+Shenzhen Taxi,very_extreme,0.791,69.044,99.068,17.832
+ETTm1,very_extreme,1.006,75.342,97.032,27.458
+Jena Weather,very_extreme,1.887,76.705,97.098,35.640
+ETTm2,very_extreme,2.057,77.259,95.918,25.788
+Seattle Traffic,very_extreme,2.388,76.149,97.531,30.820
+COVID Deaths,very_extreme,0.000,0.000,0.000,0.000

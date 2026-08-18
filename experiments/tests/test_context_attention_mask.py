@@ -7,6 +7,7 @@ from torch import nn
 from experiments.context_attention_mask import (
     _chronosbolt_mask,
     _chronosbolt_patch_geometry,
+    _patchtstfm_retained_patches,
     _restore_forwards,
 )
 
@@ -103,6 +104,18 @@ class TestChronosBoltAttentionMask(unittest.TestCase):
         )
         self.assertTrue(
             torch.all(inner.encoder_attention.last_mask[..., 1:] == 0))
+
+
+class TestPatchTSTAttentionMask(unittest.TestCase):
+    def test_forecast_patches_do_not_consume_context_budget(self):
+        # Patch size 32 and horizon 64 means two forecast patches are always
+        # retained *in addition to* the requested historical patches.
+        self.assertEqual(_patchtstfm_retained_patches(32, 64, 32), (1, 2, 3))
+        self.assertEqual(_patchtstfm_retained_patches(64, 64, 32), (2, 2, 4))
+        self.assertEqual(_patchtstfm_retained_patches(128, 64, 32), (4, 2, 6))
+
+    def test_partial_patches_round_up(self):
+        self.assertEqual(_patchtstfm_retained_patches(33, 65, 32), (2, 3, 5))
 
 
 if __name__ == "__main__":

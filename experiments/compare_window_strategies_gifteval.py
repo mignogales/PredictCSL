@@ -28,10 +28,9 @@ d, feed-forward f, E active experts):
   projections  4·L·d²        feed-forward  2·L·d·f·E        (both linear in L)
   attention    2·L²·d                                       (quadratic in L)
 
-  enc_dec (chronos2, chronos_bolt): encoder over n_ctx + decoder over n_hor
-                                    with cross-attention to the context.
-  unified (moirai, timesfm, patchtst_fm, sundial, timemoe): one stack over
-                                    n_ctx + n_hor tokens.
+  unified (timesfm, patchtst_fm, timemoe): one stack over n_ctx + n_hor.
+  Custom audited paths account for Chronos direct prediction, Moirai recursion,
+  Sundial flow sampling, FlowState S5/FFT, and TiRex's fixed native grid + TTA.
 
 where n_ctx = ⌈C/P⌉, n_hor = ⌈H/P⌉, P = effective patch size.  The linear terms
 dominate when n_ctx < d (the usual regime here), so dropping them — as the old
@@ -298,8 +297,8 @@ def conservative_native_gate(
 # vs d = 512..1280).  The previous proxy kept only the L^2 term and therefore
 # overstated the savings from shrinking context.  Carrying d, the layer count,
 # and f fixes both the within-model scaling AND makes cross-model numbers an
-# approximate absolute MAC count (still a proxy: it ignores embeddings, norms,
-# quantile heads, and exact attention-kernel constants).
+# approximate absolute MAC count (still a proxy: some family-specific embeddings
+# and heads, norms, elementwise ops, and exact kernel constants are omitted).
 #
 # Architecture specs below are taken verbatim from each model's HF config.json.
 
@@ -308,29 +307,40 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ModelArch:
-    """Architecture spec used by the FLOPs proxy (from HF config.json)."""
+    """Architecture spec used by the FLOPs proxy (from shipped configs)."""
     d_model: int
     d_ff: int
     patch_size: int
-    seq_type: str            # "enc_dec" | "unified"
+    seq_type: str            # "enc_dec" | "unified" | audited custom family
     n_enc_layers: int = 0    # encoder blocks (enc_dec) / total blocks (unified)
     n_dec_layers: int = 0    # decoder blocks (enc_dec only)
     experts_per_tok: int = 1 # active experts for MoE FFN (1 = dense)
     max_window: int = 8192   # largest context the model accepts (caps full_window);
                              # default = MAX_WINDOW grid top, overridden per family
+    output_quantiles: int = 1 # direct probabilistic output channels, when used
+    decoder_dim: int = 0      # functional-basis width (FlowState only)
 
 
 # Per-family architecture.  Patch sizes here are the defaults; --patch-sizes can
 # still override the patch field at runtime (see resolve_arch).
 MODEL_ARCH: Dict[str, ModelArch] = {
-    # T5-style encoder-decoder (encoder over context, decoder over horizon + cross-attn)
-    "chronos2":     ModelArch(d_model=512,  d_ff=2048, patch_size=16, seq_type="enc_dec",
-                              n_enc_layers=6,  n_dec_layers=6),
-    "chronos_bolt": ModelArch(d_model=512,  d_ff=2048, patch_size=32, seq_type="enc_dec",
-                              n_enc_layers=6,  n_dec_layers=6, max_window=2048),
-    # Encoder over the [context; masked-horizon] sequence
-    "moirai":       ModelArch(d_model=384,  d_ff=1024, patch_size=16, seq_type="unified",
-                              n_enc_layers=6),
+    # Chronos2 is a 12-block encoder over context + future patches. Every block
+    # has time attention, group attention, and one FFN. GiftEval inference keeps
+    # series independent, so group attention has group size one but still pays
+    # its Q/K/V/O projections. Values are from the shipped checkpoint configs.
+    "chronos2":     ModelArch(d_model=768,  d_ff=3072, patch_size=16, seq_type="chronos2",
+                              n_enc_layers=12, output_quantiles=21),
+    # Chronos-Bolt Base: T5 encoder-decoder with a single decoder query producing
+    # one direct 64-step block. Longer horizons recurse in 64-step blocks and
+    # expand later calls over nine quantile histories.
+    "chronos_bolt": ModelArch(d_model=768,  d_ff=3072, patch_size=16, seq_type="chronos_bolt",
+                              n_enc_layers=12, n_dec_layers=12, max_window=2048,
+                              output_quantiles=9),
+    # Moirai 2.0 emits four 16-sample prediction tokens (64 samples) per call.
+    # Longer horizons recursively branch over nine quantile histories. Its FFN
+    # is gated (three matrices), unlike the two-matrix generic Transformer FFN.
+    "moirai":       ModelArch(d_model=384,  d_ff=1024, patch_size=16, seq_type="moirai2",
+                              n_enc_layers=6, max_window=8192, output_quantiles=9),
     "moirai_1_1":   ModelArch(d_model=384,  d_ff=1024, patch_size=32, seq_type="unified",
                               n_enc_layers=6),
     # Stacked decoder over context patches (intermediate_size == d_model for TimesFM-2.5)
@@ -340,7 +350,7 @@ MODEL_ARCH: Dict[str, ModelArch] = {
     "patchtst_fm":  ModelArch(d_model=1024, d_ff=4096, patch_size=16, seq_type="unified",
                               n_enc_layers=20),
     # Decoder-only patch LM (context capped at 2880; see SUNDIAL_MAX_CONTEXT)
-    "sundial":      ModelArch(d_model=768,  d_ff=3072, patch_size=16, seq_type="unified",
+    "sundial":      ModelArch(d_model=768,  d_ff=3072, patch_size=16, seq_type="sundial",
                               n_enc_layers=12, max_window=2880),
     # Decoder-only MoE (top-2 of 8 experts active per token; ctx+horizon <= 4096)
     "timemoe":      ModelArch(d_model=768,  d_ff=3072, patch_size=1,  seq_type="unified",
@@ -351,24 +361,59 @@ MODEL_ARCH: Dict[str, ModelArch] = {
     # installed checkpoint before trusting its FLOPs column.
     "toto":         ModelArch(d_model=1024, d_ff=2736, patch_size=32, seq_type="unified",
                               n_enc_layers=24, max_window=4096),
-    # IBM Granite FlowState (r1.1). SSM encoder + functional-basis decoder, so its
-    # *true* cost is LINEAR in context — the attention-based proxy below therefore
-    # OVERSTATES it at long windows (keeps a spurious L^2 term). d_model/patch from
-    # config.json (512 / 6); d_ff is unset there, estimated at 4*d_model. max_window
-    # mirrors the FLOWSTATE_MAX_CONTEXT label cap. Treat its FLOPs column as a loose
-    # upper bound, not a faithful SSM count.
-    "flowstate":    ModelArch(d_model=512,  d_ff=2048, patch_size=6,  seq_type="unified",
-                              n_enc_layers=6,  max_window=4096),
-    # NX-AI TiRex (~35M). xLSTM (recurrent) blocks, so its *true* cost is LINEAR
-    # in context — the attention proxy below OVERSTATES it at long windows (keeps
-    # a spurious L^2 term), same caveat as FlowState. No external config.json
-    # (arch is inside model.ckpt), so d_model/d_ff/patch/layers are ESTIMATES.
-    # max_window = TiRex2's 8192 pretraining context (TiRex-1 was 2048), mirroring
-    # the TIREX_MAX_CONTEXT label cap. Treat its FLOPs column as a loose upper
-    # bound, and re-confirm the arch against the checkpoint.
-    "tirex":        ModelArch(d_model=512,  d_ff=2048, patch_size=32, seq_type="unified",
-                              n_enc_layers=12, max_window=8192),
+    # IBM Granite FlowState r1.1. The encoder consumes every raw time step (it is
+    # not patchified); decoder_patch_len=6 describes output sampling only. The
+    # checkpoint has a 512->1024 gated MLP in each of six S5/FFT layers and a
+    # 256-wide, nine-quantile functional-basis decoder.
+    "flowstate":    ModelArch(d_model=512,  d_ff=1024, patch_size=6, seq_type="flowstate",
+                              n_enc_layers=6, max_window=4096,
+                              output_quantiles=9, decoder_dim=256),
+    # NX-AI TiRex2 (82.5M parameters). The public forecast path always pads or
+    # truncates to its complete 8192-context + 928-future grid, then applies
+    # sign-flip TTA. Therefore selected context length does not change backbone
+    # work; horizons above 928 require additional complete forecast calls.
+    "tirex":        ModelArch(d_model=512,  d_ff=2048, patch_size=32, seq_type="tirex",
+                              n_enc_layers=12, max_window=8192,
+                              output_quantiles=9),
 }
+
+# Family defaults above are insufficient for differently-sized checkpoints in
+# the same family.  These exact-id overrides are audited against the shipped
+# checkpoint configs on the experiment server.  Keep this table explicit: a
+# substring such as ``chronos-2`` must never silently price Small as Base.
+MODEL_ARCH_BY_ID: Dict[str, ModelArch] = {
+    "autogluon/chronos-2-small": ModelArch(
+        d_model=512, d_ff=2048, patch_size=16, seq_type="chronos2",
+        n_enc_layers=6, output_quantiles=13),
+    "autogluon/chronos-2-synth": ModelArch(
+        d_model=768, d_ff=3072, patch_size=16, seq_type="chronos2",
+        n_enc_layers=12, output_quantiles=13),
+    "autogluon/chronos-2": ModelArch(
+        d_model=768, d_ff=3072, patch_size=16, seq_type="chronos2",
+        n_enc_layers=12, output_quantiles=21),
+    "amazon/chronos-bolt-small": ModelArch(
+        d_model=512, d_ff=2048, patch_size=16, seq_type="chronos_bolt",
+        n_enc_layers=6, n_dec_layers=6, max_window=2048,
+        output_quantiles=9),
+    "amazon/chronos-bolt-base": ModelArch(
+        d_model=768, d_ff=3072, patch_size=16, seq_type="chronos_bolt",
+        n_enc_layers=12, n_dec_layers=12, max_window=2048,
+        output_quantiles=9),
+}
+
+
+def resolve_model_arch(model_id: str) -> Optional[ModelArch]:
+    """Resolve exact checkpoint metadata before falling back to a family spec."""
+    key = str(model_id).lower()
+    exact = MODEL_ARCH_BY_ID.get(key)
+    if exact is None:
+        # Most reports store the stable display label, while inference receives
+        # the Hugging Face id. Resolve both to the same checkpoint-specific spec.
+        spec = next((item for item in models_config.CATALOG
+                     if item.display.lower() == key), None)
+        if spec is not None:
+            exact = MODEL_ARCH_BY_ID.get(spec.model_id.lower())
+    return exact if exact is not None else MODEL_ARCH.get(infer_model_family(model_id))
 
 
 # Patch sizes exposed for the --patch-sizes CLI override / printout.  Derived
@@ -426,6 +471,156 @@ def _layer_macs(L: int, d: int, f: int, mem: int = 0, experts: int = 1) -> float
     return proj + self_attn + ffn + cross
 
 
+def _chronos2_macs(context: int, horizon: int, arch: ModelArch, patch_size: int) -> float:
+    """MACs for independent-series Chronos2 inference (checkpoint-faithful)."""
+    n_ctx = _n_patches(context, patch_size)
+    n_hor = _n_patches(horizon, patch_size)
+    length = n_ctx + 1 + n_hor  # context, REG token, masked future patches
+    d, f = arch.d_model, arch.d_ff
+    # Base layer = time attention + FFN. Group size is one, hence another set of
+    # projections and only a length*1 attention product.
+    per_layer = _layer_macs(length, d, f) + 4.0 * length * d * d + 2.0 * length * d
+    input_dim = 3 * patch_size
+    input_embed = length * (input_dim * f + f * d + input_dim * d)
+    output_dim = arch.output_quantiles * patch_size
+    output_head = n_hor * (d * f + f * output_dim + d * output_dim)
+    return float(arch.n_enc_layers * per_layer + input_embed + output_head)
+
+
+def _chronos_bolt_macs(context: int, horizon: int, arch: ModelArch, patch_size: int) -> float:
+    """MACs for direct 64-step Chronos-Bolt blocks, including long-horizon recursion."""
+    block_length = 64
+    n_blocks = max(1, math.ceil(horizon / block_length))
+    d, f = arch.d_model, arch.d_ff
+    total = 0.0
+    for block in range(n_blocks):
+        # After the first block the pipeline follows each of nine quantile
+        # histories independently before reducing them back to nine quantiles.
+        multiplicity = 1 if block == 0 else 9
+        block_context = min(arch.max_window, context + block * block_length)
+        n_ctx = _n_patches(block_context, patch_size)
+        encoder = arch.n_enc_layers * _layer_macs(n_ctx, d, f)
+        decoder = arch.n_dec_layers * _layer_macs(1, d, f, mem=n_ctx)
+        input_dim = 2 * patch_size
+        input_embed = n_ctx * (input_dim * f + f * d + input_dim * d)
+        output_dim = arch.output_quantiles * block_length
+        output_head = d * f + f * output_dim + d * output_dim
+        total += multiplicity * (encoder + decoder + input_embed + output_head)
+    return float(total)
+
+
+def _sundial_flow_macs(arch: ModelArch) -> float:
+    """One 100-sample, 50-step Sundial TimeFlow call (always emits 720 values)."""
+    d = arch.d_model
+    output = 720
+    depth = 3
+    one_net = (
+        output * d                       # noisy target projection
+        + 256 * d + d * d               # timestep embedding MLP
+        + d * d                         # condition projection
+        + depth * 5 * d * d             # residual MLP + AdaLN modulation
+        + 2 * d * d + d * output        # final AdaLN + output projection
+    )
+    return float(100 * 50 * one_net)
+
+
+def _sundial_macs(context: int, horizon: int, arch: ModelArch, patch_size: int) -> float:
+    """Sundial context Transformer plus its dominant fixed-cost TimeFlow sampler."""
+    n_ctx = _n_patches(context, patch_size)
+    transformer = arch.n_enc_layers * _layer_macs(
+        n_ctx, arch.d_model, arch.d_ff)
+    input_dim = 2 * patch_size
+    embedding = n_ctx * (
+        input_dim * arch.d_ff + arch.d_ff * arch.d_model
+        + input_dim * arch.d_model)
+    flow_blocks = max(1, math.ceil(horizon / 720))
+    return float(transformer + embedding + flow_blocks * _sundial_flow_macs(arch))
+
+
+def _moirai2_macs(
+    context: int, horizon: int, arch: ModelArch, patch_size: int,
+) -> float:
+    """Moirai 2.0 MAC proxy including its recursive quantile-path expansion."""
+    samples_per_call = 4 * patch_size
+    n_calls = max(1, math.ceil(horizon / samples_per_call))
+    d, f = arch.d_model, arch.d_ff
+    total = 0.0
+    for call in range(n_calls):
+        # Four prediction tokens are appended. The first call is batched once;
+        # recursive calls follow all nine quantile histories independently.
+        length = min(
+            512,
+            _n_patches(context + call * samples_per_call, patch_size) + 4,
+        )
+        multiplicity = 1 if call == 0 else arch.output_quantiles
+        projections = 4.0 * length * d * d
+        attention = 2.0 * length * length * d
+        gated_ffn = 3.0 * length * d * f
+        total += multiplicity * arch.n_enc_layers * (
+            projections + attention + gated_ffn)
+    return float(total)
+
+
+def _tirex_macs(horizon: int, arch: ModelArch, patch_size: int) -> float:
+    """Checkpoint-shape TiRex2 MAC proxy over its fixed native forecast grid."""
+    context_length = 8192
+    future_length = 928
+    length = _n_patches(context_length, patch_size) + _n_patches(
+        future_length, patch_size)
+    d = arch.d_model
+
+    # Input residual MLP: 64 -> 2048 -> 512, plus 64 -> 512.
+    input_width = 2 * patch_size
+    input_head = length * (
+        input_width * 2048 + 2048 * d + input_width * d)
+
+    # Six mLSTM and six sLSTM blocks. Constants below are the shipped matrix
+    # shapes, including time mixing, gated time FFN, variate attention and the
+    # variate FFN. Elementwise recurrent operations remain outside this proxy.
+    time_ffn = 3 * d * 1408
+    variate_stack = 4 * d * d + 2 * d * 2048
+    mlstm_time = (
+        2 * 256 * d + 3 * d * d + 2 * 4 * d + d * 1024 + time_ffn)
+    slstm_time = 524288 + d * 1024 + time_ffn
+    blocks = length * 6 * (
+        mlstm_time + slstm_time + 2 * variate_stack)
+
+    # Direct nine-quantile, 32-sample output head with a residual projection.
+    output_width = arch.output_quantiles * patch_size
+    output_head = length * (
+        d * 2048 + 2048 * output_width + d * output_width)
+    one_backbone_pass = input_head + blocks + output_head
+
+    # Sign-flip TTA evaluates both x and -x. Forecasts beyond the checkpoint's
+    # native 928 samples autoregress through another full native-grid call.
+    tta_passes = 2
+    chunks = max(1, math.ceil(horizon / future_length))
+    return float(tta_passes * chunks * one_backbone_pass)
+
+
+def _flowstate_macs(context: int, horizon: int, arch: ModelArch) -> float:
+    """FlowState r1.1 S5/FFT encoder plus functional-basis decoder MAC proxy.
+
+    FlowState embeds each raw observation, rather than context/6 patches. Each
+    checkpoint layer has complex B/C state projections, an output gate, and
+    three gated-MLP matrices. FFT constants are approximate, but the resulting
+    O(L log L) scaling is faithful and, crucially, contains no Transformer L^2.
+    """
+    length = max(1, int(context))
+    d, f = arch.d_model, arch.d_ff
+    embedding = 2.0 * length * d  # value + missingness flag -> d_model
+    state_projections = 2.0 * length * d * d  # B and C projections
+    output_gate = length * d * d
+    gated_mlp = 3.0 * length * d * f
+    # Two forward FFTs and one inverse FFT over a zero-padded 2L sequence.
+    fft = 6.0 * length * math.log2(max(2, 2 * length)) * d
+    encoder = arch.n_enc_layers * (
+        state_projections + output_gate + gated_mlp + fft)
+    decoder_linear = d * arch.output_quantiles * arch.decoder_dim
+    decoder_basis = arch.output_quantiles * max(1, horizon) * arch.decoder_dim
+    return float(embedding + encoder + decoder_linear + decoder_basis)
+
+
 def theoretical_flops(
     model_id: str,
     context: int,
@@ -438,18 +633,18 @@ def theoretical_flops(
     experts, so both the linear (projection + FFN) and quadratic (attention)
     cost terms are represented.  Comparable as a within-model ratio across
     context sizes, and — being a real MAC estimate — roughly comparable across
-    models too (still a proxy: ignores embeddings/norms/heads and kernel
-    constants).
+    models too (still a proxy: omits some embeddings/heads, norms, elementwise
+    operations, and exact kernel constants).
 
       enc_dec  (chronos2, chronos_bolt): encoder over n_ctx + decoder over
                                          n_hor with cross-attn to the context.
-      unified  (moirai, timesfm, patchtst_fm, sundial, timemoe): single stack
+      unified  (timesfm, patchtst_fm, timemoe): single stack
                                          over n_ctx + n_hor tokens.
 
     Families without a spec fall back to the legacy attention-only proxy.
     """
     family = infer_model_family(model_id)
-    arch = MODEL_ARCH.get(family)
+    arch = resolve_model_arch(model_id)
     if arch is None:
         # Legacy attention-only fallback for unknown families.
         P = patch_sizes.get(family, 1)
@@ -458,6 +653,18 @@ def theoretical_flops(
         return float(n_ctx ** 2 + n_ctx * n_hor)
 
     P = patch_sizes.get(family, arch.patch_size)
+    if arch.seq_type == "chronos2":
+        return _chronos2_macs(context, horizon, arch, P)
+    if arch.seq_type == "chronos_bolt":
+        return _chronos_bolt_macs(context, horizon, arch, P)
+    if arch.seq_type == "sundial":
+        return _sundial_macs(context, horizon, arch, P)
+    if arch.seq_type == "moirai2":
+        return _moirai2_macs(context, horizon, arch, P)
+    if arch.seq_type == "tirex":
+        return _tirex_macs(horizon, arch, P)
+    if arch.seq_type == "flowstate":
+        return _flowstate_macs(context, horizon, arch)
     n_ctx = _n_patches(context, P)
     n_hor = _n_patches(horizon, P)
     d, f = arch.d_model, arch.d_ff
@@ -711,16 +918,21 @@ def _instance_oracle_from_cache(
 
     candidates = np.column_stack([direct, native])
     finite = np.isfinite(candidates)
-    if not finite.any(axis=1).all():
+    has_candidate = finite.any(axis=1)
+    if not has_candidate.any():
         return None
+    # Undefined seasonal-naive denominators legitimately make MASE unavailable
+    # for a subset of GiftEval rows.  Keep those rows masked instead of rejecting
+    # the entire aligned cohort and silently falling back to aggregate metrics
+    # whose served-instance set can vary by window.
     oracle_idx = np.argmin(np.where(finite, candidates, np.inf), axis=1)
     rows = np.arange(n_instances)
-    oracle_values = candidates[rows, oracle_idx]
-    oracle_windows = np.where(
-        oracle_idx < len(window_grid),
-        window_grid[np.minimum(oracle_idx, len(window_grid) - 1)],
-        -1,
-    )
+    oracle_values = np.full(n_instances, np.nan, dtype=np.float64)
+    oracle_values[has_candidate] = candidates[
+        rows[has_candidate], oracle_idx[has_candidate]]
+    oracle_windows = np.full(n_instances, -1, dtype=np.int64)
+    chose_grid = has_candidate & (oracle_idx < len(window_grid))
+    oracle_windows[chose_grid] = window_grid[oracle_idx[chose_grid]]
     exact = "mase_gluonts_proxy" not in sources
     return {
         "comparable_curve": curve,
@@ -731,7 +943,8 @@ def _instance_oracle_from_cache(
         if np.any(oracle_windows >= 0) else float("nan"),
         "instance_oracle_window_median": float(np.median(oracle_windows[oracle_windows >= 0]))
         if np.any(oracle_windows >= 0) else float("nan"),
-        "instance_oracle_native_count": int(np.sum(oracle_idx == len(window_grid))),
+        "instance_oracle_native_count": int(np.sum(
+            has_candidate & (oracle_idx == len(window_grid)))),
         "instance_oracle_metric_exact": exact,
         "instance_oracle_metric_source": mase_metric if exact else "mase_gluonts_proxy",
     }

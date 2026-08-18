@@ -143,6 +143,11 @@ BATCH_SIZE   = 32
 # [MIN_CONTEXT, MAX_WINDOW]. The ACTUAL ratio (context/parameter) is what gets
 # plotted, so clamped points appear at their true position.
 RATIO_GRID = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]
+# Delay, horizon, and SNR are deliberately probed farther into the long-context
+# regime.  The ordinary grid already answers the short-to-medium question;
+# these extensions distinguish a late plateau from a genuinely long tail.
+LONG_TAIL_EXPERIMENTS = frozenset({"delay", "horizon", "snr"})
+LONG_TAIL_RATIO_GRID = RATIO_GRID + [24.0, 32.0, 48.0, 64.0]
 
 # Non-`horizon` experiments: forecast once at MAX_EVAL_HORIZON, slice at each h.
 EVAL_HORIZONS    = [16, 64, 256]
@@ -504,8 +509,10 @@ def resolve_bins(experiment: str, test: bool) -> List[Bin]:
     return bins[:2] if test else bins
 
 
-def resolve_ratios(test: bool) -> List[float]:
-    return TEST_RATIO_GRID if test else RATIO_GRID
+def resolve_ratios(experiment: str, test: bool) -> List[float]:
+    if test:
+        return TEST_RATIO_GRID
+    return LONG_TAIL_RATIO_GRID if experiment in LONG_TAIL_EXPERIMENTS else RATIO_GRID
 
 
 def _context_cap(family: str, horizon: int) -> int:
@@ -548,7 +555,7 @@ def run_cell(
     test: bool,
 ) -> None:
     bins = resolve_bins(experiment, test)
-    ratios = resolve_ratios(test)
+    ratios = resolve_ratios(experiment, test)
     per_bin_h = experiment == "horizon"
     eval_hs = [-1] if per_bin_h else EVAL_HORIZONS   # -1 → each bin's own horizon
     n_bins, n_ratios, n_h = len(bins), len(ratios), len(eval_hs)
@@ -700,10 +707,117 @@ def _load_cell(display: str, experiment: str):
 
 def _mean_sem(per_series: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """(n_series, n_ratios) → mean and SEM over series, NaN-safe."""
-    mean = np.nanmean(per_series, axis=0)
     n = np.sum(np.isfinite(per_series), axis=0)
-    sem = np.nanstd(per_series, axis=0) / np.sqrt(np.maximum(n, 1))
+    mean = np.divide(
+        np.nansum(per_series, axis=0), n,
+        out=np.full(per_series.shape[1:], np.nan, dtype=np.float64),
+        where=n > 0)
+    squared = (per_series - mean[None, ...]) ** 2
+    variance = np.divide(
+        np.nansum(squared, axis=0), n,
+        out=np.full(per_series.shape[1:], np.nan, dtype=np.float64),
+        where=n > 0)
+    sem = np.sqrt(variance) / np.sqrt(np.maximum(n, 1))
     return mean, sem
+
+
+def _terminal_context_is_clamped(contexts: np.ndarray) -> bool:
+    """True when the final requested ratios repeat an attainable context."""
+    valid = np.asarray(contexts)[np.asarray(contexts) >= 0]
+    return bool(len(valid) >= 2 and np.any(np.diff(valid[-4:]) == 0))
+
+
+def _closest_agreement_window(lines) -> Optional[Tuple[float, float, float]]:
+    """Return a three-point window around the lowest cross-curve spread.
+
+    At every attainable normalized-context value, curves are compared after
+    log-linear interpolation (never extrapolation).  The centre is the point
+    with the smallest mean pairwise absolute difference; its immediate
+    One predecessor and two successors on the pooled attainable grid form the
+    inset, giving a little additional room to inspect what happens after the
+    closest-agreement point.
+    """
+    prepared = []
+    for x, y in lines:
+        valid = np.isfinite(x) & np.isfinite(y) & (x > 0)
+        if not np.any(valid):
+            continue
+        x, y = x[valid], y[valid]
+        unique_x = np.unique(x)
+        unique_y = np.array([np.nanmean(y[x == value]) for value in unique_x])
+        if len(unique_x):
+            prepared.append((unique_x, unique_y))
+    if not prepared:
+        return None
+
+    candidates = np.unique(np.concatenate([x for x, _ in prepared]))
+    spreads = np.full(len(candidates), np.nan, dtype=float)
+    for idx, candidate in enumerate(candidates):
+        values = []
+        for x, y in prepared:
+            if x[0] <= candidate <= x[-1]:
+                values.append(float(np.interp(np.log2(candidate), np.log2(x), y)))
+        if len(values) >= 2:
+            values = np.asarray(values)
+            spreads[idx] = float(np.mean(np.abs(values[:, None] - values[None, :])))
+    finite = np.flatnonzero(np.isfinite(spreads))
+    if not len(finite):
+        return None
+    centre_idx = int(finite[np.argmin(spreads[finite])])
+    return (float(candidates[max(0, centre_idx - 1)]),
+            float(candidates[centre_idx]),
+            float(candidates[min(len(candidates) - 1, centre_idx + 2)]))
+
+
+def _add_clamped_tail_inset(ax, lines) -> None:
+    """Zoom around the point of closest agreement, with one point either side."""
+    inset = ax.inset_axes([0.57, 0.53, 0.40, 0.40])
+    plotted_y = []
+    prepared = []
+    for x, mean, sem, color, clamped in lines:
+        valid = np.isfinite(x) & np.isfinite(mean)
+        x, mean, sem = x[valid], mean[valid], sem[valid]
+        if not len(x):
+            continue
+        unique_x = np.unique(x)
+        unique_mean = np.array([
+            np.nanmean(mean[x == value]) for value in unique_x])
+        unique_sem = np.array([
+            np.nanmean(sem[x == value]) for value in unique_x])
+        x, mean, sem = unique_x, unique_mean, unique_sem
+        prepared.append((x, mean, sem, color))
+    if not prepared:
+        return
+    window = _closest_agreement_window([(x, mean) for x, mean, _, _ in prepared])
+    if window is None:
+        return
+    zoom_min, _, zoom_max = window
+    for x, mean, sem, color in prepared:
+        keep = ((x >= zoom_min * (1 - 1e-12))
+                & (x <= zoom_max * (1 + 1e-12)))
+        tx, ty, ts = x[keep], mean[keep], sem[keep]
+        if not len(tx):
+            continue
+        inset.plot(tx, ty, marker="o", ms=2, lw=1.1, color=color)
+        inset.fill_between(tx, ty - ts, ty + ts, color=color, alpha=0.14, lw=0)
+        plotted_y.extend([ty - ts, ty + ts])
+    finite = np.concatenate([
+        values[np.isfinite(values)] for values in plotted_y
+        if np.isfinite(values).any()
+    ]) if plotted_y else np.array([])
+    if len(finite):
+        low, high = float(np.min(finite)), float(np.max(finite))
+        pad = max((high - low) * 0.12,
+                  max(abs(low), abs(high), 1.0) * 0.015)
+        inset.set_ylim(low - pad, high + pad)
+    inset.set_xscale("log", base=2)
+    inset.grid(alpha=0.18)
+    inset.tick_params(labelsize=6, length=2)
+    inset.set_title("closest-agreement zoom", fontsize=7, pad=2)
+    inset.set_facecolor((1, 1, 1, 0.94))
+    for spine in inset.spines.values():
+        spine.set_color("#6B7280")
+        spine.set_linewidth(0.8)
 
 
 def plot_model_experiment(display: str, experiment: str, plots_dir: str) -> bool:
@@ -732,6 +846,10 @@ def plot_model_experiment(display: str, experiment: str, plots_dir: str) -> bool
         n_rows, n_cols, figsize=(4.6 * n_cols, 3.6 * n_rows),
         squeeze=False, sharex=True)
     cmap = plt.get_cmap("viridis")
+    inset_lines = {(row, col): [] for row in range(n_rows)
+                   for col in range(n_cols)}
+    inset_needed = {(row, col): False for row in range(n_rows)
+                    for col in range(n_cols)}
 
     for h_idx, hh in enumerate(eval_hs):
         for b_idx, bn in enumerate(bins):
@@ -752,6 +870,11 @@ def plot_model_experiment(display: str, experiment: str, plots_dir: str) -> bool
             ax.plot(x, mean[mask], marker="o", ms=3, color=color, label=label)
             ax.fill_between(x, (mean - sem)[mask], (mean + sem)[mask],
                             color=color, alpha=0.15, lw=0)
+            inset_lines[(row, h_idx)].append(
+                (x, mean[mask], sem[mask], color,
+                 _terminal_context_is_clamped(contexts[b_idx])))
+            if _terminal_context_is_clamped(contexts[b_idx]):
+                inset_needed[(row, h_idx)] = True
             if experiment == "ar_order" and h_idx == 0:
                 ax.set_ylabel(f"tau={bn['kwargs']['tau']}\nMAE (z-scored)")
 
@@ -767,12 +890,20 @@ def plot_model_experiment(display: str, experiment: str, plots_dir: str) -> bool
                 ax.set_xlabel(f"context / {symbol}")
             if col == 0 and experiment != "ar_order":
                 ax.set_ylabel("MAE (z-scored)")
+            if inset_needed[(row, col)]:
+                _add_clamped_tail_inset(ax, inset_lines[(row, col)])
     # De-duplicated legend on the first axis (ar_order repeats labels per tau).
     handles, labels = axes[0][0].get_legend_handles_labels()
     uniq = dict(zip(labels, handles))
-    axes[0][0].legend(uniq.values(), uniq.keys(), fontsize=8)
+    has_insets = any(inset_needed.values())
+    if has_insets:
+        fig.legend(uniq.values(), uniq.keys(), fontsize=8, frameon=False,
+                   loc="outside lower center",
+                   ncol=min(6, max(1, len(uniq))))
+    else:
+        axes[0][0].legend(uniq.values(), uniq.keys(), fontsize=8)
     fig.suptitle(f"{display} — {experiment} ({desc})")
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.tight_layout(rect=(0, 0.10 if has_insets else 0, 1, 0.96))
 
     out = os.path.join(plots_dir, experiment, f"{display}.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)

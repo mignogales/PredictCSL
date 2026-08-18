@@ -817,7 +817,8 @@ def main() -> None:
         rollup += ["--run-dir", os.path.join(ablation_root, "general_v3"),
                    "--output-dir", os.path.join(ablation_root, "general_all"),
                    "--plot-strategies", "pred_cheap", "pred_mamba",
-                   "pred_cheap_instance", "pred_mamba_instance"]
+                   "pred_cheap_instance", "pred_mamba_instance",
+                   "pred_ensemble_instance"]
         if args.models:
             rollup += ["--models", *args.models]
         _run(rollup, "Phase 7 — combined cross-predictor overview")

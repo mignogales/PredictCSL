@@ -30,6 +30,7 @@ from experiments.compare_window_strategies_gifteval import (
     compute_flops_savings,
     compute_summary_stats,
     load_strategy_records,
+    resolve_model_arch,
     discover_period_tree,
     theoretical_flops,
 )
@@ -736,6 +737,9 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
             records.append({**common, "method": "mamba_curve_instance",
                             "method_kind": "predictor_instance",
                             "policy_scope": "instance_native", "mase_gluonts": 1.5})
+            records.append({**common, "method": "ensemble_curve_instance",
+                            "method_kind": "predictor_instance",
+                            "policy_scope": "instance_native", "mase_gluonts": 1.1})
             audit_dir = os.path.join(root, "combined", "cells")
             os.makedirs(audit_dir)
             np.savez_compressed(
@@ -746,6 +750,9 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
                 mamba_curve_instance__mase=np.asarray([1.25, 1.75]),
                 mamba_curve_instance__window=np.asarray([32, 64]),
                 mamba_curve_instance__valid_count=np.ones(2),
+                ensemble_curve_instance__mase=np.asarray([1.0, 1.2]),
+                ensemble_curve_instance__window=np.asarray([32, 64]),
+                ensemble_curve_instance__valid_count=np.ones(2),
                 full_native__mase=np.asarray([2.0, 2.0]),
                 native_effective_context=np.asarray([80, 80]),
             )
@@ -759,6 +766,9 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
                 root, model, "strategy_comparison_v4_instance")
             v3 = pd.read_csv(os.path.join(v3_dir, "comparison.csv"))
             v4 = pd.read_csv(os.path.join(v4_dir, "comparison.csv"))
+            ensemble = pd.read_csv(os.path.join(
+                root, model, "strategy_comparison_ensemble_instance",
+                "comparison.csv"))
             details = pd.read_csv(os.path.join(v3_dir, "instance_details.csv"))
             expected_reports = (
                 "bar_aggregate_mase_gluonts.png",
@@ -778,6 +788,9 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
 
         self.assertAlmostEqual(v3.loc[0, "pred_mase"], 1.25)
         self.assertAlmostEqual(v4.loc[0, "pred_mase"], 1.5)
+        self.assertAlmostEqual(ensemble.loc[0, "pred_mase"], 1.1)
+        self.assertEqual(v3.loc[0, "instance_policy_version"], 3)
+        self.assertAlmostEqual(v3.loc[0, "instance_weight"], 0.25)
         self.assertEqual(v3.loc[0, "pred_policy_scope"], "instance_native")
         self.assertTrue(np.isfinite(v3.loc[0, "pred_flops"]))
         self.assertTrue(np.isfinite(details.loc[0, "selected_flops_estimate"]))
@@ -833,6 +846,12 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
 
         self.assertTrue(records)
         self.assertNotIn(99.0, [record["mase_gluonts"] for record in records])
+        predicted = next(
+            record for record in records
+            if record["method"] == "cheap_curve_instance")
+        self.assertFalse(predicted["selection_eligible"])
+        self.assertAlmostEqual(predicted["mase_gluonts"], 2.0)
+        self.assertEqual(predicted["n_native_selected"], 2)
 
     def test_comparable_curve_carries_forward_previous_window(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -862,6 +881,35 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
         np.testing.assert_allclose(result["comparable_curve"], [4.0, 3.0])
         self.assertAlmostEqual(result["instance_oracle_mase"], 2.5)
         self.assertTrue(result["instance_oracle_metric_exact"])
+
+    def test_comparable_curve_masks_rows_with_undefined_mase(self) -> None:
+        """One zero seasonal denominator must not reject the entire cohort."""
+        with tempfile.TemporaryDirectory() as root:
+            base = os.path.join(
+                root, "datasets", "Example", "Chronos2-Small", "tshort")
+
+            def save(window, values):
+                path = os.path.join(base, f"w{window}")
+                os.makedirs(path)
+                np.savez_compressed(
+                    os.path.join(path, "per_sample_metrics.npz"),
+                    mase_gluonts_real=np.asarray(values, dtype=float),
+                    valid_count=np.ones(2, dtype=np.int32),
+                    served_index=np.arange(2, dtype=np.int32),
+                )
+
+            save(32, [1.0, np.nan])
+            save(64, [2.0, np.nan])
+            save("full_native", [3.0, np.nan])
+
+            result = _instance_oracle_from_cache(
+                root, "Example", "Chronos2-Small", "short",
+                np.array([32, 64]), np.array([True, True]), 2,
+                "mase_gluonts_real")
+
+        self.assertIsNotNone(result)
+        np.testing.assert_allclose(result["comparable_curve"], [1.0, 2.0])
+        self.assertAlmostEqual(result["instance_oracle_mase"], 1.0)
 
     def test_discovery_includes_complete_gifteval_cohort(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -928,6 +976,38 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
         np.testing.assert_array_equal(selected_w, [80, 48])
         np.testing.assert_array_equal(selected_native, [True, True])
 
+    def test_unsupported_last_score_cannot_masquerade_as_native(self) -> None:
+        windows = np.array([32, 64])
+        errors = np.array([[2.0, np.nan]])
+        scores = np.array([[0.0, -10.0]])
+        native = np.array([1.0])
+        native_w = np.array([48])
+
+        selected, selected_w, selected_native = (
+            instance_eval._choose_scores_with_native(
+                scores, errors, windows, native, native_w,
+                native_score_supported=False))
+
+        np.testing.assert_allclose(selected, [2.0])
+        np.testing.assert_array_equal(selected_w, [32])
+        np.testing.assert_array_equal(selected_native, [False])
+
+    def test_regularized_scores_shrink_toward_cell_consensus(self) -> None:
+        scores = np.array([
+            [0.0, 2.0],
+            [2.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 0.0],
+        ])
+
+        regularized = instance_eval._regularize_scores(scores, 0.25)
+
+        expected = 0.25 * scores + 0.75 * scores.mean(axis=0, keepdims=True)
+        np.testing.assert_allclose(regularized, expected)
+        self.assertEqual(int(np.argmin(regularized[0])), 1)
+        with self.assertRaisesRegex(ValueError, "\[0, 1\]"):
+            instance_eval._regularize_scores(scores, 1.1)
+
     def test_instance_record_uses_gifteval_valid_count_weights(self) -> None:
         cell = instance_eval.Cell(
             "Chronos2-Small", "Example", "short", "unused.npz")
@@ -960,6 +1040,42 @@ class PerInstanceWindowEvaluationTest(unittest.TestCase):
         np.testing.assert_allclose(selected, [1.0, 3.0])
         np.testing.assert_array_equal(selected_w, [128, 64])
         self.assertFalse(fallback.any())
+
+    def test_shared_score_window_clamps_unsupported_prediction(self) -> None:
+        selected = instance_eval._shared_score_window(
+            scores=np.array([[1.0, 0.0, -10.0], [1.0, 0.0, -9.0]]),
+            windows=np.array([32, 64, 128]),
+            valid_windows=np.array([True, True, False]),
+        )
+
+        self.assertEqual(selected, 64)
+
+    def test_bounded_shared_score_window_limits_aggressive_shortening(self) -> None:
+        selected = instance_eval._bounded_shared_score_window(
+            scores=np.array([
+                [-10.0, 2.0, 3.0, 4.0, 5.0],
+                [-9.0, 2.0, 3.0, 4.0, 5.0],
+            ]),
+            windows=np.array([32, 64, 128, 256, 512]),
+            valid_windows=np.array([True, True, True, True, True]),
+            max_backoff_steps=2,
+        )
+
+        self.assertEqual(selected, 128)
+
+    def test_bounded_shared_score_window_counts_only_valid_actions(self) -> None:
+        selected = instance_eval._bounded_shared_score_window(
+            scores=np.array([[0.0, 1.0, 2.0, 3.0, 4.0]]),
+            windows=np.array([32, 64, 128, 256, 512]),
+            valid_windows=np.array([True, False, True, False, True]),
+            max_backoff_steps=1,
+        )
+
+        self.assertEqual(selected, 128)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            instance_eval._bounded_shared_score_window(
+                np.zeros((1, 2)), np.array([32, 64]),
+                np.array([True, True]), max_backoff_steps=-1)
 
     def test_per_instance_mase_ignores_missing_horizon_points(self) -> None:
         forecast = ForecastResult(median=torch.tensor([
@@ -1208,6 +1324,31 @@ class AblationDynamicBatchTest(unittest.TestCase):
         self.assertEqual(size, 4)
 
 class PeriodStrategyAccountingTest(unittest.TestCase):
+    def test_flops_proxy_resolves_checkpoint_specific_chronos_architectures(self) -> None:
+        small = resolve_model_arch("autogluon/chronos-2-small")
+        base = resolve_model_arch("autogluon/chronos-2")
+        synth = resolve_model_arch("autogluon/chronos-2-synth")
+
+        self.assertEqual(
+            (small.d_model, small.d_ff, small.n_enc_layers, small.output_quantiles),
+            (512, 2048, 6, 13),
+        )
+        self.assertEqual(
+            (base.d_model, base.d_ff, base.n_enc_layers, base.output_quantiles),
+            (768, 3072, 12, 21),
+        )
+        self.assertEqual(synth.output_quantiles, 13)
+        self.assertLess(
+            theoretical_flops("autogluon/chronos-2-small", 8192, 64, {}),
+            theoretical_flops("autogluon/chronos-2", 8192, 64, {}),
+        )
+
+    def test_flops_proxy_resolves_bolt_small_separately_from_base(self) -> None:
+        small = resolve_model_arch("amazon/chronos-bolt-small")
+        base = resolve_model_arch("amazon/chronos-bolt-base")
+        self.assertEqual((small.d_model, small.n_enc_layers), (512, 6))
+        self.assertEqual((base.d_model, base.n_enc_layers), (768, 12))
+
     def test_period_sidecar_exposes_per_series_windows(self) -> None:
         with tempfile.TemporaryDirectory() as compare_dir:
             stem = "period_Example_tshort_ExampleModel"

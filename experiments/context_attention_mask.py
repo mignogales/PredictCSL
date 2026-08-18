@@ -57,6 +57,7 @@ server (mirroring the existing "verify on the server" notes for toto/tirex).
 from __future__ import annotations
 
 from contextlib import contextmanager
+import math
 from typing import List, Optional
 
 import torch
@@ -83,20 +84,39 @@ def _patchtstfm_patch_len(model) -> int:
         "check the attribute name on the server.")
 
 
+def _patchtstfm_retained_patches(
+    last_timesteps: int,
+    horizon: int,
+    patch_len: int,
+) -> tuple[int, int, int]:
+    """Return retained (context, forecast, total) PatchTST-FM patch counts.
+
+    PatchTST-FM appends ``horizon`` placeholder timesteps *before* patching, so
+    its attention key axis contains both historical and forecast patches.  The
+    forecast patches must not consume the requested historical-context budget.
+    """
+    visible_context = max(1, math.ceil(int(last_timesteps) / int(patch_len)))
+    forecast = max(1, math.ceil(int(horizon) / int(patch_len)))
+    return visible_context, forecast, visible_context + forecast
+
+
 @contextmanager
-def _patchtstfm_mask(model, last_timesteps: int):
+def _patchtstfm_mask(model, last_timesteps: int, horizon: int):
     """Wrap ``make_attn_mask`` so the oldest key patches are also ``-inf``'d.
 
     ``make_attn_mask(query_pad, key_pad)`` returns an additive float mask of shape
     ``(B, n_query, n_key)`` (``-inf`` on padded key positions). We keep only the
-    last ``visible`` patch columns; the leading ``n_key - visible`` columns (which
-    already includes any NaN-pad patches for short series) get ``-inf``.
+    last ``visible_context + forecast`` patch columns. PatchTST-FM appends the
+    forecast slots before patching, so the final forecast patches are preserved
+    in addition to the requested historical context. The leading columns (which
+    already include any NaN-pad patches for short series) get ``-inf``.
     """
     import tsfm_public.models.patchtst_fm.basic as B
     import tsfm_public.models.patchtst_fm.modeling_patchtst_fm as M
 
     patch_len = _patchtstfm_patch_len(model)
-    visible = max(1, int(last_timesteps) // patch_len)   # visible patch tokens
+    _visible_context, _forecast, retained = _patchtstfm_retained_patches(
+        last_timesteps, horizon, patch_len)
     orig = B.make_attn_mask
     # ``modeling`` may hold its own bound reference (``from .basic import ...``);
     # patch whichever name(s) exist so ``decode`` resolves the wrapped version.
@@ -105,7 +125,7 @@ def _patchtstfm_mask(model, last_timesteps: int):
     def wrapped(query_pad, key_pad):
         m = orig(query_pad, key_pad)                     # (B, nq, nk) additive
         n_key = m.shape[-1]
-        cutoff = max(0, n_key - visible)
+        cutoff = max(0, n_key - min(n_key, retained))
         if cutoff > 0:
             m[..., :cutoff] = float("-inf")
         return m
@@ -606,67 +626,72 @@ def _moirai2_mask(handle, last_timesteps: int, full_len: int):
 
 
 def _toto_mask(handle, last_timesteps: int, full_len: int):
-    """Wrap Toto's ``TimeWiseMultiheadAttention`` (causal, time axis) to build/edit
-    a boolean SDPA mask restricting attention to the last ``last_timesteps``.
-    Toto uses ``is_causal`` SDPA (no mask at prefill), so we CONSTRUCT a causal
-    boolean mask with the oldest context columns dropped. NOTE: assumes Toto 2.0's
-    single-pass (CPM) decode; verify patch size + seq layout on the server."""
+    """Restrict Toto 2.0 temporal ``SelfAttention`` to the visible suffix.
+
+    The installed Toto 2.0 API uses ``SelfAttention.forward(state, seq_ids,
+    **kwargs)`` and the additive-mask keyword ``attn_mask``.  The last layer is
+    variate attention and must not receive a temporal visibility mask.  Earlier
+    code targeted an obsolete ``TimeWiseMultiheadAttention`` class and therefore
+    never patched the installed checkpoint.
+
+    Context patches lead the sequence and forecast patches trail it.  Hidden
+    prefix queries retain their causal rows (avoiding all-masked SDPA rows), but
+    every visible-context and forecast query is prevented from reading the
+    oldest context keys.  Rectangular cache/decode masks use the same absolute
+    leading-key cutoff.
+    """
     patch = _config_int(handle, ["patch_size", "input_patch_size", "patch_len"])
     state = {"applied": 0, "saw_none": 0}
 
-    def _hide(seq_len):
-        if patch:
-            n_ctx = max(1, round(int(full_len) / patch))
-            vis = max(1, round(int(last_timesteps) / patch))
-            return max(0, min(seq_len - 1, n_ctx - vis))
-        vis = max(1, round(int(last_timesteps) * seq_len / int(full_len)))
-        return max(0, seq_len - vis)
+    if not patch:
+        raise RuntimeError("Could not resolve Toto patch_size from model config")
+    n_ctx = max(1, int(full_len) // int(patch))
+    visible = max(1, int(last_timesteps) // int(patch))
+    hide = max(0, n_ctx - visible)
 
     def make_wrapper(orig):
         def wrapper(*args, **kwargs):
-            # forward(self, layer_idx, inputs[b,var,seq,emb], attention_mask, kv_cache)
-            inputs = args[1] if len(args) >= 2 else kwargs.get("inputs")
-            m = kwargs.get("attention_mask", None)
-            if m is None and len(args) >= 3:
-                m = args[2]
+            inputs = args[0] if args else kwargs.get("state")
             if not torch.is_tensor(inputs):
                 state["saw_none"] += 1
                 return orig(*args, **kwargs)
-            seq_len = inputs.shape[-2]
-            hide = _hide(seq_len)
             if hide <= 0:
                 return orig(*args, **kwargs)
-            if torch.is_tensor(m) and m.dtype == torch.bool:
-                m = _rect_hide_bool(m.clone(), hide)
-            elif torch.is_tensor(m) and m.is_floating_point():
-                q, kv = m.shape[-2], m.shape[-1]
-                start = max(0, hide - (kv - q))
+            m = kwargs.get("attn_mask")
+            q = int(inputs.shape[-2])
+            kv = int(kwargs.get("kv_read_len") or q)
+            if torch.is_tensor(m):
                 m = m.clone()
-                m[..., start:, :hide] = torch.finfo(m.dtype).min
+                q, kv = int(m.shape[-2]), int(m.shape[-1])
             else:
-                # No mask (is_causal path): build a causal boolean mask (True=attend)
-                # then drop the oldest columns for the visible rows.
-                causal = torch.ones((seq_len, seq_len), dtype=torch.bool,
-                                    device=inputs.device).tril()
-                causal[hide:, :hide] = False
-                m = causal
-            kwargs = {**kwargs, "attention_mask": m}
-            # drop a positional mask if present so our kwarg wins
-            if len(args) >= 3:
-                args = args[:2] + (None,) + args[3:]
+                causal = torch.tril(
+                    torch.ones((q, kv), dtype=torch.bool,
+                               device=inputs.device),
+                    diagonal=kv - q)
+                m = torch.where(
+                    causal,
+                    torch.zeros(1, dtype=inputs.dtype, device=inputs.device),
+                    torch.full((1,), -torch.inf, dtype=inputs.dtype,
+                               device=inputs.device))
+            start = max(0, hide - (kv - q))
+            if m.dtype == torch.bool:
+                m[..., start:, :hide] = False
+            else:
+                m[..., start:, :hide] = -torch.inf
+            kwargs = {**kwargs, "attn_mask": m}
             state["applied"] += 1
             return orig(*args, **kwargs)
         return wrapper
 
     patched = []
     for module in handle.modules():
-        if type(module).__name__ == "TimeWiseMultiheadAttention":
+        if (type(module).__name__ == "SelfAttention"
+                and not bool(getattr(module, "is_variate_layer", False))):
             orig = module.forward
             module.forward = make_wrapper(orig)
             patched.append((module, orig))
     if not patched:
-        raise RuntimeError("No TimeWiseMultiheadAttention on Toto — verify class "
-                           "name against the installed toto2 on the server.")
+        raise RuntimeError("No temporal Toto SelfAttention modules found")
     return patched, state
 
 
@@ -692,6 +717,7 @@ def context_attention_mask(
     model,
     last_timesteps: int,
     full_len: int,
+    horizon: Optional[int] = None,
 ):
     """Restrict a transformer TSFM to attend only to the last ``last_timesteps``.
 
@@ -705,7 +731,11 @@ def context_attention_mask(
         return
 
     if family == "patchtst_fm":
-        with _patchtstfm_mask(model, last_timesteps):
+        if horizon is None or int(horizon) <= 0:
+            raise ValueError(
+                "PatchTST-FM masking requires the forecast horizon so forecast "
+                "patches are not counted as visible context")
+        with _patchtstfm_mask(model, last_timesteps, int(horizon)):
             yield
         return
 

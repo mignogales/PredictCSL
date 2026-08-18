@@ -1,0 +1,3 @@
+label,normalized_mase,flops_saved_pct,source
+Full/native,0.7045267799847655,0.0,logs/experiments/master_recompute/window_ablation_gifteval/PatchTST-FM-R1/strategy_comparison_v4_oracle_refresh/comparison.csv
+Unconstrained oracle,0.6951509834288481,29.062692282507562,logs/experiments/master_recompute/window_ablation_gifteval/PatchTST-FM-R1/strategy_comparison_v4_oracle_refresh/comparison.csv

@@ -1,0 +1,25 @@
+extends: experiments_masking_kernelsynth.yaml
+
+# Tail-stat masking counterpart to the main all-input-sizes Exp0 figure.
+output_root: logs/experiments/context_interpretability_masking_kernelsynth_tail_all_contexts
+batch_size: 16
+dynamic_batching:
+  enabled: false
+
+experiments:
+  exp0_attention_masking: false
+  exp1_perturbation: false
+  exp2_activation_patching: false
+  exp3_forecast_lens: false
+  exp4_synthetic_controls: false
+  exp5_integrated_gradients: false
+  exp6_predictor_contrast_saliency: false
+  exp7_context_decomposition: true
+  exp8_tsfm_contrast_saliency: false
+
+context_decomposition:
+  metrics: [mse]
+  all_full_contexts: true
+  full_contexts: null
+  visible_lengths: null
+  statistic_ablation: false

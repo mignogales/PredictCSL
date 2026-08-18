@@ -1,11 +1,13 @@
 """
 Evaluation pools for exp0/1/2/3/5 (exp4 generates its own control data).
 
-Two sources, mirroring the rest of the repo:
+Four sources, mirroring the rest of the repo:
   * synthetic — the stage-1 non-stationary generator
     (``experiments.build_context_length_dataset.generate_dataset``). Short /
     left-padded series are EXCLUDED here: interventions on artificial padding
     would confound the block effects (recorded in run_meta by the caller).
+  * harmonic — clean random-phase sinusoid mixtures at controlled scales.
+  * kernelsynth — Chronos-style random-composite GP samples.
   * gifteval — the v5 ablation cache (server only). Instances shorter than the
     largest requested context are dropped so every sample supports every
     effective context length with genuine data.
@@ -38,6 +40,37 @@ def load_synthetic(n_series: int, seed: int, horizon: int,
         sample_ids=[f"synth_{seed}_{int(i)}" for i in keep],
         season_length=1,
         metadata={"source": "generate_dataset", "seed": seed},
+    )
+
+
+def load_harmonic(config: dict, max_samples: int, horizon: int
+                  ) -> List[ExperimentData]:
+    from context_interpretability.data.validation_generators import (
+        DEFAULT_PERIODS, load_harmonic_pools)
+    n = min(int(config.get("n_series", 48)), int(max_samples))
+    return load_harmonic_pools(
+        n_instances=n,
+        series_length=int(config.get("series_length", 8192)),
+        horizon=int(horizon), seed=int(config.get("seed", 42)),
+        periods=config.get("periods") or DEFAULT_PERIODS,
+        scales=config.get("scales") or (0.5, 1.0, 2.0),
+        max_tones=int(config.get("max_tones", 4)),
+    )
+
+
+def load_kernelsynth(config: dict, max_samples: int, horizon: int
+                     ) -> ExperimentData:
+    from context_interpretability.data.validation_generators import (
+        load_kernelsynth_pool)
+    n = min(int(config.get("n_series", 32)), int(max_samples))
+    return load_kernelsynth_pool(
+        n_instances=n,
+        series_length=int(config.get("series_length", 1024)),
+        horizon=int(horizon), seed=int(config.get("seed", 42)),
+        max_kernels=int(config.get("max_kernels", 5)),
+        normalize_std=bool(config.get("normalize_std", True)),
+        cache_path=config.get("cache_path"),
+        scalable=bool(config.get("scalable", False)),
     )
 
 

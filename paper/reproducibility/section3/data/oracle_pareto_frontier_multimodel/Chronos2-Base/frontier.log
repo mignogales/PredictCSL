@@ -1,0 +1,74 @@
+{
+  "model": "Chronos2-Base",
+  "mase_metric": "mase_gluonts_real",
+  "flops_weighting": "cell",
+  "policy_scope": "one dataset-shared action per GiftEval dataset/term cell",
+  "frontier_kind": "exact supported frontier from global linear scalarization",
+  "n_cells": 97,
+  "n_supported_points": 487,
+  "full_normalized_mase": 0.7047375232106846,
+  "full_total_flops": 4232467392225.297,
+  "unconstrained_oracle_normalized_mase": 0.690871197868749,
+  "unconstrained_oracle_flops_saved_pct": 40.90613027042607,
+  "maximum_supported_flops_saved_pct": 94.28258079595575,
+  "minimum_compute_normalized_mase": 1.029615829703923,
+  "key_operating_points": [
+    {
+      "constraint": "no worse than full",
+      "normalized_mase_limit": 0.7047375232106846,
+      "normalized_mase": 0.7044075056038278,
+      "flops_saved_pct": 82.46740645698762,
+      "native_cells": 8,
+      "frontier_index": 162
+    },
+    {
+      "constraint": "within 0.1% of oracle",
+      "normalized_mase_limit": 0.6915620690666177,
+      "normalized_mase": 0.6915235923062122,
+      "flops_saved_pct": 58.79267578799363,
+      "native_cells": 12,
+      "frontier_index": 41
+    },
+    {
+      "constraint": "within 0.5% of oracle",
+      "normalized_mase_limit": 0.6943255538580926,
+      "normalized_mase": 0.6941437016886894,
+      "flops_saved_pct": 71.04605375366442,
+      "native_cells": 10,
+      "frontier_index": 80
+    },
+    {
+      "constraint": "within 1% of oracle",
+      "normalized_mase_limit": 0.6977799098474364,
+      "normalized_mase": 0.6977746497548569,
+      "flops_saved_pct": 77.26177355973437,
+      "native_cells": 9,
+      "frontier_index": 119
+    },
+    {
+      "constraint": "within 2% of oracle",
+      "normalized_mase_limit": 0.7046886218261239,
+      "normalized_mase": 0.7044075056038278,
+      "flops_saved_pct": 82.46740645698762,
+      "native_cells": 8,
+      "frontier_index": 162
+    },
+    {
+      "constraint": "within 5% of oracle",
+      "normalized_mase_limit": 0.7254147577621864,
+      "normalized_mase": 0.7253077329287066,
+      "flops_saved_pct": 88.44901220033215,
+      "native_cells": 6,
+      "frontier_index": 229
+    },
+    {
+      "constraint": "within 10% of oracle",
+      "normalized_mase_limit": 0.7599583176556239,
+      "normalized_mase": 0.7599453275281445,
+      "flops_saved_pct": 91.51292598459602,
+      "native_cells": 3,
+      "frontier_index": 322
+    }
+  ]
+}
+Saved frontier artifacts to logs/experiments/master_recompute/oracle_pareto_frontier_multimodel/Chronos2-Base

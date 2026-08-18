@@ -99,14 +99,39 @@ VAL_FRACTION   = 0.1           # held-out fraction of the labeled dataset
 # is used so the best label remains exactly 1 rather than being normalised.
 # ``risk`` predicts calibrated log error relative to the full/native candidate
 # and adds a differentiable expected-regret term with extra weight on choices
-# that are worse than full context.
+# that are worse than full context. ``pairwise`` only learns the cost-weighted
+# preference between adjacent windows; this targets the local shortening
+# decision without requiring calibrated absolute curve values. ``acceptable``
+# treats every action within a relative tolerance of the row oracle as a valid
+# label, then resolves ambiguous predictions toward the largest/safest window.
 TRAINING_OBJECTIVE = os.environ.get(
     "PREDICTCSL_TRAINING_OBJECTIVE", "curve").lower()
-if TRAINING_OBJECTIVE not in ("curve", "classification", "risk"):
+if TRAINING_OBJECTIVE not in (
+        "curve", "classification", "risk", "pairwise", "acceptable"):
     raise ValueError(
         f"PREDICTCSL_TRAINING_OBJECTIVE={TRAINING_OBJECTIVE!r}; expected "
-        "'curve', 'classification', or 'risk'.")
+        "'curve', 'classification', 'risk', 'pairwise', or 'acceptable'.")
 SOFT_TOPK_WEIGHTS = (1.0, 0.5, 0.25)
+# An acceptable action may be up to 3% worse than the row oracle. At inference,
+# logits with sigmoid probability >=0.5 are treated as credible and the largest
+# credible valid action wins. If none clears 0.5, the highest-probability action
+# wins. Both values are persisted in best_config.json for reproducibility.
+ACCEPTABLE_REL_TOLERANCE = float(os.environ.get(
+    "PREDICTCSL_ACCEPTABLE_REL_TOLERANCE", "0.03"))
+ACCEPTABLE_PROB_THRESHOLD = float(os.environ.get(
+    "PREDICTCSL_ACCEPTABLE_PROB_THRESHOLD", "0.5"))
+if ACCEPTABLE_REL_TOLERANCE < 0:
+    raise ValueError("PREDICTCSL_ACCEPTABLE_REL_TOLERANCE must be non-negative.")
+if not 0 <= ACCEPTABLE_PROB_THRESHOLD <= 1:
+    raise ValueError("PREDICTCSL_ACCEPTABLE_PROB_THRESHOLD must be in [0, 1].")
+# Adjacent pairs whose relative error differs by <=1% are treated as ambiguous
+# and contribute no preference loss. Decisive pairs are weighted by the
+# magnitude of log(error_left / error_right), clipped to keep a few extreme
+# curves from dominating a batch.
+PAIRWISE_TIE_TOLERANCE = float(os.environ.get(
+    "PREDICTCSL_PAIRWISE_TIE_TOLERANCE", "0.01"))
+PAIRWISE_MAX_WEIGHT = float(os.environ.get(
+    "PREDICTCSL_PAIRWISE_MAX_WEIGHT", "2.0"))
 RISK_POLICY_WEIGHT = float(os.environ.get(
     "PREDICTCSL_RISK_POLICY_WEIGHT", "1.0"))
 RISK_FULL_HARM_WEIGHT = float(os.environ.get(
@@ -777,6 +802,10 @@ def compute_dual_loss(
     logits and the target carries literal rank weights 1, 1/2, 1/4 for the best
     three windows. Risk mode consumes the raw positive error curve and combines
     calibrated log-relative-error regression with expected asymmetric regret.
+    Pairwise mode consumes the raw curve but supervises only adjacent score
+    differences, weighted by the forecast consequence of reversing a pair.
+    Acceptable-set mode uses a multi-label target containing every valid action
+    within a relative tolerance of the row oracle.
     Reconstruction remains the same masked-patch MSE.
     """
     curve_valid = ~torch.isnan(curve_target)
@@ -800,8 +829,12 @@ def compute_dual_loss(
             curve_mse = (bce * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
         else:
             curve_mse = curve_pred.sum() * 0.0
+    elif TRAINING_OBJECTIVE == "acceptable":
+        curve_mse = acceptable_set_task_loss(curve_pred, curve_target)
     elif TRAINING_OBJECTIVE == "risk":
         curve_mse = risk_aware_task_loss(curve_pred, curve_target)
+    elif TRAINING_OBJECTIVE == "pairwise":
+        curve_mse = pairwise_task_loss(curve_pred, curve_target)
     else:
         target_safe = torch.nan_to_num(curve_target, nan=0.0)
         sq = (curve_pred - target_safe).pow(2) * curve_valid.float()
@@ -817,6 +850,121 @@ def compute_dual_loss(
 
     total = lambda_curve * curve_mse + lambda_recon * recon_mse
     return total, curve_mse, recon_mse
+
+
+def acceptable_set_targets(
+    raw_error: torch.Tensor,
+    rel_tolerance: float = ACCEPTABLE_REL_TOLERANCE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return multi-label near-oracle targets and their valid-window mask."""
+    if raw_error.ndim != 2:
+        raise ValueError(
+            "acceptable_set_targets expects a (batch, windows) tensor; "
+            f"got {tuple(raw_error.shape)}.")
+    if rel_tolerance < 0:
+        raise ValueError("rel_tolerance must be non-negative.")
+    valid = torch.isfinite(raw_error) & (raw_error > 0)
+    safe_error = torch.where(
+        valid, raw_error, torch.full_like(raw_error, float("inf")))
+    best = safe_error.min(dim=1, keepdim=True).values
+    target = valid & (safe_error <= best * (1.0 + rel_tolerance))
+    return target.to(raw_error.dtype), valid
+
+
+def acceptable_decision_scores(
+    logits: torch.Tensor,
+    prob_threshold: float = ACCEPTABLE_PROB_THRESHOLD,
+) -> torch.Tensor:
+    """Convert acceptable-set logits to lower-is-better decision scores.
+
+    Every action above the calibrated probability threshold is credible. The
+    largest credible action receives the lowest score, implementing the
+    accuracy-first policy for an ambiguous label set. When no action is
+    credible, ordinary maximum predicted probability is used instead.
+    Downstream valid-window masking remains authoritative.
+    """
+    if logits.ndim != 2:
+        raise ValueError(
+            "acceptable_decision_scores expects a (batch, windows) tensor; "
+            f"got {tuple(logits.shape)}.")
+    if not 0 <= prob_threshold <= 1:
+        raise ValueError("prob_threshold must be in [0, 1].")
+    probs = torch.sigmoid(logits)
+    credible = probs >= prob_threshold
+    n_windows = logits.shape[1]
+    index = torch.arange(
+        n_windows, device=logits.device, dtype=logits.dtype).unsqueeze(0)
+    # Credible scores lie in [-1, 0], ordered from largest to smallest window;
+    # non-credible scores lie in [0, 1] and retain probability ordering.
+    safe_rank = -index / max(n_windows - 1, 1)
+    return torch.where(credible, safe_rank, 1.0 - probs)
+
+
+def acceptable_set_task_loss(
+    logits: torch.Tensor,
+    raw_error: torch.Tensor,
+    rel_tolerance: float = ACCEPTABLE_REL_TOLERANCE,
+) -> torch.Tensor:
+    """Masked BCE for all windows within ``rel_tolerance`` of the oracle."""
+    if logits.shape != raw_error.shape:
+        raise ValueError(
+            "acceptable_set_task_loss expects matching tensors; "
+            f"got logits={tuple(logits.shape)}, error={tuple(raw_error.shape)}.")
+    target, valid = acceptable_set_targets(raw_error, rel_tolerance)
+    if not valid.any():
+        return logits.sum() * 0.0
+    loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    return (loss * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+
+
+def pairwise_task_loss(
+    curve_pred: torch.Tensor,
+    raw_error: torch.Tensor,
+    tie_tolerance: float = PAIRWISE_TIE_TOLERANCE,
+    max_weight: float = PAIRWISE_MAX_WEIGHT,
+) -> torch.Tensor:
+    """Cost-weighted preference loss for adjacent context windows.
+
+    Lower predictor scores mean lower forecast error. For every adjacent valid
+    pair ``(k, k+1)``, ``score[k+1] - score[k]`` is therefore the logit that the
+    shorter/left action is better. Near-ties are deliberately unsupervised:
+    their discrete ordering is unstable and getting it wrong has negligible
+    forecast cost. Multiplying every raw curve by a positive constant leaves the
+    labels and weights unchanged.
+    """
+    if curve_pred.ndim != 2 or raw_error.shape != curve_pred.shape:
+        raise ValueError(
+            "pairwise_task_loss expects matching (batch, windows) tensors; "
+            f"got pred={tuple(curve_pred.shape)}, error={tuple(raw_error.shape)}.")
+    if tie_tolerance < 0:
+        raise ValueError("tie_tolerance must be non-negative.")
+    if max_weight <= 0:
+        raise ValueError("max_weight must be positive.")
+    if curve_pred.shape[1] < 2:
+        return curve_pred.sum() * 0.0
+
+    left_error = raw_error[:, :-1]
+    right_error = raw_error[:, 1:]
+    valid = (
+        torch.isfinite(left_error) & torch.isfinite(right_error)
+        & (left_error > 0) & (right_error > 0)
+    )
+    log_ratio = torch.log(
+        left_error.clamp_min(1e-8) / right_error.clamp_min(1e-8))
+    decisive = valid & (log_ratio.abs() > math.log1p(tie_tolerance))
+    if not decisive.any():
+        return curve_pred.sum() * 0.0
+
+    target_left_better = (log_ratio < 0).to(curve_pred.dtype)
+    left_better_logit = curve_pred[:, 1:] - curve_pred[:, :-1]
+    pair_loss = F.binary_cross_entropy_with_logits(
+        left_better_logit, target_left_better, reduction="none")
+    weight = torch.where(
+        decisive,
+        log_ratio.abs().clamp(max=max_weight),
+        torch.zeros_like(log_ratio),
+    )
+    return (pair_loss * weight).sum() / weight.sum().clamp_min(1e-8)
 
 
 def risk_aware_task_loss(
@@ -969,7 +1117,7 @@ def _probe_vram(
 
             x = torch.randn(batch_size, CONTEXT_LENGTH, 1, device=device)
             y = (torch.rand(batch_size, n_windows, device=device) + 0.1
-                 if TRAINING_OBJECTIVE == "risk"
+                 if TRAINING_OBJECTIVE in ("risk", "pairwise", "acceptable")
                  else torch.randn(batch_size, n_windows, device=device))
             h_idx = torch.randint(0, n_horizons, (batch_size,), device=device)
 
@@ -1082,11 +1230,12 @@ def _evaluate(
                     x, horizon_idx=h_idx_batch, mask=mask,
                     valid_length=lengths)
 
-                # Classification and risk-aware regression consume raw forecast
-                # errors; original curve regression retains the per-series
-                # z-scored shape target.
+                # Classification, acceptable-set learning, risk-aware regression,
+                # and adjacent-pair ranking consume raw forecast errors; original
+                # curve regression retains the per-series z-scored shape target.
                 task_target = (
-                    yr if TRAINING_OBJECTIVE in ("classification", "risk")
+                    yr if TRAINING_OBJECTIVE in (
+                        "classification", "risk", "pairwise", "acceptable")
                     else yn)
                 cvalid = ~torch.isnan(task_target)
                 if TRAINING_OBJECTIVE == "classification":
@@ -1110,12 +1259,32 @@ def _evaluate(
                             logits, soft, reduction="none")
                         curve_sum = curve_sum + (bce * valid_cls.float()).sum()
                         curve_count = curve_count + valid_cls.float().sum()
+                elif TRAINING_OBJECTIVE == "acceptable":
+                    valid_rows = cvalid.any(dim=1)
+                    if valid_rows.any():
+                        acceptable_loss = acceptable_set_task_loss(
+                            curve_pred, task_target)
+                        n_rows = valid_rows.float().sum()
+                        curve_sum = curve_sum + acceptable_loss * n_rows
+                        curve_count = curve_count + n_rows
                 elif TRAINING_OBJECTIVE == "risk":
                     valid_rows = cvalid.any(dim=1)
                     if valid_rows.any():
                         risk_loss = risk_aware_task_loss(curve_pred, task_target)
                         n_rows = valid_rows.float().sum()
                         curve_sum = curve_sum + risk_loss * n_rows
+                        curve_count = curve_count + n_rows
+                elif TRAINING_OBJECTIVE == "pairwise":
+                    valid_pairs = (
+                        cvalid[:, :-1] & cvalid[:, 1:]
+                        & (task_target[:, :-1] > 0)
+                        & (task_target[:, 1:] > 0)
+                    )
+                    valid_rows = valid_pairs.any(dim=1)
+                    if valid_rows.any():
+                        pair_loss = pairwise_task_loss(curve_pred, task_target)
+                        n_rows = valid_rows.float().sum()
+                        curve_sum = curve_sum + pair_loss * n_rows
                         curve_count = curve_count + n_rows
                 else:
                     yn_safe = torch.nan_to_num(task_target, nan=0.0)
@@ -1140,6 +1309,11 @@ def _evaluate(
                         rvalid, curve_pred,
                         torch.full_like(curve_pred, float("-inf")))
                     pred_arg = pred_score.argmax(dim=1)
+                elif TRAINING_OBJECTIVE == "acceptable":
+                    pred_score = torch.where(
+                        rvalid, acceptable_decision_scores(curve_pred),
+                        torch.full_like(curve_pred, float("inf")))
+                    pred_arg = pred_score.argmin(dim=1)
                 else:
                     pred_score = torch.where(
                         rvalid, curve_pred,
@@ -1292,7 +1466,8 @@ def _run_single_trial(
                 x = x_train.index_select(0, idx)
                 task_surface = (
                     y_train_raw
-                    if TRAINING_OBJECTIVE in ("classification", "risk")
+                    if TRAINING_OBJECTIVE in (
+                        "classification", "risk", "pairwise", "acceptable")
                     else y_train)
                 y = task_surface.index_select(0, idx)         # (bs, n_w, n_h)
                 lengths = length_train.index_select(0, idx)
@@ -1508,9 +1683,13 @@ def _plot_sweep_summary(trials_df: pd.DataFrame, save_path: str,
         ("val_curve_mse", (
             "val soft-label cross-entropy"
             if TRAINING_OBJECTIVE == "classification"
-            else ("val calibrated asymmetric risk loss"
+            else ("val acceptable-set cross-entropy"
+                  if TRAINING_OBJECTIVE == "acceptable"
+                  else ("val calibrated asymmetric risk loss"
                   if TRAINING_OBJECTIVE == "risk"
-                  else "val curve MSE (z-scored)"))),
+                  else ("val adjacent-pair preference loss"
+                        if TRAINING_OBJECTIVE == "pairwise"
+                        else "val curve MSE (z-scored)"))))),
         ("val_recon_mse", "val reconstruction MSE"),
     ]
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
@@ -1933,6 +2112,10 @@ def main() -> None:
                     ARCH == "patchtst" and TRAINING_OBJECTIVE == "risk"),
                 "cheap_search":      _CHEAP,
                 "soft_topk_weights": list(SOFT_TOPK_WEIGHTS),
+                "acceptable_rel_tolerance": ACCEPTABLE_REL_TOLERANCE,
+                "acceptable_prob_threshold": ACCEPTABLE_PROB_THRESHOLD,
+                "pairwise_tie_tolerance": PAIRWISE_TIE_TOLERANCE,
+                "pairwise_max_weight": PAIRWISE_MAX_WEIGHT,
                 "risk_policy_weight": RISK_POLICY_WEIGHT,
                 "risk_full_harm_weight": RISK_FULL_HARM_WEIGHT,
                 "risk_softmax_temperature": RISK_SOFTMAX_TEMPERATURE,

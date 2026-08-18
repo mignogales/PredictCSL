@@ -1,0 +1,6 @@
+policy,training_target,full_nmase,policy_nmase,relative_nmase_gain_pct,cell_flops_saved_pct,tsfm_wall_time_saved_pct,beats_full_eligible,n_eligible,synthetic_val_regret
+Mamba curve,z-scored error curve,0.726707598,0.724343722,0.325286,56.492235,52.616982,54,95,0.19563550
+Soft top-k classification,"rank weights 1;1/2;1/4",0.726707598,0.722412185,0.591079,27.888918,39.608836,46,95,0.19632860
+Risk-aware,log error relative to full plus asymmetric regret,0.726707598,0.726155261,0.076005,57.799157,51.273392,56,95,
+Adjacent pairwise,cost-weighted adjacent preferences,0.726707598,0.725724683,0.135256,54.236176,39.616932,58,95,0.21321000
+3% acceptable set,all actions within 3% of the row oracle,0.726707598,0.723630073,0.423489,26.385452,32.242821,46,95,0.21834000

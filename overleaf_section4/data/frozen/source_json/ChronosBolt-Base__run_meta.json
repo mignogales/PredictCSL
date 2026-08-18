@@ -1,0 +1,676 @@
+{
+  "git_commit": "6e371a8a653bd9f881871d9e2c3625037b5673d9",
+  "model": "ChronosBolt-Base",
+  "device": "cuda:0",
+  "seed": 42,
+  "platform": "Linux-5.15.0-179-generic-x86_64-with-glibc2.35",
+  "package_versions": {
+    "python": "3.11.15",
+    "torch": "2.4.1+cu121",
+    "numpy": "2.4.6",
+    "pandas": "2.3.3",
+    "scipy": "1.17.1",
+    "transformers": "4.57.6",
+    "gluonts": "0.15.1",
+    "tsfm_public": "0.3.6"
+  },
+  "config": {
+    "output_root": "logs/experiments/context_interpretability",
+    "seed": 42,
+    "horizon": 64,
+    "batch_size": 32,
+    "dynamic_batching": {
+      "enabled": true,
+      "reference_context": 8192,
+      "max_batch_size": 4096
+    },
+    "max_samples": 256,
+    "primary_metric": "mae",
+    "extra_metrics": [
+      "mse",
+      "smape"
+    ],
+    "context_lengths": [
+      32,
+      48,
+      64,
+      96,
+      128,
+      192,
+      256,
+      384,
+      512,
+      768,
+      1024,
+      1536,
+      2048,
+      2560,
+      3072,
+      4096,
+      6144,
+      8192
+    ],
+    "block_mode": "model_patch",
+    "block_length": 32,
+    "perturb_partial_patches": false,
+    "max_blocks_per_context": 64,
+    "experiments": {
+      "exp0_attention_masking": true,
+      "exp1_perturbation": true,
+      "exp2_activation_patching": true,
+      "exp3_forecast_lens": true,
+      "exp4_synthetic_controls": true,
+      "exp5_integrated_gradients": true,
+      "exp6_predictor_contrast_saliency": false,
+      "exp7_context_decomposition": false,
+      "exp8_tsfm_contrast_saliency": false
+    },
+    "perturbation": {
+      "methods": [
+        "block_mean",
+        "permutation",
+        "matched_block",
+        "noise"
+      ],
+      "interventions_per_call": 8,
+      "mean_scope": "block",
+      "noise_scales": [
+        0.1,
+        0.5,
+        1.0
+      ],
+      "noise_std_floor": 0.001,
+      "n_seeds": 3,
+      "matched": {
+        "same_series_tolerance": 0.25,
+        "fallback": "other_series"
+      }
+    },
+    "attention_masking": {
+      "enabled": true
+    },
+    "activation_patching": {
+      "corruption": "permutation",
+      "granularity": [
+        "block_token",
+        "forecast_token"
+      ],
+      "pilot_samples": 32,
+      "layers": "all",
+      "full_layers": "every:2"
+    },
+    "forecast_lens": {
+      "stability_tau": 0.05
+    },
+    "integrated_gradients": {
+      "steps": 64,
+      "batch_size": 16,
+      "convergence_steps": [
+        16,
+        32,
+        64
+      ],
+      "internal_batch_size": 8,
+      "baselines": [
+        "context_mean",
+        "zero_after_norm",
+        "random_sample"
+      ],
+      "n_random_baselines": 3,
+      "target": "mean_forecast",
+      "supplementary_loss_target": true
+    },
+    "predictor_contrast_saliency": {
+      "predictor_dir": null,
+      "predictor_root": "logs/experiments/context_length_predictor",
+      "short_window": null,
+      "long_window": null,
+      "window_pairs": null,
+      "steps": 64,
+      "baselines": [
+        "zero",
+        "random_sample"
+      ],
+      "n_random_baselines": 3,
+      "max_blocks": 64
+    },
+    "context_decomposition": {
+      "metrics": [
+        "mae",
+        "mse"
+      ],
+      "all_full_contexts": false,
+      "full_contexts": null,
+      "visible_lengths": null
+    },
+    "tsfm_contrast_saliency": {
+      "metrics": [
+        "mae",
+        "mse"
+      ],
+      "short_window": null,
+      "long_window": null,
+      "window_pairs": null,
+      "steps": 64,
+      "batch_size": 8,
+      "baselines": [
+        "context_mean",
+        "random_sample"
+      ],
+      "n_random_baselines": 3
+    },
+    "synthetic_controls": {
+      "n_instances": 128,
+      "series_length": 1024,
+      "context_lengths": [
+        16,
+        32,
+        48,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        1024
+      ],
+      "local_order": 8,
+      "local_kinds": [
+        "linear",
+        "nonlinear",
+        "seasonal"
+      ],
+      "distant_kind": "linear",
+      "distant_lags": [
+        32,
+        64,
+        128,
+        256
+      ],
+      "dependency_strengths": [
+        0.0,
+        0.5,
+        1.0
+      ],
+      "noise_levels": [
+        0.1
+      ],
+      "noise_robustness": {
+        "lag": 128,
+        "strength": 1.0,
+        "extra_noise_levels": [
+          0.05,
+          0.25
+        ]
+      },
+      "family_c_fraction_distant": 0.5,
+      "oracle_ridge_alpha": 1.0,
+      "run_methods": [
+        "perturbation",
+        "attention_masking"
+      ],
+      "sentinel_methods": [
+        "activation_patching",
+        "integrated_gradients"
+      ],
+      "sentinel_lags": [
+        32,
+        256
+      ],
+      "sentinel_strengths": [
+        0.0,
+        1.0
+      ],
+      "sufficient_context_tolerance": 0.05
+    },
+    "analysis": {
+      "bootstrap_samples": 2000,
+      "alpha": 0.05,
+      "multiple_comparison": "benjamini_hochberg",
+      "top_k_blocks": 5
+    },
+    "datasets": {
+      "source": "synthetic",
+      "synthetic": {
+        "n_series": 256,
+        "seed": 42
+      },
+      "gifteval": {
+        "datasets": [
+          "ETTh1",
+          "ETTh2",
+          "us_births/D"
+        ],
+        "term": "short"
+      }
+    }
+  },
+  "started_utc": "2026-08-08T03:44:54Z",
+  "precision": "torch.float32",
+  "checkpoint": "amazon/chronos-bolt-base",
+  "effective_context_lengths": {
+    "16": 16,
+    "32": 32,
+    "48": 48,
+    "64": 64,
+    "96": 96,
+    "128": 128,
+    "192": 192,
+    "256": 256,
+    "384": 384,
+    "512": 512,
+    "1024": 1024
+  },
+  "n_samples": {
+    "exp1_perturbation": 128,
+    "exp0_attention_masking": 128,
+    "exp2_activation_patching": 128,
+    "exp4_synthetic_controls": 2304,
+    "exp7_context_decomposition": 256
+  },
+  "subsampling": {
+    "exp2_activation_patching": "pilot: 32 samples x 12 layers; full: 128 samples x 7 layers"
+  },
+  "skipped_capabilities": [
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w16"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w32"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w48"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w64"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w96"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w128"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w192"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w256"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w384"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w512"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w1024"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w16"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w32"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w48"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w64"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w96"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w128"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w192"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w256"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w384"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w512"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w1024"
+    },
+    {
+      "experiment": "exp4/famB_linear_r8_d32_s0_linear_n0.1/integrated_gradients",
+      "reason": "ChronosBolt-Base: capability off"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w16"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w32"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w48"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w64"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w96"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w128"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w192"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w256"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w384"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w512"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w1024"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w16"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w32"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w48"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w64"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w96"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w128"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w192"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w256"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w384"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w512"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w1024"
+    },
+    {
+      "experiment": "exp4/famB_linear_r8_d32_s1_linear_n0.1/integrated_gradients",
+      "reason": "ChronosBolt-Base: capability off"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w16"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w32"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w48"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w64"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w96"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w128"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w192"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w256"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w384"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w512"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w1024"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w16"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w32"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w48"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w64"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w96"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w128"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w192"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w256"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w384"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w512"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w1024"
+    },
+    {
+      "experiment": "exp4/famB_linear_r8_d256_s0_linear_n0.1/integrated_gradients",
+      "reason": "ChronosBolt-Base: capability off"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w16"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w32"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w48"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w64"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w96"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w128"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w192"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w256"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w384"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w512"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w1024"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w16"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w32"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w48"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w64"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w96"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w128"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w192"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w256"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w384"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w512"
+    },
+    {
+      "experiment": "exp2_activation_patching/forecast_token",
+      "reason": "ChronosBolt-Base: no dedicated forecast token at w1024"
+    },
+    {
+      "experiment": "exp4/famB_linear_r8_d256_s1_linear_n0.1/integrated_gradients",
+      "reason": "ChronosBolt-Base: capability off"
+    }
+  ],
+  "runtime_seconds": 8401.9,
+  "peak_gpu_memory_bytes": 13708424192,
+  "adapter": {
+    "name": "ChronosBolt-Base",
+    "horizon": 64,
+    "device": "cuda:0",
+    "batching": {
+      "dynamic": true,
+      "base_batch_size": 32,
+      "reference_context": 8192,
+      "max_batch_size": 4096
+    },
+    "capabilities": {
+      "supports_attention_masking": true,
+      "supports_activation_patching": true,
+      "supports_forecast_lens": false,
+      "supports_integrated_gradients": false,
+      "uses_patches": true,
+      "patch_length": 16,
+      "maximum_context_length": 2048,
+      "max_includes_horizon": false,
+      "fixed_native_context": false
+    },
+    "model_id": "amazon/chronos-bolt-base",
+    "family": "chronos_bolt",
+    "precision": "torch.float32",
+    "n_parameters": 205292928
+  },
+  "exp7_context_decomposition_full_contexts": [
+    2048
+  ]
+}

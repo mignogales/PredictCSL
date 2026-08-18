@@ -16,7 +16,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 MAIN_ENV="${MAIN_ENV:-predictcsl-main}"
-PATCHTST_ENV="${PATCHTST_ENV:-predictcsl-patchtst}"
+PATCHTST_ENV="${PATCHTST_ENV:-TSFM_PATCH}"
 LEGACY_ENV="${LEGACY_ENV:-predictcsl-legacy}"
 TOTO_ENV="${TOTO_ENV:-predictcsl-toto}"
 TIREX_ENV="${TIREX_ENV:-predictcsl-tirex}"
@@ -130,6 +130,10 @@ do_sweep_plots() {
     Chronos2-Small Moirai2-Small TimesFM2.5-200M PatchTST-FM-R1 \
     Sundial-Base-128M Chronos2-Synth Chronos2-Base ChronosBolt-Base \
     Toto-2.0-313m FlowState-R1 TiRex2
+  run_conda "$MAIN_ENV" -m experiments.plot_synth_sweep_results \
+    --root "$SWEEP_ROOT"
+  run_conda "$MAIN_ENV" -m experiments.plot_synth_sweep_alignment \
+    --root "$SWEEP_ROOT" --per-cell
 }
 
 report_sweep_coverage() {

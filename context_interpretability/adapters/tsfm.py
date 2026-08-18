@@ -146,6 +146,11 @@ class TSFMAdapter(InterpretabilityAdapter):
                 p = _moirai2_patch_size(self._base)
                 if p:
                     self.capabilities.patch_length = p
+            elif self.family == "toto":
+                p = getattr(getattr(self._base, "config", None),
+                            "patch_size", None)
+                if p:
+                    self.capabilities.patch_length = int(p)
         except Exception as exc:  # noqa: BLE001 — keep the declared fallback
             print(f"[{self.name}] patch-length resolution failed "
                   f"({exc!r}); using declared {self.capabilities.patch_length}")
@@ -322,7 +327,8 @@ class TSFMAdapter(InterpretabilityAdapter):
         x = torch.from_numpy(
             np.ascontiguousarray(contexts, dtype=np.float32)).unsqueeze(-1)
         with torch.no_grad(), context_attention_mask(
-                self.family, self._base, int(visible_timesteps), W):
+                self.family, self._base, int(visible_timesteps), W,
+                horizon=self.horizon):
             med = self._uniform_forecast(
                 x, W, self.batch_size_for(W, len(contexts)))
         return med.float().cpu().numpy()

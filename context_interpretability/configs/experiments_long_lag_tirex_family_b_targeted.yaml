@@ -1,0 +1,20 @@
+extends: experiments_long_lag_comparison.yaml
+
+# TiRex paper completion: measure the four core Family-B long-lag curves, then
+# perturb only the planted causal source band at the largest supported context.
+# This keeps the requested sanity check while avoiding the exhaustive block grid.
+output_root: logs/experiments/context_interpretability_long_lag
+
+synthetic_controls:
+  only_datasets:
+    - famB_linear_r8_d128_s1_linear_n0.1
+    - famB_linear_r8_d512_s1_linear_n0.1
+    - famB_linear_r8_d1024_s1_linear_n0.1
+    - famB_linear_r8_d2048_s1_linear_n0.1
+  run_methods: [perturbation]
+
+perturbation:
+  largest_context_only: true
+  only_forced_blocks: true
+  cell_subdir: targeted_causal_band
+

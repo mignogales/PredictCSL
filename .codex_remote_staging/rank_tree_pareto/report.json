@@ -1,0 +1,26 @@
+{
+  "comparison": "achieved ExtraTrees versus Rank-distilled depth-8 tree",
+  "oracle_actions_used": false,
+  "models": [
+    "Chronos2-Base",
+    "Chronos2-Small",
+    "Chronos2-Synth",
+    "ChronosBolt-Base",
+    "FlowState-R1",
+    "Moirai2-Small",
+    "PatchTST-FM-R1",
+    "Sundial-Base-128M",
+    "TiRex2",
+    "TimesFM2.5-200M",
+    "Toto-2.0-313m"
+  ],
+  "n_models": 11,
+  "n_points": 1963,
+  "n_union_pareto": 985,
+  "threshold_calibration": "held-out synthetic data only",
+  "final_evaluation": "GiftEval",
+  "counterfactual_outputs": {
+    "scope": "TiRex2 cost only",
+    "assumption": "remove left-context padding; retain fixed 928-point future grid, sign-flip TTA, and public-wrapper quality"
+  }
+}

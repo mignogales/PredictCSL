@@ -47,7 +47,11 @@ pip install -c "$CONSTRAINTS" gluonts==0.14.4 uni2ts==2.0.0
 
 # 5) TSFM packages from GIT at the exact commits running on the server.
 pip install -c "$CONSTRAINTS" "git+https://github.com/amazon-science/chronos-forecasting.git@f951d9aefa06f5389b2ed6b0e51fd5a1a4cf194b"
-pip install -c "$CONSTRAINTS" "git+https://github.com/ibm-granite/granite-tsfm.git@e4d48868969281f2f4cbc520bd8354c9f9ea3d48"
+# FlowState r1.1 requires the gated-MLP implementation released in 0.3.6.
+# The older e4d488689 snapshot is retained only in setup-patchtst.sh for exact
+# PatchTST-FM leaderboard parity; using it here silently drops FlowState's
+# mlp.w1/w2/w3 weights and random-initializes incompatible `out` layers.
+pip install -c "$CONSTRAINTS" "git+https://github.com/ibm-granite/granite-tsfm.git@c2c7b3771bffd9b7e101891607225368f01e5e93"
 pip install -c "$CONSTRAINTS" "git+https://github.com/google-research/timesfm.git@8a755c9c755fd5b1fe2f0c8af3b86d7a5b846160"
 pip install -c "$CONSTRAINTS" "git+https://github.com/SalesforceAIResearch/gift-eval.git@d8184bb51079bb5021332f8e5d7486c378a52202"
 
@@ -61,4 +65,5 @@ pip install --no-deps \
 echo
 python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())"
 python -c "from mamba_ssm import Mamba; print('mamba-ssm import OK')"
+python -c "import tsfm_public; from packaging.version import Version; assert Version(tsfm_public.__version__.split('+')[0]) >= Version('0.3.6'), tsfm_public.__version__; print('granite-tsfm', tsfm_public.__version__)"
 echo "predictcsl-main ready (PatchTST-FM/Toto/TiRex2 use dedicated envs — see envs/README.md)."

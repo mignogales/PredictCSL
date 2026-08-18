@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from typing import Dict, List, Optional
 
 import matplotlib
@@ -124,7 +125,8 @@ def _sliced_loss_delta_profiles(df: pd.DataFrame,
     comparable to masking's ``masked(L) - clean(W)`` effect and avoids weighting
     samples by the number of experiment rows they happen to have.
     """
-    keys = ["model", "dataset", "sample_id", "context_length"]
+    df = df[df["method"] == "attention_masking"]
+    keys = ["model", "dataset", "sample_id", "context_length", "metric"]
     required = set(keys + ["clean_loss"])
     if masking.empty or not required.issubset(df.columns):
         return {}
@@ -140,7 +142,8 @@ def _sliced_loss_delta_profiles(df: pd.DataFrame,
             sliced = clean[clean["context_length"] == L].rename(
                 columns={"clean_loss": "sliced_loss"})
             paired = sliced.merge(
-                full, on=["model", "dataset", "sample_id"], how="inner")
+                full, on=["model", "dataset", "sample_id", "metric"],
+                how="inner")
             if not paired.empty:
                 points[L] = float(
                     (paired["sliced_loss"] - paired["full_loss"]).mean())
@@ -152,7 +155,8 @@ def _sliced_loss_delta_profiles(df: pd.DataFrame,
 def _sliced_loss_profiles(df: pd.DataFrame,
                           masking: pd.DataFrame) -> Dict[int, pd.Series]:
     """Absolute loss from actual input slicing, paired to each full-W cohort."""
-    keys = ["model", "dataset", "sample_id", "context_length"]
+    df = df[df["method"] == "attention_masking"]
+    keys = ["model", "dataset", "sample_id", "context_length", "metric"]
     required = set(keys + ["clean_loss"])
     if masking.empty or not required.issubset(df.columns):
         return {}
@@ -162,14 +166,15 @@ def _sliced_loss_profiles(df: pd.DataFrame,
     profiles: Dict[int, pd.Series] = {}
     for W, group in masking.groupby("context_length"):
         cohort = (clean[clean["context_length"] == W]
-                  [["model", "dataset", "sample_id"]]
+                  [["model", "dataset", "sample_id", "metric"]]
                   .drop_duplicates())
         points = {}
         for L in sorted(group["lookback_start"].dropna().unique()):
             sliced = clean[clean["context_length"] == L].rename(
                 columns={"clean_loss": "sliced_loss"})
             paired = sliced.merge(
-                cohort, on=["model", "dataset", "sample_id"], how="inner")
+                cohort, on=["model", "dataset", "sample_id", "metric"],
+                how="inner")
             if not paired.empty:
                 points[L] = float(paired["sliced_loss"].mean())
         if points:
@@ -184,7 +189,8 @@ def _masking_colors(contexts) -> Dict[int, object]:
     return {w: cmap(i) for i, w in enumerate(windows)}
 
 
-def _masking_legend_handles(colors: Dict[int, object]):
+def _masking_legend_handles(
+        colors: Dict[int, object], masked_label: str = "attention masked"):
     """Independent legend handles for color (W) and shape (intervention)."""
     color_handles = [
         Line2D([0], [0], color=color, lw=2.2, label=f"W={W}")
@@ -192,7 +198,7 @@ def _masking_legend_handles(colors: Dict[int, object]):
     ]
     shape_handles = [
         Line2D([0], [0], color="black", marker="o", linestyle="-",
-               label="attention masked"),
+               label=masked_label),
         Line2D([0], [0], color="black", marker="s", linestyle="--",
                label="input sliced"),
     ]
@@ -215,15 +221,32 @@ def _add_masking_legends(ax, colors: Dict[int, object]) -> None:
 def _plot_masking_effect(ax, df: pd.DataFrame, title: str,
                          colors: Optional[Dict[int, object]] = None,
                          add_legends: bool = True,
-                         absolute_loss: bool = False) -> bool:
+                         absolute_loss: bool = False,
+                         dataset: Optional[str] = None,
+                         metric: Optional[str] = None,
+                         largest_full_context_only: bool = False) -> bool:
     """Draw masking and paired slicing curves on ``ax``."""
-    d = df[df["method"] == "attention_masking"]
-    if d.empty:
+    scoped = df[df["method"] == "attention_masking"]
+    if dataset is not None:
+        scoped = scoped[scoped["dataset"].astype(str) == str(dataset)]
+    if metric is not None:
+        scoped = scoped[scoped["metric"].astype(str) == str(metric)]
+    if scoped.empty:
         return False
-    collapsed = agg.collapse_seeds(d)
+    datasets = scoped["dataset"].astype(str).unique()
+    metrics = scoped["metric"].astype(str).unique()
+    if len(datasets) != 1 or len(metrics) != 1:
+        raise ValueError(
+            "masking plots require exactly one dataset and one metric; got "
+            f"datasets={datasets.tolist()}, metrics={metrics.tolist()}")
+    masking = scoped
+    if largest_full_context_only:
+        masking = masking[
+            masking["context_length"] == masking["context_length"].max()]
+    collapsed = agg.collapse_seeds(masking)
     sliced_profiles = (
-        _sliced_loss_profiles(df, collapsed) if absolute_loss
-        else _sliced_loss_delta_profiles(df, collapsed)
+        _sliced_loss_profiles(scoped, collapsed) if absolute_loss
+        else _sliced_loss_delta_profiles(scoped, collapsed)
     )
     masked_value = "intervened_loss" if absolute_loss else "loss_delta"
     if colors is None:
@@ -237,8 +260,10 @@ def _plot_masking_effect(ax, df: pd.DataFrame, title: str,
             ax.plot(sliced.index, sliced.values, "s--", color=color)
     ax.set_xscale("log", base=2)
     ax.set_xlabel("visible span L (timesteps) — everything older is masked")
+    metric_label = str(metrics[0]).upper()
     ax.set_ylabel(
-        "mean loss" if absolute_loss else "Δ loss vs full-W clean input")
+        f"mean {metric_label}" if absolute_loss
+        else f"Δ {metric_label} vs full-W clean input")
     ax.set_title(title)
     if add_legends:
         _add_masking_legends(ax, colors)
@@ -247,43 +272,115 @@ def _plot_masking_effect(ax, df: pd.DataFrame, title: str,
 
 
 def fig_masking_effect(df: pd.DataFrame, out_dir: str) -> None:
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    if not _plot_masking_effect(
-            ax, df, "attention masking vs input slicing"):
-        plt.close(fig)
+    d = df[df["method"] == "attention_masking"]
+    if d.empty:
         return
-    _save(fig, out_dir, "02_masking_effect_vs_lookback.png")
+    datasets = sorted(d["dataset"].astype(str).unique())
+    # The shared tree contains Exp4 control rows under the same method name.
+    # Never pool them with the ordinary evaluation dataset.
+    if "synthetic" in datasets:
+        datasets = ["synthetic"]
+    first = True
+    for dataset in datasets:
+        metrics = sorted(d.loc[d["dataset"].astype(str) == dataset,
+                               "metric"].astype(str).unique())
+        for metric in metrics:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            if not _plot_masking_effect(
+                    ax, df,
+                    f"attention masking vs input slicing — {dataset} — {metric.upper()}",
+                    dataset=dataset, metric=metric):
+                plt.close(fig)
+                continue
+            suffix = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{dataset}_{metric}")
+            _save(fig, out_dir,
+                  "02_masking_effect_vs_lookback.png" if first else
+                  f"02_masking_effect_vs_lookback_{suffix}.png")
+            first = False
 
 
 def fig_masking_loss(df: pd.DataFrame, out_dir: str) -> None:
     """Absolute-loss companion to the delta-loss masking comparison."""
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    if not _plot_masking_effect(
-            ax, df, "attention masking vs input slicing — absolute loss",
-            absolute_loss=True):
-        plt.close(fig)
+    d = df[df["method"] == "attention_masking"]
+    if d.empty:
         return
-    _save(fig, out_dir, "02b_masking_loss_vs_lookback.png")
+    datasets = sorted(d["dataset"].astype(str).unique())
+    if "synthetic" in datasets:
+        datasets = ["synthetic"]
+    first = True
+    for dataset in datasets:
+        metrics = sorted(d.loc[d["dataset"].astype(str) == dataset,
+                               "metric"].astype(str).unique())
+        for metric in metrics:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            if not _plot_masking_effect(
+                    ax, df,
+                    f"attention masking vs input slicing — {dataset} — absolute {metric.upper()}",
+                    absolute_loss=True, dataset=dataset, metric=metric):
+                plt.close(fig)
+                continue
+            suffix = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{dataset}_{metric}")
+            _save(fig, out_dir,
+                  "02b_masking_loss_vs_lookback.png" if first else
+                  f"02b_masking_loss_vs_lookback_{suffix}.png")
+            first = False
 
 
 def fig_masking_effect_all_models(model_frames: Dict[str, pd.DataFrame],
                                   out_dir: str,
-                                  absolute_loss: bool = False) -> None:
+                                  absolute_loss: bool = False,
+                                  dataset: Optional[str] = None,
+                                  largest_full_context_only: bool = True) -> None:
     """One attention-masking/slicing overview containing every model."""
-    frames = {
+    candidates = {
         model: frame for model, frame in model_frames.items()
+        if not frame.empty and (frame["method"] == "attention_masking").any()
+    }
+    if not candidates:
+        return
+    if dataset is None:
+        common_datasets = None
+        for frame in candidates.values():
+            available = set(frame.loc[
+                frame["method"] == "attention_masking", "dataset"].astype(str))
+            common_datasets = (available if common_datasets is None else
+                               common_datasets & available)
+        if not common_datasets:
+            return
+        dataset = ("synthetic" if "synthetic" in common_datasets else
+                   sorted(common_datasets)[0])
+    frames = {
+        model: frame for model, frame in candidates.items()
         if not frame.empty
-        and (frame["method"] == "attention_masking").any()
+        and ((frame["method"] == "attention_masking")
+             & (frame["dataset"].astype(str) == dataset)).any()
     }
     if not frames:
         return
-    all_windows = sorted({
-        int(W)
-        for frame in frames.values()
-        for W in frame.loc[
-            frame["method"] == "attention_masking",
-            "context_length"].dropna().unique()
-    })
+    common_metrics = None
+    for frame in frames.values():
+        available = set(frame.loc[
+            (frame["method"] == "attention_masking")
+            & (frame["dataset"].astype(str) == dataset), "metric"].astype(str))
+        common_metrics = available if common_metrics is None else common_metrics & available
+    if not common_metrics:
+        return
+    metric = "mse" if "mse" in common_metrics else "mae"
+    if largest_full_context_only:
+        all_windows = sorted({int(frame.loc[
+            (frame["method"] == "attention_masking")
+            & (frame["dataset"].astype(str) == dataset)
+            & (frame["metric"].astype(str) == metric), "context_length"].max())
+            for frame in frames.values()})
+    else:
+        all_windows = sorted({
+            int(W) for frame in frames.values()
+            for W in frame.loc[
+                (frame["method"] == "attention_masking")
+                & (frame["dataset"].astype(str) == dataset)
+                & (frame["metric"].astype(str) == metric),
+                "context_length"].dropna().unique()
+        })
     colors = _masking_colors(all_windows)
     ncols = min(3, len(frames))
     nrows = math.ceil(len(frames) / ncols)
@@ -292,7 +389,8 @@ def fig_masking_effect_all_models(model_frames: Dict[str, pd.DataFrame],
     for ax, (model, frame) in zip(axes.flat, frames.items()):
         _plot_masking_effect(
             ax, frame, model, colors=colors, add_legends=False,
-            absolute_loss=absolute_loss)
+            absolute_loss=absolute_loss, dataset=dataset, metric=metric,
+            largest_full_context_only=largest_full_context_only)
     for ax in axes.flat[len(frames):]:
         ax.set_visible(False)
     color_handles, shape_handles = _masking_legend_handles(colors)
@@ -304,18 +402,130 @@ def fig_masking_effect_all_models(model_frames: Dict[str, pd.DataFrame],
         handles=shape_handles, title="intervention (shape / line)",
         ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.89),
         fontsize=7, title_fontsize=8)
-    comparison = "absolute loss" if absolute_loss else "Δ loss"
+    comparison = (f"absolute {metric.upper()}" if absolute_loss
+                  else f"Δ {metric.upper()}")
+    context_scope = ("largest full context per model"
+                     if largest_full_context_only else
+                     "all available full input sizes")
     fig.suptitle(
-        f"attention masking vs input slicing — all models ({comparison})",
+        f"attention masking vs input slicing — {dataset} — "
+        f"{context_scope} ({comparison})",
         fontsize=14, y=0.995)
     filename = (
         "02b_masking_loss_vs_lookback_all_models.png"
         if absolute_loss
         else "02_masking_effect_vs_lookback_all_models.png"
     )
+    if not largest_full_context_only:
+        filename = filename.replace(".png", "_all_input_sizes.png")
     _save(
         fig, out_dir, filename,
         tight_rect=(0, 0, 1, 0.84))
+
+
+def _plot_tail_stats_masking(ax, df: pd.DataFrame, title: str,
+                             colors: Dict[int, object], dataset: str,
+                             metric: str,
+                             largest_full_context_only: bool) -> bool:
+    variant = "attention_mask/tail_matched_stats"
+    d = df[(df["method"] == "context_decomposition")
+           & (df["perturbation_type"] == variant)
+           & (df["dataset"].astype(str) == dataset)
+           & (df["metric"].astype(str) == metric)]
+    if d.empty:
+        return False
+    if largest_full_context_only:
+        d = d[d["context_length"] == d["context_length"].max()]
+    for W, g in d.groupby("context_length"):
+        color = colors[int(W)]
+        masked = g.groupby("lookback_start")["intervened_loss"].mean()
+        sliced = g.groupby("lookback_start")["clean_loss"].mean()
+        ax.plot(masked.index, masked.values, "o-", color=color)
+        ax.plot(sliced.index, sliced.values, "s--", color=color)
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("visible span L (timesteps) — everything older is masked")
+    ax.set_ylabel(f"mean {metric.upper()}")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    return True
+
+
+def fig_tail_stats_masking_all_models(
+        model_frames: Dict[str, pd.DataFrame], out_dir: str,
+        largest_full_context_only: bool = True) -> None:
+    """Main-style masking/slicing plot using tail-matched preprocessing."""
+    variant = "attention_mask/tail_matched_stats"
+    frames = {
+        model: frame for model, frame in model_frames.items()
+        if not frame.empty and ((frame["method"] == "context_decomposition")
+                                & (frame["perturbation_type"] == variant)).any()
+    }
+    if not frames:
+        return
+    common_datasets = None
+    for frame in frames.values():
+        available = set(frame.loc[
+            (frame["method"] == "context_decomposition")
+            & (frame["perturbation_type"] == variant), "dataset"].astype(str))
+        common_datasets = (available if common_datasets is None else
+                           common_datasets & available)
+    if not common_datasets:
+        return
+    dataset = ("kernelsynth_chronos"
+               if "kernelsynth_chronos" in common_datasets
+               else sorted(common_datasets)[0])
+    metric = "mse"
+    frames = {
+        model: frame for model, frame in frames.items()
+        if ((frame["method"] == "context_decomposition")
+            & (frame["perturbation_type"] == variant)
+            & (frame["dataset"].astype(str) == dataset)
+            & (frame["metric"].astype(str) == metric)).any()
+    }
+    if not frames:
+        return
+    if largest_full_context_only:
+        windows = sorted({int(frame.loc[
+            (frame["method"] == "context_decomposition")
+            & (frame["perturbation_type"] == variant)
+            & (frame["dataset"].astype(str) == dataset)
+            & (frame["metric"].astype(str) == metric),
+            "context_length"].max()) for frame in frames.values()})
+    else:
+        windows = sorted({int(W) for frame in frames.values() for W in
+            frame.loc[(frame["method"] == "context_decomposition")
+                      & (frame["perturbation_type"] == variant)
+                      & (frame["dataset"].astype(str) == dataset)
+                      & (frame["metric"].astype(str) == metric),
+                      "context_length"].unique()})
+    colors = _masking_colors(windows)
+    ncols = min(3, len(frames))
+    nrows = math.ceil(len(frames) / ncols)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(7 * ncols, 4.8 * nrows), squeeze=False)
+    for ax, (model, frame) in zip(axes.flat, frames.items()):
+        _plot_tail_stats_masking(
+            ax, frame, model, colors, dataset, metric,
+            largest_full_context_only)
+    for ax in axes.flat[len(frames):]:
+        ax.set_visible(False)
+    color_handles, shape_handles = _masking_legend_handles(
+        colors, masked_label="attention masked + tail stats")
+    fig.legend(handles=color_handles, title="full context W (color)",
+               ncol=min(8, len(color_handles)), loc="upper center",
+               bbox_to_anchor=(0.5, 0.96), fontsize=7, title_fontsize=8)
+    fig.legend(handles=shape_handles, title="intervention (shape / line)",
+               ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.89),
+               fontsize=7, title_fontsize=8)
+    scope = ("largest full context per model" if largest_full_context_only
+             else "all available full input sizes")
+    fig.suptitle(
+        f"tail-stat attention masking vs input slicing — {dataset} — "
+        f"{scope} (absolute MSE)", fontsize=14, y=0.995)
+    filename = "02c_tail_stats_masking_loss_all_models.png"
+    if not largest_full_context_only:
+        filename = filename.replace(".png", "_all_input_sizes.png")
+    _save(fig, out_dir, filename, tight_rect=(0, 0, 1, 0.84))
 
 
 # -- 3+6. block-effect heatmaps (perturbation Δloss / pred-distance / IG) ---------
@@ -844,8 +1054,11 @@ def fig_context_decomposition(df: pd.DataFrame, out_dir: str) -> None:
         return
     full_name = "attention_mask/full_history_stats"
     tail_name = "attention_mask/tail_matched_stats"
-    for metric in sorted(d["metric"].dropna().unique()):
-        dm = d[d["metric"] == metric]
+    combinations = d[["dataset", "metric"]].dropna().drop_duplicates()
+    first_by_metric = set()
+    for dataset, metric in combinations.sort_values(
+            ["dataset", "metric"]).itertuples(index=False, name=None):
+        dm = d[(d["dataset"] == dataset) & (d["metric"] == metric)]
         contexts = sorted(int(v) for v in dm["context_length"].unique())
         colors = _masking_colors(contexts)
         fig, axes = plt.subplots(1, 3, figsize=(17, 4.8))
@@ -898,10 +1111,60 @@ def fig_context_decomposition(df: pd.DataFrame, out_dir: str) -> None:
         axes[2].set_ylabel(f"Δ {metric.upper()}")
         axes[2].set_title("normalization proxy: full-stats mask − tail-stats mask")
         fig.suptitle(
-            f"Context restriction decomposition — {metric.upper()}",
+            f"Context restriction decomposition — {dataset} — {metric.upper()}",
             fontsize=13)
-        _save(fig, out_dir, f"12_context_decomposition_{metric}.png",
+        suffix = re.sub(
+            r"[^A-Za-z0-9_.-]+", "_", f"{dataset}_{metric}")
+        filename = (f"12_context_decomposition_{metric}.png"
+                    if metric not in first_by_metric else
+                    f"12_context_decomposition_{suffix}.png")
+        first_by_metric.add(metric)
+        _save(fig, out_dir, filename,
               tight_rect=(0, 0, 1, 0.94))
+
+
+def fig_normalization_stat_ablation(df: pd.DataFrame, out_dir: str) -> None:
+    """Mean-only versus scale-only direct normalization interventions."""
+    variants = [
+        ("attention_mask/full_history_stats", "mask/full stats", "o-"),
+        ("attention_mask/tail_mean_full_scale", "tail mean only", "^-"),
+        ("attention_mask/full_mean_tail_scale", "tail scale only", "v-"),
+        ("attention_mask/tail_mean_tail_scale_direct", "tail mean + scale", "D-"),
+    ]
+    d = df[(df["method"] == "context_decomposition") &
+           df["perturbation_type"].isin([v[0] for v in variants])]
+    if d.empty or not d["perturbation_type"].str.contains(
+            "tail_mean_tail_scale_direct", regex=False).any():
+        return
+    first_by_metric = set()
+    for (dataset, metric), dm in d.groupby(["dataset", "metric"]):
+        fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8))
+        for stat, ax in (("mean", axes[0]), ("median", axes[1])):
+            sliced = dm.groupby("lookback_start")["clean_loss"].agg(stat)
+            ax.plot(sliced.index, sliced.values, "s--", lw=2,
+                    label="input sliced")
+            for name, label, style in variants:
+                v = dm[dm["perturbation_type"] == name]
+                if v.empty:
+                    continue
+                prof = v.groupby("lookback_start")["intervened_loss"].agg(stat)
+                ax.plot(prof.index, prof.values, style, lw=1.7, label=label)
+            ax.set_xscale("log", base=2)
+            ax.set_yscale("log")
+            ax.set_xlabel("visible suffix L")
+            ax.set_ylabel(f"{stat} {str(metric).upper()} (log scale)")
+            ax.set_title(f"{stat} across instances")
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=7)
+        fig.suptitle(
+            f"Direct normalization-statistic ablation — {dataset} — "
+            f"{str(metric).upper()}", fontsize=13)
+        suffix = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{dataset}_{metric}")
+        filename = (f"12b_normalization_stat_ablation_{metric}.png"
+                    if metric not in first_by_metric else
+                    f"12b_normalization_stat_ablation_{suffix}.png")
+        first_by_metric.add(metric)
+        _save(fig, out_dir, filename, tight_rect=(0, 0, 1, 0.94))
 
 
 # -- 13. direct TSFM loss-contrast saliency -------------------------------------
@@ -960,6 +1223,7 @@ def generate_all(run_dir: str, tolerance: float = 0.05) -> None:
         fig_cross_method(df, out_dir)
         fig_predictor_contrast_saliency(df, out_dir)
         fig_context_decomposition(df, out_dir)
+        fig_normalization_stat_ablation(df, out_dir)
         fig_tsfm_contrast_saliency(df, out_dir)
     # error curves + instance distributions from every clean cache found
     for dirpath, dirs, _files in os.walk(run_dir):
@@ -1062,6 +1326,17 @@ def generate_all_models(output_root: str, models: List[str]) -> None:
         frames, os.path.join(output_root, "figures"))
     fig_masking_effect_all_models(
         frames, os.path.join(output_root, "figures"), absolute_loss=True)
+    fig_masking_effect_all_models(
+        frames, os.path.join(output_root, "figures"),
+        largest_full_context_only=False)
+    fig_masking_effect_all_models(
+        frames, os.path.join(output_root, "figures"), absolute_loss=True,
+        largest_full_context_only=False)
+    fig_tail_stats_masking_all_models(
+        frames, os.path.join(output_root, "figures"))
+    fig_tail_stats_masking_all_models(
+        frames, os.path.join(output_root, "figures"),
+        largest_full_context_only=False)
     fig_perturbation_recency_all_models(
         frames, os.path.join(output_root, "figures"))
     fig_control_sweeps_all_models(

@@ -1,0 +1,9 @@
+extends: experiments_long_lag.yaml
+
+# Paper comparison grid. Toto's completed long-lag run used the same 48-series
+# cohort through experiments_long_lag_toto.yaml; keep every comparator on that
+# cohort so sufficient-context estimates are directly comparable across models.
+max_samples: 48
+
+synthetic_controls:
+  n_instances: 48

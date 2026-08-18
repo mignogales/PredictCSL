@@ -1,0 +1,82 @@
+{
+  "run_dir": "logs/experiments/context_interpretability/TiRex2",
+  "sufficient_contexts": {
+    "exp1_perturbation": 1536,
+    "exp4_synthetic_controls/famA_linear_r8_n0.1": 96,
+    "exp4_synthetic_controls/famA_linear_r8_n0.1/perturbation": 96,
+    "exp4_synthetic_controls/famA_nonlinear_r8_n0.1": 192,
+    "exp4_synthetic_controls/famA_nonlinear_r8_n0.1/perturbation": 192,
+    "exp4_synthetic_controls/famA_seasonal_r8_n0.1": 192,
+    "exp4_synthetic_controls/famA_seasonal_r8_n0.1/perturbation": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d32_s0_linear_n0.1": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d32_s0_linear_n0.1/perturbation": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d32_s0.5_linear_n0.1": 96,
+    "exp4_synthetic_controls/famB_linear_r8_d32_s0.5_linear_n0.1/perturbation": 96,
+    "exp4_synthetic_controls/famB_linear_r8_d32_s1_linear_n0.1": 96,
+    "exp4_synthetic_controls/famB_linear_r8_d32_s1_linear_n0.1/perturbation": 96,
+    "exp4_synthetic_controls/famB_linear_r8_d64_s0_linear_n0.1": 128,
+    "exp4_synthetic_controls/famB_linear_r8_d64_s0_linear_n0.1/perturbation": 128,
+    "exp4_synthetic_controls/famB_linear_r8_d64_s0.5_linear_n0.1": 128,
+    "exp4_synthetic_controls/famB_linear_r8_d64_s0.5_linear_n0.1/perturbation": 128,
+    "exp4_synthetic_controls/famB_linear_r8_d64_s1_linear_n0.1": 384,
+    "exp4_synthetic_controls/famB_linear_r8_d64_s1_linear_n0.1/perturbation": 384,
+    "exp4_synthetic_controls/famB_linear_r8_d128_s0_linear_n0.1": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d128_s0_linear_n0.1/perturbation": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d128_s0.5_linear_n0.1": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d128_s0.5_linear_n0.1/perturbation": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d128_s1_linear_n0.1": 384,
+    "exp4_synthetic_controls/famB_linear_r8_d128_s1_linear_n0.1/perturbation": 384,
+    "exp4_synthetic_controls/famB_linear_r8_d256_s0_linear_n0.1": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d256_s0_linear_n0.1/perturbation": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d256_s0.5_linear_n0.1": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d256_s0.5_linear_n0.1/perturbation": 192,
+    "exp4_synthetic_controls/famB_linear_r8_d256_s1_linear_n0.1": 1024,
+    "exp4_synthetic_controls/famB_linear_r8_d256_s1_linear_n0.1/perturbation": 1024,
+    "exp4_synthetic_controls/famB_linear_r8_d128_s1_linear_n0.05": 384,
+    "exp4_synthetic_controls/famB_linear_r8_d128_s1_linear_n0.05/perturbation": 384,
+    "exp4_synthetic_controls/famB_linear_r8_d128_s1_linear_n0.25": 384,
+    "exp4_synthetic_controls/famB_linear_r8_d128_s1_linear_n0.25/perturbation": 384,
+    "exp4_synthetic_controls/famC_linear_r8_d128_s1_linear_n0.1": 384,
+    "exp4_synthetic_controls/famC_linear_r8_d128_s1_linear_n0.1/perturbation": 384
+  },
+  "ig_limitations": "Low gradient attribution is not proof of causal irrelevance; gradients may be affected by model saturation; attribution depends on the baseline; the perturbation experiments remain the principal causal evidence.",
+  "hypotheses": {
+    "H1": {
+      "statement": "Perturbing observations beyond the sufficient context causes negligible forecast degradation.",
+      "recent_effect": 0.00861126388147679,
+      "distant_effect": 0.0014342930309241603,
+      "ratio": 0.1665601067004099,
+      "n_significant_distant_blocks": 562,
+      "threshold": 0.2,
+      "verdict": "supporting"
+    },
+    "H2": {
+      "statement": "Forecast-relevant attribution and intervention effects concentrate inside the sufficient context.",
+      "per_method_fraction_inside": {
+        "perturbation": 0.7728734132212706
+      },
+      "mean_fraction_inside": 0.7728734132212706,
+      "threshold": 0.8,
+      "verdict": "mixed"
+    },
+    "H3": {
+      "statement": "Intermediate predictions stabilize across context lengths as representations progress through the network.",
+      "verdict": "insufficient_data"
+    },
+    "H4": {
+      "statement": "When distant information is made genuinely predictive, the model's effective context expands toward that dependency.",
+      "spearman_lag_vs_sufficient": 0.7453559924999299,
+      "fraction_reaching_lag": 0.875,
+      "zero_strength_stays_local": false,
+      "architectural_limitation_flags": [
+        "famB_linear_r8_d256_s0.5_linear_n0.1"
+      ],
+      "threshold": 0.6,
+      "verdict": "supporting"
+    },
+    "H5": {
+      "statement": "Attention masking, perturbation, activation patching, forecast lens and integrated gradients give qualitatively consistent estimates of the effective context.",
+      "verdict": "insufficient_data"
+    }
+  }
+}

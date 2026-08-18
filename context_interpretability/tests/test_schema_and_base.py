@@ -8,6 +8,7 @@ from torch import nn
 from context_interpretability.adapters.base import (
     AdapterCapabilities, align_context_lengths, blocks_for_context, thin_blocks)
 from context_interpretability.adapters.tsfm import TSFMAdapter
+from context_interpretability.experiments.common import block_grid
 from context_interpretability.schema import (
     ResultsWriter, cell_done, load_results, make_row)
 
@@ -70,6 +71,29 @@ class TestContextAlignment(unittest.TestCase):
         subset2, thinned2 = thin_blocks(blocks[:10], 16)
         self.assertFalse(thinned2)
         self.assertEqual(len(subset2), 10)
+
+    def test_block_grid_can_force_planted_lag_band(self):
+        from context_interpretability.adapters.base import InterpretabilityAdapter
+        adapter = InterpretabilityAdapter(
+            "test", AdapterCapabilities(), horizon=64, batch_size=1)
+        config = {
+            "block_mode": "fixed_length",
+            "block_length": 32,
+            "max_blocks_per_context": 8,
+            "perturbation": {
+                "force_lookback_ranges": [[1985, 2049]],
+                "only_forced_blocks": True,
+            },
+        }
+        blocks, thinned, width = block_grid(adapter, 8192, config)
+        self.assertEqual(width, 32)
+        self.assertTrue(thinned)
+        self.assertGreaterEqual(len(blocks), 2)
+        self.assertTrue(all(block.lookback_end > 1985
+                            and block.lookback_start < 2049
+                            for block in blocks))
+        self.assertTrue(any(block.lookback_start <= 2048 < block.lookback_end
+                            for block in blocks))
 
     def test_dynamic_batch_size_scales_with_short_contexts(self):
         from context_interpretability.adapters.base import InterpretabilityAdapter

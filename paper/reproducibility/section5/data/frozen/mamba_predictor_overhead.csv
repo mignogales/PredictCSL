@@ -1,0 +1,12 @@
+model,family,arch,patch_length,d_model,layers,pred_params_m,predictor_gmac,full_window,tsfm_gmac_full_h48,pct_of_full_h48
+Chronos2-Base,chronos2,mamba,64,128,4,0.985938,0.128936,8192,64.674165,0.199363
+Chronos2-Small,chronos2,mamba,64,128,4,0.985938,0.128936,8192,64.674165,0.199363
+Chronos2-Synth,chronos2,mamba,64,128,4,0.985938,0.128936,8192,64.674165,0.199363
+ChronosBolt-Base,chronos_bolt,mamba,64,128,4,0.985293,0.128936,2048,13.409323,0.961537
+FlowState-R1,flowstate,mamba,128,128,2,0.527504,0.033282,4096,15.975832,0.208327
+Moirai2-Small,moirai,mamba,64,128,4,0.985938,0.128936,8192,5.474788,2.355090
+PatchTST-FM-R1,patchtst_fm,mamba,64,128,4,0.985938,0.128936,8192,140.467610,0.091791
+Sundial-Base-128M,sundial,mamba,64,128,4,0.985551,0.128936,2880,78.878147,0.163462
+TiRex2,tirex,mamba,64,128,4,0.985938,0.128936,8192,10.758390,1.198471
+TimesFM2.5-200M,timesfm,mamba,64,128,4,1.000532,0.240872,8192,54.132941,0.444964
+Toto-2.0-313m,toto,mamba,128,128,4,0.993936,0.065497,4096,31.399281,0.208594

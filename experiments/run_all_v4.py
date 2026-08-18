@@ -152,10 +152,13 @@ def parse_args() -> argparse.Namespace:
                    help="Also pin the constrained Mamba corner "
                         "(PREDICTCSL_CHEAP_PREDICTOR=1): match v3's patch sizes, "
                         "d_model, and layer counts.")
-    p.add_argument("--training-objective", choices=["curve", "classification"],
+    p.add_argument("--training-objective",
+                   choices=["curve", "classification", "pairwise", "acceptable"],
                    default="curve",
-                   help="Predict the curve shape (original) or classify the best "
-                        "window with soft top-3 labels.")
+                   help=("Predict the curve shape (original), classify the best "
+                         "window with soft top-3 labels, learn cost-weighted "
+                         "preferences between adjacent windows, or classify "
+                         "every near-oracle window as acceptable."))
     p.add_argument(
         "--cached-only-ablation", action="store_true",
         help=("Pass --cached-only to stage 3, refusing to load the foundation "
@@ -178,7 +181,9 @@ def main() -> None:
     # ---- Arch + constraint env vars (read at import by predict_context_length) -
     # subprocess.Popen inherits os.environ, so setting these here propagates to
     # the stage-2 child and, in turn, to its spawned per-GPU trial workers.
-    objective_suffix = "" if args.training_objective == "curve" else "_classification"
+    objective_suffix = (
+        "" if args.training_objective == "curve"
+        else f"_{args.training_objective}")
     test_mode = os.environ.get("PREDICTCSL_TEST") == "1"
     master_root = (ra_v3._apply_output_root(args.output_root) if args.output_root
                    else os.environ.get("PREDICTCSL_MASTER_ROOT"))

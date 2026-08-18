@@ -1,0 +1,17 @@
+% Requires \usepackage{graphicx}
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.98\textwidth]
+        {figures/fig7_multimodel_pareto_overlay.pdf}
+    \caption{Superposed cell-shared supported Pareto frontiers for 11
+    time-series foundation models on the 97-cell GiftEval cohort.  To make
+    architectures comparable, normalized MASE is divided by each model's
+    native-context value; the dashed horizontal reference therefore denotes
+    native accuracy.  The vertical range is capped at $1.10\times$ native
+    MASE; supported points above that limit are clipped.  Circles mark each
+    minimum-MASE oracle and
+    squares mark the greatest supported FLOPs reduction that remains no worse
+    than native accuracy.  Chronos2-Small, the running example, is highlighted
+    in orange.}
+    \label{fig:multimodel-pareto-overlay}
+\end{figure*}

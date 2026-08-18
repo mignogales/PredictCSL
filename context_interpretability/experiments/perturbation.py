@@ -178,9 +178,17 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
         pcfg.get("interventions_per_call", 8)))
     metric = config.get("primary_metric", "mae")
 
-    cache = CleanCache(adapter, data, metric,
-                       cache_dir=os.path.join(out_dir, "clean_cache"))
+    reuse_clean_root = pcfg.get("reuse_clean_cache_root")
+    cache_dir = (
+        os.path.join(str(reuse_clean_root), adapter.name,
+                     "exp4_synthetic_controls", data.name, "perturbation",
+                     "clean_cache")
+        if reuse_clean_root else os.path.join(out_dir, "clean_cache")
+    )
+    cache = CleanCache(adapter, data, metric, cache_dir=cache_dir)
     pairs = adapter.effective_context_lengths(config["context_lengths"])
+    if pcfg.get("largest_context_only", False) and pairs:
+        pairs = [pairs[-1]]
     if run_meta:
         run_meta.note("effective_context_lengths",
                       {str(r): e for r, e in pairs})
@@ -188,7 +196,9 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
     cells: List[str] = []
 
     for requested, W in pairs:
-        cell = os.path.join(out_dir, data.name, f"w{W}")
+        cell_root = os.path.join(
+            out_dir, str(pcfg.get("cell_subdir") or ""), data.name)
+        cell = os.path.join(cell_root, f"w{W}")
         cells.append(cell)
         if cell_done(cell):
             continue

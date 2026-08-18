@@ -1,0 +1,43 @@
+extends: experiments.yaml
+
+# Follow-up using the Chronos paper's random-composite GP construction.  A
+# 960-step context plus the 64-step target matches upstream's length 1024.
+output_root: logs/experiments/context_interpretability_masking_kernelsynth
+max_samples: 16
+batch_size: 2
+dynamic_batching:
+  enabled: false
+
+context_lengths: [32, 64, 128, 256, 512, 768]
+
+experiments:
+  exp0_attention_masking: true
+  exp1_perturbation: false
+  exp2_activation_patching: false
+  exp3_forecast_lens: false
+  exp4_synthetic_controls: false
+  exp5_integrated_gradients: false
+  exp6_predictor_contrast_saliency: false
+  exp7_context_decomposition: true
+  exp8_tsfm_contrast_saliency: false
+
+attention_masking:
+  enabled: true
+  metrics: [mse, mae]
+
+context_decomposition:
+  metrics: [mse, mae]
+  all_full_contexts: false
+  full_contexts: null
+  visible_lengths: [32, 64, 128, 256, 512]
+
+datasets:
+  source: kernelsynth
+  kernelsynth:
+    n_series: 16
+    series_length: 960
+    seed: 4202
+    max_kernels: 5
+    normalize_std: true
+    cache_path: logs/experiments/_interpretability_data_cache/kernelsynth_n16_t1024_seed4202.npz
+

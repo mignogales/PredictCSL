@@ -24,7 +24,9 @@ from tqdm.auto import tqdm
 from context_interpretability.adapters.base import (
     CapabilityError, InterpretabilityAdapter)
 from context_interpretability.experiments.common import (
-    CleanCache, ExperimentData, intervention_effects)
+    CleanCache, ExperimentData)
+from context_interpretability.metrics import forecast_metrics as fm
+from context_interpretability.metrics import prediction_distance as pdist
 from context_interpretability.schema import ResultsWriter, cell_done
 
 METHOD = "attention_masking"
@@ -35,8 +37,15 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
     if not adapter.capabilities.supports_attention_masking:
         raise CapabilityError(f"{adapter.name}: attention masking unsupported")
 
-    metric = config.get("primary_metric", "mae")
-    cache = CleanCache(adapter, data, metric,
+    acfg = config.get("attention_masking") or {}
+    metrics = list(dict.fromkeys(
+        str(m).lower() for m in acfg.get(
+            "metrics", [config.get("primary_metric", "mae")])
+    ))
+    bad = set(metrics) - {"mae", "mse", "smape", "mase"}
+    if bad:
+        raise ValueError(f"Unsupported attention-masking metrics: {sorted(bad)}")
+    cache = CleanCache(adapter, data, metrics[0],
                        cache_dir=os.path.join(out_dir, "clean_cache"))
     pairs = adapter.effective_context_lengths(config["context_lengths"])
     if run_meta:
@@ -51,7 +60,7 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
         if cell_done(cell):
             continue
         window = data.window(W)
-        clean_pred, clean_loss = cache.get(W)
+        clean_pred, _primary_clean_loss = cache.get(W)
         writer = ResultsWriter(cell)
 
         # every effective grid length strictly below W is a visible-span level
@@ -61,26 +70,33 @@ def run(adapter: InterpretabilityAdapter, data: ExperimentData, config: dict,
                         unit="mask", dynamic_ncols=True)
         for L in progress:
             masked_pred = adapter.forecast_attention_masked(window, L)
-            eff = intervention_effects(clean_pred, clean_loss, masked_pred,
-                                       cache)
+            distance = pdist.l1_distance(masked_pred, clean_pred)
+            distance_norm = pdist.normalized_distance(clean_pred, masked_pred)
             first_hidden_block = L // P
-            for i, sid in enumerate(data.sample_ids):
-                writer.add(
-                    model=adapter.name, dataset=data.name, sample_id=sid,
-                    context_length=W, requested_context_length=requested,
-                    horizon=adapter.horizon,
-                    block_index=first_hidden_block,
-                    lookback_start=L, lookback_end=W,
-                    method=METHOD, perturbation_type="attention_masking",
-                    metric=metric, seed=seed,
-                    clean_loss=eff["clean_loss"][i],
-                    intervened_loss=eff["intervened_loss"][i],
-                    loss_delta=eff["loss_delta"][i],
-                    prediction_distance=eff["prediction_distance"][i],
-                    prediction_distance_norm=eff["prediction_distance_norm"][i],
-                )
+            for metric in metrics:
+                clean_loss = fm.compute_loss(
+                    metric, clean_pred, data.targets, context=data.contexts,
+                    season_length=data.season_length)
+                masked_loss = fm.compute_loss(
+                    metric, masked_pred, data.targets, context=data.contexts,
+                    season_length=data.season_length)
+                for i, sid in enumerate(data.sample_ids):
+                    writer.add(
+                        model=adapter.name, dataset=data.name, sample_id=sid,
+                        context_length=W, requested_context_length=requested,
+                        horizon=adapter.horizon,
+                        block_index=first_hidden_block,
+                        lookback_start=L, lookback_end=W,
+                        method=METHOD, perturbation_type="attention_masking",
+                        metric=metric, seed=seed,
+                        clean_loss=clean_loss[i],
+                        intervened_loss=masked_loss[i],
+                        loss_delta=masked_loss[i] - clean_loss[i],
+                        prediction_distance=distance[i],
+                        prediction_distance_norm=distance_norm[i],
+                    )
         writer.finalize({"context_length": W, "visible_lengths": visibles,
-                         "block_length": P})
+                         "block_length": P, "metrics": metrics})
         print(f"[exp0][{adapter.name}] {data.name} w{W}: "
               f"{len(visibles)} mask levels done")
     return cells

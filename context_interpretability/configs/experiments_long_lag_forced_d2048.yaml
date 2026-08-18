@@ -1,0 +1,19 @@
+extends: experiments_long_lag_comparison.yaml
+
+# Targeted audit for the five models whose geometric 64-block thinning omitted
+# the planted d=2048 source band. Reuse the canonical pools and clean forecasts,
+# while keeping audit rows isolated from the canonical paper-analysis tree.
+output_root: logs/experiments/context_interpretability_long_lag_forced_d2048
+
+synthetic_controls:
+  only_datasets: [famB_linear_r8_d2048_s1_linear_n0.1]
+  run_methods: [perturbation]
+  summary_filename: controls_summary_forced_d2048.json
+  control_cache_root: logs/experiments/context_interpretability_long_lag/_synthetic_control_cache
+  reuse_clean_cache_root: logs/experiments/context_interpretability_long_lag
+
+perturbation:
+  largest_context_only: true
+  only_forced_blocks: true
+  cell_subdir: forced_d2048_audit
+  reuse_clean_cache_root: logs/experiments/context_interpretability_long_lag

@@ -1,0 +1,21 @@
+{
+  "status": "provisional_single_model_extension",
+  "model": "Toto-2.0-313m",
+  "git_commit": "b1c81d08ab2c43e13d4a0c0542342c704bf8c843",
+  "seed": 42,
+  "n_instances": 48,
+  "series_length": 8192,
+  "distant_lags": [128, 512, 1024, 2048],
+  "dependency_strengths_shown": [0.5, 1.0],
+  "maximum_supported_context": 4096,
+  "source_files": [
+    {
+      "path": "../frozen_input_long_lag/Toto-2.0-313m/exp4_synthetic_controls/controls_summary.json",
+      "sha256": "7fc639b2c7dd7ee2f905489dd5d47415c18d034cb28af0fb4f6abc1fcbfe2cbe"
+    },
+    {
+      "path": "../frozen_input_long_lag/Toto-2.0-313m/run_meta.json",
+      "sha256": "9fd64f2a97d91ab0fba762eb419170ecbf890a3232cbbdfc2a324f440b26939a"
+    }
+  ]
+}

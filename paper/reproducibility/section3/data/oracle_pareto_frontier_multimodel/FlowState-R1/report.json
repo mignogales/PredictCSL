@@ -1,0 +1,73 @@
+{
+  "model": "FlowState-R1",
+  "mase_metric": "mase_gluonts_real",
+  "flops_weighting": "cell",
+  "policy_scope": "one dataset-shared action per GiftEval dataset/term cell",
+  "frontier_kind": "exact supported frontier from global linear scalarization",
+  "n_cells": 97,
+  "n_supported_points": 467,
+  "full_normalized_mase": 0.709000669052374,
+  "full_total_flops": 1174964919291.8555,
+  "unconstrained_oracle_normalized_mase": 0.6964589286527888,
+  "unconstrained_oracle_flops_saved_pct": 37.26499475898798,
+  "maximum_supported_flops_saved_pct": 91.38631400862704,
+  "minimum_compute_normalized_mase": 1.0281889187114168,
+  "key_operating_points": [
+    {
+      "constraint": "no worse than full",
+      "normalized_mase_limit": 0.709000669052374,
+      "normalized_mase": 0.708926383247444,
+      "flops_saved_pct": 74.23898531246165,
+      "native_cells": 10,
+      "frontier_index": 103
+    },
+    {
+      "constraint": "within 0.1% of oracle",
+      "normalized_mase_limit": 0.6971553875814415,
+      "normalized_mase": 0.6971104483628366,
+      "flops_saved_pct": 50.9513736601146,
+      "native_cells": 16,
+      "frontier_index": 33
+    },
+    {
+      "constraint": "within 0.5% of oracle",
+      "normalized_mase_limit": 0.6999412232960527,
+      "normalized_mase": 0.6999361524130048,
+      "flops_saved_pct": 62.028864215870485,
+      "native_cells": 14,
+      "frontier_index": 69
+    },
+    {
+      "constraint": "within 1% of oracle",
+      "normalized_mase_limit": 0.7034235179393167,
+      "normalized_mase": 0.7032992857405794,
+      "flops_saved_pct": 67.95224792693023,
+      "native_cells": 11,
+      "frontier_index": 87
+    },
+    {
+      "constraint": "within 2% of oracle",
+      "normalized_mase_limit": 0.7103881072258446,
+      "normalized_mase": 0.7103579763470833,
+      "flops_saved_pct": 75.4502731667899,
+      "native_cells": 10,
+      "frontier_index": 112
+    },
+    {
+      "constraint": "within 5% of oracle",
+      "normalized_mase_limit": 0.7312818750854283,
+      "normalized_mase": 0.7301222185529004,
+      "flops_saved_pct": 83.1787916779229,
+      "native_cells": 5,
+      "frontier_index": 197
+    },
+    {
+      "constraint": "within 10% of oracle",
+      "normalized_mase_limit": 0.7661048215180677,
+      "normalized_mase": 0.765047091566408,
+      "flops_saved_pct": 87.45974120752447,
+      "native_cells": 4,
+      "frontier_index": 254
+    }
+  ]
+}
